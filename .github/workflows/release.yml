@@ -55,6 +55,9 @@ jobs:
           brew install pkgconf cmake
 
       - name: Build Nida.app and the DMG
+        env:
+          # Read-only GitHub API calls (when a homebrew-core patch changed).
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -o pipefail
           scripts/ci/build-macos.sh 2>&1 | tee build.log

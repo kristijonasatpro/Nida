@@ -30,7 +30,6 @@ Usage: bundle-macos-libs.py APP --min-macos 15.7.9 [--identifier ID]
 """
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -39,6 +38,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -285,6 +285,18 @@ def spdx_texts(ids, out):
         sys.exit(f"no standard licence text found for: {', '.join(missing)}")
 
 
+def installed_version(entry):
+    """The Cellar folder name an internal package-list entry installs."""
+    revision = entry.get("revision", 0)
+    return f"{entry['stable_version']}_{revision}" if revision else entry["stable_version"]
+
+
+def install_platform():
+    """This Mac's bottle tag (arm64_sequoia…), from the internal list's name."""
+    lists = sorted((Path(run("brew", "--cache").strip()) / "api" / "internal").glob("packages.*.jws.json"))
+    return lists[0].name.split(".")[1] if lists else ""
+
+
 def install_data():
     """What `brew install` read: Homebrew's internal package list for this
     Mac — each formula's version, source, checksums and patches — and the
@@ -298,10 +310,22 @@ def install_data():
     return payload["formula_tap_git_head"], payload["formulae"]
 
 
-def installed_version(entry):
-    """The Cellar folder name an internal package-list entry installs."""
-    revision = entry.get("revision", 0)
-    return f"{entry['stable_version']}_{revision}" if revision else entry["stable_version"]
+def spdx_string(licence):
+    """An SPDX expression from the internal list's licence form: a string,
+    or {"any_of": […]} / {"all_of": […]} nested, or {"id": {"with": "exception"}}."""
+    if licence is None or isinstance(licence, str):
+        return licence
+    if isinstance(licence, list):
+        return " AND ".join(spdx_string(part) for part in licence)
+    if isinstance(licence, dict):
+        for key, joiner in (("any_of", " OR "), ("all_of", " AND ")):
+            if key in licence:
+                return "(" + joiner.join(spdx_string(part) for part in licence[key]) + ")"
+        (spdx, extra), = licence.items()
+        if isinstance(extra, dict) and "with" in extra:
+            return f"{spdx} WITH {extra['with']}"
+        return spdx
+    return str(licence)
 
 
 def source_url(entry):
@@ -317,7 +341,7 @@ def licences(app, packages, info, installs, version):
     for name in sorted(packages):
         _, installed, keg = packages[name]
         entry = installs.get(name, {})
-        spdx = entry.get("license") or info.get(name, {}).get("license")
+        spdx = info.get(name, {}).get("license") or spdx_string(entry.get("license"))
         licence = spdx or "see its files"
         files = [p for p in sorted(keg.iterdir()) if p.is_file() and KEG_LICENCE.match(p.name)]
         if not files:
@@ -445,136 +469,189 @@ def fetch_url(url):
         sys.exit(f"could not fetch {url}: {e}")
 
 
-def sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def on_this_mac(lines, i, judge_all=True):
+    """Whether line `i` of a formula applies on Apple silicon macOS when the
+    formula is read: not inside a head, on_linux or on_intel block, a test
+    block or a method — nor, if `judge_all`, under a condition this does
+    not judge (another on_… block; without `judge_all` such a line counts
+    as applying). Formulae are laid out by rubocop, so each block's opener
+    is the nearest line above that is indented less."""
+    indent = len(lines[i]) - len(lines[i].lstrip())
+    for prev in reversed(lines[:i]):
+        stripped = prev.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        depth = len(prev) - len(prev.lstrip())
+        if depth >= indent:
+            continue
+        indent = depth
+        word = stripped.split()[0]
+        opens = re.search(r"\bdo(\s*\|[^|]*\|)?$", stripped)
+        if word == "def" or (opens and (
+            word in ("head", "on_linux", "on_intel", "test")
+            or (judge_all and word.startswith("on_") and word not in ("on_macos", "on_arm"))
+        )):
+            return False
+        if depth == 0:
+            return True
+    return True
+
+
+def kept_patches(ruby):
+    """Every patch a formula takes from homebrew-core's own Patches/ folder
+    (`patch do file "Patches/…" end`), each with whether it may apply on
+    Apple silicon macOS (all are archived; those that may apply must be
+    shown to be what the package was built with)."""
+    lines = ruby.splitlines()
+    return [(m.group(1), on_this_mac(lines, i, judge_all=False)) for i, line in enumerate(lines)
+            for m in [re.match(r'^\s*file "(Patches/[^"]+)"', line)] if m]
+
+
+def ghcr(path, accept):
+    """Homebrew's package registry (anonymous, as Homebrew reads it)."""
+    req = urllib.request.Request(f"https://ghcr.io/v2/homebrew/core/{path}", headers={
+        "Authorization": "Bearer QQ==", "Accept": accept, "User-Agent": "nida-release"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+
+def bottle_built(name, installed, entry, platform):
+    """When Homebrew built the package this Mac installed: its registry
+    entry for this platform — found by the bottle's checksum when the
+    install data is of the installed version, else the latest rebuild of
+    the installed version for this platform. None if none is found."""
+    repo = name.replace("@", "/")
+    exact = entry and installed_version(entry) == installed
+    if exact:
+        rebuild = entry.get("bottle_rebuild", 0)
+        tags = [f"{installed}-{rebuild}" if rebuild else installed]
+    else:
+        tags = [installed] + [f"{installed}-{n}" for n in range(1, 6)]
+    found = None
+    for tag in tags:
+        try:
+            index = ghcr(f"{repo}/manifests/{tag}", "application/vnd.oci.image.index.v1+json")
+        except OSError:
+            continue
+        for m in index.get("manifests", []):
+            a = m.get("annotations", {})
+            if exact and a.get("sh.brew.bottle.digest") == entry.get("bottle_checksum"):
+                found = m
+            elif not exact and f".{platform}" in a.get("org.opencontainers.image.ref.name", ""):
+                found = m
+    if not found:
+        return None
+    try:
+        manifest = ghcr(f"{repo}/manifests/{found['digest']}", "application/vnd.oci.image.manifest.v1+json")
+    except OSError:
+        return None
+    return manifest.get("annotations", {}).get("org.opencontainers.image.created")
+
+
+def commit_before(path, head, until):
+    """The newest homebrew-core commit up to `head` that changed `path` at or
+    before `until` (an ISO time): where the file stood then."""
+    url = (f"https://api.github.com/repos/Homebrew/homebrew-core/commits?per_page=1"
+           f"&sha={head}&path={urllib.parse.quote(path)}&until={urllib.parse.quote(until)}")
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "nida-release"}
+    if os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as r:
+        commits = json.loads(r.read())
+    return commits[0]["sha"] if commits else None
 
 
 def mac_resources(ruby):
-    """The resources a formula declares that Apple silicon macOS fetches:
-    none inside a head, on_linux or on_intel block, a test block or a
-    method (run later, if ever, not when the formula is read), nor under a
-    condition this does not judge (another on_… block). Formulae are laid
-    out by rubocop, so each block's opener is the nearest line above that
-    is indented less."""
+    """The resources a formula declares that Apple silicon macOS fetches
+    (see `on_this_mac`); `resource "x", :test do` is fetched for `brew test`
+    only."""
     lines = ruby.splitlines()
     names = []
     for i, line in enumerate(lines):
-        # `resource "x", :test do` is fetched for `brew test` only.
         m = re.match(r'^(\s*)resource "([^"]+)"(\s*,\s*:(\w+))? do\b', line)
-        if not m or m.group(4) == "test":
-            continue
-        indent, fetched = len(m.group(1)), True
-        for prev in reversed(lines[:i]):
-            stripped = prev.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            depth = len(prev) - len(prev.lstrip())
-            if depth >= indent:
-                continue
-            indent = depth
-            word = stripped.split()[0]
-            opens = re.search(r"\bdo(\s*\|[^|]*\|)?$", stripped)
-            if word == "def" or (opens and (
-                word in ("head", "on_linux", "on_intel", "test")
-                or (word.startswith("on_") and word not in ("on_macos", "on_arm"))
-            )):
-                fetched = False
-                break
-            if depth == 0:
-                break
-        if fetched:
+        if m and m.group(4) != "test" and on_this_mac(lines, i):
             names.append(m.group(2))
     return names
 
 
-def sources(packages, info, head, installs, tar_path, version):
+def sources(packages, head, installs, tar_path, version):
     """The exact source of every bundled Homebrew package — main source,
-    resources and patches — the formula that built it and its install
+    resources and patches — the recipe that built it and its install
     receipt, in one archive for the release.
 
-    Fetched through a tap of our own holding the formulae as homebrew-core
-    had them (`tap_git_head`): a formula read from Homebrew's API data has
-    no resources, and `brew fetch` would leave them out. Then checked
-    against what each formula asks for: the main source's checksum (or git
-    revision), each patch's checksum, each resource Apple silicon gets.
-    Versions, sources and the homebrew-core commit come from what `brew
-    install` read (`installs`, `head`), so they are those installed."""
-    for name, (_, installed, _) in sorted(packages.items()):
-        if name not in installs:
-            sys.exit(f"{name} is not in Homebrew's install data")
-        if installed_version(installs[name]) != installed:
-            sys.exit(f"{name} {installed} is installed but Homebrew's install data says "
-                     f"{installed_version(installs[name])}: reinstall it, so the source matches")
+    The recipe is the one Homebrew keeps in the keg (`.brew/<name>.rb`): the
+    formula the installed package was built from, which homebrew-core's
+    may since have changed without a new version. It is fetched through a
+    tap of our own holding those recipes: a formula read from Homebrew's API
+    data has no resources, and `brew fetch` would leave them out. Patches a
+    recipe takes from homebrew-core's own Patches/ come from homebrew-core
+    as each stood when Homebrew built the installed package (its registry
+    entry's time; the last commit to change the file before it) — refused
+    for one that may apply here when that time cannot be found. (A change
+    in the minutes between Homebrew's checkout and the package's time
+    would not be told apart.) Then checked: the main source and every
+    resource Apple silicon gets are there."""
     stage = Path(tempfile.mkdtemp(prefix="nida-sources-"))
     top = stage / f"Nida-{version}-third-party-source"
     for folder in ("sources", "formulae", "patches", "receipts"):
         (top / folder).mkdir(parents=True)
+    recipes = {}
+    platform = install_platform()
     for name in sorted(packages):
-        path = info.get(name, {}).get("ruby_source_path")
-        if not path:
-            sys.exit(f"{name}: Homebrew names no formula source to fetch it by")
-        ruby = fetch_url(f"{CORE}/{head}/{path}")
-        if hashlib.sha256(ruby).hexdigest() != installs[name].get("ruby_source_checksum"):
-            sys.exit(f"{name}: {path} at {head} is not the formula Homebrew installed from")
-        (top / "formulae" / f"{name}.rb").write_bytes(ruby)
-        for patch in installs[name].get("stable_patches") or []:
-            if patch.get("file"):  # kept in homebrew-core itself
-                kept = top / "patches" / patch["file"]
-                kept.parent.mkdir(parents=True, exist_ok=True)
-                kept.write_bytes(fetch_url(f"{CORE}/{head}/{patch['file']}"))
+        _, _, keg = packages[name]
+        recipe = keg / ".brew" / f"{name}.rb"
+        if not recipe.is_file():
+            sys.exit(f"{name}: its keg keeps no recipe ({recipe})")
+        recipes[name] = recipe.read_text()
+        (top / "formulae" / f"{name}.rb").write_text(recipes[name])
+        built = None
+        for kept, may_apply in kept_patches(recipes[name]):
+            at = head
+            built = built or bottle_built(name, packages[name][1], installs.get(name, {}), platform)
+            if built:
+                at = commit_before(kept, head, built) or head
+            elif may_apply:
+                sys.exit(f"{name}: when its package was built is not in the registry, so which "
+                         f"{kept} it was built with cannot be told")
+            (top / "patches" / kept).parent.mkdir(parents=True, exist_ok=True)
+            (top / "patches" / kept).write_bytes(fetch_url(f"{CORE}/{at}/{kept}"))
 
     tap = Path(run("brew", "--repository").strip()) / "Library/Taps" / TAP[0] / f"homebrew-{TAP[1]}"
     if tap.parent.exists():
         sys.exit(f"{tap.parent} is there already: remove it first")
-    # A download cache of its own, so exactly what these formulae build from
-    # lands in it — but the formula data `brew info` read.
+    # A download cache of its own, so exactly what these recipes build from
+    # lands in it.
     cache = stage / "cache"
     cache.mkdir()
     (cache / "api").symlink_to(Path(run("brew", "--cache").strip()) / "api")
     env = dict(os.environ, HOMEBREW_CACHE=str(cache), HOMEBREW_NO_AUTO_UPDATE="1",
                HOMEBREW_API_AUTO_UPDATE_SECS="1000000")
+    pinned = [f"{TAP[0]}/{TAP[1]}/{name}" for name in sorted(packages)]
     try:
         (tap / "Formula").mkdir(parents=True)
-        for formula in sorted((top / "formulae").iterdir()):
+        for name, ruby in recipes.items():
             # What only official taps may say: how Homebrew bumps versions,
             # nothing about what a formula builds or fetches.
-            ruby = re.sub(r"(?m)^\s*no_autobump!.*\n", "", formula.read_text())
-            (tap / "Formula" / formula.name).write_text(ruby)
+            (tap / "Formula" / f"{name}.rb").write_text(re.sub(r"(?m)^\s*no_autobump!.*\n", "", ruby))
         shutil.copytree(top / "patches", tap, dirs_exist_ok=True)
-        run("brew", "fetch", "--build-from-source", "--retry", "--formula",
-            *(f"{TAP[0]}/{TAP[1]}/{name}" for name in sorted(packages)), env=env)
+        # Homebrew checks every download against the recipe's checksum.
+        run("brew", "fetch", "--build-from-source", "--retry", "--formula", *pinned, env=env)
+        mains = {name: Path(run("brew", "--cache", "--build-from-source", "--formula", f, env=env).strip())
+                 for name, f in zip(sorted(packages), pinned)}
     finally:
         shutil.rmtree(tap.parent, ignore_errors=True)
 
-    downloads = cache / "downloads"
-    sums = {sha256(p) for p in downloads.iterdir() if p.is_file() and not p.is_symlink()}
     for name in sorted(packages):
-        entry = installs[name]
-        args = entry.get("stable_url_args") or [""]
-        options = next((a for a in args[1:] if isinstance(a, dict)), {})
-        revision = options.get(":revision")
-        if revision or args[0].endswith(".git"):
-            checkout = cache / f"{name}--git"
-            at = run("git", "-C", str(checkout), "rev-parse", "HEAD").strip() if checkout.is_dir() else ""
-            if not at or (revision and at != revision):
-                sys.exit(f"{name}: its git source was not fetched at {revision}")
-        elif entry.get("stable_checksum") not in sums:
-            sys.exit(f"{name}: no download has its source's checksum")
-        for patch in entry.get("stable_patches") or []:
-            if patch.get("url") and patch.get("sha256") not in sums:
-                sys.exit(f"{name}: its patch {patch['url']} was not fetched")
+        if not mains[name].exists():
+            sys.exit(f"{name}: its source was not fetched ({mains[name].name})")
         # Homebrew names each resource it fetched <formula>--<resource>--…
         # in its cache: a link to the download, or a git checkout.
-        for resource in mac_resources((top / "formulae" / f"{name}.rb").read_text()):
+        for resource in mac_resources(recipes[name]):
             if not any(e.name.startswith(f"{name}--{resource}--") and e.exists() for e in cache.iterdir()):
                 sys.exit(f"{name}: its resource {resource} was not fetched")
 
     # Homebrew's own: formula data, its Ruby boot cache, the formulae it
-    # read (formulae/ has them from homebrew-core).
+    # read (formulae/ has the recipes).
     for entry in sorted(cache.iterdir()):
         if entry.name in ("api", "api-source", "bootsnap") or entry.is_symlink():
             continue
@@ -589,30 +666,31 @@ def sources(packages, info, head, installs, tar_path, version):
     rows = []
     for name in sorted(packages):
         _, installed, keg = packages[name]
-        entry = installs[name]
         receipt = keg / "INSTALL_RECEIPT.json"
         if receipt.is_file():
             shutil.copyfile(receipt, top / "receipts" / f"{name}.json")
-        spdx = entry.get("license") or info.get(name, {}).get("license") or "?"
-        rows.append(f"| {name} | {installed} | {spdx} | {source_url(entry)} |")
+        rows.append(f"| {name} | {installed} | `formulae/{name}.rb` |")
     (top / "README.md").write_text(
         f"# Source of the libraries inside Nida.app {version}\n\n"
         "Nida.app carries FFmpeg (GPL version 3 or later) and the libraries below,\n"
         "copied from Homebrew, so the app as a whole is given away under the GPL\n"
         "version 3. This archive is their corresponding source:\n\n"
-        "- `sources/`: each package's source exactly as Homebrew fetched it to build\n"
-        "  that version — main source, resources (a git one as its files at the\n"
-        "  formula's revision) and downloaded patches;\n"
-        "- `patches/`: the patches homebrew-core keeps itself;\n"
-        "- `formulae/<name>.rb`: the Homebrew formula that built it (homebrew-core at\n"
-        f"  {head});\n"
+        "- `formulae/<name>.rb`: the recipe each installed package was built from,\n"
+        "  as Homebrew keeps it in the package;\n"
+        "- `sources/`: everything those recipes build from — main source, resources\n"
+        "  (a git one as its files at the recipe's revision) and downloaded\n"
+        "  patches — exactly as Homebrew fetched it, checked against the recipes'\n"
+        "  checksums;\n"
+        "- `patches/`: the patches the recipes take from homebrew-core itself, as\n"
+        "  each stood when its package was built (the last homebrew-core commit to\n"
+        "  change it before the package's time in Homebrew's registry);\n"
         "- `receipts/<name>.json`: Homebrew's install receipt (options, dependencies).\n\n"
         f"Nida's own source, with the code it vendors (vendor/), is the repository at\n"
         f"tag v{version} ({REPO}/tree/v{version}, and the Source code archives on the\n"
         "release page); the other Rust crates built into it are on crates.io at the\n"
         "versions its Cargo.lock names (`cargo fetch` downloads them).\n"
         "scripts/ci/build-macos.sh builds the app from all of it.\n\n"
-        "| Package | Version | Licence | Published at |\n|---|---|---|---|\n" + "\n".join(rows) + "\n"
+        "| Package | Version | Recipe |\n|---|---|---|\n" + "\n".join(rows) + "\n"
     )
     with tarfile.open(tar_path, "w:gz") as tar:
         tar.add(top, arcname=top.name)
@@ -641,7 +719,7 @@ def main():
     run("codesign", "--force", "--sign", "-", "--identifier", args.identifier, str(app))
     run("codesign", "--verify", "--deep", "--strict", str(app))
     if args.sources:
-        sources(packages, info, head, installs, args.sources, args.version)
+        sources(packages, head, installs, args.sources, args.version)
     print(f"bundled {len(named)} libraries from {len(packages)} Homebrew packages; {crates} crates")
 
 

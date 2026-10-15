@@ -75,8 +75,16 @@ if [ "$SKIP_DEPS" = false ]; then
   export HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1
   # shellcheck disable=SC2086
   brew upgrade --force-bottle ffmpeg-full $DEPS || true
+  # Still older than Homebrew's package: removed and poured afresh.
+  # shellcheck disable=SC2086
+  for formula in $(brew outdated --formula --quiet ffmpeg-full $DEPS); do
+    brew uninstall --ignore-dependencies --force "$formula"
+    brew install --force-bottle "$formula"
+  done
   # shellcheck disable=SC2086
   brew reinstall --force-bottle ffmpeg-full $DEPS
+  # shellcheck disable=SC2086
+  echo "Homebrew packages the app will carry: $(brew list --versions ffmpeg-full $DEPS | tr '\n' ';')"
 fi
 BREW="$(brew --prefix)"
 FFMPEG_FULL="$BREW/opt/ffmpeg-full"
