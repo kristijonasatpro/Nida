@@ -235,17 +235,16 @@ def formula_of(real):
     return parts[at + 1], parts[at + 2], Path(*parts[: at + 3])
 
 
-def keg_version(f):
-    """The Cellar folder name the formula `f` (brew info) installs."""
-    stable, revision = f["versions"]["stable"], f.get("revision", 0)
-    return f"{stable}_{revision}" if revision else stable
-
-
 def homebrew_packages(named, origins):
     packages = {}
     for real in list(named) + [os.path.realpath(o) for o in origins.values()]:
         found = formula_of(os.path.realpath(real))
         if found:
+            if found[0] in packages and packages[found[0]][1] != found[1]:
+                # A binary built against an older keg (--binary): two
+                # versions of one package would go in, one unchecked.
+                sys.exit(f"{found[0]} {packages[found[0]][1]} and {found[1]} both bundled: "
+                         "build nida against the installed version")
             packages[found[0]] = found
     info = {}
     if packages:
@@ -286,25 +285,45 @@ def spdx_texts(ids, out):
         sys.exit(f"no standard licence text found for: {', '.join(missing)}")
 
 
-def source_url(f):
-    return (f.get("urls", {}).get("stable") or {}).get("url") or f.get("homepage", "")
+def install_data():
+    """What `brew install` read: Homebrew's internal package list for this
+    Mac — each formula's version, source, checksums and patches — and the
+    homebrew-core commit it was made from. `brew info --json=v2` reads
+    another list, which can be newer: a version there need not be the one
+    installed."""
+    lists = sorted((Path(run("brew", "--cache").strip()) / "api" / "internal").glob("packages.*.jws.json"))
+    if len(lists) != 1:
+        sys.exit(f"expected one internal package list in Homebrew's cache, found {len(lists)}")
+    payload = json.loads(json.loads(lists[0].read_text())["payload"])
+    return payload["formula_tap_git_head"], payload["formulae"]
 
 
-def licences(app, packages, info, version):
+def installed_version(entry):
+    """The Cellar folder name an internal package-list entry installs."""
+    revision = entry.get("revision", 0)
+    return f"{entry['stable_version']}_{revision}" if revision else entry["stable_version"]
+
+
+def source_url(entry):
+    args = entry.get("stable_url_args") or []
+    return args[0] if args else entry.get("homepage", "")
+
+
+def licences(app, packages, info, installs, version):
     """Each bundled Homebrew package's licence files, and THIRD-PARTY.md."""
     out = app / "Contents/Resources/licenses"
     out.mkdir(parents=True, exist_ok=True)
     rows, bare = [], set()
     for name in sorted(packages):
         _, installed, keg = packages[name]
-        f = info.get(name, {})
-        note = "" if not f or keg_version(f) == installed else f" (the formula is now {keg_version(f)})"
-        licence = f.get("license") or "see its files"
+        entry = installs.get(name, {})
+        spdx = entry.get("license") or info.get(name, {}).get("license")
+        licence = spdx or "see its files"
         files = [p for p in sorted(keg.iterdir()) if p.is_file() and KEG_LICENCE.match(p.name)]
         if not files:
             licence += " (standard text in texts/)"
-            bare.update(spdx_ids(f.get("license")))
-        rows.append(f"| {name} | {installed}{note} | {licence} | {source_url(f)} |")
+            bare.update(spdx_ids(spdx))
+        rows.append(f"| {name} | {installed} | {licence} | {source_url(entry)} |")
         for file in files:
             (out / name).mkdir(exist_ok=True)
             shutil.copyfile(file, out / name / file.name)
@@ -472,7 +491,7 @@ def mac_resources(ruby):
     return names
 
 
-def sources(packages, info, tar_path, version):
+def sources(packages, info, head, installs, tar_path, version):
     """The exact source of every bundled Homebrew package — main source,
     resources and patches — the formula that built it and its install
     receipt, in one archive for the release.
@@ -481,22 +500,28 @@ def sources(packages, info, tar_path, version):
     had them (`tap_git_head`): a formula read from Homebrew's API data has
     no resources, and `brew fetch` would leave them out. Then checked
     against what each formula asks for: the main source's checksum (or git
-    revision), each patch's checksum, each resource Apple silicon gets."""
+    revision), each patch's checksum, each resource Apple silicon gets.
+    Versions, sources and the homebrew-core commit come from what `brew
+    install` read (`installs`, `head`), so they are those installed."""
     for name, (_, installed, _) in sorted(packages.items()):
-        if keg_version(info[name]) != installed:
-            sys.exit(f"{name} {installed} is installed but its formula is now "
-                     f"{keg_version(info[name])}: reinstall it, so the source matches")
+        if name not in installs:
+            sys.exit(f"{name} is not in Homebrew's install data")
+        if installed_version(installs[name]) != installed:
+            sys.exit(f"{name} {installed} is installed but Homebrew's install data says "
+                     f"{installed_version(installs[name])}: reinstall it, so the source matches")
     stage = Path(tempfile.mkdtemp(prefix="nida-sources-"))
     top = stage / f"Nida-{version}-third-party-source"
     for folder in ("sources", "formulae", "patches", "receipts"):
         (top / folder).mkdir(parents=True)
     for name in sorted(packages):
-        f = info[name]
-        head, path = f.get("tap_git_head"), f.get("ruby_source_path")
-        if not (head and path):
+        path = info.get(name, {}).get("ruby_source_path")
+        if not path:
             sys.exit(f"{name}: Homebrew names no formula source to fetch it by")
-        (top / "formulae" / f"{name}.rb").write_bytes(fetch_url(f"{CORE}/{head}/{path}"))
-        for patch in f.get("patches") or []:
+        ruby = fetch_url(f"{CORE}/{head}/{path}")
+        if hashlib.sha256(ruby).hexdigest() != installs[name].get("ruby_source_checksum"):
+            sys.exit(f"{name}: {path} at {head} is not the formula Homebrew installed from")
+        (top / "formulae" / f"{name}.rb").write_bytes(ruby)
+        for patch in installs[name].get("stable_patches") or []:
             if patch.get("file"):  # kept in homebrew-core itself
                 kept = top / "patches" / patch["file"]
                 kept.parent.mkdir(parents=True, exist_ok=True)
@@ -528,16 +553,18 @@ def sources(packages, info, tar_path, version):
     downloads = cache / "downloads"
     sums = {sha256(p) for p in downloads.iterdir() if p.is_file() and not p.is_symlink()}
     for name in sorted(packages):
-        f = info[name]
-        stable = f.get("urls", {}).get("stable") or {}
-        if stable.get("revision") or stable.get("url", "").endswith(".git"):
+        entry = installs[name]
+        args = entry.get("stable_url_args") or [""]
+        options = next((a for a in args[1:] if isinstance(a, dict)), {})
+        revision = options.get(":revision")
+        if revision or args[0].endswith(".git"):
             checkout = cache / f"{name}--git"
-            head = run("git", "-C", str(checkout), "rev-parse", "HEAD").strip() if checkout.is_dir() else ""
-            if not head or (stable.get("revision") and head != stable["revision"]):
-                sys.exit(f"{name}: its git source was not fetched at {stable.get('revision')}")
-        elif stable.get("checksum") not in sums:
+            at = run("git", "-C", str(checkout), "rev-parse", "HEAD").strip() if checkout.is_dir() else ""
+            if not at or (revision and at != revision):
+                sys.exit(f"{name}: its git source was not fetched at {revision}")
+        elif entry.get("stable_checksum") not in sums:
             sys.exit(f"{name}: no download has its source's checksum")
-        for patch in f.get("patches") or []:
+        for patch in entry.get("stable_patches") or []:
             if patch.get("url") and patch.get("sha256") not in sums:
                 sys.exit(f"{name}: its patch {patch['url']} was not fetched")
         # Homebrew names each resource it fetched <formula>--<resource>--…
@@ -562,12 +589,12 @@ def sources(packages, info, tar_path, version):
     rows = []
     for name in sorted(packages):
         _, installed, keg = packages[name]
-        f = info[name]
+        entry = installs[name]
         receipt = keg / "INSTALL_RECEIPT.json"
         if receipt.is_file():
             shutil.copyfile(receipt, top / "receipts" / f"{name}.json")
-        rows.append(f"| {name} | {installed} | {f.get('license') or '?'} | {source_url(f)} |")
-    heads = sorted({info[n]["tap_git_head"] for n in packages})
+        spdx = entry.get("license") or info.get(name, {}).get("license") or "?"
+        rows.append(f"| {name} | {installed} | {spdx} | {source_url(entry)} |")
     (top / "README.md").write_text(
         f"# Source of the libraries inside Nida.app {version}\n\n"
         "Nida.app carries FFmpeg (GPL version 3 or later) and the libraries below,\n"
@@ -578,7 +605,7 @@ def sources(packages, info, tar_path, version):
         "  formula's revision) and downloaded patches;\n"
         "- `patches/`: the patches homebrew-core keeps itself;\n"
         "- `formulae/<name>.rb`: the Homebrew formula that built it (homebrew-core at\n"
-        f"  {', '.join(heads)});\n"
+        f"  {head});\n"
         "- `receipts/<name>.json`: Homebrew's install receipt (options, dependencies).\n\n"
         f"Nida's own source, with the code it vendors (vendor/), is the repository at\n"
         f"tag v{version} ({REPO}/tree/v{version}, and the Source code archives on the\n"
@@ -606,14 +633,15 @@ def main():
     origins = dict(o.split("=", 1) for o in args.origin)
     named = bundle(app, args.min_macos, args.identifier, origins)
     packages, info = homebrew_packages(named, origins)
-    licences(app, packages, info, args.version)
+    head, installs = install_data()
+    licences(app, packages, info, installs, args.version)
     crates = rust_licences(app, args.cargo_args) if args.cargo_args is not None else 0
     shader_credits(app)
     # The licence files went in after signing: sign the app again over them.
     run("codesign", "--force", "--sign", "-", "--identifier", args.identifier, str(app))
     run("codesign", "--verify", "--deep", "--strict", str(app))
     if args.sources:
-        sources(packages, info, args.sources, args.version)
+        sources(packages, info, head, installs, args.sources, args.version)
     print(f"bundled {len(named)} libraries from {len(packages)} Homebrew packages; {crates} crates")
 
 

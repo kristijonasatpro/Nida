@@ -80,7 +80,7 @@ jobs:
           overwrite_files: true
           prerelease: ${{ contains(env.TAG, '-') }}
           body: |
-            For Macs with Apple silicon, macOS 15.7.9 (Sequoia, up to date) or later. Open the DMG and drag Nida to Applications.
+            For Macs with Apple silicon, macOS Sequoia 15.7.9 or later. Open the DMG and drag Nida to Applications.
 
             Nida is not signed by Apple: the first time, macOS says it cannot check it. Open **System Settings → Privacy & Security** and click **Open Anyway** next to Nida — once. For NDI, install the free NDI runtime from [ndi.video](https://ndi.video) — the NDI SDK for Apple, or `brew install --cask libndi`.
 

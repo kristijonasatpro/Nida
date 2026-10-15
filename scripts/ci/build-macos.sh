@@ -181,7 +181,7 @@ mkdir -p "$DMG_DIR"
 ditto "$APP" "$DMG_DIR/Nida.app"
 ln -s /Applications "$DMG_DIR/Applications"
 cat > "$DMG_DIR/Read me first.txt" <<TXT
-Nida $VERSION — for Macs with Apple silicon, macOS $MIN_MACOS or later
+Nida $VERSION — for Macs with Apple silicon, macOS Sequoia $MIN_MACOS or later
 
 1. Drag Nida to Applications.
 2. Open it. The first time, macOS says it cannot check Nida for malicious
