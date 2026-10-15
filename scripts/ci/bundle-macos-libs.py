@@ -33,6 +33,7 @@ import argparse
 import hashlib
 import json
 import os
+import plistlib
 import re
 import shutil
 import subprocess
@@ -199,14 +200,27 @@ def bundle(app, min_macos, identifier, origins):
             run("codesign", "--force", "--sign", "-", str(program))
     run("codesign", "--force", "--sign", "-", "--identifier", identifier, str(app))
 
-    check(app, min_macos)
+    needs = check(app, min_macos)
+    # The app says the macOS it needs, so an older one refuses it plainly.
+    plist = app / "Contents/Info.plist"
+    with open(plist, "rb") as f:
+        info = plistlib.load(f)
+    if info.get("LSMinimumSystemVersion") != needs:
+        info["LSMinimumSystemVersion"] = needs
+        with open(plist, "wb") as f:
+            plistlib.dump(info, f)
+        print(f"needs macOS {needs}")
     return named
 
 
 def check(app, min_macos):
-    """Nothing loaded from outside the app, nothing newer than `min_macos`."""
+    """Nothing loaded from outside the app, and nothing that needs a macOS of
+    a later major version than `min_macos` (Homebrew's packages for macOS 15
+    may need a 15.x). Returns the macOS the app needs: the newest any of its
+    files asks for, `min_macos` at least."""
     frameworks = app / "Contents/Frameworks"
     problems = []
+    needs = min_macos
     for file in sorted(p for p in app.rglob("*") if p.is_file() and is_macho(p)):
         refs, _ = load_commands(file)
         for ref in refs:
@@ -218,11 +232,14 @@ def check(app, min_macos):
         for rpath in rpaths:
             if rpath != OWN_RPATH:
                 problems.append(f"{file.relative_to(app)} looks in {rpath}")
-        if minos and version_tuple(minos) > version_tuple(min_macos):
+        if minos and version_tuple(minos)[0] > version_tuple(min_macos)[0]:
             problems.append(f"{file.relative_to(app)} needs macOS {minos}")
+        elif minos and version_tuple(minos) > version_tuple(needs):
+            needs = minos
     if problems:
         sys.exit("the app is not self-contained:\n  " + "\n  ".join(problems))
     run("codesign", "--verify", "--deep", "--strict", str(app))
+    return needs
 
 
 def formula_of(real):

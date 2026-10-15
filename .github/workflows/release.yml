@@ -55,7 +55,20 @@ jobs:
           brew install pkgconf cmake
 
       - name: Build Nida.app and the DMG
-        run: scripts/ci/build-macos.sh
+        run: |
+          set -o pipefail
+          scripts/ci/build-macos.sh 2>&1 | tee build.log
+
+      # The log needs a GitHub login to read; an annotation does not.
+      - name: Say why the build failed
+        if: failure()
+        run: |
+          [ -f build.log ] || exit 0
+          python3 - <<'PY'
+          lines = open("build.log", errors="replace").readlines()[-60:]
+          text = "".join(lines).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print("::error title=Build failed (last lines of its log)::" + text)
+          PY
 
       - name: Draft release
         uses: softprops/action-gh-release@v2

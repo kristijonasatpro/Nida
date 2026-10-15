@@ -162,6 +162,9 @@ for program in nida ffmpeg; do
   fi
 done
 
+# What the bundled libraries need, which may be a later 15.x than asked.
+MIN_MACOS="$(plutil -extract LSMinimumSystemVersion raw "$APP/Contents/Info.plist")"
+
 DMG_DIR="$STAGE/dmg"
 mkdir -p "$DMG_DIR"
 ditto "$APP" "$DMG_DIR/Nida.app"
