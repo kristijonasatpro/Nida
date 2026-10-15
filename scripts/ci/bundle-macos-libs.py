@@ -221,6 +221,7 @@ def check(app, min_macos):
     frameworks = app / "Contents/Frameworks"
     problems = []
     needs = min_macos
+    newer = []  # (minos, file) above min_macos, to be named
     for file in sorted(p for p in app.rglob("*") if p.is_file() and is_macho(p)):
         refs, _ = load_commands(file)
         for ref in refs:
@@ -234,11 +235,18 @@ def check(app, min_macos):
                 problems.append(f"{file.relative_to(app)} looks in {rpath}")
         if minos and version_tuple(minos)[0] > version_tuple(min_macos)[0]:
             problems.append(f"{file.relative_to(app)} needs macOS {minos}")
-        elif minos and version_tuple(minos) > version_tuple(needs):
-            needs = minos
+        elif minos and version_tuple(minos) > version_tuple(min_macos):
+            newer.append((minos, str(file.relative_to(app))))
+            if version_tuple(minos) > version_tuple(needs):
+                needs = minos
     if problems:
         sys.exit("the app is not self-contained:\n  " + "\n  ".join(problems))
     run("codesign", "--verify", "--deep", "--strict", str(app))
+    if newer:
+        named = ", ".join(f"{f} ({m})" for m, f in sorted(newer, key=lambda n: version_tuple(n[0]), reverse=True)[:8])
+        print(f"needing more than macOS {min_macos}: {named}")
+        if os.environ.get("GITHUB_ACTIONS"):
+            print(f"::warning title=Nida needs macOS {needs}::{named}")
     return needs
 
 

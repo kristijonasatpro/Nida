@@ -63,6 +63,11 @@ echo "==> Nida $VERSION for macOS $MIN_MACOS and later"
 
 if [ "$SKIP_DEPS" = false ]; then
   brew install ffmpeg-full
+  # What the machine had installed before may be older than its formula,
+  # or built there for its own macOS: every library the app will carry,
+  # fresh from Homebrew's packages for this macOS.
+  # shellcheck disable=SC2046
+  brew reinstall ffmpeg-full $(brew deps --installed ffmpeg-full)
 fi
 BREW="$(brew --prefix)"
 FFMPEG_FULL="$BREW/opt/ffmpeg-full"
