@@ -507,6 +507,45 @@ def kept_patches(ruby):
             for m in [re.match(r'^\s*file "(Patches/[^"]+)"', line)] if m]
 
 
+def declared_deps(ruby):
+    """What a recipe builds against that the source offer must cover: the
+    dependencies it declares that apply here (`depends_on "x"`, not build
+    or test only), and the header packages it builds with (`depends_on
+    "x-headers" => :build` — interface definitions; compilers and build
+    tools are general-purpose programs the GPL leaves out)."""
+    lines = ruby.splitlines()
+    deps = []
+    for i, line in enumerate(lines):
+        m = re.match(r'^\s*depends_on "([^"]+)"(.*)$', line)
+        if not m or not on_this_mac(lines, i, judge_all=False):
+            continue
+        name, rest = m.groups()
+        tools_only = re.search(r":(build|test)\b", rest)
+        if not tools_only or (":build" in rest and name.endswith("-headers")):
+            deps.append(name)
+    return deps
+
+
+def with_build_interfaces(packages):
+    """`packages` and, followed recipe by recipe, every installed package
+    they declare (see `declared_deps`): headers such as vulkan-headers go
+    into no binary, yet the libraries were built against them."""
+    prefix = Path(run("brew", "--prefix").strip())
+    every = dict(packages)
+    queue = sorted(every)
+    while queue:
+        name = queue.pop(0)
+        recipe = every[name][2] / ".brew" / f"{name}.rb"
+        if not recipe.is_file():
+            continue
+        for dep in declared_deps(recipe.read_text()):
+            found = formula_of(os.path.realpath(prefix / "opt" / dep))
+            if found and found[0] not in every:
+                every[found[0]] = found
+                queue.append(found[0])
+    return every
+
+
 def ghcr(path, accept):
     """Homebrew's package registry (anonymous, as Homebrew reads it)."""
     req = urllib.request.Request(f"https://ghcr.io/v2/homebrew/core/{path}", headers={
@@ -574,7 +613,7 @@ def mac_resources(ruby):
     return names
 
 
-def sources(packages, head, installs, tar_path, version):
+def sources(packages, in_app, head, installs, tar_path, version):
     """The exact source of every bundled Homebrew package — main source,
     resources and patches — the recipe that built it and its install
     receipt, in one archive for the release.
@@ -669,7 +708,8 @@ def sources(packages, head, installs, tar_path, version):
         receipt = keg / "INSTALL_RECEIPT.json"
         if receipt.is_file():
             shutil.copyfile(receipt, top / "receipts" / f"{name}.json")
-        rows.append(f"| {name} | {installed} | `formulae/{name}.rb` |")
+        inside = "yes" if name in in_app else "built against"
+        rows.append(f"| {name} | {installed} | {inside} | `formulae/{name}.rb` |")
     (top / "README.md").write_text(
         f"# Source of the libraries inside Nida.app {version}\n\n"
         "Nida.app carries FFmpeg (GPL version 3 or later) and the libraries below,\n"
@@ -683,14 +723,18 @@ def sources(packages, head, installs, tar_path, version):
         "  checksums;\n"
         "- `patches/`: the patches the recipes take from homebrew-core itself, as\n"
         "  each stood when its package was built (the last homebrew-core commit to\n"
-        "  change it before the package's time in Homebrew's registry);\n"
+        "  change it before the package's time in Homebrew's registry — a change in\n"
+        "  the minutes between Homebrew's checkout and that time could not be told\n"
+        "  apart);\n"
         "- `receipts/<name>.json`: Homebrew's install receipt (options, dependencies).\n\n"
         f"Nida's own source, with the code it vendors (vendor/), is the repository at\n"
         f"tag v{version} ({REPO}/tree/v{version}, and the Source code archives on the\n"
         "release page); the other Rust crates built into it are on crates.io at the\n"
         "versions its Cargo.lock names (`cargo fetch` downloads them).\n"
         "scripts/ci/build-macos.sh builds the app from all of it.\n\n"
-        "| Package | Version | Recipe |\n|---|---|---|\n" + "\n".join(rows) + "\n"
+        "Packages marked \"built against\" are not in the app: headers and libraries\n"
+        "the ones inside were built with.\n\n"
+        "| Package | Version | In the app | Recipe |\n|---|---|---|---|\n" + "\n".join(rows) + "\n"
     )
     with tarfile.open(tar_path, "w:gz") as tar:
         tar.add(top, arcname=top.name)
@@ -719,7 +763,7 @@ def main():
     run("codesign", "--force", "--sign", "-", "--identifier", args.identifier, str(app))
     run("codesign", "--verify", "--deep", "--strict", str(app))
     if args.sources:
-        sources(packages, head, installs, args.sources, args.version)
+        sources(with_build_interfaces(packages), set(packages), head, installs, args.sources, args.version)
     print(f"bundled {len(named)} libraries from {len(packages)} Homebrew packages; {crates} crates")
 
 
