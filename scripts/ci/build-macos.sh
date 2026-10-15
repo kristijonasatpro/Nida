@@ -5,9 +5,11 @@
 # where Homebrew put it), this app carries what it needs: the FFmpeg
 # libraries Nida links, the `ffmpeg` program it runs for REC and STREAM, and
 # every library those load (bundle-macos-libs.py), and the shaders. It opens
-# on any Mac with Apple silicon and macOS 15 or later — Homebrew's libraries
-# need the macOS they were built for, so build this on macOS 15 (as the
-# release workflow does) for the DMG to open there.
+# on any Mac with Apple silicon and macOS 15.7.9 or later — Homebrew's
+# libraries need the macOS they were built for, so build this on macOS 15
+# (as the release workflow does). Most of Homebrew's packages for macOS 15
+# need 15.0; tesseract's (FFmpeg's OCR filter, linked by ffmpeg-full) needs
+# 15.7.9, so that is the floor. Anything needing more stops the build.
 #
 # The FFmpeg inside is Homebrew's `ffmpeg-full`, under GPL version 3 or later,
 # so the app as a whole is given away under the GPLv3; Nida's own source
@@ -25,7 +27,7 @@
 # (shaders-left-out.txt).
 #
 # Usage: scripts/ci/build-macos.sh [--skip-deps] [--binary PATH] [--out DIR]
-#          [--min-macos 15.0] [--no-sources]
+#          [--min-macos 15.7.9] [--no-sources]
 #   --binary      package a nida already built, instead of building one
 #   --no-sources  skip the source archive (a try-out, not for giving away)
 # Produces in DIR (the project root by default): Nida-<version>-macOS-arm64.dmg,
@@ -39,7 +41,7 @@ SKIP_DEPS=false
 SOURCES=true
 BINARY=""
 OUT="$ROOT"
-MIN_MACOS="15.0"
+MIN_MACOS="15.7.9"
 BUNDLE_ID="lt.proconf.nida"
 FEATURES="--no-default-features --features screen-capture"
 while [ $# -gt 0 ]; do
@@ -65,9 +67,16 @@ if [ "$SKIP_DEPS" = false ]; then
   brew install ffmpeg-full
   # What the machine had installed before may be older than its formula,
   # or built there for its own macOS: every library the app will carry,
-  # fresh from Homebrew's packages for this macOS.
-  # shellcheck disable=SC2046
-  brew reinstall ffmpeg-full $(brew deps --installed ffmpeg-full)
+  # Homebrew's own package of today's version (bundle-macos-libs.py
+  # refuses one that was not poured from a package).
+  DEPS="$(brew deps --installed ffmpeg-full)"
+  # shellcheck disable=SC2086
+  brew unpin ffmpeg-full $DEPS 2>/dev/null || true
+  export HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1
+  # shellcheck disable=SC2086
+  brew upgrade --force-bottle ffmpeg-full $DEPS || true
+  # shellcheck disable=SC2086
+  brew reinstall --force-bottle ffmpeg-full $DEPS
 fi
 BREW="$(brew --prefix)"
 FFMPEG_FULL="$BREW/opt/ffmpeg-full"
@@ -166,9 +175,6 @@ for program in nida ffmpeg; do
     exit 1
   fi
 done
-
-# What the bundled libraries need, which may be a later 15.x than asked.
-MIN_MACOS="$(plutil -extract LSMinimumSystemVersion raw "$APP/Contents/Info.plist")"
 
 DMG_DIR="$STAGE/dmg"
 mkdir -p "$DMG_DIR"

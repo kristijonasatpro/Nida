@@ -39,7 +39,7 @@ Experimental:
 
 ### Download (macOS)
 
-[Releases](https://github.com/kristijonasatpro/Nida/releases) have `Nida-<version>-macOS-arm64.dmg`, for Macs with Apple silicon and macOS 15 or later. Open it and drag Nida to Applications. Nida is not signed by Apple, so the first time macOS says it cannot check it: open **System Settings → Privacy & Security** and click **Open Anyway** next to Nida — once. For NDI, install the free NDI runtime from [ndi.video](https://ndi.video) — the NDI SDK for Apple, or `brew install --cask libndi`.
+[Releases](https://github.com/kristijonasatpro/Nida/releases) have `Nida-<version>-macOS-arm64.dmg`, for Macs with Apple silicon and macOS 15.7.9 (Sequoia, up to date) or later. Open it and drag Nida to Applications. Nida is not signed by Apple, so the first time macOS says it cannot check it: open **System Settings → Privacy & Security** and click **Open Anyway** next to Nida — once. For NDI, install the free NDI runtime from [ndi.video](https://ndi.video) — the NDI SDK for Apple, or `brew install --cask libndi`.
 
 The app carries its own FFmpeg (built with GPL parts), so the download as a whole is under the GPL version 3; the licences of everything inside are in `Nida.app/Contents/Resources/licenses`, and the exact source of every library inside is `Nida-<version>-third-party-source.tar.gz` beside the DMG. Nida's source stays MIT. A few of Varda's shaders, adapted from works whose licence is non-commercial or not stated, are left out of the download (they are in the source). `scripts/ci/build-macos.sh` makes the DMG, and the release workflow runs it for every `v*` tag.
 

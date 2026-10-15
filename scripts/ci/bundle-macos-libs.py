@@ -23,7 +23,7 @@ With --sources, it also makes the archive the GPL asks to be offered beside
 the DMG: the exact source Homebrew built each bundled package from (patches
 and resources too), the formula that built it, and its install receipt.
 
-Usage: bundle-macos-libs.py APP --min-macos 15.0 [--identifier ID]
+Usage: bundle-macos-libs.py APP --min-macos 15.7.9 [--identifier ID]
          [--origin nida=target/release/varda] [--origin ffmpeg=PATH]
          [--cargo-args "--no-default-features --features screen-capture"]
          [--version 0.9.0 --sources Nida-0.9.0-third-party-source.tar.gz]
@@ -33,7 +33,6 @@ import argparse
 import hashlib
 import json
 import os
-import plistlib
 import re
 import shutil
 import subprocess
@@ -200,28 +199,15 @@ def bundle(app, min_macos, identifier, origins):
             run("codesign", "--force", "--sign", "-", str(program))
     run("codesign", "--force", "--sign", "-", "--identifier", identifier, str(app))
 
-    needs = check(app, min_macos)
-    # The app says the macOS it needs, so an older one refuses it plainly.
-    plist = app / "Contents/Info.plist"
-    with open(plist, "rb") as f:
-        info = plistlib.load(f)
-    if info.get("LSMinimumSystemVersion") != needs:
-        info["LSMinimumSystemVersion"] = needs
-        with open(plist, "wb") as f:
-            plistlib.dump(info, f)
-        print(f"needs macOS {needs}")
+    check(app, min_macos)
     return named
 
 
 def check(app, min_macos):
-    """Nothing loaded from outside the app, and nothing that needs a macOS of
-    a later major version than `min_macos` (Homebrew's packages for macOS 15
-    may need a 15.x). Returns the macOS the app needs: the newest any of its
-    files asks for, `min_macos` at least."""
+    """Nothing loaded from outside the app, nothing newer than `min_macos`:
+    the macOS the app says it opens on is a promise."""
     frameworks = app / "Contents/Frameworks"
     problems = []
-    needs = min_macos
-    newer = []  # (minos, file) above min_macos, to be named
     for file in sorted(p for p in app.rglob("*") if p.is_file() and is_macho(p)):
         refs, _ = load_commands(file)
         for ref in refs:
@@ -233,21 +219,11 @@ def check(app, min_macos):
         for rpath in rpaths:
             if rpath != OWN_RPATH:
                 problems.append(f"{file.relative_to(app)} looks in {rpath}")
-        if minos and version_tuple(minos)[0] > version_tuple(min_macos)[0]:
+        if minos and version_tuple(minos) > version_tuple(min_macos):
             problems.append(f"{file.relative_to(app)} needs macOS {minos}")
-        elif minos and version_tuple(minos) > version_tuple(min_macos):
-            newer.append((minos, str(file.relative_to(app))))
-            if version_tuple(minos) > version_tuple(needs):
-                needs = minos
     if problems:
         sys.exit("the app is not self-contained:\n  " + "\n  ".join(problems))
     run("codesign", "--verify", "--deep", "--strict", str(app))
-    if newer:
-        named = ", ".join(f"{f} ({m})" for m, f in sorted(newer, key=lambda n: version_tuple(n[0]), reverse=True)[:8])
-        print(f"needing more than macOS {min_macos}: {named}")
-        if os.environ.get("GITHUB_ACTIONS"):
-            print(f"::warning title=Nida needs macOS {needs}::{named}")
-    return needs
 
 
 def formula_of(real):
@@ -275,6 +251,16 @@ def homebrew_packages(named, origins):
     if packages:
         data = json.loads(run("brew", "info", "--json=v2", *sorted(packages)))
         info = {f["name"]: f for f in data["formulae"]}
+    # Built on this machine, a library is made for its macOS and from
+    # whatever source it had: only Homebrew's own packages go in.
+    built = []
+    for name, (_, _, keg) in sorted(packages.items()):
+        receipt = keg / "INSTALL_RECEIPT.json"
+        if not receipt.is_file() or not json.loads(receipt.read_text()).get("poured_from_bottle"):
+            built.append(name)
+    if built:
+        sys.exit("built here, not poured from Homebrew's package: " + ", ".join(built)
+                 + " — brew reinstall --force-bottle them")
     return packages, info
 
 
