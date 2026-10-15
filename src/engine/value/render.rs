@@ -115,6 +115,13 @@ pub struct PresentationRequest {
     /// Whether deterministic destination-aware dithering is enabled.
     #[serde(default = "presentation_dither_default")]
     pub dither: bool,
+    /// Whether the picture goes out in video levels — black at code 16 and
+    /// white at 235 (64 and 940 at ten bits) — for a screen that is video
+    /// gear and reads it so: a switcher's HDMI input, an LED processor. Off,
+    /// full levels, 0–255, as a monitor takes. Chosen per output; off by
+    /// default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub video_levels: bool,
 }
 
 const fn presentation_dither_default() -> bool {
@@ -126,6 +133,7 @@ impl Default for PresentationRequest {
         Self {
             depth: PresentationDepth::default(),
             dither: presentation_dither_default(),
+            video_levels: false,
         }
     }
 }
@@ -329,6 +337,14 @@ pub enum OutputSource {
     Deck(usize, usize),
     /// The domemaster fisheye output (equidistant azimuthal projection)
     Domemaster,
+    /// A production bus's Program, by stable bus UUID.
+    ///
+    /// The destination follows whatever that bus has on air, so a `CUT` on the
+    /// bus changes this output and nothing else. Resolved once per frame
+    /// against the bus's *effective* program — a route the bus cannot resolve,
+    /// or one held black by a partial load, reads black here rather than
+    /// falling back to some other source.
+    BusProgram(String),
 }
 
 impl OutputSource {
@@ -353,6 +369,7 @@ impl std::fmt::Display for OutputSource {
             }
             OutputSource::Deck(ch, dk) => write!(f, "Ch {} Deck {}", ch + 1, dk + 1),
             OutputSource::Domemaster => write!(f, "Domemaster"),
+            OutputSource::BusProgram(uuid) => write!(f, "Bus {uuid}"),
         }
     }
 }
@@ -441,6 +458,25 @@ pub enum OutputTarget {
     NdiSend { sender_name: String },
     /// Publish frames via Syphon (macOS inter-app sharing)
     SyphonServer { server_name: String },
+    /// A Blackmagic DeckLink device's video out — an UltraStudio Monitor 3G:
+    /// HDMI and SDI — in its format named `mode` ("1080p60" …). See
+    /// `crate::decklink`.
+    DeckLink {
+        device: String,
+        mode: String,
+        /// Full levels — black at 0, white at 255 (1 and 254: 0 and 255 are
+        /// the signal's own) — for a display set to take them; off, video
+        /// levels, black at 16 and white at 235, as video gear takes them.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        full_range: bool,
+    },
+    /// The stream: one encode sent to up to four RTMP destinations. Its
+    /// settings live with the stream (`crate::streaming`), and it never
+    /// appears among the outputs — the STREAM button runs it.
+    Stream,
+    /// The recording: the REC button's file. Like the stream, its settings
+    /// live with it (`crate::record`) and it is never among the outputs.
+    Record,
 }
 
 impl OutputTarget {
@@ -508,6 +544,16 @@ impl std::fmt::Display for OutputTarget {
             OutputTarget::RtmpStream { url, codec, .. } => write!(f, "RTMP [{codec}]: {url}"),
             OutputTarget::NdiSend { sender_name } => write!(f, "NDI: {sender_name}"),
             OutputTarget::SyphonServer { server_name } => write!(f, "Syphon: {server_name}"),
+            OutputTarget::DeckLink {
+                device,
+                mode,
+                full_range,
+            } => {
+                let levels = if *full_range { ", full levels" } else { "" };
+                write!(f, "Blackmagic: {device} ({mode}{levels})")
+            }
+            OutputTarget::Stream => write!(f, "Stream"),
+            OutputTarget::Record => write!(f, "Record"),
         }
     }
 }
@@ -634,10 +680,14 @@ pub enum RtmpCodecContract {
     utoipa::ToSchema,
 )]
 pub enum TonemapMode {
-    /// Clamp to [0, 1] — equivalent to pre-tonemap behavior.
+    /// Clamp to [0, 1]: pixels leave exactly as the sources made them.
+    ///
+    /// The default. A switcher's job is to pass pictures through untouched;
+    /// the curves below re-grade every pixel (ACES turns white into 80% grey
+    /// and lifts mid-tones), which is a look to choose, not a starting point.
+    #[default]
     Bypass = 0,
     /// ACES filmic curve — smooth highlight rolloff, preserves saturation.
-    #[default]
     Aces = 1,
     /// Simple Reinhard: x/(x+1) per channel.
     Reinhard = 2,
@@ -922,6 +972,29 @@ mod tests {
             .to_string(),
             "HLS [H.264]: live"
         );
+        let blackmagic = OutputTarget::DeckLink {
+            device: "UltraStudio Monitor 3G".into(),
+            mode: "1080p60".into(),
+            full_range: false,
+        };
+        assert_eq!(blackmagic.to_string(), "Blackmagic: UltraStudio Monitor 3G (1080p60)");
+        let full = OutputTarget::DeckLink {
+            device: "UltraStudio Monitor 3G".into(),
+            mode: "1080p60".into(),
+            full_range: true,
+        };
+        assert_eq!(
+            full.to_string(),
+            "Blackmagic: UltraStudio Monitor 3G (1080p60, full levels)"
+        );
+        // As the API takes it.
+        assert_eq!(
+            serde_json::from_str::<OutputTarget>(
+                r#"{"DeckLink":{"device":"UltraStudio Monitor 3G","mode":"1080p60"}}"#
+            )
+            .unwrap(),
+            blackmagic
+        );
     }
 
     #[test]
@@ -1026,6 +1099,7 @@ mod tests {
             PresentationRequest {
                 depth: PresentationDepth::Sdr8,
                 dither: true,
+                video_levels: false,
             }
         );
     }
@@ -1056,6 +1130,7 @@ mod tests {
             .resolve(PresentationRequest {
                 depth: PresentationDepth::Sdr10,
                 dither: false,
+                video_levels: false,
             })
             .unwrap();
 
@@ -1075,6 +1150,7 @@ mod tests {
             .resolve(PresentationRequest {
                 depth: PresentationDepth::Sdr10,
                 dither: true,
+                video_levels: false,
             })
             .unwrap();
 
@@ -1124,6 +1200,7 @@ mod tests {
             .resolve(PresentationRequest {
                 depth: PresentationDepth::Sdr10,
                 dither: false,
+                video_levels: false,
             })
             .unwrap();
 
@@ -1135,4 +1212,35 @@ mod tests {
             Some("10-bit SDR is unavailable for this output")
         );
     }
+}
+
+/// The show frame rates the top bar's Target FPS menu offers (besides
+/// Uncapped). 25 and 50 are the European broadcast rates (ATEM, cameras,
+/// streams in PAL countries), 24 film; mixing into a switcher at a different
+/// rate judders. What Nida suggests when a rate does not fit a screen comes
+/// from here too, so it is always one the menu has.
+pub const TARGET_FPS_CHOICES: [u32; 6] = [24, 25, 30, 50, 60, 120];
+
+/// What starts each frame.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FramePacing {
+    /// The refresh of the screen the show goes to: each frame drawn as the
+    /// screen asks for it, to be shown at its next refresh.
+    #[default]
+    Refresh,
+    /// The frame before being done: frames are drawn ahead, and an output
+    /// window holds up to two ready for its screen, so one drawn late still
+    /// finds its refresh. A frame or two later on screen.
+    Ahead,
 }

@@ -145,23 +145,20 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
     let ctx = ui.ctx();
     let had_payload_id = egui::Id::new("__lib_dnd_had_payload");
     let hover_ch_id = egui::Id::new("__lib_dnd_hover_ch");
+    let hover_y_id = egui::Id::new("__lib_dnd_hover_y");
     let hover_fx_target_id = egui::Id::new("__lib_dnd_hover_fx_target");
     let on_new_ch_id = egui::Id::new("__lib_dnd_on_new_ch_zone");
     let awaiting_new_ch_id = egui::Id::new("__lib_dnd_awaiting_new_ch");
+    let on_window_id = egui::Id::new("__lib_dnd_on_settings_window");
     let has_payload = egui::DragAndDrop::has_payload_of_type::<LibraryDrag>(ctx);
 
     if has_payload {
         if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-            let mut found_ch: Option<usize> = None;
-            for ch_idx in 0..data.channels.len() {
-                let key = egui::Id::new("ch_drop_rect").with(ch_idx);
-                if let Some(rect) = ctx.memory(|mem| mem.data.get_temp::<egui::Rect>(key)) {
-                    if rect.contains(pos) {
-                        found_ch = Some(ch_idx);
-                        break;
-                    }
-                }
-            }
+            let found_ch = super::drop_channel_at(ctx, pos, data.channels.len());
+            // Over the input settings window a new layer goes on top, not
+            // between cards drawn somewhere else.
+            let on_window = super::drop_window_at(ctx, pos).is_some();
+            ctx.memory_mut(|mem| mem.data.insert_temp(on_window_id, on_window));
 
             // Check if hovering over either new-channel drop zone (left=0, right=1)
             let mut on_new_ch = false;
@@ -181,6 +178,7 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
 
             ctx.memory_mut(|mem| {
                 mem.data.insert_temp(hover_ch_id, found_ch);
+                mem.data.insert_temp(hover_y_id, pos.y);
                 mem.data.insert_temp(hover_fx_target_id, found_fx);
                 mem.data.insert_temp::<bool>(on_new_ch_id, on_new_ch);
                 mem.data.insert_temp::<bool>(had_payload_id, true);
@@ -192,6 +190,7 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
         if drag_just_ended {
             let hover_ch: Option<usize> =
                 ctx.memory(|mem| mem.data.get_temp(hover_ch_id).unwrap_or(None));
+            let hover_y: Option<f32> = ctx.memory(|mem| mem.data.get_temp(hover_y_id));
             let hover_fx: Option<FxHover> =
                 ctx.memory(|mem| mem.data.get_temp(hover_fx_target_id).unwrap_or(None));
             let on_new_ch_zone: bool =
@@ -237,7 +236,24 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
                 let gen_idx: Option<usize> = ctx.memory(|mem| mem.data.get_temp(gen_key));
                 if let Some(gen_idx) = gen_idx {
                     log::info!("Library drop (deferred): generator {gen_idx} -> ch {channel_uuid}");
-                    actions.session.shader_to_add = Some((channel_uuid.clone(), gen_idx));
+                    // Between the cards it was dropped between, when dropped
+                    // on a channel; a new channel just takes it.
+                    let on_window: bool =
+                        ctx.memory(|mem| mem.data.get_temp(on_window_id).unwrap_or(false));
+                    let before_deck_uuid =
+                        hover_ch
+                            .zip(hover_y)
+                            .filter(|_| !on_window)
+                            .and_then(|(ch_idx, y)| {
+                                super::insertion::insertion_at(ctx, ch_idx, y).before
+                            });
+                    actions.session.shader_to_add = Some((
+                        crate::usecases::ui::DeckPlace {
+                            channel_uuid: channel_uuid.clone(),
+                            before_deck_uuid,
+                        },
+                        gen_idx,
+                    ));
                 }
 
                 let cam_key = egui::Id::new("__lib_dnd_cam_id");
@@ -248,6 +264,7 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
                     actions.commands.push(EngineCommand::AddCameraDeck {
                         channel_uuid: channel_uuid.clone(),
                         camera_id: cam_id,
+                        mode: None,
                     });
                 }
 
@@ -442,6 +459,7 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
             ctx.memory_mut(|mem| {
                 mem.data.remove::<bool>(had_payload_id);
                 mem.data.remove::<Option<usize>>(hover_ch_id);
+                mem.data.remove::<f32>(hover_y_id);
                 mem.data.remove::<Option<FxHover>>(hover_fx_target_id);
                 mem.data.remove::<bool>(on_new_ch_id);
                 mem.data.remove::<usize>(egui::Id::new("__lib_dnd_gen_idx"));

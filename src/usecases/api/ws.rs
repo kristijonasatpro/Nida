@@ -258,4 +258,24 @@ mod tests {
         let ws_cmd: WsCommand = serde_json::from_str(json).unwrap();
         assert!(ws_cmd.id.is_none());
     }
+
+    /// The client message docs/13-api.md shows parses as one: it showed a
+    /// shape the socket never read.
+    #[test]
+    fn the_docs_client_message_parses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/13-api.md");
+        let doc = std::fs::read_to_string(path).expect("docs/13-api.md");
+        let after = doc
+            .split_once("**Client → Server:**")
+            .expect("the docs show a client message")
+            .1;
+        let block = after
+            .split_once("```json")
+            .and_then(|(_, rest)| rest.split_once("```"))
+            .expect("in a json block")
+            .0;
+        let message: WsCommand = serde_json::from_str(block.trim())
+            .unwrap_or_else(|e| panic!("{}: {e}", block.trim()));
+        assert_eq!(message.id.as_deref(), Some("req-1"));
+    }
 }

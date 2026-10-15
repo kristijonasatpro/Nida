@@ -129,6 +129,21 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!((json["fps"].as_f64().unwrap() - 60.0).abs() < 1e-3);
         assert_eq!(json["frame_count"], 100);
+        for field in [
+            "clock",
+            "clock_timestamps",
+            "control_vsync",
+            "frame_hold",
+            "frame_pacing",
+            "frames_in_flight",
+            "interval_mean_ms",
+            "late_frames",
+            "outputs",
+            "parts",
+            "slow_frames",
+        ] {
+            assert!(!json["pacing"][field].is_null(), "pacing.{field}");
+        }
     }
 
     #[tokio::test]
@@ -1520,6 +1535,90 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["status"], "ok");
+    }
+
+    /// Every body docs/13-api.md sends to `/api/params` or `/api/command`
+    /// parses as the route reads it. One that does not is an operator's first
+    /// call failing: values written `{"Float": 0.5}` for an untagged
+    /// `ParamValue`, and a crossfader command in a shape it never had, sat
+    /// in the docs unnoticed. Each whole curl command to those routes must
+    /// carry exactly one body this test can read, so none is passed over.
+    #[test]
+    fn the_api_docs_param_and_command_examples_parse() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/13-api.md");
+        let doc = std::fs::read_to_string(path).expect("docs/13-api.md");
+        // Whole curl commands: a `curl` line and every line it runs on to
+        // with a trailing `\`.
+        let mut curls: Vec<String> = Vec::new();
+        let mut current: Option<String> = None;
+        for line in doc.lines() {
+            let part = line.trim().trim_end_matches('\\').trim();
+            if let Some(command) = current.as_mut() {
+                command.push(' ');
+                command.push_str(part);
+            } else if line.trim_start().starts_with("curl ") {
+                current = Some(part.to_string());
+            }
+            if !line.trim_end().ends_with('\\') {
+                curls.extend(current.take());
+            }
+        }
+        let (mut params, mut commands) = (0, 0);
+        for curl in &curls {
+            let route = curl
+                .split_whitespace()
+                .map(|word| word.trim_matches(|c| c == '"' || c == '\''))
+                .find_map(|word| word.strip_prefix("http://localhost:8080"))
+                .unwrap_or_default();
+            if route != "/api/params" && route != "/api/command" {
+                continue;
+            }
+            let flags = curl.matches(" -d").count()
+                + curl.matches("--data").count()
+                + curl.matches("--json").count();
+            assert_eq!(flags, 1, "one body, written as -d '…': {curl}");
+            let after = curl[curl.find(" -d").expect("-d") + 3..].trim_start();
+            let Some((body, _)) = after
+                .strip_prefix('\'')
+                .and_then(|rest| rest.split_once('\''))
+            else {
+                panic!("a body this test cannot read: {curl}");
+            };
+            if route == "/api/params" {
+                serde_json::from_str::<super::super::decks::SetParamBody>(body)
+                    .unwrap_or_else(|e| panic!("PUT /api/params {body}: {e}"));
+                params += 1;
+            } else {
+                serde_json::from_str::<crate::engine::EngineCommand>(body)
+                    .unwrap_or_else(|e| panic!("POST /api/command {body}: {e}"));
+                commands += 1;
+            }
+        }
+        assert!(
+            params >= 2 && commands >= 6,
+            "found only {params} param and {commands} command examples"
+        );
+    }
+
+    /// An app's sound is asked for by the app's bundle ID; the strip's name
+    /// may be left out.
+    #[tokio::test]
+    async fn an_apps_sound_is_added_by_bundle_id() {
+        let (status, json) = post_json(
+            router_with_mock_engine(),
+            "/api/audio-inputs/app",
+            serde_json::json!({"app": "us.zoom.xos"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["status"], "ok");
+        let (status, _) = post_json(
+            router_with_mock_engine(),
+            "/api/audio-inputs/app",
+            serde_json::json!({"name": "Zoom"}),
+        )
+        .await;
+        assert!(status.is_client_error(), "no app named: {status}");
     }
 
     // ── Write: Generic command ──────────────────────────────────
@@ -3772,6 +3871,7 @@ mod tests {
             crate::engine::EngineCommand::MoveDeck {
                 deck_uuid,
                 dst_channel_uuid,
+                ..
             } => {
                 assert_eq!(deck_uuid, "dk-001");
                 assert_eq!(dst_channel_uuid, "ch-002");

@@ -615,7 +615,7 @@ fn connect_cast(
         .map_err(|e| pipewire_error(&e))?;
     let stream = pw::stream::StreamRc::new(
         core,
-        "Varda Screen Capture",
+        "Nida Screen Capture",
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Video",
             *pw::keys::MEDIA_CATEGORY => "Capture",

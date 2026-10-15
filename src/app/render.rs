@@ -27,11 +27,12 @@ pub struct DeckLoadToken(pub usize);
 ///
 /// The target channel is held by UUID, not index: the dialog runs on a
 /// background thread while the UI stays live, so the channel list can change
-/// between opening the dialog and picking a file.
+/// between opening the dialog and picking a file. No channel means a new
+/// input for each file, as vMix's Add Input makes them.
 #[derive(Debug)]
 pub struct FileDialogResult {
     pub kind: FileDialogKind,
-    pub channel_uuid: String,
+    pub channel_uuid: Option<String>,
     pub paths: Vec<std::path::PathBuf>,
 }
 
@@ -45,6 +46,13 @@ pub struct DeckLoadResult {
     pub name: String,
 }
 
+/// A file to load as a deck.
+pub enum DeckFile {
+    Image(std::path::PathBuf),
+    Video(std::path::PathBuf),
+    Shader(Box<crate::isf::ISFShader>),
+}
+
 /// Mutable external delivery sinks the headless render loop feeds frames and
 /// audio into. Bundled so the render helper stays under the argument-count lint
 /// while each manager remains a disjoint `&mut` borrow of `VardaApp`.
@@ -53,6 +61,7 @@ struct HeadlessDeliverySinks<'a> {
     #[cfg(target_os = "macos")]
     syphon_manager: &'a mut crate::syphon::SyphonManager,
     audio_manager: &'a mut crate::audio::AudioManager,
+    audio_mix: &'a crate::audio_mix::AudioEngine,
     notifications: &'a mut crate::notifications::NotificationSystem,
     /// Master render rate, resolved through `encoder_fps` so an uncapped stage
     /// still names a real number. Used to reopen an ffmpeg output on the SRT
@@ -60,6 +69,9 @@ struct HeadlessDeliverySinks<'a> {
     /// reconnected stream would be timed differently from the one it replaced —
     /// and to declare the NDI sender's frame rate.
     encoder_fps: u32,
+    /// When this frame was drawn: what a recording or stream times it by
+    /// (see `VardaApp::frame_drawn`).
+    drawn: std::time::Instant,
 }
 
 /// Deactivate a headless output and tell the operator. A log line alone is
@@ -74,6 +86,73 @@ fn stop_headless_output(
     log::error!("{reason}");
     *active = false;
     notifications.error(format!("Output '{name}' stopped: {reason}"));
+}
+
+/// The frame-wide inputs every destination resolves against.
+///
+/// Bundled because they always travel together and are all borrowed for the
+/// same frame: the mixer's composited output, the bus feeds resolved once at
+/// the top of the frame, and the domemaster view when one exists.
+struct FrameSources<'a> {
+    mixer: &'a crate::mixer::Mixer,
+    bus_feeds: &'a std::collections::HashMap<String, crate::app::BusFeed>,
+    domemaster_view: Option<&'a wgpu::TextureView>,
+}
+
+/// What LED feeds need each frame beyond the sources: the master's size (a
+/// bus's region is a share of it) and the test cards.
+struct LedFrame<'a> {
+    master: [u32; 2],
+    cards: &'a crate::renderer::led_card::LedCards,
+    /// The outputs' own test cards (calibration `Projector`).
+    output_cards: &'a crate::renderer::led_card::OutputCards,
+}
+
+/// One LED screen ready to draw: where it lands in the feed (fractions) and
+/// what it samples.
+struct LedDraw<'a> {
+    quad: [[f32; 2]; 4],
+    rect: [f32; 4],
+    uv_scale: [f32; 2],
+    uv_offset: [f32; 2],
+    view: &'a wgpu::TextureView,
+    uuid: &'a str,
+}
+
+impl LedDraw<'_> {
+    fn info(&self) -> SurfaceRenderInfo<'_> {
+        SurfaceRenderInfo {
+            uuid: self.uuid,
+            content_view: self.view,
+            vertices: &self.quad,
+            extra_contours: &[],
+            bounding_box: self.rect,
+            uv_scale: self.uv_scale,
+            uv_offset: self.uv_offset,
+            warp_mode: None,
+            overlap_zones: crate::renderer::edge_blend::SurfaceOverlapZones::default(),
+            hole_uv_contours: Vec::new(),
+        }
+    }
+
+    fn desc<'b>(
+        &'b self,
+        no_zones: &'b crate::renderer::edge_blend::SurfaceOverlapZones,
+    ) -> crate::renderer::blit::PolygonDrawDesc<'b> {
+        let [x, y, w, h] = self.rect;
+        crate::renderer::blit::PolygonDrawDesc {
+            content_view: self.view,
+            uv_scale: self.uv_scale,
+            uv_offset: self.uv_offset,
+            homography: None,
+            overlap_zones: no_zones,
+            vertices: crate::renderer::blit::PolygonBlitPipeline::triangulate_verts(
+                &self.quad, x, y, w, h,
+            ),
+            mask_uuid: self.uuid,
+            mask_uv_contours: Vec::new(),
+        }
+    }
 }
 
 impl VardaApp {
@@ -185,6 +264,63 @@ impl VardaApp {
         }
     }
 
+    /// A frame starts, `start_delay` after the refresh that called for it
+    /// (when a screen's refresh starts frames). See [`super::frame_parts`].
+    pub fn frame_begin(&mut self, start_delay: Option<std::time::Duration>) {
+        self.frame_stats
+            .parts
+            .begin(std::time::Instant::now(), start_delay);
+    }
+
+    /// This frame was called for by the screen's refresh at `at` (none when
+    /// a timer starts frames): what moves by whole frames moves on by it.
+    pub fn set_frame_refresh_at(&mut self, at: Option<std::time::Instant>) {
+        use crate::renderer::present_trace::{host_seconds_of, Step, TRACE};
+        self.frame_stats.refresh_at = at;
+        if TRACE.recording() {
+            let refresh = at.map(host_seconds_of);
+            let number = self.frame_stats.frame_count;
+            TRACE.note("", 0, Step::Frame { number, refresh });
+        }
+    }
+
+    /// When the frame the mixer drew last was drawn, as the recording and
+    /// stream will time it — for tests.
+    #[doc(hidden)]
+    pub fn frame_drawn_at(&self) -> Option<std::time::Instant> {
+        self.frame_stats.drawn_at
+    }
+
+    /// When this frame was drawn, for the encoders that time frames by it: the
+    /// refresh it was drawn for, else now — and now too when that refresh is
+    /// long past, so a display clock that stopped ticking cannot hold every
+    /// frame of a recording to one moment.
+    fn frame_drawn(&self) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        self.frame_stats
+            .refresh_at
+            .filter(|at| now.saturating_duration_since(*at) < std::time::Duration::from_millis(100))
+            .unwrap_or(now)
+    }
+
+    /// `took` spent on `part` of this frame.
+    pub fn frame_part(&mut self, part: &str, took: std::time::Duration) {
+        self.frame_stats.parts.add(part, took);
+    }
+
+    /// The frame is done: its parts are kept, and it is logged if slow.
+    pub fn frame_end(&mut self) {
+        #[allow(clippy::cast_precision_loss)]
+        let frame_ms = if self.target_fps > 0 {
+            1000.0 / self.target_fps as f32
+        } else {
+            1000.0 / 60.0
+        };
+        self.frame_stats
+            .parts
+            .end(std::time::Instant::now(), frame_ms);
+    }
+
     /// Update frame timing (FPS measurement) and system stats. Call once per frame before any work.
     pub fn update_frame_timing(&mut self) {
         let now = std::time::Instant::now();
@@ -196,6 +332,12 @@ impl VardaApp {
         // previous frame — including the output, preview, and present submits
         // that happen after the mixer is done.
         self.frame_stats.last_frame_submits = self.context.submits.take();
+        // When the command buffers since ran on the GPU — the control
+        // window's too, submitted from the main thread.
+        let runs = crate::renderer::gpu_time::take_runs(&self.context.queue);
+        trace_gpu_runs(&runs);
+        self.frame_stats.gpu_time.add(now, runs);
+        self.finish_present_trace();
         self.frame_stats.frame_count = self.frame_stats.frame_count.wrapping_add(1);
         if self.frame_stats.frame_count.is_multiple_of(120) {
             log::debug!(
@@ -204,6 +346,10 @@ impl VardaApp {
                 self.frame_stats.fps_smoothed,
             );
         }
+        if self.frame_stats.intervals.len() >= super::PACING_FRAMES {
+            self.frame_stats.intervals.pop_front();
+        }
+        self.frame_stats.intervals.push_back(dt * 1000.0);
         if dt > 0.0 {
             let instant_fps = 1.0 / dt;
             self.frame_stats.fps_history.push_back(instant_fps);
@@ -213,7 +359,43 @@ impl VardaApp {
             self.frame_stats.fps_smoothed = self.frame_stats.fps_history.iter().sum::<f32>()
                 / self.frame_stats.fps_history.len() as f32;
         }
+        self.frame_stats.frame_time_secs = now
+            .duration_since(self.frame_stats.start_instant)
+            .as_secs_f64();
         self.frame_stats.system_monitor.update();
+    }
+
+    /// Write the present trace once its time is up (see `TracePresents`).
+    fn finish_present_trace(&self) {
+        use crate::renderer::context::UnifiedOutput;
+        let fps = if self.target_fps > 0 { self.target_fps } else { 60 };
+        let frame_ms = 1000.0 / f64::from(fps);
+        let outputs = || {
+            self.output
+                .outputs
+                .iter()
+                .filter_map(|output| match output {
+                    UnifiedOutput::Window(window) => Some(window.trace_info()),
+                    // A Blackmagic output's device refreshes at its format's rate.
+                    UnifiedOutput::Headless(h) => h.decklink.as_ref().map(|device| {
+                        crate::renderer::present_trace::OutputInfo {
+                            name: h.name.clone(),
+                            display: None,
+                            refresh_ms: device.refresh_ms,
+                            follows_clock: false,
+                            frame_hold: None,
+                        }
+                    }),
+                })
+                .collect()
+        };
+        // Written on a thread of its own, which logs it.
+        let writing = crate::renderer::present_trace::TRACE.finish_if_due(
+            &self.frame_stats.clock,
+            frame_ms,
+            outputs,
+        );
+        drop(writing);
     }
 
     /// Collect all analyzer scalar values from all decks into a flat lookup table.
@@ -240,6 +422,20 @@ impl VardaApp {
     /// Render the mixer frame: update cameras, NDI, Syphon, collect audio, render mixer.
     /// This performs all GPU work that doesn't need the surface texture.
     pub fn render_mixer_frame(&mut self) {
+        // The shader Main's chosen transition needs, compiled the first
+        // frame it is chosen (the library is the app's, not the mixer's).
+        if let Some((transition, name)) = self.mixer.main_transition_shader_wanted() {
+            let shader = self.registry.get(name).cloned();
+            if let Err(e) = self.mixer.set_main_transition_shader(&self.context, transition, shader) {
+                log::warn!(
+                    "Main's {} transition could not be made ({e}): it fades instead",
+                    transition.name()
+                );
+            }
+        }
+        // Sound follows the scene as this frame starts: new or removed clips,
+        // what is on air, devices coming and going.
+        self.update_audio_mix();
         // Surface a one-time notice for any deck whose ping-pong RAM cache was
         // truncated (hit the memory cap). The supported path for full-length
         // reverse on heavy/long/high-res clips is to pre-transcode to HAP.
@@ -271,27 +467,15 @@ impl VardaApp {
             );
         }
 
-        // Compute effective channel opacities to determine which cameras are needed
-        let channel_count = self.mixer.channel_count();
-        let crossfader = self.mixer.crossfader();
-        let two_ch_buf: [f32; 2];
-        let n_ch_buf: Vec<f32>;
-        let effective_opacities: &[f32] = if channel_count == 2 {
-            two_ch_buf = [
-                (1.0 - crossfader) * self.mixer.channel_opacity(0),
-                crossfader * self.mixer.channel_opacity(1),
-            ];
-            &two_ch_buf
-        } else {
-            n_ch_buf = (0..channel_count)
-                .map(|i| self.mixer.channel_opacity(i))
-                .collect();
-            &n_ch_buf
-        };
+        // How strongly each channel shows, to know which cameras are needed:
+        // in Main mode what is on Main, fading or overlaid, not the layered
+        // mix's crossfader.
+        let effective_opacities = self.mixer.channel_weights();
 
-        // Collect camera IDs needed by visible channels. Cued (previewed)
-        // channels are included even at zero opacity so their live camera inputs
-        // keep advancing while off-air. See /spec/channel-preview.md.
+        // Collect camera IDs needed by visible channels. Watched channels — cued
+        // previews and anything a bus has on air or staged — are included even
+        // at zero opacity so their live camera inputs keep advancing while
+        // off-air. See /spec/channel-preview.md.
         let mut needed_camera_ids = std::collections::HashSet::new();
         let mut needed_capture_ids = std::collections::HashSet::new();
         // Counted over every deck, not just the visible ones: this is what the
@@ -299,12 +483,29 @@ impl VardaApp {
         // must still count as a holder.
         let mut capture_holders: std::collections::HashMap<crate::screen_capture::CaptureId, u32> =
             std::collections::HashMap::new();
+        // How each camera's pictures are read into colours, as its decks say
+        // (see `CameraManager::set_colours`).
+        let mut camera_colours = std::collections::HashMap::new();
+        let mut camera_latencies = std::collections::HashMap::new();
+        // What each camera's picture is coded as, a LUT file named in full
+        // (see `CameraManager::set_profiles`).
+        let mut camera_profiles = std::collections::HashMap::new();
+        let luts = self.session.workspace.luts_dir();
+        let watched = self.watched_channels();
         for (ch_idx, channel) in self.mixer.channels().iter().enumerate() {
             let visible = effective_opacities.get(ch_idx).copied().unwrap_or(0.0) > 0.0;
-            let wanted = visible || self.preview_channels.contains(&ch_idx);
+            // A channel shown as a tile in the control window is drawn now
+            // and then (see `Mixer::tile_previews`): its camera stays live.
+            // So does one shown in another as a layer of it (a tap).
+            let wanted = visible || watched.contains(&ch_idx) || self.ui_tiles || channel.tapped;
             for slot in &channel.decks {
                 if let Some(cap_id) = slot.deck.screen_capture_id() {
                     *capture_holders.entry(cap_id).or_default() += 1;
+                }
+                if let Some(cam_id) = slot.deck.camera_id() {
+                    camera_colours.insert(cam_id, slot.deck.camera_colour);
+                    camera_latencies.insert(cam_id, slot.deck.camera_lowest_latency);
+                    camera_profiles.insert(cam_id, lut_in_full(&slot.deck.camera_profile, &luts));
                 }
                 // The arrangement knows more than the current opacity does: it
                 // knows this deck is about to be needed, or that it will not be
@@ -333,18 +534,32 @@ impl VardaApp {
         self.screen_capture_manager
             .reconcile_holders(&capture_holders);
 
+        // A camera missing when the show opened is picked up once it is here.
+        self.reconcile_cameras();
+        // macOS camera effects change a camera's picture on air: say so.
+        if let Some(effects) = self.camera_manager.poll_video_effects() {
+            let text = crate::camera::video_effects_warning(&effects);
+            log::warn!("{text}");
+            self.session.notifications.warn(text);
+        }
+        self.camera_manager.set_colours(&camera_colours);
+        self.camera_manager.set_lowest_latencies(&camera_latencies);
+        self.camera_manager.set_profiles(&camera_profiles);
+        // Each camera's and capture's frame is picked by when this show
+        // frame is due on screen (see `crate::frame_picker`).
+        let show_at = self
+            .frame_stats
+            .refresh_at
+            .map_or_else(crate::host_clock::host_seconds, crate::host_clock::host_seconds_of);
         // Update only needed camera frames
         self.camera_manager
-            .update_selective(&self.context.queue, &needed_camera_ids);
+            .update_selective(&self.context, &needed_camera_ids, show_at);
 
         // Upload screen-capture frames for visible/cued decks only. An
         // invisible capture deck costs nothing, which is what makes a
         // self-capture deck safe to leave in a scene.
-        self.screen_capture_manager.update_selective(
-            &self.context.device,
-            &self.context.queue,
-            &needed_capture_ids,
-        );
+        self.screen_capture_manager
+            .update_selective(&self.context, &needed_capture_ids, show_at);
 
         // Update NDI receiver frames
         self.external_io
@@ -364,7 +579,9 @@ impl VardaApp {
             .update(&self.context.device, &self.context.queue);
 
         // Update stream receiver frames
-        self.external_io.stream_manager.update(&self.context.queue);
+        self.external_io
+            .stream_manager
+            .update(&self.context.device, &self.context.queue);
 
         // Pump HTML (Servo) instances and upload their frames
         self.external_io
@@ -381,9 +598,21 @@ impl VardaApp {
                     use crate::deck::ExternalSourceKind;
                     slot.deck.external_source_view = match kind {
                         ExternalSourceKind::Camera(cam_id) => {
+                            // A device set to another size mid-show sends
+                            // pictures of that size: the deck follows.
+                            if let Some((w, h)) = self.camera_manager.resolution(cam_id) {
+                                slot.deck.set_external_source_size(w, h);
+                            }
                             self.camera_manager.texture_view(cam_id).cloned()
                         }
                         ExternalSourceKind::Ndi(idx) => {
+                            // Known once its first picture comes: 4:3,
+                            // portrait or 16:10 is not stretched to 16:9.
+                            if let Some((w, h)) =
+                                self.external_io.ndi_manager.receiver_dimensions(idx)
+                            {
+                                slot.deck.set_external_source_size(w, h);
+                            }
                             self.external_io.ndi_manager.texture_view(idx).cloned()
                         }
                         #[cfg(target_os = "macos")]
@@ -396,6 +625,13 @@ impl VardaApp {
                         | ExternalSourceKind::Hls(idx)
                         | ExternalSourceKind::Dash(idx)
                         | ExternalSourceKind::Rtmp(idx) => {
+                            // At the stream's own size, once its first
+                            // picture says it: not stretched to 16:9.
+                            if let Some((w, h)) =
+                                self.external_io.stream_manager.receiver_dimensions(idx)
+                            {
+                                slot.deck.set_external_source_size(w, h);
+                            }
                             self.external_io.stream_manager.texture_view(idx).cloned()
                         }
                         ExternalSourceKind::Html(idx) => {
@@ -509,9 +745,22 @@ impl VardaApp {
         };
 
         let target_fps = self.target_fps;
-        if let Err(e) =
-            self.mixer
-                .render(&self.context, &inputs, target_fps, &self.preview_channels)
+        let watched = self.watched_channels();
+        self.mixer.decks_shown_alone = self.decks_shown_alone();
+        self.mixer.tile_previews = self.ui_tiles;
+        // The refresh is taken by the mixer: when the frame was drawn is kept
+        // for the outputs first, or the recording timed every frame by when
+        // its readback was started — a few milliseconds later each time, by
+        // however long the mixer took — and repeated one and left out the
+        // next, a pair a second (a laptop, 2026-10-03).
+        self.frame_stats.drawn_at = Some(self.frame_drawn());
+        self.mixer.frame_timing = crate::mixer::FrameTiming {
+            refresh_at: self.frame_stats.refresh_at.take(),
+            held: self.frames_follow_a_screen(),
+        };
+        if let Err(e) = self
+            .mixer
+            .render(&self.context, &inputs, target_fps, &watched)
         {
             log::error!("Failed to render mixer: {e}");
         }
@@ -583,16 +832,48 @@ impl VardaApp {
         }
     }
 
-    /// Render content to all outputs (windowed + headless) using the surface layout.
+    /// Render content to all outputs (windowed + headless) using the surface
+    /// layout. Each output window's presenter puts its frame on its screen
+    /// (see `renderer::presenter::Presenter`).
     pub fn render_outputs(&mut self) {
+        self.draw_outputs();
+    }
+
+    /// Render content to all outputs (windowed + headless) using the surface
+    /// layout, handing the windows' frames to their presenters.
+    pub fn draw_outputs(&mut self) {
+        let t_prep = std::time::Instant::now();
+        // Before anything borrows the context: these may start the stream's
+        // or the recording's encoder again.
+        self.poll_stream();
+        self.poll_recording();
+        self.poll_blackmagic_outputs();
+        for output in &mut self.output.outputs {
+            if let crate::renderer::context::UnifiedOutput::Window(window) = output {
+                window.clock_display = self.frame_stats.clock_display;
+            }
+        }
         let context = &self.context;
 
-        // Prepare sub-mixes for any Channels(...) sources
+        // Resolved once per frame, before any destination renders, so every
+        // output following a bus sees the same on-air content this frame.
+        let mut bus_feeds = self.bus_feeds();
+
+        // Prepare sub-mixes for any Channels(...) sources: a surface's own, or
+        // the master with layers hidden that a bus puts on air.
         {
             let mut seen: std::collections::HashSet<Vec<usize>> = std::collections::HashSet::new();
             let mut sub_mix_sources: Vec<Vec<usize>> = Vec::new();
-            for surface in &self.output.surface_manager.surfaces {
-                if let OutputSource::Channels(indices) = &surface.source {
+            let bus_sources = bus_feeds.values().flat_map(|f| f.picture.sources());
+            for source in self
+                .output
+                .surface_manager
+                .surfaces
+                .iter()
+                .map(|s| &s.source)
+                .chain(bus_sources)
+            {
+                if let OutputSource::Channels(indices) = source {
                     let mut sorted = indices.clone();
                     sorted.sort_unstable();
                     sorted.dedup();
@@ -604,12 +885,22 @@ impl VardaApp {
             self.mixer.prepare_sub_mixes(&sub_mix_sources, context);
         }
 
-        // Prepare tonemapped copies for any Channel(idx) sources
+        // Prepare tonemapped copies for any Channel(idx) sources — a surface's
+        // own, or one a bus puts on air — so a channel looks the same on every
+        // screen it reaches, and as it does in the main output.
         {
             let mut channel_indices: Vec<usize> = Vec::new();
             let mut seen = std::collections::HashSet::new();
-            for surface in &self.output.surface_manager.surfaces {
-                if let OutputSource::Channel(idx) = &surface.source {
+            let bus_sources = bus_feeds.values().flat_map(|f| f.picture.sources());
+            for source in self
+                .output
+                .surface_manager
+                .surfaces
+                .iter()
+                .map(|s| &s.source)
+                .chain(bus_sources)
+            {
+                if let OutputSource::Channel(idx) = source {
                     if seen.insert(*idx) {
                         channel_indices.push(*idx);
                     }
@@ -624,6 +915,29 @@ impl VardaApp {
         let render_aspect = self.render_width as f32 / self.render_height.max(1) as f32;
         let mixer = &self.mixer;
 
+        // Guarantee the black source actually reads black: one 1x1 clear,
+        // the first frame.
+        if !mixer.black_source_cleared() {
+            let mut encoder =
+                self.context
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Black source clear"),
+                    });
+            mixer.clear_black_source(&mut encoder);
+            self.context.submit(Some(encoder.finish()));
+        }
+
+        // Buses mid-`AUTO` fade into targets of their own, after the tonemapped
+        // channel copies they read are ready.
+        self.output.bus_dissolves.render(
+            context,
+            (self.render_width, self.render_height),
+            &mut bus_feeds,
+            |source| Self::resolve_direct(mixer, source, None),
+            mixer.black_view(),
+        );
+
         // Run domemaster renderer if enabled (content rotation is updated each frame via set_content_rotation)
         let domemaster_view = if let Some(dome) = &self.output.domemaster {
             if dome.enabled {
@@ -637,18 +951,98 @@ impl VardaApp {
             None
         };
 
+        self.output.led_cards.prepare(
+            &self.context.device,
+            &self.context.queue,
+            self.output.outputs.iter().filter_map(|o| o.led()),
+        );
+        // Each output showing its test card has it at its own pixels.
+        {
+            use crate::renderer::context::{CalibrationMode, UnifiedOutput};
+            use crate::renderer::led_card::WantedCard;
+            let wanted: Vec<WantedCard> = self
+                .output
+                .outputs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, o)| match o {
+                    UnifiedOutput::Window(w) if w.calibration_mode == CalibrationMode::Projector => {
+                        let (width, height) =
+                            w.rotation.effective_dimensions(w.size.width, w.size.height);
+                        Some(WantedCard {
+                            uuid: w.uuid.clone(),
+                            name: w.name.clone(),
+                            size: [width, height],
+                            index,
+                        })
+                    }
+                    UnifiedOutput::Headless(h)
+                        if h.calibration_mode == CalibrationMode::Projector =>
+                    {
+                        Some(WantedCard {
+                            uuid: h.uuid.clone(),
+                            name: h.name.clone(),
+                            size: [h.width, h.height],
+                            index,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            self.output.output_cards.prepare(
+                &self.context.device,
+                &self.context.queue,
+                wanted.into_iter(),
+            );
+        }
+        let led = LedFrame {
+            master: [self.render_width, self.render_height],
+            cards: &self.output.led_cards,
+            output_cards: &self.output.output_cards,
+        };
+        self.frame_stats
+            .parts
+            .add("outputs prep", t_prep.elapsed());
+        self.frame_stats.windows_presented = false;
+        let hold = self.frame_hold_secs();
+        let period = 1.0 / f64::from(self.target_fps.max(1));
+        for output in &mut self.output.outputs {
+            if let crate::renderer::context::UnifiedOutput::Window(window) = output {
+                window.frame_period = period;
+                // Held only on a screen refreshing faster than the show (see
+                // `OutputWindow::holds_frames`).
+                let hold = hold.filter(|_| window.holds_frames(period));
+                if window.frame_hold != hold {
+                    crate::renderer::context::set_frame_hold(&window.surface, hold);
+                    window.frame_hold = hold;
+                }
+            }
+        }
         for output in &mut self.output.outputs {
             match output {
                 crate::renderer::context::UnifiedOutput::Window(output) => {
+                    let t_window = std::time::Instant::now();
+                    let presents = output.presents;
                     Self::render_window_output(
                         output,
                         context,
-                        mixer,
+                        &FrameSources {
+                            mixer,
+                            bus_feeds: &bus_feeds,
+                            domemaster_view,
+                        },
                         &self.output.surface_manager,
                         &self.output.calibration_textures,
-                        domemaster_view,
                         render_aspect,
+                        &led,
                     );
+                    self.frame_stats.windows_presented |= output.presents > presents;
+                    // Drawing the picture; and the last present's wait for a
+                    // frame to draw into, made after the engine was handed
+                    // back (see `take_present_jobs`).
+                    let parts = &mut self.frame_stats.parts;
+                    parts.add(&format!("{} draw", output.name), t_window.elapsed());
+                    parts.add(&format!("{} acquire", output.name), output.last_acquire);
                 }
                 crate::renderer::context::UnifiedOutput::Headless(_) => {
                     // Headless rendering handled separately (needs &mut for subprocess)
@@ -657,40 +1051,128 @@ impl VardaApp {
         }
 
         // Render headless outputs (needs &mut self for subprocess feeding)
+        let drawn = self
+            .frame_stats
+            .drawn_at
+            .take()
+            .unwrap_or_else(std::time::Instant::now);
         let sinks = HeadlessDeliverySinks {
             ndi_manager: &mut self.external_io.ndi_manager,
             #[cfg(target_os = "macos")]
             syphon_manager: &mut self.external_io.syphon_manager,
             audio_manager: &mut self.audio_manager,
+            audio_mix: &self.audio_mix,
             notifications: &mut self.session.notifications,
             encoder_fps: crate::app::state::encoder_fps(self.target_fps),
+            drawn,
         };
+        let t_headless = std::time::Instant::now();
         Self::render_headless_outputs_inner(
             &mut self.output.outputs,
             context,
-            mixer,
+            &FrameSources {
+                mixer,
+                bus_feeds: &bus_feeds,
+                domemaster_view,
+            },
             &self.output.surface_manager,
             sinks,
-            domemaster_view,
+            &led,
         );
+        self.frame_stats
+            .parts
+            .add("headless outputs", t_headless.elapsed());
+
+        // The stream renders like a headless output, kept off the list.
+        let sinks = HeadlessDeliverySinks {
+            ndi_manager: &mut self.external_io.ndi_manager,
+            #[cfg(target_os = "macos")]
+            syphon_manager: &mut self.external_io.syphon_manager,
+            audio_manager: &mut self.audio_manager,
+            audio_mix: &self.audio_mix,
+            notifications: &mut self.session.notifications,
+            encoder_fps: crate::app::state::encoder_fps(self.target_fps),
+            drawn,
+        };
+        let t_headless = std::time::Instant::now();
+        Self::render_headless_outputs_inner(
+            &mut self.streaming.output,
+            context,
+            &FrameSources {
+                mixer,
+                bus_feeds: &bus_feeds,
+                domemaster_view,
+            },
+            &self.output.surface_manager,
+            sinks,
+            &led,
+        );
+        self.frame_stats
+            .parts
+            .add("stream", t_headless.elapsed());
+
+        // And the recording.
+        let sinks = HeadlessDeliverySinks {
+            ndi_manager: &mut self.external_io.ndi_manager,
+            #[cfg(target_os = "macos")]
+            syphon_manager: &mut self.external_io.syphon_manager,
+            audio_manager: &mut self.audio_manager,
+            audio_mix: &self.audio_mix,
+            notifications: &mut self.session.notifications,
+            encoder_fps: crate::app::state::encoder_fps(self.target_fps),
+            drawn,
+        };
+        let t_headless = std::time::Instant::now();
+        Self::render_headless_outputs_inner(
+            &mut self.recording.output,
+            context,
+            &FrameSources {
+                mixer,
+                bus_feeds: &bus_feeds,
+                domemaster_view,
+            },
+            &self.output.surface_manager,
+            sinks,
+            &led,
+        );
+        self.frame_stats
+            .parts
+            .add("recording", t_headless.elapsed());
     }
 
     fn render_window_output(
         output: &mut crate::renderer::context::OutputWindow,
         context: &crate::renderer::context::GpuContext,
-        mixer: &crate::mixer::Mixer,
+        frame: &FrameSources<'_>,
         surface_manager: &crate::surface::SurfaceManager,
         calibration_textures: &[(wgpu::Texture, wgpu::TextureView)],
-        domemaster_view: Option<&wgpu::TextureView>,
         render_aspect: f32,
+        led: &LedFrame<'_>,
     ) {
         use crate::renderer::context::CalibrationMode;
+
+        let (mixer, bus_feeds, domemaster_view) =
+            (frame.mixer, frame.bus_feeds, frame.domemaster_view);
         // Projector calibration: one full-frame test card over the whole output,
         // bypassing surface geometry/warp (physical projector alignment).
-        if output.calibration_mode == CalibrationMode::Projector && !calibration_textures.is_empty()
-        {
-            output.render(context, &calibration_textures[0].1);
-            output.window.request_redraw();
+        if output.calibration_mode == CalibrationMode::Projector {
+            // Its own card, at its pixels — the shared one until that is made.
+            let card = led
+                .output_cards
+                .view(&output.uuid)
+                .or_else(|| calibration_textures.first().map(|(_, view)| view));
+            if let Some(card) = card {
+                output.render(context, card);
+                output.request_redraw();
+                return;
+            }
+        }
+        // An LED feed: each screen at its own pixels, in place of surfaces.
+        if let Some(layout) = output.led.clone() {
+            let draws = Self::led_draws(&layout, frame, led);
+            let infos: Vec<SurfaceRenderInfo<'_>> = draws.iter().map(LedDraw::info).collect();
+            output.render_surfaces(context, &infos);
+            output.request_redraw();
             return;
         }
         // Surfaces calibration: each surface shows a colored test card through its warp.
@@ -717,12 +1199,12 @@ impl VardaApp {
                     let content_view = if surfaces_cal && !calibration_textures.is_empty() {
                         &calibration_textures[ai % calibration_textures.len()].1
                     } else {
-                        Self::resolve_source(mixer, &surface.source, domemaster_view)?
+                        Self::resolve_source(mixer, &surface.source, domemaster_view, bus_feeds)?
                     };
                     let (uv_scale, uv_offset) = if surfaces_cal {
                         ([1.0, 1.0], [0.0, 0.0])
                     } else {
-                        Self::compute_uv(surface.content_mapping, &bb)
+                        Self::surface_uv(&surface.source, surface.content_mapping, &bb, bus_feeds)
                     };
                     Some(SurfaceRenderInfo {
                         uuid: &surface.uuid,
@@ -749,12 +1231,12 @@ impl VardaApp {
                     let content_view = if surfaces_cal && !calibration_textures.is_empty() {
                         &calibration_textures[si % calibration_textures.len()].1
                     } else {
-                        Self::resolve_source(mixer, &surface.source, domemaster_view)?
+                        Self::resolve_source(mixer, &surface.source, domemaster_view, bus_feeds)?
                     };
                     let (uv_scale, uv_offset) = if surfaces_cal {
                         ([1.0, 1.0], [0.0, 0.0])
                     } else {
-                        Self::compute_uv(surface.content_mapping, &bb)
+                        Self::surface_uv(&surface.source, surface.content_mapping, &bb, bus_feeds)
                     };
                     Some(SurfaceRenderInfo {
                         uuid: &surface.uuid,
@@ -772,10 +1254,104 @@ impl VardaApp {
                 .collect();
             output.render_surfaces(context, &render_infos);
         }
-        output.window.request_redraw();
+        output.request_redraw();
     }
 
+    /// The screens of an LED feed as draws: each at its own pixels of the
+    /// feed, sampling its part of Main or of its bus's region of the master.
+    /// A screen whose bus shows nothing draws black; one showing test cards
+    /// draws its card over its whole rectangle.
+    fn led_draws<'a>(
+        layout: &'a crate::engine::value::led::LedLayout,
+        frame: &FrameSources<'a>,
+        led: &LedFrame<'a>,
+    ) -> Vec<LedDraw<'a>> {
+        let [fw, fh] = layout.feed.map(|v| v.max(1) as f32);
+        let quad = |[x, y, w, h]: [f32; 4]| [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+        layout
+            .screens
+            .iter()
+            .filter_map(|screen| {
+                if layout.test_card {
+                    let [x, y, w, h] = screen.feed_rect().map(|v| v as f32);
+                    let rect = [x / fw, y / fh, w / fw, h / fh];
+                    return Some(LedDraw {
+                        quad: quad(rect),
+                        rect,
+                        uv_scale: [1.0, 1.0],
+                        uv_offset: [0.0, 0.0],
+                        view: led.cards.view(&screen.uuid)?,
+                        uuid: &screen.uuid,
+                    });
+                }
+                let view = Self::resolve_source(
+                    frame.mixer,
+                    &screen.source,
+                    frame.domemaster_view,
+                    frame.bus_feeds,
+                )?;
+                // A bus's picture is its region of the master.
+                let (region_scale, region_offset) = match &screen.source {
+                    OutputSource::BusProgram(uuid) => frame
+                        .bus_feeds
+                        .get(uuid)
+                        .map_or(([1.0, 1.0], [0.0, 0.0]), |f| (f.uv_scale, f.uv_offset)),
+                    _ => ([1.0, 1.0], [0.0, 0.0]),
+                };
+                let picture = [0, 1]
+                    .map(|i| (region_scale[i] * led.master[i] as f32).round().max(1.0) as u32);
+                let placed = screen.placement(layout.feed, picture)?;
+                Some(LedDraw {
+                    quad: quad(placed.dest),
+                    rect: placed.dest,
+                    uv_scale: [0, 1].map(|i| placed.uv_scale[i] * region_scale[i]),
+                    uv_offset: [0, 1]
+                        .map(|i| region_offset[i] + placed.uv_offset[i] * region_scale[i]),
+                    view,
+                    uuid: &screen.uuid,
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve a destination's configured source to the view it should show.
+    ///
+    /// `bus_feeds` maps a bus UUID to whatever that bus currently has on air,
+    /// resolved once per frame by `VardaApp::bus_feeds`. A bus with nothing on
+    /// air — black, unresolvable, or quarantined — is absent from the map and
+    /// resolves to the black source rather than `None`: returning `None` would
+    /// make the destination skip its blit and keep showing the previous frame,
+    /// which is precisely what a black bus must not do.
     fn resolve_source<'a>(
+        mixer: &'a Mixer,
+        source: &OutputSource,
+        domemaster_view: Option<&'a wgpu::TextureView>,
+        bus_feeds: &'a std::collections::HashMap<String, crate::app::BusFeed>,
+    ) -> Option<&'a wgpu::TextureView> {
+        use crate::app::FeedPicture;
+
+        let OutputSource::BusProgram(bus_uuid) = source else {
+            return Self::resolve_direct(mixer, source, domemaster_view);
+        };
+        // One level only: a feed is always a concrete source or a rendered
+        // dissolve, never another bus, so this cannot recurse.
+        match bus_feeds.get(bus_uuid).map(|f| &f.picture) {
+            Some(FeedPicture::Source(source)) => {
+                Self::resolve_direct(mixer, source, domemaster_view)
+            }
+            Some(FeedPicture::Rendered(view)) => Some(view),
+            // A dissolve nobody rendered this frame holds where it started.
+            Some(FeedPicture::Dissolve { from, .. }) => Some(
+                from.as_ref()
+                    .and_then(|s| Self::resolve_direct(mixer, s, domemaster_view))
+                    .unwrap_or_else(|| mixer.black_view()),
+            ),
+            None => Some(mixer.black_view()),
+        }
+    }
+
+    /// Resolve a concrete (non-bus) source to its view.
+    pub(crate) fn resolve_direct<'a>(
         mixer: &'a Mixer,
         source: &OutputSource,
         domemaster_view: Option<&'a wgpu::TextureView>,
@@ -797,7 +1373,32 @@ impl VardaApp {
                 .and_then(|ch| ch.decks.get(*deck_idx))
                 .map(|slot| &slot.deck.texture_view),
             OutputSource::Domemaster => domemaster_view,
+            // Buses are resolved by `resolve_source`; a feed never names one.
+            OutputSource::BusProgram(_) => Some(mixer.black_view()),
         }
+    }
+
+    /// UV for a surface, letting a bus feed override the surface's own mapping.
+    ///
+    /// A bus declares which region of the master raster is its picture, so a
+    /// destination showing that bus must sample exactly that region — the crop
+    /// belongs to the bus, configured once, not to every destination that
+    /// happens to show it. Surfaces sourcing anything else keep their own
+    /// mapping unchanged.
+    fn surface_uv(
+        surface_source: &OutputSource,
+        mapping: ContentMapping,
+        bb: &crate::surface::BoundingBox,
+        bus_feeds: &std::collections::HashMap<String, crate::app::BusFeed>,
+    ) -> ([f32; 2], [f32; 2]) {
+        if let OutputSource::BusProgram(uuid) = surface_source {
+            return bus_feeds
+                .get(uuid)
+                .map_or(([1.0, 1.0], [0.0, 0.0]), |feed| {
+                    (feed.uv_scale, feed.uv_offset)
+                });
+        }
+        Self::compute_uv(mapping, bb)
     }
 
     fn compute_uv(
@@ -812,13 +1413,53 @@ impl VardaApp {
 
     /// Refresh monitors from the event loop.
     pub fn refresh_monitors(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        self.output.cached_monitors = event_loop
-            .available_monitors()
-            .map(|m| {
-                let name = m.name().unwrap_or_else(|| "Unknown".to_string());
-                (name, m)
+        let handles: Vec<_> = event_loop.available_monitors().collect();
+        // Sizes read here, on the main thread: the engine thread publishes
+        // them, and a screen asked for its size from another thread answers
+        // through the main thread — which may be waiting for the engine.
+        self.output.monitor_sizes = handles.iter().map(winit::monitor::MonitorHandle::size).collect();
+        let names = super::monitors::names(&handles);
+        // What macOS calls each screen, and what a name given to it is kept
+        // by, asked here on the main thread too — this runs every frame, so
+        // only when the screens change, or a second on (a rate changed).
+        let screens: Vec<(String, (i32, i32))> = names
+            .iter()
+            .zip(&handles)
+            .map(|(name, h)| {
+                let p = h.position();
+                (name.clone(), (p.x, p.y))
             })
             .collect();
+        let due = self
+            .output
+            .screen_facts_at
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1));
+        if due || screens != self.output.screen_facts_for {
+            self.output.screen_facts = super::screens::facts(&handles, &names);
+            self.output.screen_facts_for = screens;
+            self.output.screen_facts_at = Some(std::time::Instant::now());
+        }
+        self.output.cached_monitors = names.into_iter().zip(handles).collect();
+        // Which screen each output window is on, read here on the main
+        // thread for the engine thread, which may not ask the windows.
+        for output in &mut self.output.outputs {
+            if let crate::renderer::context::UnifiedOutput::Window(w) = output {
+                w.note_screen();
+            }
+        }
+        self.release_lost_displays();
+        self.adopt_awaited_displays();
+        self.follow_output_screens();
+        self.warn_on_uneven_rates();
+        // Only a running app with an event loop gets here — never the test
+        // harness — so this holds the machine awake exactly while Varda runs.
+        self.output.keep_awake.set(true);
+        // Likewise, list sound devices only in a running app: enumeration
+        // talks to the OS audio server, which a test engine has no use for.
+        if !self.audio_devices_listed {
+            self.audio_devices_listed = true;
+            self.audio_mix.rescan_devices();
+        }
     }
 
     /// Render all active headless outputs — readback + deliver frames.
@@ -827,12 +1468,25 @@ impl VardaApp {
     fn render_headless_outputs_inner(
         outputs: &mut [crate::renderer::context::UnifiedOutput],
         context: &crate::renderer::context::GpuContext,
-        mixer: &crate::mixer::Mixer,
+        frame: &FrameSources<'_>,
         surface_manager: &crate::surface::SurfaceManager,
         sinks: HeadlessDeliverySinks,
-        domemaster_view: Option<&wgpu::TextureView>,
+        led: &LedFrame<'_>,
     ) {
+        let (mixer, bus_feeds, domemaster_view) =
+            (frame.mixer, frame.bus_feeds, frame.domemaster_view);
+        let no_zones = crate::renderer::edge_blend::SurfaceOverlapZones::default();
         for output in outputs.iter_mut() {
+            // An NDI sender carries its output's audio bus while it runs,
+            // and falls silent when it is stopped.
+            if let crate::renderer::context::UnifiedOutput::Headless(h) = &*output {
+                if let crate::renderer::context::OutputTarget::NdiSend { sender_name } = &h.target {
+                    let bus = h.audio_bus.as_deref().filter(|_| h.active);
+                    sinks
+                        .ndi_manager
+                        .keep_audio(sender_name, bus, sinks.audio_mix);
+                }
+            }
             let h = match output {
                 crate::renderer::context::UnifiedOutput::Headless(h) if h.active => h,
                 _ => continue,
@@ -856,17 +1510,75 @@ impl VardaApp {
                 &h.texture_view
             };
 
-            if h.surface_assignments.is_empty() {
-                // Fallback: simple blit from source
-                let Some(source_view) = Self::resolve_source(mixer, &h.source, domemaster_view)
-                else {
+            if let Some(layout) = &h.led {
+                let draws = Self::led_draws(layout, frame, led);
+                let descs: Vec<crate::renderer::blit::PolygonDrawDesc<'_>> =
+                    draws.iter().map(|d| d.desc(&no_zones)).collect();
+                let (prepared, vertex_pool) =
+                    h.polygon_pipeline
+                        .prepare(&context.device, &context.queue, &descs);
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Headless LED Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: render_target,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                h.polygon_pipeline.draw(&mut rp, &prepared, &vertex_pool);
+            } else if h.surface_assignments.is_empty() {
+                // Fallback: simple blit from source — or the test card in
+                // its place (`calibration_mode`).
+                let card = led.output_cards.view(&h.uuid).filter(|_| {
+                    h.calibration_mode == crate::renderer::context::CalibrationMode::Projector
+                });
+                let Some(source_view) = card.or_else(|| {
+                    Self::resolve_source(mixer, &h.source, domemaster_view, bus_feeds)
+                }) else {
                     continue;
                 };
-                h.blit_pipeline.set_presentation(
+                // A bus sends only its region of the master, as it does on a
+                // screen; every other source is sent whole.
+                let region = match &h.source {
+                    OutputSource::BusProgram(uuid) if card.is_none() => bus_feeds
+                        .get(uuid)
+                        .map_or(([1.0, 1.0], [0.0, 0.0]), |f| (f.uv_scale, f.uv_offset)),
+                    _ => ([1.0, 1.0], [0.0, 0.0]),
+                };
+                h.blit_pipeline.set_presentation_of_region(
                     &context.queue,
                     h.rotation.index(),
                     &h.resolved_presentation,
+                    region,
                 );
+                // A Blackmagic output's frame is its format's: the picture
+                // fitted into it, never stretched — its test card, made at
+                // its pixels, filling it.
+                let fitted = if card.is_some() {
+                    None
+                } else {
+                    matches!(
+                        h.target,
+                        crate::renderer::context::OutputTarget::DeckLink { .. }
+                    )
+                    .then(|| {
+                        crate::renderer::context::fitted_in_format(
+                            led.master,
+                            region.0,
+                            h.rotation,
+                            h.width,
+                            h.height,
+                        )
+                    })
+                };
                 let bind_group = h
                     .blit_pipeline
                     .create_bind_group(&context.device, source_view);
@@ -887,6 +1599,10 @@ impl VardaApp {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
+                    if let Some([x, y, w, high]) = fitted {
+                        let (width, height) = (h.width as f32, h.height as f32);
+                        rp.set_viewport(x * width, y * height, w * width, high * height, 0.0, 1.0);
+                    }
                     h.blit_pipeline.render(&mut rp, &bind_group);
                 }
             } else {
@@ -904,9 +1620,18 @@ impl VardaApp {
                             .iter()
                             .find(|a| a.enabled && a.surface_uuid == surface.uuid)?;
                         let bb = surface.bounding_box();
-                        let content_view =
-                            Self::resolve_source(mixer, &surface.source, domemaster_view)?;
-                        let (uv_scale, uv_offset) = Self::compute_uv(surface.content_mapping, &bb);
+                        let content_view = Self::resolve_source(
+                            mixer,
+                            &surface.source,
+                            domemaster_view,
+                            bus_feeds,
+                        )?;
+                        let (uv_scale, uv_offset) = Self::surface_uv(
+                            &surface.source,
+                            surface.content_mapping,
+                            &bb,
+                            bus_feeds,
+                        );
                         // Warp is per-surface now; `None` = no warp (native
                         // position). `effective_warp` applies auto-warp binding.
                         let eff_warp = surface.effective_warp();
@@ -1040,7 +1765,22 @@ impl VardaApp {
                     crate::renderer::context::PresentationPixelFormat::P216
                 )
             );
-            if is_ndi_p216 {
+            // A recording or the stream: its encoder takes NV12 made here.
+            let is_nv12 = h.nv12.is_some()
+                && h.subprocess
+                    .as_ref()
+                    .is_some_and(|subprocess| subprocess.takes_nv12());
+            if is_nv12 {
+                if let Some(converter) = h.nv12.as_mut() {
+                    converter.encode(
+                        &context.device,
+                        &context.queue,
+                        &mut encoder,
+                        &h.texture,
+                        sinks.drawn,
+                    );
+                }
+            } else if is_ndi_p216 {
                 if let crate::renderer::context::OutputTarget::NdiSend { sender_name } = &h.target {
                     if let Err(error) = sinks.ndi_manager.begin_p216_frame(
                         sender_name,
@@ -1064,7 +1804,7 @@ impl VardaApp {
                 }
             } else if !is_syphon {
                 // Enqueue readback copy from the now-rendered texture
-                h.readback.begin_readback(&mut encoder, &h.texture);
+                h.readback.begin_readback(&mut encoder, &h.texture, sinks.drawn);
             }
             context.submit(std::iter::once(encoder.finish()));
 
@@ -1100,14 +1840,56 @@ impl VardaApp {
                 );
             }
 
+            if is_nv12 {
+                let frames = h
+                    .nv12
+                    .as_mut()
+                    .map(|converter| converter.try_read(&context.device))
+                    .unwrap_or_default();
+                for (made, frame) in frames {
+                    if h.subprocess
+                        .as_mut()
+                        .is_some_and(|subprocess| !subprocess.feed_nv12(&frame, made))
+                    {
+                        // The recording or stream starts its encoder again
+                        // itself, reading why it stopped from the subprocess.
+                        h.active = false;
+                        break;
+                    }
+                }
+                continue;
+            }
+
             // Deliver previous frame's readback data to target
             if !is_syphon && !is_ndi_p216 {
-                if let Some(frame_data) = h.readback.try_read(&context.device) {
+                let mut finished = h.readback.try_read_all(&context.device);
+                let newest = finished.pop();
+                // An encoder takes every frame read back, in the order drawn:
+                // the earlier ones first, the newest as every target does.
+                if let Some(subprocess) = h.subprocess.as_mut() {
+                    for frame in &finished {
+                        if !subprocess.feed_readback_frame(frame) {
+                            break;
+                        }
+                    }
+                }
+                if let Some(frame_data) = newest {
                     let delivery = if h.subprocess.is_some() {
                         if h.subprocess
                             .as_mut()
                             .is_some_and(|subprocess| !subprocess.feed_readback_frame(&frame_data))
                         {
+                            if matches!(
+                                h.target,
+                                crate::renderer::context::OutputTarget::Stream
+                                    | crate::renderer::context::OutputTarget::Record
+                            ) {
+                                // The stream starts its own encoder again
+                                // (`poll_stream`), and reads why it stopped
+                                // from the subprocess, so it is left in place.
+                                h.active = false;
+                                continue;
+                            }
                             if let Some(mut subprocess) = h.subprocess.take() {
                                 subprocess.stop();
                             }
@@ -1131,15 +1913,15 @@ impl VardaApp {
                     match delivery {
                         crate::renderer::context::DeliveryResult::Failed(msg) => {
                             stop_headless_output(&h.name, &mut h.active, sinks.notifications, msg);
+                            // A Blackmagic device is let go as its sender drops.
+                            h.decklink = None;
                         }
                         crate::renderer::context::DeliveryResult::SrtNeedsRestart => {
                             // The disconnected client's PCM tap is now stale; drop it,
                             // then respawn the listener with a fresh audio tap so the
                             // reconnecting client gets audio again (parity with start).
                             if let Some(stale) = h.audio_pcm.take() {
-                                sinks
-                                    .audio_manager
-                                    .unsubscribe_pcm(stale.source_id, stale.token);
+                                stale.release(sinks.audio_manager);
                             }
                             let (url, codec) = match &h.target {
                                 crate::renderer::context::OutputTarget::SrtStream {
@@ -1153,8 +1935,12 @@ impl VardaApp {
                             let name = h.name.clone();
                             let (audio_input, passthrough) = super::state::resolve_output_audio(
                                 sinks.audio_manager,
+                                sinks.audio_mix,
                                 sinks.notifications,
-                                device.as_deref(),
+                                super::state::OutputAudio {
+                                    bus: h.audio_bus.as_deref(),
+                                    device: device.as_deref(),
+                                },
                                 &name,
                             );
                             match crate::renderer::FfmpegSubprocess::spawn_srt(
@@ -1173,9 +1959,7 @@ impl VardaApp {
                                 }
                                 Err(e) => {
                                     if let Some(pass) = passthrough {
-                                        sinks
-                                            .audio_manager
-                                            .unsubscribe_pcm(pass.source_id, pass.token);
+                                        pass.release(sinks.audio_manager);
                                     }
                                     stop_headless_output(
                                         &name,
@@ -1193,6 +1977,77 @@ impl VardaApp {
         }
     }
 
+    /// Load files as decks one after another on a single background thread,
+    /// sending each deck as soon as it is ready.
+    ///
+    /// For files dropped in together, where order is the point — twenty
+    /// speaker slides must land in the channel in the order they were
+    /// dropped. [`Self::spawn_deck_loads`] runs a thread per file, so its
+    /// decks arrive in whatever order they finish.
+    pub fn spawn_ordered_deck_loads(
+        sender: &std::sync::mpsc::Sender<DeckLoadResult>,
+        context: &crate::renderer::context::GpuContext,
+        pending: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        (render_width, render_height): (u32, u32),
+        files: Vec<(DeckLoadToken, DeckFile)>,
+    ) {
+        use crate::deck::Deck;
+        use std::sync::atomic::Ordering;
+
+        if files.is_empty() {
+            return;
+        }
+        let tx = sender.clone();
+        let ctx = context.clone();
+        let counter = pending.clone();
+        counter.fetch_add(files.len(), Ordering::Relaxed);
+        std::thread::spawn(move || {
+            for (token, file) in files {
+                let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let file_name = |path: &std::path::Path| {
+                        path.file_name()
+                            .and_then(|f| f.to_str())
+                            .unwrap_or("file")
+                            .to_string()
+                    };
+                    match file {
+                        DeckFile::Image(path) => (
+                            file_name(&path),
+                            Deck::new_from_image(&ctx, &path, render_width, render_height),
+                        ),
+                        DeckFile::Video(path) => (
+                            file_name(&path),
+                            Deck::new_from_video(&ctx, &path, render_width, render_height),
+                        ),
+                        DeckFile::Shader(shader) => {
+                            let shader = *shader;
+                            let name = shader.name();
+                            let deck = if shader.metadata.is_compute() {
+                                Deck::new_from_compute_shader(
+                                    &ctx,
+                                    shader,
+                                    render_width,
+                                    render_height,
+                                )
+                            } else {
+                                Deck::new(&ctx, shader, render_width, render_height)
+                            };
+                            (name, deck)
+                        }
+                    }
+                }));
+                let (name, deck) = loaded.unwrap_or_else(|_| {
+                    (
+                        "file".to_string(),
+                        Err(anyhow::anyhow!("panic loading a dropped file")),
+                    )
+                });
+                let _ = tx.send(DeckLoadResult { token, deck, name });
+                counter.fetch_sub(1, Ordering::Relaxed);
+            }
+        });
+    }
+
     /// Open a native file picker on a background thread.
     /// Uses rfd's synchronous `FileDialog` which correctly dispatches to the
     /// main thread on macOS (`NSOpenPanel` requires main-thread presentation
@@ -1200,7 +2055,7 @@ impl VardaApp {
     pub fn open_file_dialog(
         sender: &std::sync::mpsc::Sender<FileDialogResult>,
         kind: FileDialogKind,
-        channel_uuid: String,
+        channel_uuid: Option<String>,
     ) {
         let tx = sender.clone();
         std::thread::spawn(move || {
@@ -1211,8 +2066,13 @@ impl VardaApp {
                         "png", "jpg", "jpeg", "bmp", "tiff", "tga", "webp", "svg", "svgz",
                     ],
                 ),
-                FileDialogKind::Video => rfd::FileDialog::new()
-                    .add_filter("Video", &["mov", "mp4", "avi", "mkv", "webm", "gif"]),
+                FileDialogKind::Video => rfd::FileDialog::new().add_filter(
+                    "Video and sound",
+                    &[
+                        "mov", "mp4", "m4v", "avi", "mkv", "webm", "gif", "mp3", "wav", "m4a",
+                        "aac", "flac", "ogg", "aif", "aiff",
+                    ],
+                ),
             };
             if let Some(paths) = dialog.pick_files() {
                 if !paths.is_empty() {
@@ -1227,10 +2087,159 @@ impl VardaApp {
     }
 }
 
+/// While a present trace is made: the command buffers that ran on the GPU —
+/// wgpu's own left out but for its uploads (`PendingWrites`), which ride on
+/// whichever thread's submit comes next (see `renderer::present_trace`).
+fn trace_gpu_runs(runs: &[crate::renderer::gpu_time::Ran]) {
+    use crate::renderer::present_trace::{Step, TRACE};
+    if !TRACE.recording() {
+        return;
+    }
+    for run in runs {
+        let internal = run.label.starts_with("(wgpu internal)");
+        if !run.label.is_empty() && (!internal || run.label.contains("PendingWrites")) {
+            let step = Step::Gpu {
+                label: run.label.clone(),
+                start: run.start,
+                end: run.end,
+            };
+            TRACE.note_at(run.start, "", 0, step);
+        }
+    }
+}
+
+impl super::VardaApp {
+    /// Each camera whose LUT its decks name in the show's LUT folder: the
+    /// camera, and its profile named in full in `from` and in `to` — the
+    /// folder a Save As copied it to — as the next frame will set it (see
+    /// `CameraManager::set_profiles`). A camera whose LUT is named by a
+    /// path of its own does not move.
+    pub(crate) fn camera_lut_moves(
+        &self,
+        from: &std::path::Path,
+        to: &std::path::Path,
+    ) -> Vec<(
+        crate::camera::CameraId,
+        crate::engine::value::camera::CameraProfile,
+        crate::engine::value::camera::CameraProfile,
+    )> {
+        lut_moves(
+            self.mixer
+                .channels()
+                .iter()
+                .flat_map(|channel| &channel.decks)
+                .filter_map(|slot| Some((slot.deck.camera_id()?, &slot.deck.camera_profile))),
+            from,
+            to,
+        )
+    }
+}
+
+/// For each camera in `profiles` — its decks' in the order a frame reads
+/// them, the last one's standing, as there — its profile named in full in
+/// `from` and in `to`, where the two differ: a LUT named in the show's
+/// folder.
+fn lut_moves<'a>(
+    profiles: impl Iterator<
+        Item = (
+            crate::camera::CameraId,
+            &'a crate::engine::value::camera::CameraProfile,
+        ),
+    >,
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> Vec<(
+    crate::camera::CameraId,
+    crate::engine::value::camera::CameraProfile,
+    crate::engine::value::camera::CameraProfile,
+)> {
+    let mut standing = std::collections::BTreeMap::new();
+    for (camera, profile) in profiles {
+        standing.insert(camera, profile);
+    }
+    standing
+        .into_iter()
+        .map(|(camera, profile)| (camera, lut_in_full(profile, from), lut_in_full(profile, to)))
+        .filter(|(_, before, after)| before != after)
+        .collect()
+}
+
+/// `profile` with a LUT file named in full: a name is one in the show's LUT
+/// folder, `luts`; a path is taken as it is.
+fn lut_in_full(
+    profile: &crate::engine::value::camera::CameraProfile,
+    luts: &std::path::Path,
+) -> crate::engine::value::camera::CameraProfile {
+    use crate::engine::value::camera::CameraProfile;
+    match profile {
+        CameraProfile::Lut { file } if !std::path::Path::new(file).is_absolute() => CameraProfile::Lut {
+            file: luts.join(file).to_string_lossy().into_owned(),
+        },
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::surface::{BoundingBox, ContentMapping};
+
+    /// Only a camera whose LUT its decks name in the show's folder moves
+    /// with it — named by the last of its decks, as a frame sets it; one
+    /// named by a path of its own, even the same file, does not, nor one
+    /// with no LUT.
+    #[test]
+    fn only_luts_named_in_the_show_move_with_it() {
+        use crate::engine::value::camera::CameraProfile;
+        let lut = |file: &str| CameraProfile::Lut { file: file.into() };
+        let named = lut("look.cube");
+        let by_path = lut("/shows/A/.varda/luts/look.cube");
+        let built_in = CameraProfile::SonySLog3;
+        let moves = lut_moves(
+            [
+                (1, &named),
+                (2, &by_path),
+                (3, &built_in),
+                (4, &by_path),
+                (4, &named),
+                (5, &named),
+                (5, &by_path),
+            ]
+            .into_iter(),
+            std::path::Path::new("/shows/A/.varda/luts"),
+            std::path::Path::new("/shows/B/.varda/luts"),
+        );
+        let in_b = lut("/shows/B/.varda/luts/look.cube");
+        assert_eq!(
+            moves,
+            vec![(1, by_path.clone(), in_b.clone()), (4, by_path, in_b)]
+        );
+    }
+
+    /// A camera's LUT named by file is the one in the show's LUT folder; one
+    /// chosen by path stays where it is; a built-in profile is untouched.
+    #[test]
+    fn a_camera_lut_named_by_file_is_found_in_the_shows_lut_folder() {
+        use crate::engine::value::camera::CameraProfile;
+        let luts = std::path::Path::new("/Shows/conference/.varda/luts");
+        let named = CameraProfile::Lut {
+            file: "Film to Video.cube".into(),
+        };
+        assert_eq!(
+            lut_in_full(&named, luts),
+            CameraProfile::Lut {
+                file: "/Shows/conference/.varda/luts/Film to Video.cube".into()
+            }
+        );
+        let chosen = CameraProfile::Lut {
+            file: "/Volumes/LUTs/s709.cube".into(),
+        };
+        assert_eq!(lut_in_full(&chosen, luts), chosen);
+        assert_eq!(
+            lut_in_full(&CameraProfile::SonyHlg, luts),
+            CameraProfile::SonyHlg
+        );
+    }
 
     #[test]
     fn compute_uv_fill() {

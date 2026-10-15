@@ -1287,11 +1287,17 @@ fn effect_toggle_and_remove() {
     let r = send_cmd(
         &mut app,
         EngineCommand::RemoveEffect {
-            effect_uuid: effect,
+            effect_uuid: effect.clone(),
         },
     );
     assert!(matches!(r, CommandResult::Ok));
-    assert!(deck_snapshot(&mut app, &deck).effects.is_empty());
+    assert!(
+        !deck_snapshot(&mut app, &deck)
+            .effects
+            .iter()
+            .any(|e| e.uuid == effect),
+        "the removed effect is gone from the chain"
+    );
 }
 
 #[test]
@@ -1315,6 +1321,7 @@ fn move_deck_between_channels() {
         EngineCommand::MoveDeck {
             deck_uuid: deck.clone(),
             dst_channel_uuid: ch1,
+            before_deck_uuid: None,
         },
     );
     assert!(matches!(r, CommandResult::Ok));
@@ -1459,6 +1466,7 @@ fn chaos_unknown_deck_uuid_errors_not_found() {
         EngineCommand::MoveDeck {
             deck_uuid: "no-such-deck".into(),
             dst_channel_uuid: ch1,
+            before_deck_uuid: None,
         },
     );
     assert!(is_not_found(&r), "{r:?}");
@@ -1468,6 +1476,7 @@ fn chaos_unknown_deck_uuid_errors_not_found() {
         EngineCommand::MoveDeck {
             deck_uuid: deck.clone(),
             dst_channel_uuid: "no-such-channel".into(),
+            before_deck_uuid: None,
         },
     );
     assert!(is_not_found(&r), "{r:?}");
@@ -2630,9 +2639,11 @@ fn add_effect_on_unknown_target_is_not_found_and_creates_nothing() {
         .find(|d| d.uuid == deck)
         .expect("deck must still exist")
         .effects;
-    assert!(
-        deck_effects.is_empty(),
-        "no effect should have been created"
+    let names: Vec<&str> = deck_effects.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["crop", "transform"],
+        "no effect beyond the deck's defaults should have been created"
     );
     assert!(
         state.mixer.master_effects.is_empty(),
@@ -4152,6 +4163,7 @@ fn presentation_request_keeps_ten_bit_intent_and_reports_ndi_fallback() {
                 request: PresentationRequest {
                     depth: PresentationDepth::Sdr10,
                     dither: true,
+                    video_levels: false,
                 },
             },
         ),
@@ -4197,6 +4209,7 @@ fn presentation_request_unknown_output_is_not_found() {
             request: PresentationRequest {
                 depth: PresentationDepth::Sdr10,
                 dither: true,
+                video_levels: false,
             },
         },
     );
@@ -4239,6 +4252,7 @@ fn presentation_request_keeps_ten_bit_intent_on_syphon_fallback() {
                 request: PresentationRequest {
                     depth: PresentationDepth::Sdr10,
                     dither: false,
+                    video_levels: false,
                 },
             },
         ),
@@ -4280,6 +4294,7 @@ fn chaos_unknown_output_uuid_presentation_does_not_panic() {
                 request: PresentationRequest {
                     depth: PresentationDepth::Sdr10,
                     dither: uuid.len() % 2 == 0,
+                    video_levels: false,
                 },
             },
         );
@@ -4318,6 +4333,7 @@ fn chaos_rapid_presentation_toggle_while_rendering() {
                         PresentationDepth::Sdr8
                     },
                     dither: i % 3 != 0,
+                    video_levels: false,
                 },
             },
         );
@@ -4392,6 +4408,7 @@ fn chaos_retarget_and_presentation_storm() {
                 request: PresentationRequest {
                     depth: PresentationDepth::Sdr10,
                     dither: i % 2 == 0,
+                    video_levels: false,
                 },
             },
         );
@@ -4441,6 +4458,7 @@ fn chaos_create_close_presentation_cycle() {
                 request: PresentationRequest {
                     depth: PresentationDepth::Sdr10,
                     dither: true,
+                    video_levels: false,
                 },
             },
         );
@@ -4451,4 +4469,413 @@ fn chaos_create_close_presentation_cycle() {
     app.update_frame_timing();
     app.render_mixer_frame();
     assert!(app.build_engine_state().outputs.windows.is_empty());
+}
+
+// ── Identity survives undo (bus routing depends on it) ──────────────
+
+/// Undo restores channel content positionally, so identity must travel with
+/// it. If it does not, a UUID-addressed reference — a production bus, a MIDI
+/// mapping, an API caller — still resolves, but to the wrong source. That is
+/// worse than failing to resolve: it puts unintended content on air.
+///
+/// Reproduces the reviewer's counterexample: channels A, B, C; remove B; undo.
+#[test]
+fn undoing_a_channel_removal_restores_identities_not_just_content() {
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    // Start from a known set. The default scene has two channels; name them
+    // and add a third so removal happens in the middle.
+    let uuids: Vec<String> = app
+        .build_engine_state()
+        .mixer
+        .channels
+        .iter()
+        .map(|c| c.uuid.clone())
+        .collect();
+    let a = uuids[0].clone();
+    let b = uuids[1].clone();
+    let c = match send_cmd(&mut app, EngineCommand::AddChannel) {
+        CommandResult::OkWithId { uuid } => uuid,
+        other => panic!("expected a channel uuid, got {other:?}"),
+    };
+    // Give each channel a distinguishable property so a swapped identity is
+    // visible. Opacity is the simplest one with a command.
+    for (uuid, opacity) in [(&a, 0.10_f32), (&b, 0.20), (&c, 0.30)] {
+        fire(
+            &mut app,
+            EngineCommand::SetChannelOpacity {
+                channel_uuid: uuid.clone(),
+                opacity,
+            },
+        );
+    }
+
+    fire(
+        &mut app,
+        EngineCommand::RemoveChannel {
+            channel_uuid: b.clone(),
+        },
+    );
+    fire(&mut app, EngineCommand::Undo);
+
+    let restored = app.build_engine_state().mixer.channels;
+    assert_eq!(restored.len(), 3, "all three channels are back");
+
+    // Every UUID must name the channel it originally named.
+    for (uuid, expected) in [(&a, 0.10_f32), (&b, 0.20), (&c, 0.30)] {
+        let found = restored
+            .iter()
+            .find(|ch| &ch.uuid == uuid)
+            .unwrap_or_else(|| panic!("uuid {uuid} should still name a channel"));
+        assert!(
+            (found.opacity - expected).abs() < 1e-4,
+            "uuid {uuid} must still name the channel with opacity {expected}, \
+             got {} — a reference that resolves to the wrong source is worse \
+             than one that does not resolve at all",
+            found.opacity
+        );
+    }
+}
+
+/// A UUID must keep naming the *same live runtime*, not merely an object
+/// carrying the same persisted properties.
+///
+/// `render_time_ms` is the proof: it is live measurement, exposed in snapshots
+/// but deliberately absent from the persisted `ChannelConfig`. If a restore
+/// reconstructs a channel rather than keeping the survivor, the sentinel is
+/// gone — which is exactly what "the runtime was transplanted" means, and what
+/// a structure-only assertion cannot see.
+///
+/// Reproduces the reviewer's counterexample: channels A, B, C; remove B; undo.
+#[test]
+fn undoing_a_channel_removal_keeps_each_uuid_on_its_own_runtime() {
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    let uuids: Vec<String> = app
+        .build_engine_state()
+        .mixer
+        .channels
+        .iter()
+        .map(|c| c.uuid.clone())
+        .collect();
+    let (a, b) = (uuids[0].clone(), uuids[1].clone());
+    let c = match send_cmd(&mut app, EngineCommand::AddChannel) {
+        CommandResult::OkWithId { uuid } => uuid,
+        other => panic!("expected a channel uuid, got {other:?}"),
+    };
+
+    // Stamp live-only state onto each channel's runtime.
+    let sentinel_a = 11.5_f32;
+    let sentinel_c = 33.5_f32;
+    for (uuid, mark) in [(&a, sentinel_a), (&c, sentinel_c)] {
+        let idx = app
+            .mixer_ref()
+            .channels()
+            .iter()
+            .position(|ch| ch.uuid() == uuid)
+            .expect("channel exists");
+        app.mixer_mut().channels_mut()[idx].render_time_ms = mark;
+    }
+
+    fire(
+        &mut app,
+        EngineCommand::RemoveChannel {
+            channel_uuid: b.clone(),
+        },
+    );
+    fire(&mut app, EngineCommand::Undo);
+
+    let restored = app.build_engine_state().mixer.channels;
+    assert_eq!(restored.len(), 3, "all three channels are back");
+
+    let ch_c = restored
+        .iter()
+        .find(|ch| ch.uuid == c)
+        .expect("uuid C should still name a channel");
+    assert!(
+        (ch_c.render_time_ms - sentinel_c).abs() < 1e-4,
+        "uuid C must still name its own runtime (sentinel {sentinel_c}), got {} — \
+         a reconstructed channel means the identity was transplanted onto \
+         different content",
+        ch_c.render_time_ms
+    );
+
+    let ch_a = restored.iter().find(|ch| ch.uuid == a).expect("A survives");
+    assert!(
+        (ch_a.render_time_ms - sentinel_a).abs() < 1e-4,
+        "uuid A kept its runtime too"
+    );
+
+    // B was genuinely removed, so it is reconstructed and carries no sentinel.
+    let ch_b = restored
+        .iter()
+        .find(|ch| ch.uuid == b)
+        .expect("B should be restored");
+    assert!(
+        ch_b.render_time_ms.abs() < 1e-4,
+        "B was reconstructed, so it starts clean"
+    );
+}
+
+/// Undo must restore a channel's effect chain, not just its decks.
+///
+/// An earlier revision of the structural merge dropped the channel-effect diff
+/// entirely, which left an effect add un-undoable and a removal unrestorable.
+#[test]
+fn undoing_a_channel_effect_removal_restores_it() {
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    let channel = channel_uuid(&mut app, 0);
+    let effect = match send_cmd(
+        &mut app,
+        EngineCommand::AddEffect {
+            target: varda::engine::EffectTarget::Channel(channel.clone()),
+            shader_name: "invert".into(),
+        },
+    ) {
+        CommandResult::OkWithId { uuid } => uuid,
+        other => panic!("expected an effect uuid, got {other:?}"),
+    };
+
+    let has_effect = |app: &mut VardaApp| -> bool {
+        app.build_engine_state().mixer.channels[0]
+            .effects
+            .iter()
+            .any(|e| e.uuid == effect)
+    };
+    assert!(has_effect(&mut app), "effect was added");
+
+    fire(
+        &mut app,
+        EngineCommand::RemoveEffect {
+            effect_uuid: effect.clone(),
+        },
+    );
+    assert!(!has_effect(&mut app), "effect was removed");
+
+    fire(&mut app, EngineCommand::Undo);
+    assert!(
+        has_effect(&mut app),
+        "undo must restore the channel effect chain"
+    );
+}
+
+/// Undoing an unrelated edit must not rewind live control.
+///
+/// Excluding a command from the history only stops it *creating* an entry;
+/// every snapshot still records the crossfader and macro positions, so a
+/// restore would otherwise snap a fader the operator is holding. Same principle
+/// the transport position and production buses already follow.
+#[test]
+fn undoing_an_edit_does_not_rewind_the_live_crossfader() {
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    // An undoable structural edit, so there is something on the history stack.
+    send_cmd(&mut app, EngineCommand::AddChannel);
+
+    // Operator moves the fader live, after the edit was recorded.
+    fire(&mut app, EngineCommand::SetCrossfader(0.75));
+    let before = app.build_engine_state().mixer.crossfader;
+    assert!((before - 0.75).abs() < 1e-4, "fader moved to {before}");
+
+    fire(&mut app, EngineCommand::Undo);
+
+    let after = app.build_engine_state().mixer.crossfader;
+    assert!(
+        (after - 0.75).abs() < 1e-4,
+        "undoing an unrelated edit rewound the live fader to {after}"
+    );
+}
+
+/// Undo currently rewinds a live macro *and* what it was driving. Known defect.
+///
+/// Pinned so the defect stays visible and a future fix has something to flip.
+/// The important property asserted here is that control and picture stay
+/// *consistent*: both rewind together. Preserving the knob alone was tried and
+/// reverted, because it left the control reading one value while the picture
+/// showed another, and the operator's next nudge would then snap the picture.
+///
+/// A correct fix needs last-writer authority per target, or a live-override
+/// layer the restore does not write through, plus a parameter read-back that
+/// does not exist. See docs/conference/known-upstream-defects.md.
+#[test]
+fn undo_rewinds_a_live_macro_and_its_targets_together_known_defect() {
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    let channel = channel_uuid(&mut app, 0);
+    let deck = match send_cmd(
+        &mut app,
+        EngineCommand::AddDeck {
+            channel_uuid: channel,
+            shader_name: "solid_color".into(),
+        },
+    ) {
+        CommandResult::OkWithId { uuid } => uuid,
+        other => panic!("expected a deck uuid, got {other:?}"),
+    };
+
+    fire(
+        &mut app,
+        EngineCommand::AddMacro {
+            kind: varda::macros::MacroKind::Knob,
+        },
+    );
+    let macro_uuid = app.build_engine_state().macros[0].uuid.clone();
+    fire(
+        &mut app,
+        EngineCommand::AddMacroTarget {
+            uuid: macro_uuid.clone(),
+            path: format!("deck/{deck}/opacity"),
+        },
+    );
+
+    // Prime the macro to a nonzero value *before* the undoable edit, so the
+    // snapshot carries a distinctive knob and opacity. Without this the macro
+    // starts at 0.0 and the assertions below pass on a knob of 0.0 against an
+    // opacity of 1.0 — the exact mismatch this test claims to reject.
+    let primed = 0.6_f32;
+    fire(
+        &mut app,
+        EngineCommand::SetMacroValue {
+            uuid: macro_uuid.clone(),
+            value: primed,
+        },
+    );
+
+    send_cmd(&mut app, EngineCommand::AddChannel);
+    fire(
+        &mut app,
+        EngineCommand::SetMacroValue {
+            uuid: macro_uuid.clone(),
+            value: 0.25,
+        },
+    );
+    let deck_opacity =
+        |app: &mut VardaApp| -> f32 { app.build_engine_state().mixer.channels[0].decks[0].opacity };
+    assert!(
+        (deck_opacity(&mut app) - 0.25).abs() < 1e-3,
+        "macro is driving"
+    );
+
+    fire(&mut app, EngineCommand::Undo);
+
+    let knob = app.build_engine_state().macros[0].value;
+    let opacity = deck_opacity(&mut app);
+
+    // Both rewound. Neither is what the operator last set, but they agree — and
+    // agreeing is the property that must not regress while the defect stands.
+    assert!(
+        (knob - primed).abs() < 1e-3,
+        "the control rewinds to the snapshot value, got {knob} (expected {primed})"
+    );
+    assert!(
+        (opacity - primed).abs() < 1e-3,
+        "and so does the target, got {opacity} (expected {primed})"
+    );
+    assert!(
+        (opacity - knob).abs() < 1e-3,
+        "control {knob} and target {opacity} must agree, or the operator's next \
+         nudge snaps the picture"
+    );
+}
+
+/// Reset puts an effect's settings back — only those named, or all of them —
+/// so the border can be reset without losing the crop.
+#[test]
+fn an_effects_settings_reset_named_or_all() {
+    use varda::params::ParamValue;
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    let ch = app.build_engine_state().mixer.channels[0].uuid.clone();
+    let deck = new_uuid(send_cmd(
+        &mut app,
+        EngineCommand::AddSolidColorDeck {
+            channel_uuid: ch,
+            color: [0.0, 1.0, 0.0, 1.0],
+        },
+    ));
+    let crop = |app: &VardaApp| {
+        app.build_engine_state()
+            .mixer
+            .channels
+            .iter()
+            .flat_map(|c| &c.decks)
+            .find(|d| d.uuid == deck)
+            .and_then(|d| d.effects.iter().find(|e| e.name == "crop").cloned())
+            .expect("every new deck has a crop")
+    };
+    let value = |app: &VardaApp, name: &str| {
+        crop(app)
+            .params
+            .params
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.value)
+    };
+    let uuid = crop(&app).uuid;
+    for (name, value) in [
+        ("crop_left", ParamValue::Float(0.3)),
+        ("border_mode", ParamValue::Bool(true)),
+        ("border_width", ParamValue::Float(40.0)),
+    ] {
+        assert!(matches!(
+            send_cmd(
+                &mut app,
+                EngineCommand::SetEffectParam {
+                    effect_uuid: uuid.clone(),
+                    name: name.into(),
+                    value,
+                },
+            ),
+            CommandResult::Ok
+        ));
+    }
+    assert!(matches!(
+        send_cmd(
+            &mut app,
+            EngineCommand::ResetEffectParams {
+                effect_uuid: uuid.clone(),
+                names: vec!["border_mode".into(), "border_width".into()],
+            },
+        ),
+        CommandResult::Ok
+    ));
+    assert!(matches!(
+        value(&app, "border_mode"),
+        Some(ParamValue::Bool(false))
+    ));
+    assert!(
+        matches!(value(&app, "border_width"), Some(ParamValue::Float(w)) if (w - 6.0).abs() < 1e-6)
+    );
+    assert!(
+        matches!(value(&app, "crop_left"), Some(ParamValue::Float(v)) if (v - 0.3).abs() < 1e-6),
+        "the crop is kept"
+    );
+    assert!(matches!(
+        send_cmd(
+            &mut app,
+            EngineCommand::ResetEffectParams {
+                effect_uuid: uuid,
+                names: Vec::new(),
+            },
+        ),
+        CommandResult::Ok
+    ));
+    assert!(matches!(value(&app, "crop_left"), Some(ParamValue::Float(v)) if v.abs() < 1e-6));
+    assert!(matches!(
+        send_cmd(
+            &mut app,
+            EngineCommand::ResetEffectParams {
+                effect_uuid: "nosuchfx".into(),
+                names: Vec::new(),
+            },
+        ),
+        CommandResult::Err { .. }
+    ));
 }

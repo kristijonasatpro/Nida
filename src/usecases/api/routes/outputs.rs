@@ -218,6 +218,42 @@ pub async fn set_presentation(
     }
 }
 
+/// Body for routing a headless output.
+#[derive(Deserialize, ToSchema)]
+pub struct SetOutputSourceBody {
+    /// `"Master"` or `{"BusProgram": "<bus uuid>"}`.
+    pub source: crate::renderer::context::OutputSource,
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/outputs/{output_uuid}/source",
+    params(("output_uuid" = String, Path, description = "Output UUID")),
+    request_body = SetOutputSourceBody,
+    responses(
+        (status = 200, body = CommandResult),
+        (status = 400, description = "Not Master or a bus, or the output is a window"),
+        (status = 404, description = "Output or bus not found")
+    ),
+    tag = "Outputs"
+)]
+pub async fn set_source(
+    State(s): State<SharedState>,
+    Path(output_uuid): Path<String>,
+    Json(b): Json<SetOutputSourceBody>,
+) -> impl IntoResponse {
+    match s
+        .send_command(EngineCommand::SetOutputSource {
+            output_uuid,
+            source: b.source,
+        })
+        .await
+    {
+        Ok(r) => command_response(r),
+        Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+    }
+}
+
 // ── Edge Blending ────────────────────────────────────────────────────
 
 #[derive(Deserialize, ToSchema)]
@@ -277,6 +313,141 @@ pub async fn set_edge_blend_mode(
         })
         .await
     {
+        Ok(r) => command_response(r),
+        Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+    }
+}
+
+// ── LED feeds ────────────────────────────────────────────────────────
+
+#[derive(Deserialize, ToSchema)]
+pub struct CreateLedOutputBody {
+    /// Monitor to go fullscreen on (by name); a window when absent.
+    #[serde(default)]
+    pub monitor_name: Option<String>,
+    /// The screens the feed carries.
+    pub layout: crate::engine::value::led::LedLayout,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/outputs/led",
+    request_body = CreateLedOutputBody,
+    responses(
+        (status = 200, body = CommandResult),
+        (status = 400, description = "A screen of no size, too many screens, or a bus that does not exist")
+    ),
+    tag = "Outputs"
+)]
+pub async fn create_led(
+    State(s): State<SharedState>,
+    Json(b): Json<CreateLedOutputBody>,
+) -> impl IntoResponse {
+    match s
+        .send_command(EngineCommand::CreateLedOutput {
+            monitor_name: b.monitor_name,
+            layout: b.layout,
+        })
+        .await
+    {
+        Ok(r) => command_response(r),
+        Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct SetOutputLedBody {
+    /// The screens the feed carries; `null` makes it an ordinary output.
+    pub layout: Option<crate::engine::value::led::LedLayout>,
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/outputs/{output_uuid}/led",
+    params(("output_uuid" = String, Path, description = "Output UUID")),
+    request_body = SetOutputLedBody,
+    responses(
+        (status = 200, body = CommandResult),
+        (status = 400, description = "A screen of no size, too many screens, or a bus that does not exist"),
+        (status = 404, description = "Output not found")
+    ),
+    tag = "Outputs"
+)]
+pub async fn set_led(
+    State(s): State<SharedState>,
+    Path(output_uuid): Path<String>,
+    Json(b): Json<SetOutputLedBody>,
+) -> impl IntoResponse {
+    match s
+        .send_command(EngineCommand::SetOutputLed {
+            output_uuid,
+            layout: b.layout,
+        })
+        .await
+    {
+        Ok(r) => command_response(r),
+        Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/outputs/{output_uuid}/led/screens/{screen_uuid}/bus",
+    params(
+        ("output_uuid" = String, Path, description = "Output UUID"),
+        ("screen_uuid" = String, Path, description = "LED screen UUID")
+    ),
+    responses(
+        (status = 200, body = CommandResult),
+        (status = 404, description = "Output, LED feed or screen not found")
+    ),
+    tag = "Outputs"
+)]
+pub async fn create_led_screen_bus(
+    State(s): State<SharedState>,
+    Path((output_uuid, screen_uuid)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match s
+        .send_command(EngineCommand::CreateLedScreenBus {
+            output_uuid,
+            screen_uuid,
+        })
+        .await
+    {
+        Ok(r) => command_response(r),
+        Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+    }
+}
+
+/// Body for naming a screen.
+#[derive(Deserialize, ToSchema)]
+pub struct ScreenNameBody {
+    /// The screen, as the engine state's monitors list it (`name`).
+    pub monitor_name: String,
+    /// Its name on this computer ("Stage LED"), or `null` to take it away.
+    pub name: Option<String>,
+}
+
+#[utoipa::path(put, path = "/api/screens/name", request_body = ScreenNameBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such screen connected")), tag = "Outputs")]
+pub async fn set_screen_name(
+    State(s): State<SharedState>,
+    Json(b): Json<ScreenNameBody>,
+) -> impl IntoResponse {
+    match s
+        .send_command(EngineCommand::RenameScreen {
+            monitor_name: b.monitor_name,
+            name: b.name,
+        })
+        .await
+    {
+        Ok(r) => command_response(r),
+        Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+    }
+}
+
+#[utoipa::path(post, path = "/api/screens/identify", responses((status = 200, body = CommandResult)), tag = "Outputs")]
+pub async fn identify_screens(State(s): State<SharedState>) -> impl IntoResponse {
+    match s.send_command(EngineCommand::IdentifyScreens).await {
         Ok(r) => command_response(r),
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }

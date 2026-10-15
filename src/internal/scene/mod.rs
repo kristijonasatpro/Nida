@@ -61,7 +61,24 @@ pub struct SceneConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_height: Option<u32>,
 
-    /// Tonemap mode (defaults to ACES if absent)
+    /// Whether the render resolution follows the output screens (Auto). Absent
+    /// in older files, which keeps their fixed resolution.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub render_resolution_auto: bool,
+
+    /// Latency: frames the GPU may still be drawing when the next starts —
+    /// 1 Low, 2 Normal, 3 High (see `EngineCommand::SetFramesInFlight`).
+    /// Absent in older files, and when Low.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames_in_flight: Option<u32>,
+
+    /// The control window's screen left at its own refresh: Nida does not
+    /// set it to the show's rate (see `crate::screen_rate`). Absent — the
+    /// default — when it does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub free_control_screen: bool,
+
+    /// Tonemap mode (defaults to Bypass if absent)
     #[serde(default)]
     pub tonemap_mode: crate::renderer::tonemap::TonemapMode,
 
@@ -79,6 +96,39 @@ pub struct SceneConfig {
     /// rate before any arrangement exists.
     #[serde(default)]
     pub transport: TransportConfig,
+
+    /// Main, the vMix way: whether the master is Main with overlays or the
+    /// layered channel mix, and what is on Main. Absent in a scene from
+    /// before Main, which is the layered mix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main: Option<MainConfig>,
+}
+
+/// Main as saved: the mode, what was on air and which overlays were on, so a
+/// restart opens on the same picture.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MainConfig {
+    #[serde(default)]
+    pub mode: crate::mixer::MixMode,
+    #[serde(default)]
+    pub program: crate::mixer::MainSource,
+    /// Overlay channels switched on, by UUID.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlays_on: Vec<String>,
+    #[serde(default = "default_fade_secs")]
+    pub fade_secs: f32,
+    /// What a take that is not a cut does; a fade in a scene from before.
+    #[serde(default, skip_serializing_if = "is_fade")]
+    pub transition: crate::mixer::MainTransition,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if takes a reference
+fn is_fade(transition: &crate::mixer::MainTransition) -> bool {
+    *transition == crate::mixer::MainTransition::Fade
+}
+
+fn default_fade_secs() -> f32 {
+    crate::mixer::DEFAULT_FADE_SECS
 }
 
 /// The persisted half of the transport. Position and run state are deliberately
@@ -172,6 +222,11 @@ pub struct ChannelConfig {
     #[serde(default)]
     pub blend_mode: BlendModeConfig,
 
+    /// An overlay in Main mode: switched on and off over Main rather than
+    /// taken to it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overlay: bool,
+
     #[serde(default)]
     pub decks: Vec<DeckConfig>,
 
@@ -246,6 +301,10 @@ pub struct DeckConfig {
     /// Per-deck render FPS cap (default: auto adaptive)
     #[serde(default)]
     pub render_fps: DeckRenderFps,
+
+    /// Resolution the deck renders at, relative to the master (default: full)
+    #[serde(default, skip_serializing_if = "is_full_render_scale")]
+    pub render_scale: crate::deck::DeckRenderScale,
 
     /// Auto-transition configuration (None = no auto-transition)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -481,6 +540,9 @@ pub enum SourceConfig {
         /// transport is running. See /spec/timecode.md § Consumer 2.
         #[serde(default)]
         transport_sync: crate::video::DeckTransportSync,
+        /// Auto Play / Pause / Restart as it goes on and off air.
+        #[serde(default)]
+        auto: crate::engine::value::video::AutoPlayback,
     },
     /// Static image
     Image {
@@ -491,8 +553,36 @@ pub enum SourceConfig {
     },
     /// Solid color fill
     SolidColor { color: [f32; 4] },
-    /// Live camera feed (matched by name on restore)
-    Camera { name: String },
+    /// Live camera feed (matched on restore by its device's unique ID, or
+    /// else by name)
+    Camera {
+        name: String,
+        /// The size and rate chosen; absent takes the camera's best.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<crate::engine::value::camera::CameraMode>,
+        /// The device's unique ID, which tells two of the same model apart;
+        /// absent in shows saved before it was kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<String>,
+        /// Its picture's range and matrix when set by hand; absent, both as
+        /// the camera says.
+        #[serde(
+            default,
+            skip_serializing_if = "crate::engine::value::camera::CameraColour::is_auto"
+        )]
+        colour: crate::engine::value::camera::CameraColour,
+        /// What its picture is coded as when not Rec.709 — a log or HLG
+        /// profile, or a LUT file; absent, shown as it comes.
+        #[serde(
+            default,
+            skip_serializing_if = "crate::engine::value::camera::CameraProfile::is_normal"
+        )]
+        profile: crate::engine::value::camera::CameraProfile,
+        /// Its newest picture shown each frame, the lowest latency; absent,
+        /// each in turn at the delay that keeps them even.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        lowest_latency: bool,
+    },
     /// NDI network video source (matched by name on restore)
     Ndi { name: String },
     /// Syphon inter-app video source (matched by server name on restore, macOS only)
@@ -540,6 +630,25 @@ pub enum SourceConfig {
         source: TapSourceConfig,
         #[serde(default)]
         scaling_mode: crate::deck::ScalingMode,
+    },
+    /// Clips and pictures shown one after another, as vMix's List input.
+    Playlist {
+        #[serde(default)]
+        items: Vec<crate::engine::value::playlist::PlaylistItem>,
+        #[serde(default)]
+        settings: crate::engine::value::playlist::PlaylistSettings,
+        #[serde(default)]
+        scaling_mode: crate::deck::ScalingMode,
+    },
+    /// A count down, count to a time, count up or the time of day, drawn as
+    /// text over clear.
+    Timer {
+        #[serde(default)]
+        settings: crate::engine::value::timer::TimerSettings,
+        /// How long a count down or up had run when saved, in seconds; it
+        /// comes back paused there.
+        #[serde(default)]
+        elapsed: f64,
     },
 }
 
@@ -734,10 +843,32 @@ pub struct EffectConfig {
     /// Parameter values (name -> value)
     #[serde(default)]
     pub params: HashMap<String, ParamValue>,
+    /// Where the effect shows; everywhere when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<crate::engine::value::mask::EffectMask>,
+}
+
+impl EffectConfig {
+    /// An effect as it stands, to be saved or copied.
+    pub fn of(effect: &crate::deck::Effect) -> Self {
+        Self {
+            uuid: effect.uuid().to_owned(),
+            path: effect.shader.file_path.clone().unwrap_or_default(),
+            enabled: effect.enabled,
+            params: effect.params.values.clone(),
+            mask: effect.mask.clone(),
+        }
+    }
 }
 
 fn default_true() -> bool {
     true
+}
+
+// `skip_serializing_if` hands over a reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_full_render_scale(scale: &crate::deck::DeckRenderScale) -> bool {
+    *scale == crate::deck::DeckRenderScale::Full
 }
 
 // ── Output ─────────────────────────────────────────────────────────
@@ -797,6 +928,12 @@ pub enum OutputTargetConfig {
     SyphonServer {
         server_name: String,
     },
+    DeckLink {
+        device: String,
+        mode: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        full_range: bool,
+    },
 }
 
 /// Serializable output configuration (unified model).
@@ -834,6 +971,31 @@ pub struct OutputConfig {
     /// Requested SDR precision and deterministic presentation dithering.
     #[serde(default, flatten)]
     pub presentation: crate::engine::value::render::PresentationRequest,
+    /// What a headless output sends when it has no surfaces: the master, or a
+    /// bus's program by UUID. Absent means the master, as before routing.
+    #[serde(
+        default = "master_output_source",
+        skip_serializing_if = "is_master_output_source"
+    )]
+    pub source: crate::renderer::context::OutputSource,
+    /// The audio-mixer bus a recording or stream carries, by UUID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_bus: Option<String>,
+    /// The LED screens this output's feed carries, when it is an LED feed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub led: Option<crate::engine::value::led::LedLayout>,
+    /// A Blackmagic output that was running when the stage was saved: it
+    /// starts again as the stage opens, as a screen comes back on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub running: bool,
+}
+
+fn master_output_source() -> crate::renderer::context::OutputSource {
+    crate::renderer::context::OutputSource::Master
+}
+
+fn is_master_output_source(source: &crate::renderer::context::OutputSource) -> bool {
+    *source == crate::renderer::context::OutputSource::Master
 }
 
 impl OutputConfig {
@@ -851,6 +1013,10 @@ impl OutputConfig {
             edge_blend: crate::renderer::edge_blend::EdgeBlendConfig::default(),
             rotation: crate::renderer::context::OutputRotation::default(),
             presentation: crate::engine::value::render::PresentationRequest::default(),
+            source: crate::renderer::context::OutputSource::Master,
+            audio_bus: None,
+            led: None,
+            running: false,
         }
     }
 }
@@ -970,7 +1136,7 @@ impl SourceConfig {
                     }
                 }
             }
-            SourceConfig::Camera { name } => {
+            SourceConfig::Camera { name, .. } => {
                 if name.trim().is_empty() {
                     errors.push(format!("{prefix}: camera name is empty"));
                 }
@@ -1059,6 +1225,9 @@ impl SourceConfig {
                     }
                 }
             }
+            // A missing file is skipped as the list plays, not refused here;
+            // a timer's settings out of range are brought into it.
+            SourceConfig::Playlist { .. } | SourceConfig::Timer { .. } => {}
         }
         errors
     }
@@ -1142,6 +1311,53 @@ impl SceneConfig {
         for (i, fx) in self.master_effects.iter().enumerate() {
             errors.extend(fx.validate(&format!("master_effects[{i}]")));
         }
+
+        errors.extend(self.validate_identities());
+        errors
+    }
+
+    /// Identity errors alone: empty or duplicate UUIDs, per addressable kind.
+    ///
+    /// Kept separate from [`SceneConfig::validate`] because these are *fatal*
+    /// rather than advisory. Restore reconciles by UUID, and "keep the runtime
+    /// belonging to UUID X" is undefined when two entities claim X — the merge
+    /// would consume the survivor once and then construct a second entity with
+    /// the same identity. An empty UUID names nothing a command, MIDI mapping
+    /// or API route can address. See /spec/entity-identity.md.
+    ///
+    /// Effect UUIDs share one namespace across master, channel and deck chains:
+    /// the HTTP routes are flat and UUID-only, the mixer resolves an effect
+    /// UUID across every chain, and modulation keys on a global `fx_{uuid}`
+    /// prefix.
+    pub fn validate_identities(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut channel_ids = std::collections::HashSet::new();
+        let mut deck_ids = std::collections::HashSet::new();
+        let mut effect_ids = std::collections::HashSet::new();
+        let check = |kind: &str, uuid: &str, seen: &mut std::collections::HashSet<String>| {
+            if uuid.trim().is_empty() {
+                Some(format!("{kind} has an empty uuid"))
+            } else if seen.insert(uuid.to_string()) {
+                None
+            } else {
+                Some(format!("duplicate {kind} uuid '{uuid}'"))
+            }
+        };
+        for fx in &self.master_effects {
+            errors.extend(check("master effect", &fx.uuid, &mut effect_ids));
+        }
+        for ch in &self.channels {
+            errors.extend(check("channel", &ch.uuid, &mut channel_ids));
+            for fx in &ch.effects {
+                errors.extend(check("effect", &fx.uuid, &mut effect_ids));
+            }
+            for deck in &ch.decks {
+                errors.extend(check("deck", &deck.uuid, &mut deck_ids));
+                for fx in &deck.effects {
+                    errors.extend(check("effect", &fx.uuid, &mut effect_ids));
+                }
+            }
+        }
         errors
     }
 
@@ -1159,8 +1375,19 @@ impl SceneConfig {
         let mut scene: SceneConfig = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse scene file: {}", path.as_ref().display()))?;
         scene.migrate();
-        let warnings = scene.validate();
-        for w in &warnings {
+        // Identity errors are fatal, not advisory: a scene whose UUIDs are
+        // empty or duplicated cannot be reconciled by identity, and loading it
+        // anyway would let restore construct two entities answering to the same
+        // address. Everything else stays a warning.
+        let identity_errors = scene.validate_identities();
+        if !identity_errors.is_empty() {
+            anyhow::bail!(
+                "Scene file {} has unusable entity identities: {}",
+                path.as_ref().display(),
+                identity_errors.join("; ")
+            );
+        }
+        for w in &scene.validate() {
             log::warn!("Scene config {}: {}", path.as_ref().display(), w);
         }
         Ok(scene)
@@ -1173,13 +1400,20 @@ impl SceneConfig {
     /// Returns an error if the scene cannot be serialized to JSON, or if the
     /// atomic write fails (temp file creation, write, or rename).
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        crate::persistence::atomic_write(path.as_ref(), &self.to_json()?)
+    }
+
+    /// The text [`SceneConfig::save`] writes, its problems logged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scene cannot be serialized to JSON.
+    pub fn to_json(&self) -> Result<String> {
         let errors = self.validate();
         for e in &errors {
             log::error!("Scene config save: {e}");
         }
-        let content = serde_json::to_string_pretty(self).context("Failed to serialize scene")?;
-        crate::persistence::atomic_write(path.as_ref(), &content)?;
-        Ok(())
+        serde_json::to_string_pretty(self).context("Failed to serialize scene")
     }
 }
 
@@ -1261,6 +1495,7 @@ mod tests {
     #[test]
     fn scene_config_roundtrip_empty() {
         let scene = SceneConfig {
+            main: None,
             version: 2,
             channels: vec![],
             crossfader: 0.5,
@@ -1271,6 +1506,9 @@ mod tests {
             transition_sequences: vec![],
             render_width: None,
             render_height: None,
+            render_resolution_auto: false,
+            frames_in_flight: None,
+            free_control_screen: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -1286,8 +1524,10 @@ mod tests {
     #[test]
     fn scene_config_roundtrip_with_channels() {
         let scene = SceneConfig {
+            main: None,
             version: 2,
             channels: vec![ChannelConfig {
+                overlay: false,
                 uuid: crate::deck::generate_short_uuid(),
                 name: "Ch 0".into(),
                 opacity: 1.0,
@@ -1310,6 +1550,7 @@ mod tests {
                     auto_transition: None,
                     modulation: vec![],
                     render_fps: DeckRenderFps::default(),
+                    render_scale: crate::deck::DeckRenderScale::default(),
                 }],
                 effects: vec![],
                 modulation: vec![],
@@ -1322,6 +1563,9 @@ mod tests {
             transition_sequences: vec![],
             render_width: None,
             render_height: None,
+            render_resolution_auto: false,
+            frames_in_flight: None,
+            free_control_screen: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -1340,6 +1584,7 @@ mod tests {
     #[test]
     fn scene_config_roundtrip_with_effects() {
         let scene = SceneConfig {
+            main: None,
             version: 2,
             channels: vec![],
             crossfader: 0.0,
@@ -1353,12 +1598,16 @@ mod tests {
                     p.insert("amount".into(), ParamValue::Float(0.5));
                     p
                 },
+                mask: None,
             }],
             modulation: ModulationEngine::default(),
             macros: MacroBank::default(),
             transition_sequences: vec![],
             render_width: None,
             render_height: None,
+            render_resolution_auto: false,
+            frames_in_flight: None,
+            free_control_screen: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -1399,6 +1648,12 @@ mod tests {
                 offset: 3600.0,
                 delay_frames: -2,
             },
+            auto: crate::engine::value::video::AutoPlayback {
+                play: true,
+                pause: false,
+                restart: true,
+                main_only: true,
+            },
         };
         let json = serde_json::to_string(&source).unwrap();
         let restored: SourceConfig = serde_json::from_str(&json).unwrap();
@@ -1411,7 +1666,9 @@ mod tests {
                 out_point,
                 scaling_mode,
                 transport_sync,
+                auto,
             } => {
+                assert!(auto.play && !auto.pause && auto.restart);
                 assert_eq!(path, "clips/intro.mov");
                 assert_eq!(loop_mode, crate::video::LoopMode::Loop);
                 assert!((speed - 1.0).abs() < 1e-5);
@@ -1459,15 +1716,92 @@ mod tests {
 
     #[test]
     fn scene_config_roundtrip_camera_source() {
+        let mode = crate::engine::value::camera::CameraMode {
+            width: 1920,
+            height: 1080,
+            fps: 50,
+        };
+        let colour = crate::engine::value::camera::CameraColour {
+            range: crate::engine::value::camera::CameraRange::Full,
+            matrix: crate::engine::value::camera::CameraMatrix::Bt709,
+        };
+        let profile = crate::engine::value::camera::CameraProfile::Lut {
+            file: "SLog3SGamut3.CineToLC-709.cube".into(),
+        };
         let source = SourceConfig::Camera {
             name: "FaceTime HD".into(),
+            mode: Some(mode),
+            device: Some("0x8020000005ac8514".into()),
+            colour,
+            profile: profile.clone(),
+            lowest_latency: true,
         };
         let json = serde_json::to_string(&source).unwrap();
         let restored: SourceConfig = serde_json::from_str(&json).unwrap();
         match restored {
-            SourceConfig::Camera { name } => assert_eq!(name, "FaceTime HD"),
+            SourceConfig::Camera {
+                name,
+                mode: back,
+                device,
+                colour: colour_back,
+                profile: profile_back,
+                lowest_latency,
+            } => {
+                assert!(lowest_latency, "kept");
+                assert_eq!(name, "FaceTime HD");
+                assert_eq!(back, Some(mode));
+                assert_eq!(device.as_deref(), Some("0x8020000005ac8514"));
+                assert_eq!(colour_back, colour);
+                assert_eq!(profile_back, profile);
+            }
             _ => panic!("Expected Camera"),
         }
+        // Saved before formats or colours could be chosen: the camera's best,
+        // read as it says.
+        let old: SourceConfig =
+            serde_json::from_str(r#"{"type":"Camera","name":"FaceTime HD"}"#).unwrap();
+        assert!(
+            matches!(
+                &old,
+                SourceConfig::Camera {
+                    mode: None,
+                    device: None,
+                    colour,
+                    profile,
+                    ..
+                } if colour.is_auto() && profile.is_normal()
+            ),
+            "{old:?}"
+        );
+        // Left as the camera says, nothing is written for it.
+        let plain = SourceConfig::Camera {
+            name: "FaceTime HD".into(),
+            mode: None,
+            device: None,
+            colour: crate::engine::value::camera::CameraColour::default(),
+            profile: crate::engine::value::camera::CameraProfile::Normal,
+            lowest_latency: false,
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !json.contains("colour") && !json.contains("profile") && !json.contains("latency"),
+            "{json}"
+        );
+        // A built-in profile is written by name.
+        let s_log3 = SourceConfig::Camera {
+            name: "FaceTime HD".into(),
+            mode: None,
+            device: None,
+            colour: crate::engine::value::camera::CameraColour::default(),
+            profile: crate::engine::value::camera::CameraProfile::SonySLog3Cine,
+            lowest_latency: false,
+        };
+        assert!(
+            serde_json::to_string(&s_log3)
+                .unwrap()
+                .contains(r#""profile":{"kind":"sony_s_log3_cine"}"#),
+            "{s_log3:?}"
+        );
     }
 
     // ── Migration ────────────────────────────────────────────────────
@@ -1705,8 +2039,10 @@ mod tests {
         let path = dir.join("test_scene.json");
 
         let scene = SceneConfig {
+            main: None,
             version: 2,
             channels: vec![ChannelConfig {
+                overlay: false,
                 uuid: crate::deck::generate_short_uuid(),
                 name: "Test Ch".into(),
                 opacity: 0.9,
@@ -1723,6 +2059,9 @@ mod tests {
             transition_sequences: vec![],
             render_width: Some(1920),
             render_height: Some(1080),
+            render_resolution_auto: false,
+            frames_in_flight: None,
+            free_control_screen: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -1744,8 +2083,10 @@ mod tests {
     #[test]
     fn validate_valid_scene() {
         let scene = SceneConfig {
+            main: None,
             version: 2,
             channels: vec![ChannelConfig {
+                overlay: false,
                 uuid: crate::deck::generate_short_uuid(),
                 name: "Ch 0".into(),
                 opacity: 1.0,
@@ -1768,6 +2109,7 @@ mod tests {
                     auto_transition: None,
                     modulation: vec![],
                     render_fps: DeckRenderFps::default(),
+                    render_scale: crate::deck::DeckRenderScale::default(),
                 }],
                 effects: vec![],
                 modulation: vec![],
@@ -1780,6 +2122,9 @@ mod tests {
             transition_sequences: vec![],
             render_width: Some(1920),
             render_height: Some(1080),
+            render_resolution_auto: false,
+            frames_in_flight: None,
+            free_control_screen: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -1791,6 +2136,7 @@ mod tests {
     #[test]
     fn validate_crossfader_out_of_range() {
         let mut scene = SceneConfig {
+            main: None,
             version: 2,
             channels: vec![],
             crossfader: 1.5,
@@ -1801,6 +2147,9 @@ mod tests {
             transition_sequences: vec![],
             render_width: None,
             render_height: None,
+            render_resolution_auto: false,
+            frames_in_flight: None,
+            free_control_screen: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -1815,6 +2164,7 @@ mod tests {
     #[test]
     fn validate_render_dims_zero() {
         let scene = SceneConfig {
+            main: None,
             version: 2,
             channels: vec![],
             crossfader: 0.0,
@@ -1825,6 +2175,9 @@ mod tests {
             transition_sequences: vec![],
             render_width: Some(0),
             render_height: Some(0),
+            render_resolution_auto: false,
+            frames_in_flight: None,
+            free_control_screen: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -1838,6 +2191,7 @@ mod tests {
     #[test]
     fn validate_channel_opacity_out_of_range() {
         let ch = ChannelConfig {
+            overlay: false,
             uuid: crate::deck::generate_short_uuid(),
             name: "Bad".into(),
             opacity: 2.0,
@@ -1870,6 +2224,7 @@ mod tests {
             auto_transition: None,
             modulation: vec![],
             render_fps: DeckRenderFps::default(),
+            render_scale: crate::deck::DeckRenderScale::default(),
         };
         let errors = deck.validate("d[0]");
         assert!(errors.iter().any(|e| e.contains("opacity")));
@@ -1891,6 +2246,7 @@ mod tests {
             out_point: 0.0,
             scaling_mode: crate::deck::ScalingMode::default(),
             transport_sync: crate::video::DeckTransportSync::default(),
+            auto: crate::engine::value::video::AutoPlayback::default(),
         };
         assert!(!s.validate("src").is_empty());
         let s = SourceConfig::Image {
@@ -1916,6 +2272,7 @@ mod tests {
             path: String::new(),
             enabled: true,
             params: HashMap::new(),
+            mask: None,
         };
         let errors = fx.validate("fx[0]");
         assert!(!errors.is_empty());

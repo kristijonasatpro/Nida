@@ -1,6 +1,6 @@
 [package]
 name = "varda"
-version = "0.5.0"
+version = "0.9.0"
 edition = "2021"
 authors = ["Varda Contributors"]
 description = "Linux, MacOS, and Windows VJ software"
@@ -80,6 +80,7 @@ ffmpeg-next = "9.0.0"
 rosc = "0.11.4"
 image = "0.25.10"
 rfd = "0.17.2"
+libc = "0.2"
 snap = "1.1.1"
 nokhwa = { version = "0.10.10", features = ["input-native", "output-threaded"] }
 midir = "0.11"
@@ -99,7 +100,7 @@ uuid = { version = "1.23.1", features = ["v4"] }
 json-patch = "4.2.0"
 utoipa = { version = "5.5.0", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive", "env"] }
 ctrlc = "3.5.2"
 imageproc = "0.26.2"
 # SVG. `usvg` parses to a resolved tree (stage plan import walks it for contours);
@@ -111,6 +112,8 @@ resvg = "0.47.0"
 dxf = "0.6.1"
 base64 = "0.22.1"
 dirs = "6.0.0"
+# The time of day, for timers that show it or count to it.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 arc-swap = "1.9.1"
 # ONNX Runtime is statically linked via ort's default `download-binaries`
 # feature (CPU build). No dylib to locate, bundle, or version-match.
@@ -129,6 +132,7 @@ freenectrs = { version = "0.1.0", optional = true }
 # covers unit tests; this entry is what makes the helper reachable from
 # integration tests, where the lib is built as a plain dependency.
 tempfile = { version = "3.27.0", optional = true }
+egui_dock = { version = "0.21.1", features = ["serde"] }
 
 # Syphon client FFI (macOS only). The syphon module is compiled unconditionally
 # on macOS; Syphon.framework itself is dlopen'd at runtime (via libloading), so
@@ -136,19 +140,84 @@ tempfile = { version = "3.27.0", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2            = "0.6"
 objc2-foundation = "0.3"
-objc2-metal      = "0.3"
+# IOSurface: captured screens reach the GPU as the surfaces macOS captured
+# them into (src/internal/screen_capture/surface.rs), never through memory.
+objc2-metal      = { version = "0.3", features = ["objc2-io-surface"] }
+# Named for its default features: without them its surfaces are not
+# CoreFoundation types, and objc2-core-video's IOSurface calls do not build —
+# a release build without the default features showed it.
+objc2-io-surface = "0.3"
+# Blocks for AppKit callbacks: the screen colour sampler, screen capture.
+block2           = "0.6"
 
 # ScreenCaptureKit for the macOS screen/window capture backend (spec/screen-capture.md).
 # These are objc2-family crates from the same maintainer as the three above, so
 # they unify on objc2 0.6 / objc2-foundation 0.3 with no duplicate tree — the
 # same version alignment external-io.md verified for the wgpu-hal Metal interop.
 objc2-screen-capture-kit = { version = "0.3", optional = true }
-objc2-core-media         = { version = "0.3", optional = true }
-objc2-core-video         = { version = "0.3", optional = true }
-objc2-core-graphics      = { version = "0.3", optional = true }
-objc2-core-foundation    = { version = "0.3", optional = true }
-dispatch2                = { version = "0.3", optional = true }
-block2                   = { version = "0.6", optional = true }
+# Also for the control window's screen held at the show's rate
+# (src/internal/screen_rate.rs), with or without screen capture.
+objc2-core-graphics      = "0.3"
+# Cameras on a Mac come straight from AVFoundation (src/internal/camera/avf.rs):
+# nokhwa cuts their rates down to whole numbers and refuses a device a hair
+# under one (an ATEM at 60p says 59.9999), and its capture never returns once
+# a device is unplugged. The media, video and dispatch crates serve screen
+# capture as well.
+objc2-av-foundation      = { version = "0.3", default-features = false, features = [
+    "std",
+    "AVCaptureDevice",
+    "AVCaptureInput",
+    "AVCaptureOutputBase",
+    "AVCaptureSession",
+    "AVCaptureSessionPreset",
+    "AVCaptureVideoDataOutput",
+    "AVMediaFormat",
+    "dispatch2",
+    "objc2-core-media",
+] }
+objc2-core-media         = "0.3"
+objc2-core-video         = { version = "0.3", features = ["objc2-io-surface"] }
+# The stream's video encoded in Nida itself, so its bit rate can change while
+# it is live (src/internal/streaming/vt_encoder.rs): ffmpeg's encoders take
+# theirs once.
+objc2-video-toolbox      = { version = "0.3", default-features = false, features = [
+    "std",
+    "VTBase",
+    "VTCompressionProperties",
+    "VTCompressionSession",
+    "VTErrors",
+    "VTSession",
+    "objc2-core-media",
+    "objc2-core-video",
+] }
+objc2-core-foundation    = "0.3"
+dispatch2                = "0.3"
+# An app's sound taken straight from it — a Zoom or Teams call's — with a
+# Core Audio process tap (src/internal/audio/app_sound.rs): no driver.
+objc2-core-audio         = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "objc2-foundation",
+    "AudioHardware",
+] }
+# What macOS calls each screen, and the Identify overlay that puts each
+# screen's name on it (src/app/screens.rs).
+objc2-app-kit            = { version = "0.3", default-features = false, features = [
+    "std",
+    # CGFloat sizes and colours: a release build has no other crate asking.
+    "objc2-core-foundation",
+    "NSColor",
+    "NSControl",
+    "NSFont",
+    "NSGraphics",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSText",
+    "NSTextField",
+    "NSView",
+    "NSWindow",
+] }
 
 # Windows Graphics Capture for the Windows screen/window capture backend
 # (spec/screen-capture.md). Microsoft-maintained, so no third-party binding.
@@ -218,11 +287,15 @@ depth = ["dep:freenectrs"]
 # XDG portal + PipeWire on Wayland or GetImage on X11. The `dep:` entries below
 # are target-scoped, so each platform pulls only its own bindings.
 # See spec/screen-capture.md.
-screen-capture = ["dep:objc2-screen-capture-kit", "dep:objc2-core-media", "dep:objc2-core-video", "dep:objc2-core-graphics", "dep:objc2-core-foundation", "dep:dispatch2", "dep:block2", "dep:windows", "dep:x11rb", "dep:ashpd", "dep:pipewire"]
+screen-capture = ["dep:objc2-screen-capture-kit", "dep:windows", "dep:x11rb", "dep:ashpd", "dep:pipewire"]
 test-fixtures = ["dep:tempfile"]
 url = ["dep:url"]
 euclid = ["dep:euclid"]
 keyboard-types = ["dep:keyboard-types"]
+
+[build-dependencies]
+# Blackmagic outputs: a small C++ face on the DeckLink API (build.rs).
+cc = "1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -269,6 +342,15 @@ name = "presentation"
 harness = false
 
 
+# Dev and test builds carry line tables only: panics and backtraces keep
+# file and line, and the build cache is a fraction of the size — full debug
+# info in every test binary and dependency filled the Mac's disk (75 GB of
+# target/ on 2026-10-08, growing by tens of GB a day). Not incremental:
+# builds here go from scratch per change, and its cache only grew.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
@@ -284,3 +366,8 @@ panic = "unwind"
 [profile.bench]
 debug = true
 strip = "none"
+
+# Metal's presentDrawable:afterMinimumDuration: for even frame pacing on
+# ProMotion screens, which wgpu does not expose. See vendor/wgpu-hal/NIDA-PATCH.md.
+[patch.crates-io]
+wgpu-hal = { path = "vendor/wgpu-hal" }

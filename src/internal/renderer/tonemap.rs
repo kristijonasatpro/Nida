@@ -71,7 +71,7 @@ impl TonemapPipeline {
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Tonemap Params Buffer"),
             contents: bytemuck::cast_slice(&[TonemapParams {
-                mode: TonemapMode::Aces as u32,
+                mode: TonemapMode::default() as u32,
                 _pad0: 0,
                 _pad1: 0,
                 _pad2: 0,

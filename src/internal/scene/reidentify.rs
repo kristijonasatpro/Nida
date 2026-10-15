@@ -128,6 +128,7 @@ mod tests {
             path: "shaders/blur.fs".to_string(),
             enabled: true,
             params: std::collections::HashMap::new(),
+            mask: None,
         }
     }
 
@@ -148,6 +149,7 @@ mod tests {
             solo: false,
             z_index: 0,
             render_fps: crate::channel::DeckRenderFps::Auto,
+            render_scale: crate::deck::DeckRenderScale::default(),
             auto_transition: None,
             modulation: Vec::new(),
         }
@@ -279,6 +281,7 @@ mod tests {
     #[test]
     fn a_channel_reidentifies_everything_under_it() {
         let mut config = ChannelConfig {
+            overlay: false,
             uuid: "chan0001".to_string(),
             name: "A".to_string(),
             opacity: 1.0,

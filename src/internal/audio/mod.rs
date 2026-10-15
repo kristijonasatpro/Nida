@@ -1,5 +1,7 @@
 //! Audio input and analysis for audio-reactive shaders
 
+pub mod app_sound;
+
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -18,8 +20,10 @@ pub type AudioSourceId = u32;
 pub type PcmToken = u64;
 
 /// Bounded capacity (in chunks) of a passthrough PCM channel. One chunk is
-/// produced per cpal callback (~10ms), so 32 ≈ 320ms of slack before drops.
-const PCM_CHANNEL_CAPACITY: usize = 32;
+/// produced per cpal callback (~10ms), so 300 ≈ 3 s of slack before drops:
+/// a recording's ffmpeg reads the sound only once the picture's first frame
+/// has come, and a first take can wait more than half a second for it.
+const PCM_CHANNEL_CAPACITY: usize = 300;
 
 /// Monotonic source of unique [`PcmToken`]s.
 static NEXT_PCM_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -38,6 +42,11 @@ pub struct AudioFormat {
 pub struct PcmChunk {
     /// Interleaved `f32` samples in the device's native channel count.
     pub samples: Vec<f32>,
+    /// Samples lost just before this chunk — dropped on a full channel, or
+    /// never made — which a consumer timing sound by its sample count puts
+    /// back as silence, here and not elsewhere: put before chunks that came
+    /// earlier, as a total lost once was, it pushed them late.
+    pub lost_before: u64,
 }
 
 /// A registered passthrough consumer. The cpal callback fans raw PCM out to
@@ -48,6 +57,8 @@ struct PcmSubscriber {
     sender: Sender<PcmChunk>,
     dropped: Arc<AtomicU64>,
     lost_samples: Arc<AtomicU64>,
+    /// Samples lost since the last chunk that got through: told with the next.
+    pending_lost: Arc<AtomicU64>,
 }
 
 /// Handle returned by [`AudioManager::subscribe_pcm`]. The receiver yields raw
@@ -79,14 +90,20 @@ pub struct PcmSubscription {
 /// are silently skipped.
 fn fan_out_pcm(subs: &[PcmSubscriber], samples: &[f32]) {
     for sub in subs {
+        let lost_before = sub.pending_lost.swap(0, Ordering::Relaxed);
         match sub.sender.try_send(PcmChunk {
             samples: samples.to_vec(),
+            lost_before,
         }) {
             Ok(()) | Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
-            Err(crossbeam_channel::TrySendError::Full(_)) => {
+            Err(crossbeam_channel::TrySendError::Full(chunk)) => {
                 sub.dropped.fetch_add(1, Ordering::Relaxed);
                 sub.lost_samples
                     .fetch_add(samples.len() as u64, Ordering::Relaxed);
+                sub.pending_lost.fetch_add(
+                    chunk.lost_before + chunk.samples.len() as u64,
+                    Ordering::Relaxed,
+                );
             }
         }
     }
@@ -114,6 +131,29 @@ const ONSET_THRESHOLD_OFFSET: f32 = 0.01;
 const TEMPO_TOLERANCE: f32 = 0.15;
 
 /// Information about a detected audio input device.
+/// What `list` returns, if it does within `wait` — run on a thread of its own
+/// — or else the receiver it will arrive on.
+fn within<T: Send + 'static>(
+    wait: std::time::Duration,
+    list: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, std::sync::mpsc::Receiver<T>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("audio-input-listing".into())
+        .spawn(move || {
+            let _ = tx.send(list());
+        });
+    if let Err(e) = spawned {
+        log::warn!("Listing sound inputs on a thread of its own: {e}");
+        return Err(rx);
+    }
+    rx.recv_timeout(wait).map_err(|_| rx)
+}
+
+/// A listing of the input devices still being made (see
+/// [`AudioManager::new_waiting_at_most`]).
+pub type InputListing = std::sync::mpsc::Receiver<(Vec<AudioDeviceInfo>, Option<AudioSourceId>)>;
+
 #[derive(Debug, Clone)]
 pub struct AudioDeviceInfo {
     pub id: AudioSourceId,
@@ -341,10 +381,57 @@ impl AudioManager {
         devices.first().map(|d| d.id)
     }
 
+    /// A manager with the input devices listed — or, when listing takes
+    /// longer than `wait`, none yet and the listing still going: the
+    /// receiver gets it when it is done (hand it to [`Self::adopt`]).
+    ///
+    /// Listing sound inputs asks `CoreAudio` about them, and while macOS has
+    /// not decided whether the app may use the microphone that waits for its
+    /// prompt — hidden behind a full-screen output, it waited for ever, with
+    /// no window and no API. Started this way, Nida comes up regardless.
+    pub fn new_waiting_at_most(wait: std::time::Duration) -> (Self, Option<InputListing>) {
+        let mut mgr = Self {
+            devices: Vec::new(),
+            active: HashMap::new(),
+            default_source_id: None,
+            manual_pins: HashSet::new(),
+            mod_refs: HashSet::new(),
+        };
+        match within(wait, Self::list_inputs) {
+            Ok(listing) => {
+                mgr.adopt(listing);
+                (mgr, None)
+            }
+            Err(rx) => {
+                log::warn!(
+                    "Sound inputs not listed within {:.0} s — macOS may be asking for \
+                     microphone access; carrying on without them for now",
+                    wait.as_secs_f64()
+                );
+                (mgr, Some(rx))
+            }
+        }
+    }
+
+    /// Take a listing made by [`Self::new_waiting_at_most`]'s helper.
+    pub fn adopt(&mut self, (devices, default): (Vec<AudioDeviceInfo>, Option<AudioSourceId>)) {
+        self.devices = devices;
+        self.default_source_id = default;
+        log::info!("Audio scan: found {} input device(s)", self.devices.len());
+        for dev in &self.devices {
+            log::info!("  Audio {}: {}", dev.id, dev.name);
+        }
+    }
+
     /// Scan for available audio input devices and cache the resolved default.
     pub fn scan_devices(&mut self) {
+        self.adopt(Self::list_inputs());
+    }
+
+    /// The input devices, and which is the default.
+    fn list_inputs() -> (Vec<AudioDeviceInfo>, Option<AudioSourceId>) {
         let host = cpal::default_host();
-        self.devices = host
+        let devices: Vec<AudioDeviceInfo> = host
             .input_devices()
             .map(|devs| {
                 devs.enumerate()
@@ -367,11 +454,8 @@ impl AudioManager {
         let default_name = host
             .default_input_device()
             .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()));
-        self.default_source_id = Self::pick_default_input(default_name.as_deref(), &self.devices);
-        log::info!("Audio scan: found {} input device(s)", self.devices.len());
-        for dev in &self.devices {
-            log::info!("  Audio {}: {}", dev.id, dev.name);
-        }
+        let default = Self::pick_default_input(default_name.as_deref(), &devices);
+        (devices, default)
     }
 
     /// Get the list of detected audio input devices.
@@ -505,6 +589,7 @@ impl AudioManager {
             sender,
             dropped: dropped.clone(),
             lost_samples: lost_samples.clone(),
+            pending_lost: Arc::default(),
         };
         source.pcm_subs.rcu(|cur| {
             let mut next = Vec::with_capacity(cur.len() + 1);
@@ -903,6 +988,27 @@ impl AudioTextures {
 
 #[cfg(test)]
 mod tests {
+
+    /// Listing sound inputs that takes longer than the startup will wait —
+    /// macOS asking for the microphone — does not hold the startup up: the
+    /// listing arrives later.
+    #[test]
+    fn a_slow_listing_does_not_hold_up_the_start() {
+        let started = std::time::Instant::now();
+        let slow = super::within(std::time::Duration::from_millis(50), || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            7
+        });
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        let later = slow.expect_err("not within the wait");
+        assert_eq!(
+            later.recv_timeout(std::time::Duration::from_secs(2)).ok(),
+            Some(7),
+            "it arrives later"
+        );
+        let quick = super::within(std::time::Duration::from_secs(2), || 3);
+        assert_eq!(quick.ok(), Some(3));
+    }
     use super::*;
 
     #[test]
@@ -1221,6 +1327,7 @@ mod tests {
             sender,
             dropped: dropped.clone(),
             lost_samples: lost_samples.clone(),
+            pending_lost: Arc::default(),
         };
         (sub, receiver, dropped, lost_samples)
     }
@@ -1271,6 +1378,23 @@ mod tests {
 
         assert_eq!(dropped.load(Ordering::Relaxed), 3);
         assert_eq!(lost.load(Ordering::Relaxed), 24);
+    }
+
+    /// What a full channel threw away is told with the next chunk that gets
+    /// through, so silence goes there — after the chunks queued before it.
+    #[test]
+    fn pcm_fan_out_tells_the_next_chunk_what_was_lost_before_it() {
+        let (sub, rx, _) = make_sub(1);
+        let subs = vec![sub];
+        fan_out_pcm(&subs, &[0.1; 4]);
+        fan_out_pcm(&subs, &[0.2; 6]);
+        fan_out_pcm(&subs, &[0.3; 8]);
+        let first = rx.try_recv().expect("the first got through");
+        assert_eq!(first.lost_before, 0);
+        fan_out_pcm(&subs, &[0.4; 4]);
+        let next = rx.try_recv().expect("room again");
+        assert_eq!(next.samples, vec![0.4; 4]);
+        assert_eq!(next.lost_before, 14, "the two thrown away, before it");
     }
 
     #[test]

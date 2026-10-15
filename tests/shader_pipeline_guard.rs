@@ -104,7 +104,7 @@ fn every_generator_survives_a_rendered_frame() {
             deck.render(&gpu, &audio, &modulation, 0, &mut cmds)
                 .unwrap_or_else(|e| panic!("{name}: render failed: {e:#}"));
         }
-        gpu.queue.submit(cmds);
+        gpu.submit(cmds);
         let _ = gpu.device.poll(wgpu::PollType::Wait {
             submission_index: None,
             timeout: Some(std::time::Duration::from_secs(5)),

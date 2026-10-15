@@ -94,6 +94,27 @@ pub async fn set_resolution(
 }
 
 #[derive(Deserialize, ToSchema)]
+pub struct ResolutionAutoBody {
+    /// `true`: the render resolution follows the largest screen an output is
+    /// on (a 4K TV gets a 4K picture). `false`: it stays at its current size.
+    /// Setting a resolution with `PUT /api/resolution` also turns Auto off.
+    pub enabled: bool,
+}
+#[utoipa::path(put, path = "/api/resolution/auto", request_body = ResolutionAutoBody, responses((status = 200, body = CommandResult)), tag = "System")]
+pub async fn set_resolution_auto(
+    State(state): State<SharedState>,
+    Json(b): Json<ResolutionAutoBody>,
+) -> impl IntoResponse {
+    match state
+        .send_command(EngineCommand::SetRenderResolutionAuto { enabled: b.enabled })
+        .await
+    {
+        Ok(r) => command_response(r),
+        Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
 pub struct DomemasterResolutionBody {
     /// Domemaster output size. Square, so it is a preset rather than a width
     /// and height: `R1K` (1024²), `R2K` (2048²), or `R4K` (4096²).

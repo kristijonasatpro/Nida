@@ -1,6 +1,6 @@
 # Frame Analysis & Preprocessors
 
-Varda can **look at a picture and turn what it sees into data** — the average brightness of a deck, the position of a performer's face, a live depth silhouette. One subsystem does all of this: the **analyzer engine**. It feeds two very different workflows from a single running analysis:
+Nida can **look at a picture and turn what it sees into data** — the average brightness of a deck, the position of a performer's face, a live depth silhouette. One subsystem does all of this: the **analyzer engine**. It feeds two very different workflows from a single running analysis:
 
 | Path | What it produces | Who uses it | Set up in |
 |------|------------------|-------------|-----------|
@@ -79,7 +79,7 @@ The shader-author side of depth (texture formats, GLSL access) lives in [Shader 
 
 ## Preprocessors (concept)
 
-When an effect needs **structured data the fragment shader can't compute itself** — face landmarks, a depth map, a segmentation mask — the shader declares a **preprocessor** in its ISF header. Varda runs the named analyzer and injects its output as a **texture** bound alongside the shader's other inputs; the shader reads it with ordinary texture samples.
+When an effect needs **structured data the fragment shader can't compute itself** — face landmarks, a depth map, a segmentation mask — the shader declares a **preprocessor** in its ISF header. Nida runs the named analyzer and injects its output as a **texture** bound alongside the shader's other inputs; the shader reads it with ordinary texture samples.
 
 From a performer's seat this is invisible: you drop the effect on a deck and it works, drawing on whatever analysis it needs. The full authoring mechanics — the `PREPROCESSORS` JSON block, binding order, and `texelFetch` access patterns — are in [Shader Authoring → Analyzer Preprocessors](12-isf-authoring.md#analyzer-preprocessors).
 

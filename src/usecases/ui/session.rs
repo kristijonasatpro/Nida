@@ -6,6 +6,40 @@
 
 use super::{CameraDetectAction, DomeAction};
 
+/// What the Show menu asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShowAction {
+    /// Save this show and start an empty one, keeping the room setup.
+    New,
+    /// Save this show and pick another to open.
+    Open,
+    /// Save this show and open this one.
+    OpenRecent(std::path::PathBuf),
+    /// Save this show under a new name, and carry on in it.
+    SaveAs,
+    /// Show the show's folder in Finder.
+    Reveal,
+}
+
+/// Where a new deck goes: a channel, and the deck in it that it goes
+/// before — `None` for the end. Both by UUID, since a load can outlive the
+/// positions it was aimed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeckPlace {
+    pub channel_uuid: String,
+    pub before_deck_uuid: Option<String>,
+}
+
+impl DeckPlace {
+    /// The end of a channel.
+    pub fn end_of(channel_uuid: impl Into<String>) -> Self {
+        Self {
+            channel_uuid: channel_uuid.into(),
+            before_deck_uuid: None,
+        }
+    }
+}
+
 /// UI-local session/ephemeral state accumulated during a frame (Population 2).
 ///
 /// This is the half of the frame's UI output that is **not** an engine mutation:
@@ -25,14 +59,27 @@ pub struct UISession {
     /// channel is held by UUID: a channel index captured at click time can name a
     /// different channel by the time the shader finishes compiling. See
     /// [`/spec/api-addressing.md`].
-    pub shader_to_add: Option<(String, usize)>,
+    pub shader_to_add: Option<(DeckPlace, usize)>,
     /// Channel UUID to open an image file dialog for (deferred to outside egui
     /// frame). A UUID rather than an index because the dialog outlives the
     /// frame that requested it — see [`/spec/api-addressing.md`].
     pub open_image_dialog_for_channel: Option<String>,
     /// Channel UUID to open a video file dialog for (deferred to outside egui frame)
     pub open_video_dialog_for_channel: Option<String>,
-    pub notifications_to_dismiss: Vec<usize>,
+    /// Pick pictures, a new input each (Add Input's Image).
+    pub open_image_dialog_for_new_inputs: bool,
+    /// Pick clips and sound files, a new input each (Add Input's Video).
+    pub open_video_dialog_for_new_inputs: bool,
+    /// Files dropped in from Finder, each batch with where it goes, in the
+    /// order they were dropped.
+    pub files_to_add: Vec<(DeckPlace, Vec<std::path::PathBuf>)>,
+    /// Open a folder picker for where recordings go (outside the frame, like
+    /// the file dialogs).
+    pub choose_record_folder: bool,
+    /// Show a file in Finder (or the system's file manager).
+    pub reveal_file: Option<std::path::PathBuf>,
+    /// Notifications to put away, by id (see `Notification::id`).
+    pub notifications_to_dismiss: Vec<u64>,
     /// Info notifications to push (e.g. "Copied URL to clipboard")
     pub info_notifications: Vec<String>,
     /// MIDI learn: toggle learn mode on/off
@@ -98,11 +145,30 @@ pub struct UISession {
     pub toggle_snap: bool,
     /// Toggle library panel open/closed
     pub toggle_library_panel: bool,
+    /// Panels to open (true) or close (false) — a timer's control panel,
+    /// from its buttons.
+    pub panel_requests: Vec<(crate::usecases::ui::screen_layout::Pane, bool)>,
     /// Toggle right panel open/closed
     pub toggle_right_panel: bool,
+    /// The panel arrangement after this frame — dragged, resized, opened,
+    /// closed, or a layout chosen. Sent every frame the dock is drawn.
+    pub screen_layout: Option<crate::usecases::ui::screen_layout::ScreenLayout>,
+    /// Save the arrangement in use under this name, for the user rather than
+    /// the workspace.
+    pub save_layout_as: Option<String>,
+    /// Forget this saved layout.
+    pub delete_saved_layout: Option<String>,
+    /// Choices made in windows to keep for every show — where the Input
+    /// Settings window puts its controls (see `window_choices`).
+    pub window_choices: Option<crate::usecases::ui::window_choices::WindowChoices>,
+    /// Fold this channel to a strip in the Inputs panel, or open it out.
+    pub toggle_collapsed_channel: Option<String>,
     /// Save workspace requested (Ctrl+S / Cmd+S). Layout-coupled runner trigger
     /// (accepted deviation, /spec/ui-engine-boundary.md Decision #10).
     pub save_requested: bool,
+    /// Something to do with shows, from the Show menu: layout-coupled (the
+    /// layout is saved with the show) and needing file dialogs, so the runner's.
+    pub show_action: Option<ShowAction>,
     /// Undo last undoable action. Layout-coupled runner trigger (accepted deviation).
     pub undo_requested: bool,
     /// Redo last undone action. Layout-coupled runner trigger (accepted deviation).
@@ -127,6 +193,11 @@ impl UISession {
             shader_to_add: None,
             open_image_dialog_for_channel: None,
             open_video_dialog_for_channel: None,
+            open_image_dialog_for_new_inputs: false,
+            open_video_dialog_for_new_inputs: false,
+            files_to_add: Vec::new(),
+            choose_record_folder: false,
+            reveal_file: None,
             notifications_to_dismiss: Vec::new(),
             info_notifications: Vec::new(),
             midi_learn_toggle: false,
@@ -156,8 +227,15 @@ impl UISession {
             set_grid_size: None,
             toggle_snap: false,
             toggle_library_panel: false,
+            panel_requests: Vec::new(),
             toggle_right_panel: false,
+            screen_layout: None,
+            save_layout_as: None,
+            delete_saved_layout: None,
+            window_choices: None,
+            toggle_collapsed_channel: None,
             save_requested: false,
+            show_action: None,
             undo_requested: false,
             redo_requested: false,
             gesture_active: false,

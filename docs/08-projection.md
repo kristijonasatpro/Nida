@@ -6,7 +6,7 @@
 
 The simplest setup: one output window displaying the full mixer output on one projector or display.
 
-1. Click **"+ Windowed"** in the right panel's **📺 Outputs** section — a floating output window appears
+1. Click **"+ Windowed"** in the **Setup** panel's **📺 Outputs** section — a floating output window appears
 2. Select a **display target** from the dropdown (enumerates connected monitors)
 3. Click **Fullscreen** to send the window to that display
 
@@ -66,7 +66,7 @@ Bezier edits work in raw, un-snapped coordinates so handles move with full sub-g
 
 ### Combining Surfaces (Multi-Contour)
 
-Select two or more surfaces and click **🔗 Combine** (G) to merge them into a single surface. Varda computes a polygon union: overlapping regions fuse into one outline, while disjoint regions are kept as **extra contours** on the combined surface. All contours share one content source and color, and every contour shows the slice of that source falling over its area (a bounding-box UV fill across the combined bounds) this is useful for treating several separate shapes (e.g. the arms of a mandala, or a row of panels) as one routing target.
+Select two or more surfaces and click **🔗 Combine** (G) to merge them into a single surface. Nida computes a polygon union: overlapping regions fuse into one outline, while disjoint regions are kept as **extra contours** on the combined surface. All contours share one content source and color, and every contour shows the slice of that source falling over its area (a bounding-box UV fill across the combined bounds) this is useful for treating several separate shapes (e.g. the arms of a mandala, or a row of panels) as one routing target.
 
 A combined (multi-contour) surface does **not** carry a per-surface warp: a single warp mesh can't describe disjoint contours, so warp controls are unavailable while a surface has extra contours. To warp individual pieces, keep them as separate surfaces.
 
@@ -96,7 +96,7 @@ shape (discarding manual edits).
 2. Select a surface on the stage; the bottom bar shows its warp grid
 3. Drag the 4 corner handles (TL, TR, BR, BL) to align the projected image with
    the physical surface
-4. Varda computes a perspective-correct homography (DLT 3×3) for accurate UV mapping
+4. Nida computes a perspective-correct homography (DLT 3×3) for accurate UV mapping
 5. Click **↺ Reset** to clear the surface's warp (back to native position)
 
 To align the projectors themselves, use the per-output **🔧 Calibrate** selector:
@@ -159,12 +159,12 @@ For multi-projector setups where projectors overlap:
 1. Create an output for each projector (click **"+ Windowed"** for each)
 2. Assign each output to its display target and go fullscreen
 3. Draw surfaces in the Stage Editor that match each projector's coverage area
-4. Where surfaces overlap, Varda applies **edge blending** — smoothstep alpha ramps that feather the overlap region for a seamless image
+4. Where surfaces overlap, Nida applies **edge blending** — smoothstep alpha ramps that feather the overlap region for a seamless image
 
 **Edge blend modes:**
 
 - **Manual** (default) — per-edge controls for the top/bottom/left/right edges: enable/disable, blend **width** (0.0–0.5), and **gamma** (default 2.2, the smoothstep exponent for the falloff ramp). Applied as a post-process over the whole output. Best for simple side-by-side projectors with straight overlap edges.
-- **Auto** — Varda detects overlapping surface regions via precise polygon intersection and computes blend zones automatically (up to 4 overlap zones per surface), applying the ramp per-surface in the fragment shader. Reactive — recomputes when surfaces move. Best for complex stages with arbitrary, circular, or non-rectangular overlaps.
+- **Auto** — Nida detects overlapping surface regions via precise polygon intersection and computes blend zones automatically (up to 4 overlap zones per surface), applying the ramp per-surface in the fragment shader. Reactive — recomputes when surfaces move. Best for complex stages with arbitrary, circular, or non-rectangular overlaps.
 
 Each output's edge blend settings are independent and saved in `stage.json`.
 
@@ -191,7 +191,7 @@ Mesh warp can be hand-edited on-canvas in the stage editor's bottom-bar warp edi
 
 > **🧪 Experimental.** Dome projection is under active development. The workflow and parameters described below may change, and edge cases (especially multi-projector slicing) are not yet fully hardened. Validate your setup before relying on it for a live show.
 
-Varda includes built-in dome projection: a domemaster renderer, an auto-slicer for 1–8 projectors, and an interactive 3D preview. No external tools needed.
+Nida includes built-in dome projection: a domemaster renderer, an auto-slicer for 1–8 projectors, and an interactive 3D preview. No external tools needed.
 
 ### Domemaster Format
 
@@ -227,7 +227,7 @@ A domemaster is a circular fisheye image using **equidistant azimuthal projectio
 
 Or configure projector positions and orientations manually.
 
-**4. Click "Generate Slices."** Varda computes per-projector warp meshes, creates surfaces with Domemaster source and mesh warp applied, and determines polygon shapes via convex hull.
+**4. Click "Generate Slices."** Nida computes per-projector warp meshes, creates surfaces with Domemaster source and mesh warp applied, and determines polygon shapes via convex hull.
 
 **5. Assign to outputs** — create an output per projector, assign surfaces, fullscreen on each display.
 
@@ -259,7 +259,7 @@ All three axes are **MIDI-mappable** for live performance. Rotation order: Roll 
 
 > **🧪 Experimental.** Auto-detection (both file import and live camera) is under active development. Detection results vary with lighting and source quality — review and refine detected surfaces manually before going live.
 
-Instead of drawing surfaces by hand, Varda can detect them automatically from an imported file or from a live camera pointed at the stage.
+Instead of drawing surfaces by hand, Nida can detect them automatically from an imported file or from a live camera pointed at the stage.
 
 #### From a File
 
@@ -272,14 +272,14 @@ Import a stage plan and auto-detect surfaces. Three file types are supported:
 | **DXF** | Geometric entity extraction (lines, polylines, circles, arcs, ellipses). Best for CAD venue plans. |
 
 1. In the Stage Editor, click **Import** and select a file (PNG, JPG, SVG, or DXF)
-2. Varda detects contours and presents them as candidate surfaces
+2. Nida detects contours and presents them as candidate surfaces
 3. Review and confirm — detected surfaces are added to the stage canvas
 
 #### From a Camera
 
 1. Point a camera at the stage and click **📷 Detect** to enter camera detection mode. A **live** feed appears.
 2. Frame the shot, then **freeze** a still (the mode switches from live to a captured preview).
-3. Varda traces contours on the frozen frame and presents them as candidate surfaces.
+3. Nida traces contours on the frozen frame and presents them as candidate surfaces.
 4. Review and confirm — detected surfaces are added to the canvas.
 
 #### Detection Parameters
@@ -310,7 +310,7 @@ This feature is also available via the HTTP API: `POST /api/stage/detect/image`,
 | Format | Description |
 |--------|-------------|
 | **Paul Bourke XYUV CSV** | Standard dome mesh format (position + UV) |
-| **JSON** | Varda's native mesh format |
+| **JSON** | Nida's native mesh format |
 
 Auto-detected by file extension. Load and save from surface warp settings.
 

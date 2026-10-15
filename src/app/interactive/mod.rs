@@ -114,10 +114,13 @@ impl super::VardaApp {
         let Some(target) = self.interactive.pending_open.take() else {
             return;
         };
-        let attrs = Window::default_attributes()
-            .with_title("Varda — Interactive HTML")
-            .with_inner_size(PhysicalSize::new(target.width, target.height))
-            .with_resizable(false);
+        let attrs = crate::app::app_id::tagged(
+            Window::default_attributes()
+                .with_title("Nida — Interactive HTML")
+                .with_inner_size(PhysicalSize::new(target.width, target.height))
+                .with_resizable(false),
+            crate::app::app_id::INTERACTIVE,
+        );
         let window = match event_loop.create_window(attrs) {
             Ok(w) => w,
             Err(e) => {

@@ -6,15 +6,18 @@
 //! the outbound action bucket. See /spec/ui-engine-boundary.md.
 
 mod actions;
+pub mod colour_sampler;
 mod data;
 pub(crate) mod keyboard;
 pub mod notifications;
 pub mod panels;
 pub mod runner;
+pub mod screen_layout;
 mod session;
 mod snapshot;
 mod state;
 pub mod widgets;
+pub mod window_choices;
 
 #[cfg(any(test, feature = "test-fixtures"))]
 mod fixtures;

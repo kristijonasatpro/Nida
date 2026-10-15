@@ -15,9 +15,12 @@
 //! - `SCStreamConfiguration.width/height` scales at capture time, so a 4K
 //!   display arrives already sized for the deck instead of moving 33 MB a frame.
 //!
-//! Frames are BGRA8 in sRGB, uploaded to a `Bgra8UnormSrgb` texture — no CPU
-//! swizzle. This is CPU readback by design; zero-copy `IOSurface` import is a
-//! measured follow-up, see spec/screen-capture.md § Decision: CPU readback first.
+//! Frames are BGRA8 in sRGB, copied into a `Bgra8UnormSrgb` texture — no CPU
+//! swizzle. Each is handed on in the GPU surface SCK captured it into and
+//! copied on the GPU (see `screen_capture::surface`): read through memory at
+//! 1080p60, the copies and uploads cost the control window and the outputs
+//! frames of their own (spec/screen-capture.md § Decision: CPU readback
+//! first). A frame with no surface is still read through memory.
 
 #![allow(unsafe_code)]
 
@@ -31,7 +34,9 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_core_graphics::{CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess};
+use objc2_core_graphics::{
+    kCGColorSpaceSRGB, CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess,
+};
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::{
     CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight,
@@ -41,12 +46,13 @@ use objc2_core_video::{
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSObject, NSObjectProtocol, NSString};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
-    SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType, SCWindow,
+    SCStreamFrameInfoDisplayTime, SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType,
+    SCWindow,
 };
 
 use crate::screen_capture::backend::{
     CaptureConfig, CaptureError, CaptureFrame, CapturePixelFormat, CaptureTargetInfo,
-    CaptureTargetKind, PermissionState, ScreenCaptureBackend,
+    CaptureTargetKind, CropRect, PermissionState, ScreenCaptureBackend,
 };
 
 /// `kCVPixelFormatType_32BGRA` — the four-char code SCK uses for BGRA output.
@@ -225,9 +231,15 @@ fn shareable_content() -> Result<Retained<SCShareableContent>, CaptureError> {
     }
 }
 
-/// Latest-wins frame slot shared between the SCK delegate queue and the capture
-/// thread.
-type FrameSlot = Arc<Mutex<Option<CaptureFrame>>>;
+/// Frames from the SCK delegate queue on their way to the capture thread,
+/// oldest first.
+type FrameSlot = Arc<Mutex<std::collections::VecDeque<CaptureFrame>>>;
+
+/// Frames kept between the SCK delegate and the capture thread at most; more
+/// let the oldest go. Each carries when it was captured, so the show picks by
+/// that (see `crate::frame_picker`), and none is replaced by the next as a
+/// single slot did when two came within one poll.
+const SLOT_FRAMES: usize = 4;
 
 struct OutputIvars {
     slot: FrameSlot,
@@ -259,7 +271,10 @@ define_class!(
             }
             if let Some(frame) = unsafe { frame_from_sample_buffer(sample_buffer) } {
                 if let Ok(mut slot) = self.ivars().slot.lock() {
-                    *slot = Some(frame);
+                    if slot.len() >= SLOT_FRAMES {
+                        slot.pop_front();
+                    }
+                    slot.push_back(frame);
                 }
             }
         }
@@ -308,6 +323,23 @@ unsafe fn frame_is_complete(sample_buffer: &CMSampleBuffer) -> bool {
     status.integerValue() == SCFrameStatus::Complete.0
 }
 
+/// When the window server showed what a sample buffer captured, host
+/// seconds; `None` when SCK did not say.
+///
+/// # Safety
+///
+/// `sample_buffer` must be a live sample buffer delivered by SCK.
+unsafe fn display_time(sample_buffer: &CMSampleBuffer) -> Option<f64> {
+    let attachments = unsafe { sample_buffer.sample_attachments_array(false) }?;
+    // Toll-free bridged, as in `frame_is_complete`.
+    let attachments: &NSArray<NSDictionary<NSString, NSObject>> =
+        unsafe { &*std::ptr::from_ref(&*attachments).cast() };
+    let info = attachments.firstObject()?;
+    let ticks = info.objectForKey(unsafe { SCStreamFrameInfoDisplayTime })?;
+    let ticks = ticks.downcast::<NSNumber>().ok()?.unsignedLongLongValue();
+    (ticks > 0).then(|| crate::host_clock::seconds_of_ticks(ticks))
+}
+
 /// Repack a `CMSampleBuffer`'s pixel buffer into a tightly-packed BGRA frame.
 ///
 /// # Safety
@@ -317,7 +349,22 @@ unsafe fn frame_from_sample_buffer(sample_buffer: &CMSampleBuffer) -> Option<Cap
     if !unsafe { frame_is_complete(sample_buffer) } {
         return None;
     }
+    let captured_at = unsafe { display_time(sample_buffer) };
     let pixel_buffer = sample_buffer.image_buffer()?;
+    // In the GPU surface it was captured into: handed on as that, not read.
+    if let Some(surface) = crate::screen_capture::surface::SurfaceFrame::new(pixel_buffer.clone()) {
+        let (width, height) = surface.size();
+        if width > 0 && height > 0 {
+            return Some(CaptureFrame {
+                data: Vec::new(),
+                width,
+                height,
+                format: CapturePixelFormat::Bgra8UnormSrgb,
+                surface: Some(surface),
+                captured_at,
+            });
+        }
+    }
     let pixel_buffer = &*pixel_buffer;
 
     let lock = CVPixelBufferLockFlags::ReadOnly;
@@ -353,6 +400,8 @@ unsafe fn frame_from_sample_buffer(sample_buffer: &CMSampleBuffer) -> Option<Cap
             width: u32::try_from(width).ok()?,
             height: u32::try_from(height).ok()?,
             format: CapturePixelFormat::Bgra8UnormSrgb,
+            surface: None,
+            captured_at,
         })
     })();
     unsafe { CVPixelBufferUnlockBaseAddress(pixel_buffer, lock) };
@@ -384,14 +433,28 @@ pub struct MacosBackend {
     width: u32,
     height: u32,
     config: CaptureConfig,
+    /// The target's size in points, which a crop is measured in.
+    points: (f64, f64),
+    /// Its pixels to a point: 2 on a Retina display.
+    scale: f64,
 }
 
 impl MacosBackend {
     fn new(target: &CaptureTargetInfo, config: &CaptureConfig) -> Result<Self, CaptureError> {
         let content = shareable_content()?;
         let filter = build_filter(&content, target, config)?;
-        let (width, height) = output_size(target, config);
-        let stream_config = build_configuration(config, width, height);
+        // A Retina display has two pixels to each of its points, and is
+        // captured at its pixels: its points would halve its sharpness.
+        let scale =
+            f64::from(unsafe { SCShareableContent::infoForFilter(&filter).pointPixelScale() });
+        let scale = if scale.is_finite() && scale >= 1.0 {
+            scale
+        } else {
+            1.0
+        };
+        let points = (f64::from(target.width), f64::from(target.height));
+        let (width, height) = output_size(target, scale, config);
+        let stream_config = build_configuration(config, width, height, points);
 
         let stream = unsafe {
             SCStream::initWithFilter_configuration_delegate(
@@ -402,7 +465,7 @@ impl MacosBackend {
             )
         };
 
-        let slot: FrameSlot = Arc::new(Mutex::new(None));
+        let slot: FrameSlot = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let output = StreamOutput::new(Arc::clone(&slot));
         let queue = DispatchQueue::new("com.varda.screen-capture", None);
 
@@ -434,6 +497,8 @@ impl MacosBackend {
             width,
             height,
             config: config.clone(),
+            points,
+            scale,
         })
     }
 }
@@ -521,12 +586,37 @@ fn build_filter(
 /// other platforms. Using it verbatim would hand `setScalesToFit` a differently
 /// shaped box, and it would letterbox the target into it — baking bars into the
 /// pixels and leaving the deck's scaling mode with nothing to do.
-fn output_size(target: &CaptureTargetInfo, config: &CaptureConfig) -> (u32, u32) {
-    let (native_w, native_h) = (target.width.max(1), target.height.max(1));
+///
+/// The target's size is in points; `scale` pixels to a point (2 on a Retina
+/// display) gives its size in pixels, what it is captured at.
+fn output_size(target: &CaptureTargetInfo, scale: f64, config: &CaptureConfig) -> (u32, u32) {
+    let (native_w, native_h) = pixels_of(target, scale);
     let (base_w, base_h) = config.scale_to.map_or((native_w, native_h), |(w, h)| {
         super::super::resample::fit_within(native_w, native_h, w, h)
     });
     scaled_crop_size(base_w, base_h, config)
+}
+
+/// A target's size in pixels, its size in points `scale` times over.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn pixels_of(target: &CaptureTargetInfo, scale: f64) -> (u32, u32) {
+    let pixels = |points: u32| ((f64::from(points.max(1)) * scale).round() as u32).max(1);
+    (pixels(target.width), pixels(target.height))
+}
+
+/// The part of the target a crop takes, in the target's points — what
+/// `sourceRect` is measured in, whatever size the capture is delivered at.
+fn source_rect(crop: CropRect, (width, height): (f64, f64)) -> CGRect {
+    CGRect {
+        origin: CGPoint {
+            x: width * f64::from(crop.x),
+            y: height * f64::from(crop.y),
+        },
+        size: CGSize {
+            width: width * f64::from(crop.w),
+            height: height * f64::from(crop.h),
+        },
+    }
 }
 
 /// Apply the crop extent to a base size, keeping the result even and non-zero.
@@ -543,19 +633,27 @@ fn build_configuration(
     config: &CaptureConfig,
     width: u32,
     height: u32,
+    points: (f64, f64),
 ) -> Retained<SCStreamConfiguration> {
     let sc = unsafe { SCStreamConfiguration::new() };
     unsafe {
         sc.setWidth(width as usize);
         sc.setHeight(height as usize);
         sc.setPixelFormat(PIXEL_FORMAT_32BGRA);
+        // In sRGB, as the texture reads it. Left alone, a Mac's display space
+        // — Display P3 on most — comes through, and reads washed out.
+        sc.setColorSpaceName(kCGColorSpaceSRGB);
         sc.setShowsCursor(config.show_cursor);
         // Opaque output: the deck's default blit composites over black anyway,
         // and a transparent desktop background is never what a VJ wants here.
         sc.setShouldBeOpaque(true);
-        // Depth 3 is Apple's guidance for a live (non-recording) consumer: deep
-        // enough to absorb jitter, shallow enough not to accumulate latency.
-        sc.setQueueDepth(3);
+        // Apple's guidance for a live consumer is 3. Nida holds frames'
+        // surfaces until each show frame's has been picked (see
+        // `crate::frame_picker`, at most four waiting) and the GPU has copied
+        // it, so 3 could leave the stream none to capture into; 8, the most
+        // SCK takes, leaves it room. The depth is not a delay: frames are
+        // picked by when they were captured.
+        sc.setQueueDepth(8);
         sc.setScalesToFit(true);
         // Frame pacing at the source. This is what makes the 30 fps default an
         // actual saving rather than a throttle applied after the work is done.
@@ -569,26 +667,11 @@ fn build_configuration(
 
     let crop = config.crop.clamped();
     if !crop.is_full_frame() {
-        // sourceRect is in the filter's point space; we only know normalized
-        // crop, so scale it by the configured output extent.
-        let full_w = f64::from(width) / f64::from(crop.w.max(f32::EPSILON));
-        let full_h = f64::from(height) / f64::from(crop.h.max(f32::EPSILON));
-        unsafe {
-            sc.setSourceRect(CGRect {
-                origin: CGPoint {
-                    x: full_w * f64::from(crop.x),
-                    y: full_h * f64::from(crop.y),
-                },
-                size: CGSize {
-                    width: full_w * f64::from(crop.w),
-                    height: full_h * f64::from(crop.h),
-                },
-            });
-        }
+        unsafe { sc.setSourceRect(source_rect(crop, points)) };
     }
 
     unsafe {
-        sc.setStreamName(Some(&NSString::from_str("Varda Screen Capture")));
+        sc.setStreamName(Some(&NSString::from_str("Nida Screen Capture")));
     }
     sc
 }
@@ -603,7 +686,7 @@ impl ScreenCaptureBackend for MacosBackend {
     }
 
     fn next_frame(&mut self) -> Option<CaptureFrame> {
-        let frame = self.slot.try_lock().ok()?.take()?;
+        let frame = self.slot.try_lock().ok()?.pop_front()?;
         // A stream reconfiguration lands asynchronously, so trust the frame over
         // our own bookkeeping.
         self.width = frame.width;
@@ -629,12 +712,19 @@ impl ScreenCaptureBackend for MacosBackend {
         let exclusion_changed = config.exclude_varda != self.config.exclude_varda;
         self.config = config.clone();
 
-        // Recompute from the requested scale, falling back to the current output
-        // when the caller never asked for a specific size.
-        let (base_w, base_h) = config.scale_to.unwrap_or((self.width, self.height));
+        // Recomputed as at the start: the target's pixels, fit within the
+        // size asked for, then cropped.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let native = (
+            ((self.points.0 * self.scale).round() as u32).max(1),
+            ((self.points.1 * self.scale).round() as u32).max(1),
+        );
+        let (base_w, base_h) = config.scale_to.map_or(native, |(w, h)| {
+            super::super::resample::fit_within(native.0, native.1, w, h)
+        });
         let (width, height) = scaled_crop_size(base_w, base_h, config);
 
-        let stream_config = build_configuration(config, width, height);
+        let stream_config = build_configuration(config, width, height, self.points);
         unsafe {
             self.handles
                 .stream
@@ -671,7 +761,6 @@ impl Drop for MacosBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::screen_capture::backend::CropRect;
 
     fn target(w: u32, h: u32) -> CaptureTargetInfo {
         CaptureTargetInfo {
@@ -713,13 +802,13 @@ mod tests {
             ..Default::default()
         };
         // This is the whole bandwidth argument: a 4K display must not deliver 4K.
-        assert_eq!(output_size(&target(3840, 2160), &cfg), (1920, 1080));
+        assert_eq!(output_size(&target(3840, 2160), 1.0, &cfg), (1920, 1080));
     }
 
     #[test]
     fn output_size_falls_back_to_the_target_size() {
         let cfg = CaptureConfig::default();
-        assert_eq!(output_size(&target(1280, 720), &cfg), (1280, 720));
+        assert_eq!(output_size(&target(1280, 720), 1.0, &cfg), (1280, 720));
     }
 
     #[test]
@@ -734,7 +823,7 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(output_size(&target(3840, 2160), &cfg), (960, 540));
+        assert_eq!(output_size(&target(3840, 2160), 1.0, &cfg), (960, 540));
     }
 
     #[test]
@@ -746,7 +835,38 @@ mod tests {
             scale_to: Some((1920, 1080)),
             ..Default::default()
         };
-        assert_eq!(output_size(&target(1000, 800), &cfg), (1000, 800));
+        assert_eq!(output_size(&target(1000, 800), 1.0, &cfg), (1000, 800));
+    }
+
+    /// A Retina display, 1440×900 points of 2880×1800 pixels, is captured
+    /// at its pixels, and fit within the size asked for from there.
+    #[test]
+    fn a_retina_display_is_captured_at_its_pixels() {
+        let retina = target(1440, 900);
+        assert_eq!(
+            output_size(&retina, 2.0, &CaptureConfig::default()),
+            (2880, 1800)
+        );
+        let cfg = CaptureConfig {
+            scale_to: Some((1920, 1200)),
+            ..Default::default()
+        };
+        assert_eq!(output_size(&retina, 2.0, &cfg), (1920, 1200));
+    }
+
+    /// A crop takes the same part of the screen however large the capture:
+    /// it is measured in the target's points, not the delivered pixels.
+    #[test]
+    fn a_crop_takes_its_part_of_the_screen_in_points() {
+        let crop = CropRect {
+            x: 0.25,
+            y: 0.5,
+            w: 0.5,
+            h: 0.25,
+        };
+        let rect = source_rect(crop, (1440.0, 900.0));
+        assert_eq!((rect.origin.x, rect.origin.y), (360.0, 450.0));
+        assert_eq!((rect.size.width, rect.size.height), (720.0, 225.0));
     }
 
     #[test]
@@ -761,7 +881,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let (w, h) = output_size(&target(100, 100), &cfg);
+        let (w, h) = output_size(&target(100, 100), 1.0, &cfg);
         assert!(
             w > 0 && h > 0,
             "degenerate crop must not produce a 0-sized capture"

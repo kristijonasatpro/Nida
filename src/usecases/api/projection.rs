@@ -41,6 +41,8 @@ pub struct PerformanceResponse {
     pub fps: f32,
     pub frame_count: u64,
     pub target_fps: u32,
+    /// How evenly frames are started and shown.
+    pub pacing: crate::engine::PacingSnapshot,
 }
 
 // ── NDI / Syphon projections ────────────────────────────────────────
@@ -172,8 +174,12 @@ pub(crate) mod tests {
     };
     pub(crate) fn make_test_state() -> EngineState {
         EngineState {
+            buses: Vec::new(),
+            rundown: crate::engine::RundownSnapshot::default(),
             mixer: MixerSnapshot {
+                main: crate::mixer::MainSnapshot::default(),
                 channels: vec![ChannelSnapshot {
+                    overlay: false,
                     idx: 0,
                     uuid: "ch-001".into(),
                     name: "Channel A".into(),
@@ -191,6 +197,11 @@ pub(crate) mod tests {
                         depth_prepro_params: None,
                         screen_capture: None,
                         tap: None,
+                        playlist: None,
+                        timer: None,
+                        camera_colour: None,
+                        camera_lowest_latency: None,
+                        camera_profile: None,
                         opacity: 1.0,
                         effective_opacity: 1.0,
                         blend_mode: BlendMode::Normal,
@@ -198,6 +209,8 @@ pub(crate) mod tests {
                         mute: false,
                         transparent: false,
                         scaling_mode: None,
+                        source_size: None,
+                        solid_color: None,
                         generator: ShaderParamsSnapshot {
                             shader_name: "Sine".into(),
                             params: vec![],
@@ -206,10 +219,12 @@ pub(crate) mod tests {
                         video_playback: None,
                         auto_transition: None,
                         render_fps: DeckRenderFps::Auto,
+                        render_scale: crate::deck::DeckRenderScale::default(),
                         effective_render_fps: 0.0,
                         render_cost_us: 0.0,
                         gpu_render_cost_us: 0.0,
                         fps: 60.0,
+                        still: false,
                         source_asleep: false,
                         running_analyzers: vec![],
                     }],
@@ -227,6 +242,9 @@ pub(crate) mod tests {
                 tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
                 active_lut: None,
             },
+            audio_mix: crate::audio_mix::AudioMixSnapshot::default(),
+            stream: crate::streaming::StreamSnapshot::default(),
+            record: crate::record::RecordSnapshot::default(),
             audio: AudioSnapshot {
                 level: 0.0,
                 bass: 0.0,
@@ -263,6 +281,8 @@ pub(crate) mod tests {
                         crate::engine::value::render::ResolvedPresentation::default(),
                     audio_passthrough: None,
                     delivery: None,
+                    source: None,
+                    led: None,
                 }],
                 surfaces: vec![SurfaceSnapshot {
                     uuid: "srf-001".into(),
@@ -284,6 +304,10 @@ pub(crate) mod tests {
                     index: 0,
                     width: 1920,
                     height: 1080,
+                    label: "HDMI-1 (1920×1080)".into(),
+                    model: None,
+                    given_name: None,
+                    refresh_hz: None,
                 }],
             },
             registry: RegistrySnapshot {
@@ -299,6 +323,9 @@ pub(crate) mod tests {
             },
             cameras: CameraSnapshot {
                 devices: vec![("FaceTime".into(), 0u32)],
+                modes: vec![],
+                access_denied: false,
+                video_effects: Vec::new(),
             },
             depth_sensors: crate::engine::DepthSensorSnapshot { devices: vec![] },
             screen_capture: crate::engine::types::ScreenCaptureSnapshot::default(),
@@ -323,9 +350,11 @@ pub(crate) mod tests {
             fps: 60.0,
             frame_count: 100,
             target_fps: 60,
+            pacing: crate::engine::PacingSnapshot::default(),
             ndi_sources: vec!["OBS".into()],
             ndi_available: true,
             syphon_sources: vec![],
+            decklink_devices: vec![],
             syphon_available: false,
             stream_receivers: vec![],
             analyzers: vec![],
@@ -429,6 +458,8 @@ pub(crate) mod tests {
                 frames_dropped: 3,
                 frames_padded: 2,
             }),
+            source: Some(OutputSource::Master),
+            led: None,
         };
         let v = serde_json::to_value(&snap).unwrap();
         assert_eq!(v["target"]["Recording"]["audio_device"], "Scarlett 2i2");

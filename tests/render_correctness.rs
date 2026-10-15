@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use varda::{
     audio::AudioData,
     deck::Deck,
-    mixer::Mixer,
+    mixer::{MainSource, MixMode, Mixer},
     modulation::{AnalyzerValues, AudioValues},
     renderer::context::GpuContext,
     renderer::tonemap::TonemapMode,
@@ -134,7 +134,7 @@ fn read_texture(ctx: &GpuContext, tex: &wgpu::Texture, width: u32, height: u32) 
             depth_or_array_layers: 1,
         },
     );
-    ctx.queue.submit(std::iter::once(encoder.finish()));
+    ctx.submit(std::iter::once(encoder.finish()));
 
     let (tx, rx) = mpsc::channel();
     buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
@@ -333,6 +333,123 @@ fn subsequent_channel_partial_opacity_is_linear() {
     assert_near(px[0], 0.5, 0.1, "chB.R");
     assert_near(px[1], 0.5, 0.1, "chB.G");
     assert_near(px[2], 0.5, 0.1, "chB.B");
+}
+
+/// Translucent Normal decks are alpha-over whatever is below. The GPU's blend
+/// unit now does this instead of the composite shader, so the maths must come
+/// out the same to the last bit that matters: 50% green over red, then 50%
+/// blue over that, is (0.25, 0.25, 0.5) in linear light, fully opaque.
+#[test]
+fn translucent_normal_decks_blend_exactly_over_those_below() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let mut mixer = new_mixer(&ctx);
+    let ch = mixer.channel_mut(0).unwrap();
+    for color in [
+        [1.0, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+    ] {
+        ch.add_deck(Deck::new_solid_color(&ctx, color, W, H).expect("deck"));
+    }
+    ch.set_deck_opacity(1, 0.5);
+    ch.set_deck_opacity(2, 0.5);
+    let px = center(&render_and_read(&ctx, &mut mixer));
+    assert_eq!(mixer.channels()[0].composited_deck_count, 3);
+    assert_near(px[0], 0.25, 2e-3, "R");
+    assert_near(px[1], 0.25, 2e-3, "G");
+    assert_near(px[2], 0.5, 2e-3, "B");
+    assert_near(px[3], 1.0, 2e-3, "A");
+}
+
+/// The same for channels in the mixer, whose composites are premultiplied: a
+/// blue channel at half opacity over a half-white one over black.
+#[test]
+fn translucent_normal_channels_blend_exactly_over_those_below() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let mut mixer = new_mixer(&ctx);
+    mixer
+        .channel_mut(0)
+        .unwrap()
+        .add_deck(Deck::new_solid_color(&ctx, [0.0, 0.0, 0.0, 1.0], W, H).expect("A"));
+    let ch_b = mixer.channel_mut(1).unwrap();
+    ch_b.add_deck(Deck::new_solid_color(&ctx, [1.0, 1.0, 1.0, 1.0], W, H).expect("B"));
+    ch_b.set_deck_opacity(0, 0.5);
+    let c = mixer.add_channel(&ctx, W, H).expect("third channel");
+    let ch_c = mixer.channel_mut(c).unwrap();
+    ch_c.add_deck(Deck::new_solid_color(&ctx, [0.0, 0.0, 1.0, 1.0], W, H).expect("C"));
+    // The channel's own opacity, which the mixer applies while blending.
+    ch_c.opacity = 0.5;
+    mixer.set_crossfader(1.0);
+
+    let px = center(&render_and_read(&ctx, &mut mixer));
+    assert_near(px[0], 0.25, 2e-3, "R");
+    assert_near(px[1], 0.25, 2e-3, "G");
+    assert_near(px[2], 0.75, 2e-3, "B");
+}
+
+/// Add and Screen decks are blended by the GPU's blend unit too, so they must
+/// match the composite shader's formulas: over mid grey, a colour `s` at 50%
+/// coverage gives `0.5 + 0.5·s` (Add) and `0.5 + 0.5·s·0.5` (Screen). The
+/// colour's own alpha supplies the coverage, which exercises drawing a
+/// straight-alpha source premultiplied.
+#[test]
+fn add_and_screen_decks_blend_exactly() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let s = [0.5, 0.25, 1.0];
+    let run = |mode: BlendMode| {
+        let mut mixer = new_mixer(&ctx);
+        let ch = mixer.channel_mut(0).unwrap();
+        ch.add_deck(Deck::new_solid_color(&ctx, [0.5, 0.5, 0.5, 1.0], W, H).expect("grey"));
+        ch.add_deck(Deck::new_solid_color(&ctx, [s[0], s[1], s[2], 0.5], W, H).expect("top"));
+        ch.set_deck_blend_mode(1, mode);
+        center(&render_and_read(&ctx, &mut mixer))
+    };
+    let add = run(BlendMode::Add);
+    let screen = run(BlendMode::Screen);
+    for c in 0..3 {
+        assert_near(add[c], 0.5 + 0.5 * s[c], 2e-3, &format!("add[{c}]"));
+        assert_near(screen[c], 0.5 + 0.25 * s[c], 2e-3, &format!("screen[{c}]"));
+    }
+}
+
+/// The same for channels in the mixer: a channel at 50% opacity added or
+/// screened over a mid-grey one.
+#[test]
+fn add_and_screen_channels_blend_exactly() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let s = [0.5, 0.25, 1.0];
+    let run = |mode: BlendMode| {
+        let mut mixer = new_mixer(&ctx);
+        mixer
+            .channel_mut(0)
+            .unwrap()
+            .add_deck(Deck::new_solid_color(&ctx, [0.0, 0.0, 0.0, 1.0], W, H).expect("A"));
+        mixer
+            .channel_mut(1)
+            .unwrap()
+            .add_deck(Deck::new_solid_color(&ctx, [0.5, 0.5, 0.5, 1.0], W, H).expect("B"));
+        let c = mixer.add_channel(&ctx, W, H).expect("third channel");
+        let ch_c = mixer.channel_mut(c).unwrap();
+        ch_c.add_deck(Deck::new_solid_color(&ctx, [s[0], s[1], s[2], 1.0], W, H).expect("C"));
+        ch_c.opacity = 0.5;
+        ch_c.blend_mode = mode;
+        mixer.set_crossfader(1.0);
+        center(&render_and_read(&ctx, &mut mixer))
+    };
+    let add = run(BlendMode::Add);
+    let screen = run(BlendMode::Screen);
+    for c in 0..3 {
+        assert_near(add[c], 0.5 + 0.5 * s[c], 2e-3, &format!("add[{c}]"));
+        assert_near(screen[c], 0.5 + 0.25 * s[c], 2e-3, &format!("screen[{c}]"));
+    }
 }
 
 // ── Crossfader ───────────────────────────────────────────────────────
@@ -844,6 +961,619 @@ fn deck_effect_transforms_pixels() {
     assert_lo(twice[0], "inverted-twice.R");
     assert_lo(twice[1], "inverted-twice.G");
     assert_lo(twice[2], "inverted-twice.B");
+}
+
+/// Framing tests run at a real output size: crop's old fixed feather was
+/// 0.001 of the frame, far inside the first pixel at the 16px default, so the
+/// border darkening only shows once a pixel is narrower than that.
+const FRAME_W: u32 = 1280;
+const FRAME_H: u32 = 720;
+
+/// A flat deck carrying crop then transform, with `crop_left` set if given.
+fn framed_flat_deck(ctx: &GpuContext, crop_left: Option<f32>) -> Vec<[f32; 4]> {
+    let shaders = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
+    let mut mixer = Mixer::new(ctx, FRAME_W, FRAME_H).expect("mixer");
+    mixer.set_tonemap_mode(&ctx.queue, TonemapMode::Bypass);
+    let deck = Deck::new_solid_color(ctx, [0.8, 0.5, 0.3, 1.0], FRAME_W, FRAME_H).expect("deck");
+    let ch = mixer.channel_mut(0).unwrap();
+    ch.add_deck(deck);
+    for name in ["crop", "transform"] {
+        let shader = varda::isf::ISFShader::from_file(shaders.join(format!("{name}.fs")))
+            .unwrap_or_else(|e| panic!("parse {name}.fs: {e}"));
+        let fx = varda::deck::Effect::new(ctx, shader).expect("deck effect");
+        ch.decks[0].deck.add_effect(fx);
+    }
+    if let Some(left) = crop_left {
+        ch.decks[0].deck.effects[0]
+            .params
+            .set_float("crop_left", left);
+    }
+    render_once(ctx, &mut mixer);
+    read_back(ctx, &mixer, FRAME_W, FRAME_H)
+}
+
+/// Crop and transform ride on every new deck, so at their defaults they must
+/// be invisible — the outermost pixels included. Crop's fixed minimum feather
+/// used to darken the border of every deck: a corner to ~56%, the first and
+/// last columns to ~70%.
+#[test]
+fn default_crop_and_transform_leave_every_pixel_alone() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let pixels = framed_flat_deck(&ctx, None);
+    let reference = pixels[(FRAME_H / 2 * FRAME_W + FRAME_W / 2) as usize];
+    assert!(reference[0] > 0.1, "precondition: the deck is not black");
+    for (i, px) in pixels.iter().enumerate() {
+        let (x, y) = (i as u32 % FRAME_W, i as u32 / FRAME_W);
+        for c in 0..3 {
+            assert!(
+                (px[c] - reference[c]).abs() < 1e-3,
+                "pixel ({x}, {y}) channel {c} is {} where the deck is {}",
+                px[c],
+                reference[c]
+            );
+        }
+    }
+}
+
+/// A crop edge on a pixel boundary cuts exactly there: every column before it
+/// black, every one after untouched, none half-dimmed in between.
+#[test]
+fn a_crop_on_a_pixel_boundary_cuts_cleanly() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let cut = FRAME_W / 4;
+    let pixels = framed_flat_deck(&ctx, Some(cut as f32 / FRAME_W as f32));
+    let row = (FRAME_H / 2 * FRAME_W) as usize;
+    let kept = pixels[row + (FRAME_W / 2) as usize];
+    assert!(kept[0] > 0.1, "precondition: the kept side is not black");
+    for x in 0..FRAME_W {
+        let px = pixels[row + x as usize];
+        let want = if x < cut {
+            [0.0; 3]
+        } else {
+            [kept[0], kept[1], kept[2]]
+        };
+        for c in 0..3 {
+            assert!(
+                (px[c] - want[c]).abs() < 1e-3,
+                "column {x} channel {c} is {}, expected {} (cut at {cut})",
+                px[c],
+                want[c]
+            );
+        }
+    }
+}
+
+/// A flat deck carrying crop then transform, the crop set up by `setup`.
+fn framed_deck_with(
+    ctx: &GpuContext,
+    setup: impl FnOnce(&mut varda::params::ShaderParams),
+) -> Vec<[f32; 4]> {
+    let shaders = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
+    let mut mixer = Mixer::new(ctx, FRAME_W, FRAME_H).expect("mixer");
+    mixer.set_tonemap_mode(&ctx.queue, TonemapMode::Bypass);
+    let deck = Deck::new_solid_color(ctx, [0.8, 0.5, 0.3, 1.0], FRAME_W, FRAME_H).expect("deck");
+    let ch = mixer.channel_mut(0).unwrap();
+    ch.add_deck(deck);
+    for name in ["crop", "transform"] {
+        let shader = varda::isf::ISFShader::from_file(shaders.join(format!("{name}.fs")))
+            .unwrap_or_else(|e| panic!("parse {name}.fs: {e}"));
+        let fx = varda::deck::Effect::new(ctx, shader).expect("deck effect");
+        ch.decks[0].deck.add_effect(fx);
+    }
+    setup(&mut ch.decks[0].deck.effects[0].params);
+    render_once(ctx, &mut mixer);
+    read_back(ctx, &mixer, FRAME_W, FRAME_H)
+}
+
+/// A red border, 20 px at 1080 lines (so 13⅓ px at 720).
+fn red_border(params: &mut varda::params::ShaderParams, radius: f32) {
+    use varda::params::ParamValue;
+    params.set("border_mode", ParamValue::Bool(true));
+    params.set("border_color", ParamValue::Color([1.0, 0.0, 0.0, 1.0]));
+    params.set("border_width", ParamValue::Float(20.0));
+    params.set("border_radius", ParamValue::Float(radius));
+}
+
+/// Within a couple of 8-bit steps: the border's anti-aliased edge is its
+/// own test.
+fn assert_border_rgb(px: [f32; 4], want: [f32; 3], what: &str) {
+    for c in 0..3 {
+        assert!(
+            (px[c] - want[c]).abs() < 0.02,
+            "{what}: channel {c} is {}, expected {} ({px:?})",
+            px[c],
+            want[c]
+        );
+    }
+}
+
+/// vMix's layer border: the colour runs round the inside of the picture's
+/// edge, as thick at 720p as at 4K, and leaves the rest of the picture alone.
+#[test]
+fn a_border_runs_round_the_picture() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let pixels = framed_deck_with(&ctx, |p| red_border(p, 0.0));
+    let at = |x: u32, y: u32| pixels[(y * FRAME_W + x) as usize];
+    let deck = [0.8, 0.5, 0.3];
+    let mid = FRAME_H / 2;
+    assert_border_rgb(at(2, mid), [1.0, 0.0, 0.0], "left edge");
+    assert_border_rgb(at(FRAME_W - 3, mid), [1.0, 0.0, 0.0], "right edge");
+    assert_border_rgb(at(FRAME_W / 2, 2), [1.0, 0.0, 0.0], "one horizontal edge");
+    assert_border_rgb(at(FRAME_W / 2, FRAME_H - 3), [1.0, 0.0, 0.0], "the other");
+    assert_border_rgb(at(11, mid), [1.0, 0.0, 0.0], "still inside 13 px");
+    assert_border_rgb(at(16, mid), deck, "past the border");
+    assert_border_rgb(at(FRAME_W / 2, mid), deck, "the middle");
+}
+
+/// Rounded corners cut the picture's corners away, border and all.
+#[test]
+fn a_rounded_border_cuts_the_corners_away() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let pixels = framed_deck_with(&ctx, |p| red_border(p, 150.0));
+    let at = |x: u32, y: u32| pixels[(y * FRAME_W + x) as usize];
+    assert_border_rgb(at(1, 1), [0.0, 0.0, 0.0], "the very corner is gone");
+    assert_border_rgb(
+        at(2, FRAME_H / 2),
+        [1.0, 0.0, 0.0],
+        "the edge between is bordered",
+    );
+    assert_border_rgb(at(FRAME_W / 2, FRAME_H / 2), [0.8, 0.5, 0.3], "the middle");
+}
+
+/// The border follows the crop: it runs round what is kept.
+#[test]
+fn a_border_follows_the_crop() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let cut = FRAME_W / 4;
+    let pixels = framed_deck_with(&ctx, |p| {
+        red_border(p, 0.0);
+        p.set_float("crop_left", cut as f32 / FRAME_W as f32);
+    });
+    let at = |x: u32, y: u32| pixels[(y * FRAME_W + x) as usize];
+    let mid = FRAME_H / 2;
+    assert_border_rgb(at(cut - 3, mid), [0.0, 0.0, 0.0], "cropped away");
+    assert_border_rgb(
+        at(cut + 3, mid),
+        [1.0, 0.0, 0.0],
+        "the border starts at the cut",
+    );
+    assert_border_rgb(at(cut + 20, mid), [0.8, 0.5, 0.3], "then the picture");
+}
+
+/// Circle: the largest circle inside what the crop keeps — a circle on a
+/// wide frame, not an ellipse — ringed by the border, the rest cut away.
+#[test]
+fn a_circle_border_rounds_the_picture_into_a_circle() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let pixels = framed_deck_with(&ctx, |p| {
+        red_border(p, 0.0);
+        p.set("border_circle", varda::params::ParamValue::Bool(true));
+    });
+    let at = |x: u32, y: u32| pixels[(y * FRAME_W + x) as usize];
+    let (deck, red, gone) = ([0.8, 0.5, 0.3], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+    // Centred on the 1280×720 frame, 360 px across each way; the ring
+    // 13⅓ px, just inside.
+    assert_border_rgb(at(640, 360), deck, "the middle");
+    assert_border_rgb(at(640, 4), red, "the ring at the top");
+    assert_border_rgb(at(640, 20), deck, "inside the ring");
+    assert_border_rgb(at(284, 360), red, "the ring at the left: as wide as high");
+    assert_border_rgb(at(270, 360), gone, "beside the circle");
+    assert_border_rgb(at(400, 80), gone, "outside it, inside the crop");
+}
+
+/// A crop that keeps nothing draws no border either — not a dot of it.
+#[test]
+fn a_crop_that_keeps_nothing_draws_no_border() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    for (border, circle) in [(false, false), (true, false), (true, true)] {
+        // Left and right together on a pixel's centre, and the middle of
+        // what is left of the height on one too: where a stray ring would
+        // show most.
+        let x = 640.5 / FRAME_W as f32;
+        let pixels = framed_deck_with(&ctx, |p| {
+            red_border(p, 100.0);
+            p.set("border_mode", varda::params::ParamValue::Bool(border));
+            p.set("border_circle", varda::params::ParamValue::Bool(circle));
+            p.set_float("crop_left", x);
+            p.set_float("crop_right", x);
+            p.set_float("crop_bottom", 1.0 / FRAME_H as f32);
+        });
+        let lit = pixels.iter().filter(|p| p[0] > 0.01 || p[3] > 0.01).count();
+        assert_eq!(lit, 0, "border {border}, circle {circle}: {lit} pixels drawn");
+    }
+}
+
+// ── Hidden decks ─────────────────────────────────────────────────────
+
+/// A channel of red → green → `top` (bottom to top), rendered once.
+fn stacked(ctx: &GpuContext, top: Deck, setup: impl FnOnce(&mut varda::channel::Channel)) -> Mixer {
+    let mut mixer = new_mixer(ctx);
+    let ch = mixer.channel_mut(0).unwrap();
+    ch.add_deck(Deck::new_solid_color(ctx, [1.0, 0.0, 0.0, 1.0], W, H).expect("red"));
+    ch.add_deck(Deck::new_solid_color(ctx, [0.0, 1.0, 0.0, 1.0], W, H).expect("green"));
+    ch.add_deck(top);
+    setup(ch);
+    mixer
+}
+
+fn composited(mixer: &Mixer) -> usize {
+    mixer.channels()[0].composited_deck_count
+}
+
+fn framing(ctx: &GpuContext, deck: &mut Deck) {
+    let shaders = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
+    for name in ["crop", "transform"] {
+        let shader = varda::isf::ISFShader::from_file(shaders.join(format!("{name}.fs")))
+            .unwrap_or_else(|e| panic!("parse {name}.fs: {e}"));
+        deck.add_effect(varda::deck::Effect::new(ctx, shader).expect("effect"));
+    }
+}
+
+/// A full-frame opaque deck hides everything below it, so those decks are not
+/// composited at all — at 4K each cost a full-frame copy and blend — and the
+/// picture is exactly the top deck, as before.
+#[test]
+fn decks_under_one_that_covers_the_frame_are_not_composited() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let mut top = Deck::new_solid_color(&ctx, [0.0, 0.0, 1.0, 1.0], W, H).expect("blue");
+    framing(&ctx, &mut top); // every new deck carries these, at neutral
+    let mut mixer = stacked(&ctx, top, |_| {});
+    let px = center(&render_and_read(&ctx, &mut mixer));
+    assert_eq!(
+        composited(&mixer),
+        1,
+        "only the covering deck is composited"
+    );
+    assert_lo(px[0], "R");
+    assert_lo(px[1], "G");
+    assert_hi(px[2], "B");
+}
+
+/// Anything that lets the deck below show must keep it composited.
+#[test]
+fn a_top_deck_that_lets_the_ones_below_show_keeps_them() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let blue = || Deck::new_solid_color(&ctx, [0.0, 0.0, 1.0, 1.0], W, H).expect("blue");
+
+    let mut half = stacked(&ctx, blue(), |ch| ch.decks[2].opacity = 0.5);
+    let px = center(&render_and_read(&ctx, &mut half));
+    assert!(composited(&half) > 1, "half opacity");
+    assert!(
+        px[1] > 0.2,
+        "green shows through a half-opacity top: {px:?}"
+    );
+
+    let mut added = stacked(&ctx, blue(), |ch| ch.set_deck_blend_mode(2, BlendMode::Add));
+    let px = center(&render_and_read(&ctx, &mut added));
+    assert!(composited(&added) > 1, "Add blend");
+    assert_hi(px[1], "green under an added blue");
+
+    let see_through = Deck::new_solid_color(&ctx, [0.0, 0.0, 1.0, 0.5], W, H).expect("alpha");
+    let mut translucent = stacked(&ctx, see_through, |_| {});
+    let _ = render_and_read(&ctx, &mut translucent);
+    assert!(composited(&translucent) > 1, "a translucent colour");
+}
+
+/// Top crops the top of the picture and Bottom the bottom, as their names
+/// say — they were the wrong way round.
+#[test]
+fn top_crops_the_top_and_bottom_the_bottom() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let column = |pixels: &[[f32; 4]], y: u32| pixels[(y * FRAME_W + FRAME_W / 2) as usize][0];
+    let pixels = framed_deck_with(&ctx, |c| c.set_float("crop_top", 0.75));
+    assert!(
+        column(&pixels, FRAME_H / 8) < 1e-3,
+        "the top quarter cropped"
+    );
+    assert!(column(&pixels, FRAME_H * 7 / 8) > 0.1, "the bottom kept");
+    let pixels = framed_deck_with(&ctx, |c| c.set_float("crop_bottom", 0.25));
+    assert!(column(&pixels, FRAME_H / 8) > 0.1, "the top kept");
+    assert!(
+        column(&pixels, FRAME_H * 7 / 8) < 1e-3,
+        "the bottom quarter cropped"
+    );
+}
+
+/// Crop and transform count as covering only at their neutral settings: a
+/// real crop opens a hole the deck below shows through.
+#[test]
+fn a_cropped_top_deck_shows_the_deck_below_in_the_hole() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let mut top = Deck::new_solid_color(&ctx, [0.0, 0.0, 1.0, 1.0], W, H).expect("blue");
+    framing(&ctx, &mut top);
+    let mut mixer = stacked(&ctx, top, |ch| {
+        ch.decks[2].deck.effects[0]
+            .params
+            .set_float("crop_left", 0.5);
+    });
+    let pixels = render_and_read(&ctx, &mut mixer);
+    assert!(composited(&mixer) > 1, "a real crop does not cover");
+    let row = (H / 2 * W) as usize;
+    assert_hi(pixels[row + 1][1], "green in the cropped-away left half");
+    assert_hi(
+        pixels[row + (W - 2) as usize][2],
+        "blue in the kept right half",
+    );
+}
+
+/// Flipped, the crop's hole moves to the other side: the deck below shows
+/// on the right, where the kept half of the picture no longer is.
+#[test]
+fn a_flipped_cropped_top_deck_shows_the_deck_below_where_the_hole_went() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let mut top = Deck::new_solid_color(&ctx, [0.0, 0.0, 1.0, 1.0], W, H).expect("blue");
+    framing(&ctx, &mut top);
+    let mut mixer = stacked(&ctx, top, |ch| {
+        let effects = &mut ch.decks[2].deck.effects;
+        effects[0].params.set_float("crop_left", 0.5);
+        effects[1]
+            .params
+            .set("flip_x", varda::params::ParamValue::Bool(true));
+    });
+    let pixels = render_and_read(&ctx, &mut mixer);
+    assert!(composited(&mixer) > 1, "a flipped crop does not cover");
+    let row = (H / 2 * W) as usize;
+    assert_hi(pixels[row + 1][2], "blue: the kept half, mirrored to the left");
+    assert_hi(
+        pixels[row + (W - 2) as usize][1],
+        "green in the hole, now on the right",
+    );
+}
+
+/// A crop that something is moving is not neutral, whatever its value is
+/// this frame, so the deck under it stays composited.
+#[test]
+fn a_modulated_crop_does_not_count_as_covering() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let mut top = Deck::new_solid_color(&ctx, [0.0, 0.0, 1.0, 1.0], W, H).expect("blue");
+    framing(&ctx, &mut top);
+    let crop = top.effects[0].param_prefix().to_string();
+    let mut mixer = stacked(&ctx, top, |_| {});
+    let modulation = mixer.modulation_mut();
+    let lfo = modulation.add_source(varda::modulation::ModulationSource::sine_lfo(1.0));
+    modulation.assign(&format!("{crop}:crop_left"), &lfo, 0.5, None);
+    assert!(
+        !modulation.assignments.is_empty(),
+        "precondition: the crop is modulated"
+    );
+    let _ = render_and_read(&ctx, &mut mixer);
+    assert!(
+        composited(&mixer) > 1,
+        "a modulated crop may open a hole any frame"
+    );
+}
+
+/// A still image renders once, then again only when something it depends on
+/// changes — a PNG re-blitted every frame cost ~100 MB of GPU traffic per slide
+/// at 4K. A texture rebuilt at the same size must be drawn into again, not
+/// left black, and a moving crop renders every frame.
+#[test]
+fn a_still_image_renders_once_until_something_it_depends_on_changes() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slide.png");
+    image::RgbaImage::from_pixel(W, H, image::Rgba([0, 0, 255, 255]))
+        .save(&path)
+        .unwrap();
+    let mut deck = Deck::new_from_image(&ctx, &path, W, H).expect("png");
+    framing(&ctx, &mut deck);
+    let mut mixer = new_mixer(&ctx);
+    mixer.channel_mut(0).unwrap().add_deck(deck);
+    let frames = |m: &Mixer| m.channels()[0].decks[0].deck.rendered_frames();
+
+    for _ in 0..3 {
+        render_once(&ctx, &mut mixer);
+    }
+    assert_eq!(frames(&mixer), 1, "nothing changed after the first frame");
+
+    mixer.channel_mut(0).unwrap().decks[0].deck.effects[0]
+        .params
+        .set_float("crop_left", 0.5);
+    let pixels = render_and_read(&ctx, &mut mixer);
+    assert_eq!(frames(&mixer), 2, "a crop change redraws");
+    let row = (H / 2 * W) as usize;
+    assert_lo(pixels[row + 1][2], "the cropped-away half is gone");
+    assert_hi(pixels[row + (W - 2) as usize][2], "the kept half is blue");
+
+    mixer.channel_mut(0).unwrap().decks[0]
+        .deck
+        .resize(&ctx, W, H);
+    let pixels = render_and_read(&ctx, &mut mixer);
+    assert_eq!(frames(&mixer), 3, "a rebuilt texture is drawn into again");
+    assert_hi(
+        pixels[row + (W - 2) as usize][2],
+        "not left black after a rebuild",
+    );
+
+    let crop = mixer.channels()[0].decks[0].deck.effects[0]
+        .param_prefix()
+        .to_string();
+    let modulation = mixer.modulation_mut();
+    let lfo = modulation.add_source(varda::modulation::ModulationSource::sine_lfo(1.0));
+    modulation.assign(&format!("{crop}:crop_left"), &lfo, 0.1, None);
+    for _ in 0..3 {
+        render_once(&ctx, &mut mixer);
+    }
+    assert_eq!(frames(&mixer), 6, "a moving crop redraws every frame");
+}
+
+/// Crop and transform at neutral settings are not run at all — on a moving
+/// source each was a full-frame pass every frame, ~130 MB at 4K — and start
+/// running the moment a setting moves.
+#[test]
+fn neutral_framing_effects_are_skipped_until_a_setting_moves() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    // A solid colour renders every frame, as a generator or video does.
+    let mut deck = Deck::new_solid_color(&ctx, [0.0, 0.0, 1.0, 1.0], W, H).expect("blue");
+    framing(&ctx, &mut deck);
+    let mut mixer = new_mixer(&ctx);
+    mixer.channel_mut(0).unwrap().add_deck(deck);
+    let runs = |m: &Mixer| {
+        let fx = &m.channels()[0].decks[0].deck.effects;
+        (fx[0].runs(), fx[1].runs())
+    };
+    for _ in 0..3 {
+        render_once(&ctx, &mut mixer);
+    }
+    assert_eq!(runs(&mixer), (0, 0), "neutral crop and transform never run");
+
+    mixer.channel_mut(0).unwrap().decks[0].deck.effects[0]
+        .params
+        .set_float("crop_left", 0.25);
+    let pixels = render_and_read(&ctx, &mut mixer);
+    assert_eq!(runs(&mixer), (1, 0), "only the crop that moved runs");
+    let row = (H / 2 * W) as usize;
+    assert_lo(pixels[row + 1][2], "and it crops");
+}
+
+/// An image counts as covering only when none of its pixels is transparent.
+#[test]
+fn only_an_image_without_transparency_covers_the_frame() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let opaque_path = dir.path().join("opaque.png");
+    let holed_path = dir.path().join("holed.png");
+    image::RgbaImage::from_pixel(W, H, image::Rgba([0, 0, 255, 255]))
+        .save(&opaque_path)
+        .unwrap();
+    let mut holed = image::RgbaImage::from_pixel(W, H, image::Rgba([0, 0, 255, 255]));
+    holed.put_pixel(0, 0, image::Rgba([0, 0, 255, 0]));
+    holed.save(&holed_path).unwrap();
+
+    let opaque = Deck::new_from_image(&ctx, &opaque_path, W, H).expect("opaque png");
+    let mut covered = stacked(&ctx, opaque, |_| {});
+    let _ = render_and_read(&ctx, &mut covered);
+    assert_eq!(composited(&covered), 1, "an opaque PNG covers");
+
+    let with_hole = Deck::new_from_image(&ctx, &holed_path, W, H).expect("holed png");
+    let mut shows = stacked(&ctx, with_hole, |_| {});
+    let pixels = render_and_read(&ctx, &mut shows);
+    assert!(composited(&shows) > 1, "one transparent pixel is enough");
+    assert_hi(pixels[0][1], "green through the transparent pixel");
+}
+
+// ── Transform ────────────────────────────────────────────────────────
+
+/// A 16:9 frame, small enough to read back quickly, big enough to aim at.
+const TW: u32 = 64;
+const TH: u32 = 36;
+
+/// A full-frame white deck through the transform effect, `set` applied to
+/// its parameters; returns the composite.
+fn transformed(
+    ctx: &GpuContext,
+    set: impl FnOnce(&mut varda::params::ShaderParams),
+) -> Vec<[f32; 4]> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/transform.fs");
+    let mut mixer = Mixer::new(ctx, TW, TH).expect("mixer");
+    mixer.set_tonemap_mode(&ctx.queue, TonemapMode::Bypass);
+    let mut deck = Deck::new_solid_color(ctx, [1.0, 1.0, 1.0, 1.0], TW, TH).expect("deck");
+    let shader = varda::isf::ISFShader::from_file(&path).expect("transform.fs");
+    deck.add_effect(varda::deck::Effect::new(ctx, shader).expect("effect"));
+    set(&mut deck.effects[0].params);
+    mixer.channel_mut(0).unwrap().add_deck(deck);
+    render_once(ctx, &mut mixer);
+    read_back(ctx, &mixer, TW, TH)
+}
+
+fn at(pixels: &[[f32; 4]], x: u32, y: u32) -> f32 {
+    pixels[(y * TW + x) as usize][0]
+}
+
+/// Position is in frame units whatever the scale. It used to be multiplied
+/// by the scale, so a quarter-size picture could only travel a quarter of the
+/// way and never reached the corner.
+#[test]
+fn a_small_picture_can_be_moved_into_the_corner() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let px = transformed(&ctx, |p| {
+        p.set_float("scale", 0.25);
+        p.set_float("pos_x", 0.375);
+        p.set_float("pos_y", 0.375);
+    });
+    assert_hi(at(&px, 62, 34), "the picture fills the corner");
+    assert_lo(at(&px, 47, 26), "and nothing just outside it");
+    assert_lo(at(&px, 32, 18), "the centre is empty");
+}
+
+/// Rotation turns the picture about its own centre, wherever it was moved,
+/// and keeps its shape: a 16×9-pixel picture turned 90° is 9 wide and 16
+/// tall. It used to swing around the frame centre, squashed by the aspect.
+#[test]
+fn rotation_turns_the_picture_about_its_own_centre() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let px = transformed(&ctx, |p| {
+        p.set_float("scale", 0.25);
+        p.set_float("pos_x", 0.25);
+        p.set_float("rotation", std::f32::consts::FRAC_PI_2);
+    });
+    assert_hi(at(&px, 48, 18), "still centred where it was moved");
+    assert_hi(at(&px, 48, 12), "16 pixels tall once turned");
+    assert_lo(at(&px, 54, 18), "9 pixels wide once turned");
+    assert_lo(at(&px, 32, 18), "not swung back to the middle");
+}
+
+/// Scale keeps proportions. The X/Y sliders only stretch the picture once
+/// "Separate X / Y scale" is on, so it cannot be distorted by accident.
+#[test]
+fn scale_keeps_proportions_until_x_and_y_are_separated() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let half = transformed(&ctx, |p| p.set_float("scale", 0.5));
+    assert_hi(at(&half, 20, 18), "half size, inside");
+    assert_lo(at(&half, 12, 18), "half size, outside the left edge");
+    assert_lo(at(&half, 32, 5), "half size, above the top edge");
+
+    let locked = transformed(&ctx, |p| {
+        p.set_float("scale", 0.5);
+        p.set_float("scale_x", 2.0);
+    });
+    assert_lo(at(&locked, 12, 18), "X does nothing while locked");
+
+    let stretched = transformed(&ctx, |p| {
+        p.set_float("scale", 0.5);
+        p.set_float("scale_x", 2.0);
+        p.set_bool("scale_mode", true);
+    });
+    assert_hi(at(&stretched, 12, 18), "twice as wide once separated");
+    assert_lo(at(&stretched, 32, 5), "and no taller");
 }
 
 // ── Generator framing ────────────────────────────────────────────────
@@ -1843,10 +2573,12 @@ fn chroma_flow_regenerates_from_the_source() {
 
 // ── Program / channel tap ────────────────────────────────────────────
 //
-// See /spec/program-tap.md. The contract these pin is that a tap shows the
-// *previous* frame, uniformly, regardless of where the tapping deck sits in
-// the channel order. That is what makes feedback loops terminate, so it must
-// fail loudly if someone later "optimizes" a tap into reading the live target.
+// See /spec/program-tap.md. A deck showing another channel shows that
+// channel's picture of this same frame, whichever of the two comes first:
+// the channel it shows is rendered first. Only round a loop — a channel
+// showing itself, or two showing each other — does a tap show the frame
+// before, which is what makes a feedback loop settle; and the master, which
+// is composited after every channel, is always the frame before.
 
 /// Advance the mixer the way the app does: resolve taps, then render.
 fn render_frame_with_taps(ctx: &GpuContext, mixer: &mut Mixer) {
@@ -1854,12 +2586,10 @@ fn render_frame_with_taps(ctx: &GpuContext, mixer: &mut Mixer) {
     render_once(ctx, mixer);
 }
 
-/// A tap in a *later* channel than the one it reads. This is the direction a
-/// naive implementation gets wrong: channel 0 has already composited by the
-/// time channel 1's decks render, so binding it directly would show the
-/// current frame's red on frame one.
+/// A channel shown in a later channel: its picture of this frame, on the
+/// very first frame, with no second target kept for it.
 #[test]
-fn tap_shows_the_previous_frame_not_the_current_one() {
+fn a_channel_shown_in_another_shows_this_frame() {
     let Some(ctx) = headless_gpu() else {
         return;
     };
@@ -1874,23 +2604,20 @@ fn tap_shows_the_previous_frame_not_the_current_one() {
     mixer.set_crossfader(1.0);
 
     render_frame_with_taps(&ctx, &mut mixer);
-    let first = center(&read_back(&ctx, &mixer, W, H));
-    assert_lo(
-        first[0],
-        "frame 1 tap must be black — channel 0 composited earlier in this same \
-         frame, and showing its red would mean the tap read the live target",
+    assert_hi(
+        center(&read_back(&ctx, &mixer, W, H))[0],
+        "frame 1 already shows channel 0's red",
     );
-
-    render_frame_with_taps(&ctx, &mut mixer);
-    let second = center(&read_back(&ctx, &mixer, W, H));
-    assert_hi(second[0], "frame 2 tap must show frame 1's red");
+    assert!(
+        mixer.has_no_tap_targets(),
+        "a channel shown this frame needs no second target"
+    );
 }
 
-/// The same assertion with the tap in an *earlier* channel than its source.
-/// Both directions agreeing is what proves the double buffer removed the
-/// ordering dependence rather than merely reversing it.
+/// The same with the showing deck in an *earlier* channel than the one it
+/// shows: that channel is rendered first all the same.
 #[test]
-fn tap_latency_does_not_depend_on_channel_order() {
+fn a_channel_shown_in_an_earlier_one_is_rendered_first() {
     let Some(ctx) = headless_gpu() else {
         return;
     };
@@ -1905,16 +2632,90 @@ fn tap_latency_does_not_depend_on_channel_order() {
     mixer.set_crossfader(0.0);
 
     render_frame_with_taps(&ctx, &mut mixer);
-    assert_lo(
-        center(&read_back(&ctx, &mixer, W, H))[0],
-        "frame 1 tap must be black in the earlier-channel direction too",
-    );
-
-    render_frame_with_taps(&ctx, &mut mixer);
     assert_hi(
         center(&read_back(&ctx, &mixer, W, H))[0],
-        "frame 2 tap must show frame 1's red, exactly as in the other direction",
+        "frame 1 shows channel 1's red in channel 0",
     );
+}
+
+/// Two channels showing each other can't both go first: the one that does
+/// shows the other's frame before, the other shows this frame — and neither
+/// hangs or runs away.
+#[test]
+fn channels_showing_each_other_take_turns_a_frame_apart() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let mut mixer = new_mixer(&ctx);
+    let ch0_uuid = mixer.channel(0).unwrap().uuid().to_string();
+    let ch1_uuid = mixer.channel(1).unwrap().uuid().to_string();
+    let tap = |uuid: &str| {
+        Deck::new_from_tap(
+            &ctx,
+            varda::deck::TapSource::Channel(uuid.into()),
+            "tap",
+            W,
+            H,
+        )
+        .expect("tap deck")
+    };
+    // Channel 0: channel 1's picture under a red half; channel 1: channel 0.
+    mixer.channel_mut(0).unwrap().add_deck(tap(&ch1_uuid));
+    let mut red = Deck::new_solid_color(&ctx, [1.0, 0.0, 0.0, 1.0], W, H).expect("red");
+    framing(&ctx, &mut red);
+    red.effects[0].params.set_float("crop_right", 0.5);
+    mixer.channel_mut(0).unwrap().add_deck(red);
+    mixer.channel_mut(1).unwrap().add_deck(tap(&ch0_uuid));
+    mixer.set_crossfader(1.0);
+
+    render_frame_with_taps(&ctx, &mut mixer);
+    let ch1 = read_texture(&ctx, &mixer.channel(1).unwrap().composite_texture, W, H);
+    assert_hi(
+        ch1[(H / 2 * W + 2) as usize][0],
+        "channel 1 shows channel 0's red at once",
+    );
+    assert!(!mixer.has_no_tap_targets(), "the loop keeps one frame back");
+    for frame in 0..6 {
+        render_frame_with_taps(&ctx, &mut mixer);
+        let px = center(&read_back(&ctx, &mixer, W, H));
+        assert!(px.iter().all(|v| v.is_finite()), "frame {frame}: {px:?}");
+    }
+}
+
+/// A channel's picture is premultiplied; shown as a layer it comes out as
+/// it was, soft edges and all, not darkened by being multiplied twice.
+#[test]
+fn a_translucent_channel_shown_in_another_comes_out_as_it_was() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let mut mixer = new_mixer(&ctx);
+    let ch0_uuid = mixer.channel(0).unwrap().uuid().to_string();
+    let half_red = Deck::new_solid_color(&ctx, [1.0, 0.2, 0.0, 0.5], W, H).expect("solid");
+    mixer.channel_mut(0).unwrap().add_deck(half_red);
+    let mut tap = Deck::new_from_tap(&ctx, varda::deck::TapSource::Channel(ch0_uuid), "tap", W, H)
+        .expect("tap deck");
+    tap.set_transparent(true);
+    mixer.channel_mut(1).unwrap().add_deck(tap);
+    // Channel 1 up; channel 0 renders as the one shown.
+    mixer.set_crossfader(1.0);
+
+    render_frame_with_taps(&ctx, &mut mixer);
+    let original = center(&read_texture(
+        &ctx,
+        &mixer.channel(0).unwrap().composite_texture,
+        W,
+        H,
+    ));
+    let shown = center(&read_texture(
+        &ctx,
+        &mixer.channel(1).unwrap().composite_texture,
+        W,
+        H,
+    ));
+    for i in 0..4 {
+        assert_near(shown[i], original[i], 2e-3, &format!("channel {i}"));
+    }
 }
 
 /// A master tap is uniformly one frame behind for the same reason: every deck
@@ -1927,12 +2728,15 @@ fn master_tap_shows_the_previous_frame() {
     let mut mixer = new_mixer(&ctx);
 
     // The tap deck sits *under* the red deck in the same channel: an opaque
-    // Normal blend covers it, so the program is always exactly red, while the
-    // tap deck still renders every frame. Parking it in the far channel instead
-    // would fade that channel out, and a fully faded channel is culled — the
-    // deck would never render and this would measure the cull, not the tap.
+    // Normal blend covers it, so the program is always exactly red. A deck
+    // hidden like that is not rendered, so it is marked as shown on its own
+    // elsewhere (alone on a bus, say), which keeps it rendering every frame.
+    // Parking it in the far channel instead would fade that channel out, and
+    // a fully faded channel is culled — this would measure the cull, not the
+    // tap.
     let tap = Deck::new_from_tap(&ctx, varda::deck::TapSource::MasterProgram, "tap", W, H)
         .expect("tap deck");
+    mixer.decks_shown_alone = vec![tap.uuid().to_string()];
     mixer.channel_mut(0).unwrap().add_deck(tap);
     let red = Deck::new_solid_color(&ctx, [1.0, 0.0, 0.0, 1.0], W, H).expect("solid deck");
     mixer.channel_mut(0).unwrap().add_deck(red);
@@ -2003,21 +2807,417 @@ fn a_scene_without_taps_allocates_no_tap_targets() {
         "a scene with no tap decks must not allocate any tap render target"
     );
 
-    // ...and adding one, then removing it, gives the memory back.
+    // ...and a channel showing itself, which keeps its frame before, gives
+    // the memory back once it stops.
     let ch0_uuid = mixer.channel(0).unwrap().uuid().to_string();
     let tap = Deck::new_from_tap(&ctx, varda::deck::TapSource::Channel(ch0_uuid), "tap", W, H)
         .expect("tap deck");
-    let idx = mixer.channel_mut(1).unwrap().add_deck(tap);
+    let idx = mixer.channel_mut(0).unwrap().add_deck(tap);
     render_frame_with_taps(&ctx, &mut mixer);
     assert!(
         !mixer.has_no_tap_targets(),
-        "a tapped channel must have a tap target"
+        "a channel showing itself must have a tap target"
     );
 
-    mixer.channel_mut(1).unwrap().remove_deck_slot(idx);
+    mixer.channel_mut(0).unwrap().remove_deck_slot(idx);
     render_frame_with_taps(&ctx, &mut mixer);
     assert!(
         mixer.has_no_tap_targets(),
         "removing the last tap deck must release the tap target"
     );
+}
+
+// ─── Bus dissolve (the fade an AUTO shows on air) ───────────────────────────
+
+/// A `W`x`H` compositing texture cleared to one linear colour.
+fn solid_texture(ctx: &GpuContext, width: u32, height: u32, rgba: [f64; 4]) -> wgpu::Texture {
+    let tex = ctx.create_compositing_texture(width, height);
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("solid clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: rgba[0],
+                        g: rgba[1],
+                        b: rgba[2],
+                        a: rgba[3],
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+    }
+    ctx.submit(std::iter::once(encoder.finish()));
+    tex
+}
+
+/// Dissolve `from` into `to` at `mix` and read back the centre pixel.
+fn dissolve_center(
+    ctx: &GpuContext,
+    from: &wgpu::Texture,
+    to: &wgpu::Texture,
+    mix: f32,
+) -> [f32; 4] {
+    use varda::renderer::dissolve::DissolvePipeline;
+
+    let pipeline = DissolvePipeline::new(&ctx.device, ctx.compositing_format);
+    let params = pipeline.params_buffer(&ctx.device);
+    let target = ctx.create_compositing_texture(W, H);
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    pipeline.render(
+        &ctx.device,
+        &ctx.queue,
+        &mut encoder,
+        &from.create_view(&wgpu::TextureViewDescriptor::default()),
+        &to.create_view(&wgpu::TextureViewDescriptor::default()),
+        mix,
+        &params,
+        &target_view,
+    );
+    ctx.submit(std::iter::once(encoder.finish()));
+    center(&read_texture(ctx, &target, W, H))
+}
+
+#[test]
+fn a_dissolve_blends_its_two_pictures_by_the_mix() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let red = solid_texture(&ctx, W, H, [1.0, 0.0, 0.0, 1.0]);
+    let green = solid_texture(&ctx, W, H, [0.0, 1.0, 0.0, 1.0]);
+
+    let start = dissolve_center(&ctx, &red, &green, 0.0);
+    assert_near(start[0], 1.0, 0.01, "mix 0 is all `from` (red)");
+    assert_lo(start[1], "mix 0 has none of `to` (green)");
+
+    let quarter = dissolve_center(&ctx, &red, &green, 0.25);
+    assert_near(quarter[0], 0.75, 0.01, "a quarter in keeps 75% red");
+    assert_near(quarter[1], 0.25, 0.01, "a quarter in shows 25% green");
+
+    let end = dissolve_center(&ctx, &red, &green, 1.0);
+    assert_lo(end[0], "mix 1 has none of `from` (red)");
+    assert_near(end[1], 1.0, 0.01, "mix 1 is all `to` (green)");
+}
+
+#[test]
+fn a_dissolve_from_the_one_pixel_black_source_covers_the_frame() {
+    // A black end is the mixer's 1x1 black texture; sampled by UV it must read
+    // black across the whole frame, not stretch some stray texel.
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let black = solid_texture(&ctx, 1, 1, [0.0, 0.0, 0.0, 1.0]);
+    let green = solid_texture(&ctx, W, H, [0.0, 1.0, 0.0, 1.0]);
+
+    let half = dissolve_center(&ctx, &black, &green, 0.5);
+    assert_lo(half[0], "no red from a black-to-green fade");
+    assert_near(half[1], 0.5, 0.01, "halfway from black is half green");
+}
+
+// ── Main mode ────────────────────────────────────────────────────────
+
+/// Three channels, red, green and blue, with the mixer in Main mode.
+fn rgb_program_mixer(ctx: &GpuContext) -> (Mixer, [String; 3]) {
+    let mut mixer = new_mixer(ctx);
+    mixer.add_channel(ctx, W, H).expect("third channel");
+    let colors = [
+        [1.0, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+    ];
+    for (i, color) in colors.into_iter().enumerate() {
+        mixer
+            .channel_mut(i)
+            .unwrap()
+            .add_deck(Deck::new_solid_color(ctx, color, W, H).expect("deck"));
+    }
+    mixer.set_mix_mode(MixMode::Program);
+    // Long, so a fade stands still while the test looks at it.
+    mixer.main_mut().fade_secs = 1000.0;
+    let uuid = |i: usize| mixer.channel(i).unwrap().uuid().to_string();
+    let uuids = [uuid(0), uuid(1), uuid(2)];
+    (mixer, uuids)
+}
+
+fn assert_rgb(px: [f32; 4], rgb: [f32; 3], label: &str) {
+    for c in 0..3 {
+        assert_near(px[c], rgb[c], 3e-3, &format!("{label}[{c}]"));
+    }
+}
+
+#[test]
+fn main_shows_only_the_channel_taken_to_it() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let (mut mixer, ch) = rgb_program_mixer(&ctx);
+    assert_rgb(
+        center(&render_and_read(&ctx, &mut mixer)),
+        [0.0; 3],
+        "nothing on Main is black",
+    );
+    mixer
+        .main_mut()
+        .take(MainSource::Channel(ch[1].clone()), false);
+    assert_rgb(
+        center(&render_and_read(&ctx, &mut mixer)),
+        [0.0, 1.0, 0.0],
+        "green alone",
+    );
+    mixer
+        .main_mut()
+        .take(MainSource::Channel(ch[2].clone()), false);
+    assert_rgb(
+        center(&render_and_read(&ctx, &mut mixer)),
+        [0.0, 0.0, 1.0],
+        "a cut to blue",
+    );
+}
+
+#[test]
+fn a_fade_to_main_is_a_true_dissolve() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let (mut mixer, ch) = rgb_program_mixer(&ctx);
+    mixer
+        .main_mut()
+        .take(MainSource::Channel(ch[0].clone()), false);
+    mixer
+        .main_mut()
+        .take(MainSource::Channel(ch[1].clone()), true);
+    mixer.main_mut().fade.as_mut().unwrap().progress = 0.25;
+    assert_rgb(
+        center(&render_and_read(&ctx, &mut mixer)),
+        [0.75, 0.25, 0.0],
+        "a quarter of the way from red to green",
+    );
+    // Fading to black takes the old picture down, not the new one up.
+    mixer.main_mut().fade = None;
+    mixer.main_mut().take(MainSource::Black, true);
+    mixer.main_mut().fade.as_mut().unwrap().progress = 0.25;
+    assert_rgb(
+        center(&render_and_read(&ctx, &mut mixer)),
+        [0.0, 0.75, 0.0],
+        "a quarter to black",
+    );
+}
+
+#[test]
+fn an_overlay_shows_over_whatever_is_on_main() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let (mut mixer, ch) = rgb_program_mixer(&ctx);
+    // Blue becomes a half-strength overlay.
+    let blue = mixer.channel_mut(2).unwrap();
+    blue.overlay = true;
+    blue.opacity = 0.5;
+    mixer
+        .main_mut()
+        .take(MainSource::Channel(ch[1].clone()), false);
+    mixer.main_mut().set_overlay(&ch[2], true, false);
+    assert_rgb(
+        center(&render_and_read(&ctx, &mut mixer)),
+        [0.0, 0.5, 0.5],
+        "half blue over green",
+    );
+    mixer
+        .main_mut()
+        .take(MainSource::Channel(ch[0].clone()), false);
+    assert_rgb(
+        center(&render_and_read(&ctx, &mut mixer)),
+        [0.5, 0.0, 0.5],
+        "the overlay stays over the next take",
+    );
+    mixer.main_mut().set_overlay(&ch[2], false, false);
+    assert_rgb(
+        center(&render_and_read(&ctx, &mut mixer)),
+        [1.0, 0.0, 0.0],
+        "off again",
+    );
+}
+
+#[test]
+fn a_deck_taken_alone_shows_without_the_rest_of_its_channel() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let (mut mixer, _) = rgb_program_mixer(&ctx);
+    // Red now has half-white over it in the same channel.
+    let red = mixer.channel_mut(0).unwrap();
+    red.add_deck(Deck::new_solid_color(&ctx, [1.0, 1.0, 1.0, 0.5], W, H).expect("top"));
+    let red_deck = red.decks[0].deck.uuid().to_string();
+    let red_channel = red.uuid().to_string();
+    mixer
+        .main_mut()
+        .take(MainSource::Channel(red_channel), false);
+    assert_rgb(
+        center(&render_and_read(&ctx, &mut mixer)),
+        [1.0, 0.5, 0.5],
+        "the channel",
+    );
+    mixer.main_mut().take(MainSource::Deck(red_deck), false);
+    assert_rgb(
+        center(&render_and_read(&ctx, &mut mixer)),
+        [1.0, 0.0, 0.0],
+        "the deck alone",
+    );
+}
+
+#[test]
+fn the_layered_mix_is_untouched_until_main_mode_is_on() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let (mut mixer, ch) = rgb_program_mixer(&ctx);
+    mixer
+        .main_mut()
+        .take(MainSource::Channel(ch[0].clone()), false);
+    mixer.set_mix_mode(MixMode::Layered);
+    // Three channels, all at full opacity: the top one covers the rest.
+    assert_rgb(
+        center(&render_and_read(&ctx, &mut mixer)),
+        [0.0, 0.0, 1.0],
+        "layered",
+    );
+}
+
+/// A logo with a transparent background as an overlay: Main shows through
+/// round it, whatever its scaling and framing. It showed a black box.
+#[test]
+fn a_transparent_png_overlay_lets_main_show_round_it() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("logo.png");
+    // Wider than the frame, transparent but for a white middle.
+    let (lw, lh) = (W * 2, H);
+    let mut logo = image::RgbaImage::from_pixel(lw, lh, image::Rgba([0, 0, 0, 0]));
+    for y in lh / 3..lh * 2 / 3 {
+        for x in lw * 2 / 5..lw * 3 / 5 {
+            logo.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+        }
+    }
+    logo.save(&path).unwrap();
+    for mode in [
+        varda::deck::ScalingMode::Fit,
+        varda::deck::ScalingMode::Fill,
+        varda::deck::ScalingMode::Center,
+    ] {
+        let (mut mixer, ch) = rgb_program_mixer(&ctx);
+        let mut deck = Deck::new_from_image(&ctx, &path, W, H).expect("png");
+        deck.set_scaling_mode(mode);
+        framing(&ctx, &mut deck);
+        let overlay = mixer.channel_mut(2).unwrap();
+        overlay.decks.clear();
+        overlay.add_deck(deck);
+        overlay.overlay = true;
+        mixer
+            .main_mut()
+            .take(MainSource::Channel(ch[0].clone()), false);
+        mixer.main_mut().set_overlay(&ch[2], true, false);
+        let pixels = render_and_read(&ctx, &mut mixer);
+        assert_rgb(
+            pixels[(H / 2 * W + 1) as usize],
+            [1.0, 0.0, 0.0],
+            &format!("{mode:?}: red round the logo"),
+        );
+        assert_rgb(
+            pixels[(2 * W + W / 2) as usize],
+            [1.0, 0.0, 0.0],
+            &format!("{mode:?}: and above it"),
+        );
+    }
+}
+
+/// A logo drawn on black, as an overlay blended with Screen: the black drops
+/// away and Main shows through; the logo stays bright.
+#[test]
+fn an_overlay_on_black_blended_with_screen_drops_the_black() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("logo_on_black.png");
+    let mut logo = image::RgbaImage::from_pixel(W, H, image::Rgba([0, 0, 0, 255]));
+    for y in H / 3..H * 2 / 3 {
+        for x in W / 3..W * 2 / 3 {
+            logo.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+        }
+    }
+    logo.save(&path).unwrap();
+    let (mut mixer, ch) = rgb_program_mixer(&ctx);
+    let overlay = mixer.channel_mut(2).unwrap();
+    overlay.decks.clear();
+    overlay.add_deck(Deck::new_from_image(&ctx, &path, W, H).expect("png"));
+    overlay.overlay = true;
+    overlay.blend_mode = varda::BlendMode::Screen;
+    mixer
+        .main_mut()
+        .take(MainSource::Channel(ch[0].clone()), false);
+    mixer.main_mut().set_overlay(&ch[2], true, false);
+    let pixels = render_and_read(&ctx, &mut mixer);
+    assert_rgb(
+        pixels[(H / 2 * W + 1) as usize],
+        [1.0, 0.0, 0.0],
+        "red where the logo is black",
+    );
+    assert_rgb(center(&pixels), [1.0, 1.0, 1.0], "the logo itself");
+}
+
+/// A picture added now fits the frame whole, as vMix adds it.
+#[test]
+fn a_new_picture_is_fitted_whole() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tall.png");
+    image::RgbaImage::from_pixel(9, 16, image::Rgba([0, 0, 255, 255]))
+        .save(&path)
+        .unwrap();
+    let deck = Deck::new_from_image(&ctx, &path, W, H).expect("png");
+    assert_eq!(deck.scaling_mode(), Some(varda::deck::ScalingMode::Fit));
+}
+
+/// Fit's bars are transparent now, so an opaque picture of another shape no
+/// longer hides the layers below it; filled, it still does.
+#[test]
+fn a_fitted_picture_with_bars_does_not_cover_the_frame() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tall.png");
+    image::RgbaImage::from_pixel(9, 16, image::Rgba([0, 0, 255, 255]))
+        .save(&path)
+        .unwrap();
+    let fitted = Deck::new_from_image(&ctx, &path, W, H).expect("png");
+    let mut shows = stacked(&ctx, fitted, |_| {});
+    let pixels = render_and_read(&ctx, &mut shows);
+    assert!(composited(&shows) > 1, "the layers below still draw");
+    assert_hi(pixels[(H / 2 * W + 1) as usize][1], "green through the bar");
+
+    let mut filled = Deck::new_from_image(&ctx, &path, W, H).expect("png");
+    filled.set_scaling_mode(varda::deck::ScalingMode::Fill);
+    let mut covered = stacked(&ctx, filled, |_| {});
+    let _ = render_and_read(&ctx, &mut covered);
+    assert_eq!(composited(&covered), 1, "filled, it covers");
 }

@@ -112,7 +112,7 @@ fn bench_presentation(c: &mut Criterion) {
                             });
                             pipeline.render(&mut pass, &bind_group);
                         }
-                        context.queue.submit([encoder.finish()]);
+                        context.submit([encoder.finish()]);
                         let _ = context.device.poll(wgpu::PollType::wait_indefinitely());
                     });
                 },

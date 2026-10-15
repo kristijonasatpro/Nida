@@ -365,7 +365,7 @@ impl MidiDeviceManager {
 
         // Snapshot output port names (throwaway MidiOutput, collect names, drop)
         let output_port_names: Vec<String> = {
-            let midi_out = MidiOutput::new("Varda scan")
+            let midi_out = MidiOutput::new("Nida scan")
                 .map_err(|e| anyhow::anyhow!("Failed to create MidiOutput for scan: {e}"))?;
             let ports = midi_out.ports();
             ports
@@ -376,7 +376,7 @@ impl MidiDeviceManager {
 
         // Snapshot input port names (throwaway MidiInput, collect names, drop)
         let input_port_names: Vec<String> = {
-            let midi_in = MidiInput::new("Varda scan")
+            let midi_in = MidiInput::new("Nida scan")
                 .map_err(|e| anyhow::anyhow!("Failed to create MidiInput for scan: {e}"))?;
             let ports = midi_in.ports();
             ports
@@ -450,7 +450,7 @@ impl MidiDeviceManager {
             // new CoreMIDI client and port ordering may differ between instances.
             let tx = self.sender.clone();
             let dev_id = device_id;
-            let port_label = format!("Varda In {device_id}");
+            let port_label = format!("Nida In {device_id}");
             match MidiInput::new(&port_label) {
                 Ok(midi_in) => {
                     let ports = midi_in.ports();
@@ -526,14 +526,14 @@ impl MidiDeviceManager {
 
     /// Connect an output port by name and store the connection.
     fn connect_output(&mut self, device_id: DeviceId, port_name: &str) {
-        match MidiOutput::new(&format!("Varda Out {device_id}")) {
+        match MidiOutput::new(&format!("Nida Out {device_id}")) {
             Ok(midi_out) => {
                 let ports = midi_out.ports();
                 let port = ports
                     .iter()
                     .find(|p| midi_out.port_name(p).is_ok_and(|n| n == port_name));
                 if let Some(port) = port {
-                    match midi_out.connect(port, &format!("Varda Out {device_id}")) {
+                    match midi_out.connect(port, &format!("Nida Out {device_id}")) {
                         Ok(conn) => {
                             self.output_connections.insert(device_id, Mutex::new(conn));
                         }
@@ -886,14 +886,20 @@ impl MidiConfig {
     /// Returns an error if the config cannot be serialized to JSON or if the
     /// atomic write to `path` fails (missing directory, permissions, disk full).
     pub fn save<P: AsRef<std::path::Path>>(&self, path: P) -> anyhow::Result<()> {
+        crate::persistence::atomic_write(path.as_ref(), &self.to_json()?)
+    }
+
+    /// The text [`MidiConfig::save`] writes, its problems logged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be serialized to JSON.
+    pub fn to_json(&self) -> anyhow::Result<String> {
         let errors = self.validate();
         for e in &errors {
             log::error!("MIDI config save: {e}");
         }
-        let content =
-            serde_json::to_string_pretty(self).context("Failed to serialize MIDI config")?;
-        crate::persistence::atomic_write(path.as_ref(), &content)?;
-        Ok(())
+        serde_json::to_string_pretty(self).context("Failed to serialize MIDI config")
     }
 }
 

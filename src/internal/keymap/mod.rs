@@ -124,6 +124,14 @@ pub enum ActionId {
     Copy,
     Paste,
     Duplicate,
+    /// Main mode: put the selected channel on Main at once (an overlay is
+    /// switched on or off). Space by default.
+    CutToMain,
+    /// Main mode: fade the selected channel onto Main. Enter by default.
+    FadeToMain,
+    /// Take the rundown's next step with a fade: GO. No key by default —
+    /// one is learned on the Rundown panel's GO button.
+    RundownGo,
 }
 
 /// Persistent keymap store. Mirrors `MidiMappingStore` pattern.
@@ -161,6 +169,22 @@ impl KeymapStore {
     pub fn defaults() -> HashMap<KeyCombo, KeyTarget> {
         let mut m = HashMap::new();
         let action = |id: ActionId| KeyTarget::Action(id);
+
+        // Main mode takes, as a vMix operator binds them.
+        for (key, id) in [
+            ("Space", ActionId::CutToMain),
+            ("Enter", ActionId::FadeToMain),
+        ] {
+            m.insert(
+                KeyCombo {
+                    key: key.into(),
+                    command: false,
+                    shift: false,
+                    alt: false,
+                },
+                action(id),
+            );
+        }
 
         // Global shortcuts
         m.insert(
@@ -491,14 +515,21 @@ impl KeymapConfig {
     /// Returns an error if the config cannot be serialized to JSON or if the
     /// atomic write to `path` fails (missing directory, permissions, disk full).
     pub fn save<P: AsRef<std::path::Path>>(&self, path: P) -> anyhow::Result<()> {
+        crate::persistence::atomic_write(path.as_ref(), &self.to_json()?)
+    }
+
+    /// The text [`KeymapConfig::save`] writes, its problems logged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be serialized to JSON.
+    pub fn to_json(&self) -> anyhow::Result<String> {
         let errors = self.validate();
         for e in &errors {
             log::error!("Keymap config save: {e}");
         }
-        let content = serde_json::to_string_pretty(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize keymap config: {e}"))?;
-        crate::persistence::atomic_write(path.as_ref(), &content)?;
-        Ok(())
+        serde_json::to_string_pretty(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize keymap config: {e}"))
     }
 }
 

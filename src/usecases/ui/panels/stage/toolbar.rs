@@ -32,12 +32,12 @@ pub(super) fn render(
             ),
             (
                 DrawingTool::Polygon,
-                "⬠ Polygon",
+                "⬟ Polygon",
                 "Draw polygon surfaces — click to add vertices, double-click to finish (P)",
             ),
             (
                 DrawingTool::Circle,
-                "⬤ Circle",
+                "● Circle",
                 "Draw circle/N-gon surfaces (C)",
             ),
             (
@@ -70,7 +70,7 @@ pub(super) fn render(
                 StageEditorMode::Polygon2D
             };
             if ui
-                .selectable_label(mode == StageEditorMode::Polygon2D, "⬡ 2D")
+                .selectable_label(mode == StageEditorMode::Polygon2D, "⬟ 2D")
                 .on_hover_text("2D Polygon mode")
                 .clicked()
             {
@@ -119,9 +119,9 @@ pub(super) fn render(
 
         // Grid controls
         let snap_label = if data.stage_editor_snap {
-            "🧲 Snap: ON"
+            "Snap: ON"
         } else {
-            "🧲 Snap: OFF"
+            "Snap: OFF"
         };
         if ui.button(snap_label).clicked() {
             actions.session.toggle_snap = true;
@@ -174,7 +174,7 @@ pub(super) fn render(
         };
         if let Some((sel_uuid, hint)) = selected_circle {
             ui.separator();
-            ui.label("⬤ Circle:");
+            ui.label("● Circle:");
             let mut radius = hint.radius;
             if ui
                 .add(
@@ -206,7 +206,7 @@ pub(super) fn render(
                 });
             }
             if ui
-                .button("⬠ Convert to Polygon")
+                .button("⬟ Convert to Polygon")
                 .on_hover_text("Drop circle identity, keep vertices as polygon")
                 .clicked()
             {
@@ -267,7 +267,7 @@ pub(super) fn render(
             }
             // Stacking order (8i.12): bring the selection to the very front/back.
             if ui
-                .button("⤒ Front")
+                .button("↥ Front")
                 .on_hover_text("Bring selected to front")
                 .clicked()
             {
@@ -279,7 +279,7 @@ pub(super) fn render(
                 }
             }
             if ui
-                .button("⤓ Back")
+                .button("↧ Back")
                 .on_hover_text("Send selected to back")
                 .clicked()
             {

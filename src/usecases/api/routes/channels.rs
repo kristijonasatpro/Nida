@@ -29,6 +29,40 @@ pub async fn add_channel(State(state): State<SharedState>) -> impl IntoResponse 
     }
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct AddInputBody {
+    /// What the input shows.
+    pub source: crate::engine::InputSource,
+    /// Its name; after the source when left out.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Its own sound — a camera or capture card's — on and off air with it.
+    #[serde(default)]
+    pub audio: Option<crate::engine::InputAudio>,
+}
+
+/// Add an input (vMix's Add Input): a camera, NDI source, screen, stream or colour.
+///
+/// The input is a channel at the end of the row, named after its source.
+/// Replies with the channel's UUID.
+#[utoipa::path(post, path = "/api/inputs", request_body = AddInputBody, responses((status = 200, body = CommandResult)), tag = "Channels")]
+pub async fn add_input(
+    State(state): State<SharedState>,
+    Json(body): Json<AddInputBody>,
+) -> impl IntoResponse {
+    match state
+        .send_command(EngineCommand::AddInput {
+            source: body.source,
+            name: body.name,
+            audio: body.audio,
+        })
+        .await
+    {
+        Ok(result) => command_response(result),
+        Err(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
 #[utoipa::path(delete, path = "/api/channels/{channel_uuid}", params(("channel_uuid" = String, Path, description = "Channel UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Channels")]
 pub async fn remove_channel(
     State(state): State<SharedState>,
@@ -71,6 +105,56 @@ pub async fn set_blend_mode(
         .send_command(EngineCommand::SetChannelBlendMode {
             channel_uuid,
             mode: body.mode,
+        })
+        .await
+    {
+        Ok(result) => command_response(result),
+        Err(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct ChannelNameBody {
+    /// The new name; at most 40 characters are kept.
+    pub name: String,
+}
+
+#[utoipa::path(put, path = "/api/channels/{channel_uuid}/name", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ChannelNameBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Channels")]
+pub async fn rename(
+    State(state): State<SharedState>,
+    Path(channel_uuid): Path<String>,
+    Json(body): Json<ChannelNameBody>,
+) -> impl IntoResponse {
+    match state
+        .send_command(EngineCommand::RenameChannel {
+            channel_uuid,
+            name: body.name,
+        })
+        .await
+    {
+        Ok(result) => command_response(result),
+        Err(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
+#[derive(Deserialize, ToSchema, Default)]
+pub struct ChannelMoveBody {
+    /// The channel to go just before; left out, the channel goes last.
+    #[serde(default)]
+    pub before_channel_uuid: Option<String>,
+}
+
+#[utoipa::path(put, path = "/api/channels/{channel_uuid}/move", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ChannelMoveBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Channels")]
+pub async fn move_channel(
+    State(state): State<SharedState>,
+    Path(channel_uuid): Path<String>,
+    body: Option<Json<ChannelMoveBody>>,
+) -> impl IntoResponse {
+    let before_channel_uuid = body.and_then(|Json(b)| b.before_channel_uuid);
+    match state
+        .send_command(EngineCommand::MoveChannel {
+            channel_uuid,
+            before_channel_uuid,
         })
         .await
     {

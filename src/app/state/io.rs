@@ -29,7 +29,11 @@ impl VardaApp {
                     self.render_width,
                     self.render_height,
                 ) {
-                    Ok(deck) => {
+                    Ok(mut deck) => {
+                        self.add_default_effects(&mut deck);
+                        // A keyed graphic sent over NDI shows what is under
+                        // it where it is clear, as it does in vMix.
+                        deck.set_transparent(true);
                         let uuid = deck.uuid().to_string();
                         if let Some(ch) = self.mixer.channel_mut(channel_idx) {
                             ch.add_deck(deck);
@@ -99,7 +103,8 @@ impl VardaApp {
                         self.render_width,
                         self.render_height,
                     ) {
-                        Ok(deck) => {
+                        Ok(mut deck) => {
+                            self.add_default_effects(&mut deck);
                             let uuid = deck.uuid().to_string();
                             if let Some(ch) = self.mixer.channel_mut(channel_idx) {
                                 ch.add_deck(deck);
@@ -163,7 +168,11 @@ impl VardaApp {
                     self.render_width,
                     self.render_height,
                 ) {
-                    Ok(deck) => {
+                    Ok(mut deck) => {
+                        self.add_default_effects(&mut deck);
+                        // A keyed graphic sent over NDI shows what is under
+                        // it where it is clear, as it does in vMix.
+                        deck.set_transparent(true);
                         let uuid = deck.uuid().to_string();
                         if let Some(ch) = self.mixer.channel_mut(channel_idx) {
                             ch.add_deck(deck);
@@ -213,7 +222,11 @@ impl VardaApp {
                     self.render_width,
                     self.render_height,
                 ) {
-                    Ok(deck) => {
+                    Ok(mut deck) => {
+                        self.add_default_effects(&mut deck);
+                        // A keyed graphic sent over NDI shows what is under
+                        // it where it is clear, as it does in vMix.
+                        deck.set_transparent(true);
                         let uuid = deck.uuid().to_string();
                         if let Some(ch) = self.mixer.channel_mut(channel_idx) {
                             ch.add_deck(deck);
@@ -264,7 +277,11 @@ impl VardaApp {
                     self.render_width,
                     self.render_height,
                 ) {
-                    Ok(deck) => {
+                    Ok(mut deck) => {
+                        self.add_default_effects(&mut deck);
+                        // A keyed graphic sent over NDI shows what is under
+                        // it where it is clear, as it does in vMix.
+                        deck.set_transparent(true);
                         let uuid = deck.uuid().to_string();
                         if let Some(ch) = self.mixer.channel_mut(channel_idx) {
                             ch.add_deck(deck);
@@ -338,7 +355,11 @@ impl VardaApp {
                     self.render_width,
                     self.render_height,
                 ) {
-                    Ok(deck) => {
+                    Ok(mut deck) => {
+                        self.add_default_effects(&mut deck);
+                        // A keyed graphic sent over NDI shows what is under
+                        // it where it is clear, as it does in vMix.
+                        deck.set_transparent(true);
                         let uuid = deck.uuid().to_string();
                         if let Some(ch) = self.mixer.channel_mut(channel_idx) {
                             ch.add_deck(deck);
@@ -393,7 +414,11 @@ impl VardaApp {
                     self.render_width,
                     self.render_height,
                 ) {
-                    Ok(deck) => {
+                    Ok(mut deck) => {
+                        self.add_default_effects(&mut deck);
+                        // A keyed graphic sent over NDI shows what is under
+                        // it where it is clear, as it does in vMix.
+                        deck.set_transparent(true);
                         let uuid = deck.uuid().to_string();
                         if let Some(ch) = self.mixer.channel_mut(channel_idx) {
                             ch.add_deck(deck);
@@ -554,9 +579,20 @@ impl VardaApp {
                 CommandResult::Ok
                 | CommandResult::OkWithId { .. }
                 | CommandResult::OkWithData { .. } => {
-                    // Re-apply the persisted slot props onto the deck we just bound
-                    // (matched by name so an idempotent no-op doesn't mis-target).
+                    // Restore the saved *identity* and the full saved
+                    // configuration onto the deck we just bound, matched by
+                    // name so an idempotent no-op does not mis-target.
+                    //
+                    // Identity matters as much as the properties: a persisted
+                    // `BusInputRef::Deck(uuid)`, MIDI mapping or API caller
+                    // addresses the deck this restores, and `cmd_add_syphon_deck`
+                    // mints a fresh UUID. Without adopting the saved one the
+                    // deck comes back but every reference to it stays dangling —
+                    // a bus routed at it would hold black forever. Same
+                    // principle as the structural scene merge: identity travels
+                    // with the runtime it names.
                     let display_name = format!("🔗 {server_name}");
+                    let mut bound = false;
                     if let Ok(ch_idx) = self.resolve_channel(&channel_uuid) {
                         if let Some(ch) = self.mixer.channel_mut(ch_idx) {
                             if let Some(slot) = ch
@@ -564,13 +600,21 @@ impl VardaApp {
                                 .iter_mut()
                                 .find(|s| s.deck.source_name() == display_name)
                             {
-                                slot.opacity = p.config.opacity;
-                                slot.blend_mode = p.config.blend_mode.into();
-                                slot.mute = p.config.mute;
-                                slot.solo = p.config.solo;
-                                slot.z_index = p.config.z_index;
+                                slot.deck.set_uuid(p.config.uuid.clone());
+                                Self::patch_deck_slot(
+                                    slot,
+                                    &p.config,
+                                    &self.context,
+                                    &self.registry,
+                                );
+                                bound = true;
                             }
                         }
+                    }
+                    // The source it was waiting for now exists, so routes that
+                    // named it can resolve again. Nothing else re-checks them.
+                    if bound {
+                        self.reconcile_buses();
                     }
                     log::info!("Syphon deck '{server_name}' late-bound to channel {channel_uuid}");
                 }

@@ -140,6 +140,35 @@ pub async fn remove_deck(
     }
 }
 
+/// A layer's own mask, or `null` to take it away.
+#[derive(Deserialize, ToSchema)]
+pub struct LayerMaskBody {
+    pub mask: Option<crate::engine::value::mask::EffectMask>,
+}
+
+/// Set or clear a layer's own mask: a shape cut out of it, or kept alone.
+///
+/// Transparent inside the shape, so what is under the layer shows through;
+/// inverted, only the shape is kept. Answers with the UUID of the effect
+/// carrying it (empty once taken away).
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/mask", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = LayerMaskBody, responses((status = 200, body = CommandResult), (status = 400, description = "The mask has no area"), (status = 404, description = "Deck not found")), tag = "Decks")]
+pub async fn set_layer_mask(
+    State(state): State<SharedState>,
+    Path(deck_uuid): Path<String>,
+    Json(body): Json<LayerMaskBody>,
+) -> impl IntoResponse {
+    match state
+        .send_command(EngineCommand::SetLayerMask {
+            deck_uuid,
+            mask: body.mask,
+        })
+        .await
+    {
+        Ok(result) => command_response(result),
+        Err(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
 #[utoipa::path(put, path = "/api/decks/{deck_uuid}/opacity", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckOpacityBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn set_opacity(
     State(state): State<SharedState>,
@@ -236,6 +265,10 @@ pub struct AddSolidColorDeckBody {
 pub struct AddCameraDeckBody {
     /// Numeric identifier of the camera device.
     pub camera_id: u32,
+    /// The size and rate to open it at (`GET /api/state/cameras` lists them);
+    /// its best when left out.
+    #[serde(default)]
+    pub mode: Option<crate::engine::value::camera::CameraMode>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -288,7 +321,7 @@ pub struct AddScreenCaptureDeckBody {
     pub crop: Option<ScreenCaptureCropBody>,
     #[serde(default)]
     pub show_cursor: Option<bool>,
-    /// Exclude Varda's own windows. Defaults to `true` for displays (so a
+    /// Exclude Nida's own windows. Defaults to `true` for displays (so a
     /// full-display capture is not an infinite mirror) and `false` for windows.
     #[serde(default)]
     pub exclude_varda: Option<bool>,
@@ -318,8 +351,11 @@ pub struct TapSourceRequestBody {
 
 #[derive(Deserialize, ToSchema)]
 pub struct MoveDeckBody {
-    /// UUID of the channel to move the deck into.
+    /// UUID of the channel to move the deck into (its own channel reorders).
     pub dst_channel_uuid: String,
+    /// Put it just before this deck in that channel; omit for the end.
+    #[serde(default)]
+    pub before_deck_uuid: Option<String>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -344,9 +380,14 @@ pub struct SetTransitionBody {
 
 #[derive(Deserialize, ToSchema)]
 pub struct SetParamBody {
-    /// Dot-separated path identifying the parameter.
+    /// Slash-separated path identifying the parameter, e.g.
+    /// `deck/<deck_uuid>/effect/<effect_uuid>/param/<name>`.
     pub path: String,
-    /// New value for the parameter.
+    /// New value: a plain number, `true`/`false`, four numbers for a colour
+    /// (RGBA) or two for a point. A number is a control position, as MIDI
+    /// and OSC send it, not the value itself — for a generator or effect
+    /// parameter 0 is its min and 1 its max, an integer one's choices split
+    /// evenly between; other paths scale it their own way.
     pub value: crate::internal::params::ParamValue,
 }
 
@@ -410,6 +451,7 @@ pub async fn add_camera_deck(
         .send_command(EngineCommand::AddCameraDeck {
             channel_uuid,
             camera_id: body.camera_id,
+            mode: body.mode,
         })
         .await
     {
@@ -509,6 +551,7 @@ pub async fn move_deck(
         .send_command(EngineCommand::MoveDeck {
             deck_uuid,
             dst_channel_uuid: body.dst_channel_uuid,
+            before_deck_uuid: body.before_deck_uuid,
         })
         .await
     {
@@ -559,6 +602,31 @@ pub async fn set_render_fps(
     }
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct DeckRenderScaleBody {
+    /// `Full`, `Half` (half width and height, a quarter of the pixels) or
+    /// `Quarter` of the master resolution.
+    pub scale: crate::engine::types::DeckRenderScale,
+}
+
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/render-scale", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckRenderScaleBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
+pub async fn set_render_scale(
+    State(state): State<SharedState>,
+    Path(deck_uuid): Path<String>,
+    Json(body): Json<DeckRenderScaleBody>,
+) -> impl IntoResponse {
+    match state
+        .send_command(EngineCommand::SetDeckRenderScale {
+            deck_uuid,
+            scale: body.scale,
+        })
+        .await
+    {
+        Ok(result) => command_response(result),
+        Err(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
 #[utoipa::path(put, path = "/api/decks/{deck_uuid}/transparent", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckBoolBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn set_transparent(
     State(state): State<SharedState>,
@@ -569,6 +637,30 @@ pub async fn set_transparent(
         .send_command(EngineCommand::SetDeckTransparent {
             deck_uuid,
             transparent: body.value,
+        })
+        .await
+    {
+        Ok(result) => command_response(result),
+        Err(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
+/// A colour, straight RGBA 0 to 1.
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct DeckColorBody {
+    pub color: [f32; 4],
+}
+
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/color", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckColorBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
+pub async fn set_color(
+    State(state): State<SharedState>,
+    Path(deck_uuid): Path<String>,
+    Json(body): Json<DeckColorBody>,
+) -> impl IntoResponse {
+    match state
+        .send_command(EngineCommand::SetDeckColor {
+            deck_uuid,
+            color: body.color,
         })
         .await
     {
@@ -611,6 +703,16 @@ pub async fn set_transition(
     }
 }
 
+/// Set a parameter by path as MIDI and OSC do: a number is a control position.
+///
+/// Not the value itself. For a generator or effect parameter, 0 is its min
+/// and 1 its max (0 and 1 where it declares none), and an integer one's
+/// choices are split evenly between; `/api/state` shows the values
+/// themselves, with their limits. Other paths scale the number their own way
+/// — speed, a time in the clip, frames per second, a mode chosen by range.
+/// To write a generator or effect parameter's value as `/api/state` shows
+/// it, send `SetEffectParam` or `SetGeneratorParam` to `POST /api/command`;
+/// a whole number for an integer parameter is kept an integer.
 #[utoipa::path(put, path = "/api/params", request_body = SetParamBody, responses((status = 200, body = CommandResult)), tag = "Params")]
 pub async fn set_param(
     State(state): State<SharedState>,
@@ -820,6 +922,34 @@ pub async fn video_set_transport_sync(
                 delay_frames: b.delay_frames,
             },
         })
+        .await
+    {
+        Ok(r) => command_response(r),
+        Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/decks/{deck_uuid}/video/auto",
+    params(("deck_uuid" = String, Path, description = "Deck UUID")),
+    request_body = crate::engine::value::video::AutoPlayback,
+    responses(
+        (status = 200, body = CommandResult),
+        (status = 400, description = "Not a clip"),
+        (status = 404, description = "Deck not found")
+    ),
+    tag = "Video"
+)]
+/// What a clip does by itself going on and off air: Auto Play, Auto Pause,
+/// Auto Restart (on air is on Main or on any bus's Program).
+pub async fn video_set_auto_playback(
+    State(s): State<SharedState>,
+    Path(deck_uuid): Path<String>,
+    Json(auto): Json<crate::engine::value::video::AutoPlayback>,
+) -> impl IntoResponse {
+    match s
+        .send_command(EngineCommand::VideoSetAutoPlayback { deck_uuid, auto })
         .await
     {
         Ok(r) => command_response(r),
@@ -1145,6 +1275,11 @@ pub async fn set_html_interactive(
 
 // ── Generator parameters ──────────────────────────────────────────
 
+/// Put a layer's own generator parameters back to their defaults.
+///
+/// Only a generated layer's (a shader source's) own; its effects — Transform,
+/// Crop and the rest — are left as they are. Reset an effect with
+/// `ResetEffectParams` to `POST /api/command`.
 #[utoipa::path(post, path = "/api/decks/{deck_uuid}/params/reset", params(("deck_uuid" = String, Path, description = "Deck UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Params")]
 pub async fn reset_generator_params(
     State(s): State<SharedState>,

@@ -2,20 +2,20 @@
 
 ## Overview
 
-Varda's GUI and HTTP API are co-equal consumers of the same engine. The GUI reads state snapshots and emits actions; the API reads the same snapshots and sends the same commands. Neither is an afterthought — they share identical engine contracts.
+Nida's GUI and HTTP API are co-equal consumers of the same engine. The GUI reads state snapshots and emits actions; the API reads the same snapshots and sends the same commands. Neither is an afterthought — they share identical engine contracts.
 
 The API runs on **port 8080** by default (configurable with `--port`).
 
 ## Security & Network Trust Model
 
-**Varda trusts the network.** The HTTP API has **no authentication** and binds to
+**Nida trusts the network.** The HTTP API has **no authentication** and binds to
 **all interfaces** (`0.0.0.0`), and the OSC input (default port 9000) does the
 same. CORS is intentionally permissive (see [CORS](#cors)). This is a deliberate
 design choice for the live-performance and installation use cases: a dedicated
 front-of-house or show/installation network where controllers, control panels,
 and automation scripts talk to the engine without credential friction.
 
-Run Varda only on a network you control. If you need it reachable from a wider or
+Run Nida only on a network you control. If you need it reachable from a wider or
 untrusted network, put it behind your own boundary. Bind the machine to a private
 interface, use a firewall or VPN, or front it with an authenticating reverse proxy.
 
@@ -32,7 +32,7 @@ Every parameter, path variable, and request body field is documented with descri
 
 ## Headless Mode
 
-Run Varda without a UI window — the engine renders on a timer-driven loop, controlled entirely via the API:
+Run Nida without a UI window — the engine renders on a timer-driven loop, controlled entirely via the API:
 
 ```sh
 varda --headless --port 8080 --fps 60
@@ -65,10 +65,10 @@ ws://localhost:8080/api/ws
 ]
 ```
 
-**Client → Server:** Send `EngineCommand` JSON messages with an optional `"id"` field for response correlation:
+**Client → Server:** Send `EngineCommand` JSON messages — the same bodies `POST /api/command` takes — with an optional `"id"` field beside the command for response correlation:
 
 ```json
-{ "id": "req-1", "command": "SetCrossfader", "position": 0.5 }
+{ "id": "req-1", "SetCrossfader": 0.5 }
 ```
 
 ## Common Patterns
@@ -124,10 +124,10 @@ curl -X POST http://localhost:8080/api/channels/<ch_uuid>/decks/screen \
 # Capture settings are ordinary parameter paths
 curl -X PUT http://localhost:8080/api/params \
   -H "Content-Type: application/json" \
-  -d '{"path": "deck/<deck_uuid>/capture/rate", "value": {"Float": 0.5}}'
+  -d '{"path": "deck/<deck_uuid>/capture/rate", "value": 0.5}'
 ```
 
-### Feed Varda's own output back in
+### Feed Nida's own output back in
 
 ```sh
 curl -X POST http://localhost:8080/api/channels/<ch_uuid>/decks/tap \
@@ -135,7 +135,7 @@ curl -X POST http://localhost:8080/api/channels/<ch_uuid>/decks/tap \
   -d '{"source": {"kind": "master_program"}}'
 ```
 
-A tap shows the previous frame. See [Program Tap](09-streaming-and-io.md#program-tap).
+A channel tap shows the channel's picture of this frame, a master tap — or a tap round a loop — the frame before. See [Program Tap](09-streaming-and-io.md#program-tap).
 
 ### Add an effect, then tweak it
 
@@ -151,10 +151,22 @@ curl -X POST http://localhost:8080/api/decks/<deck_uuid>/effects \
 # Bypass / re-enable it
 curl -X POST http://localhost:8080/api/effects/<effect_uuid>/toggle
 
-# Drive one of its parameters (see the parameter paths below)
+# Drive one of its parameters as MIDI and OSC do (see the parameter paths below).
+# The number is a control position, not the value: for an effect's parameter
+# 0 is its min and 1 its max. /api/state shows the values themselves.
 curl -X PUT http://localhost:8080/api/params \
   -H "Content-Type: application/json" \
-  -d '{"path": "deck/<deck_uuid>/effect/<effect_uuid>/param/radius", "value": {"Float": 4.0}}'
+  -d '{"path": "deck/<deck_uuid>/effect/<effect_uuid>/param/radius", "value": 0.5}'
+
+# Set a parameter to a value as /api/state shows it
+curl -X POST http://localhost:8080/api/command \
+  -H "Content-Type: application/json" \
+  -d '{"SetEffectParam": {"effect_uuid": "<effect_uuid>", "name": "radius", "value": 4.0}}'
+
+# Put its parameters back to their defaults (all, or only those named)
+curl -X POST http://localhost:8080/api/command \
+  -H "Content-Type: application/json" \
+  -d '{"ResetEffectParams": {"effect_uuid": "<effect_uuid>", "names": []}}'
 
 # Remove it — this also clears any modulation assigned to its parameters
 curl -X DELETE http://localhost:8080/api/effects/<effect_uuid>
@@ -243,7 +255,7 @@ curl -X PUT http://localhost:8080/api/macros/<uuid>/value \
 ```sh
 curl -X POST http://localhost:8080/api/command \
   -H "Content-Type: application/json" \
-  -d '{"SetCrossfader": {"position": 0.5}}'
+  -d '{"SetCrossfader": 0.5}'
 ```
 
 ### Save the workspace
@@ -254,6 +266,24 @@ curl -X POST http://localhost:8080/api/workspace/save
 
 Saving from the API preserves the editor layout in `stage.json` — it writes back
 whatever the UI last had, rather than resetting panels and grid to defaults.
+It answers once the files are written, so a backup taken after it copies what
+was saved; the outputs do not wait for the disk meanwhile.
+
+Other shows, as the 🎬 menu does them (each saves the show open first):
+
+```sh
+curl -X POST http://localhost:8080/api/command -H "Content-Type: application/json" \
+  -d '{"SaveShowAs": {"folder": "/Users/me/Documents/Nida Shows/Day 2"}}'
+curl -X POST http://localhost:8080/api/command -H "Content-Type: application/json" \
+  -d '{"NewShow": {}}'          # or {"NewShow": {"folder": "…"}}
+curl -X POST http://localhost:8080/api/command -H "Content-Type: application/json" \
+  -d '{"OpenShow": {"folder": "/Users/me/Documents/Nida Shows/Day 1"}}'
+```
+
+`SaveShowAs` answers once the copy is written and Nida has moved to the new
+folder — or with why not — while the outputs go on. Another asked for before
+then is answered `Unavailable`. `SaveDeckPreset` and `SaveChannelPreset`
+answer once the preset's file is written.
 
 ### Shut down (headless)
 
@@ -447,6 +477,33 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `POST` | `/api/audio/open` |  |
 | `POST` | `/api/audio/scan` |  |
 
+### Audio Mixer
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/audio-buses` |  |
+| `DELETE` | `/api/audio-buses/{bus_uuid}` |  |
+| `PUT` | `/api/audio-buses/{bus_uuid}/delay` |  |
+| `PUT` | `/api/audio-buses/{bus_uuid}/device` |  |
+| `PUT` | `/api/audio-buses/{bus_uuid}/gain` |  |
+| `PUT` | `/api/audio-buses/{bus_uuid}/mute` |  |
+| `PUT` | `/api/audio-buses/{bus_uuid}/name` |  |
+| `POST` | `/api/audio-devices/rescan` |  |
+| `POST` | `/api/audio-inputs` |  |
+| `POST` | `/api/audio-inputs/app` | Take an app's sound — a Zoom or Teams call's — as a source, straight from |
+| `DELETE` | `/api/audio-inputs/{input_uuid}` |  |
+| `PUT` | `/api/audio-monitor/device` |  |
+| `PUT` | `/api/audio-monitor/gain` |  |
+| `PUT` | `/api/audio-monitor/listen` |  |
+| `PUT` | `/api/audio-sources/{source_uuid}/auto` | Audio Auto: the source's sound switches on as it goes on air and off as |
+| `PUT` | `/api/audio-sources/{source_uuid}/balance` |  |
+| `PUT` | `/api/audio-sources/{source_uuid}/delay` |  |
+| `PUT` | `/api/audio-sources/{source_uuid}/follow` |  |
+| `PUT` | `/api/audio-sources/{source_uuid}/gain` |  |
+| `PUT` | `/api/audio-sources/{source_uuid}/mute` |  |
+| `PUT` | `/api/audio-sources/{source_uuid}/sends/{bus_uuid}` |  |
+| `PUT` | `/api/audio-sources/{source_uuid}/solo` |  |
+
 ### Auto Transitions
 
 | Method | Path | Description |
@@ -457,6 +514,22 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `PUT` | `/api/decks/{deck_uuid}/auto-transition/shader` |  |
 | `PUT` | `/api/decks/{deck_uuid}/auto-transition/trigger` |  |
 
+### Buses
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/buses` |  |
+| `DELETE` | `/api/buses/{bus_uuid}` |  |
+| `POST` | `/api/buses/{bus_uuid}/auto` |  |
+| `PUT` | `/api/buses/{bus_uuid}/auto-duration` |  |
+| `PUT` | `/api/buses/{bus_uuid}/blackmagic` |  |
+| `PUT` | `/api/buses/{bus_uuid}/canvas` |  |
+| `POST` | `/api/buses/{bus_uuid}/cut` |  |
+| `PUT` | `/api/buses/{bus_uuid}/layers/{channel_uuid}` |  |
+| `PUT` | `/api/buses/{bus_uuid}/name` |  |
+| `PUT` | `/api/buses/{bus_uuid}/preview` |  |
+| `PUT` | `/api/buses/{bus_uuid}/screen` |  |
+
 ### Channels
 
 | Method | Path | Description |
@@ -464,7 +537,10 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `POST` | `/api/channels` |  |
 | `DELETE` | `/api/channels/{channel_uuid}` |  |
 | `PUT` | `/api/channels/{channel_uuid}/blend-mode` |  |
+| `PUT` | `/api/channels/{channel_uuid}/move` |  |
+| `PUT` | `/api/channels/{channel_uuid}/name` |  |
 | `PUT` | `/api/channels/{channel_uuid}/opacity` |  |
+| `POST` | `/api/inputs` | Add an input (vMix's Add Input): a camera, NDI source, screen, stream or colour. |
 
 ### Clipboard
 
@@ -494,12 +570,15 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `POST` | `/api/channels/{channel_uuid}/decks/video` |  |
 | `DELETE` | `/api/decks/{deck_uuid}` |  |
 | `PUT` | `/api/decks/{deck_uuid}/blend-mode` |  |
+| `PUT` | `/api/decks/{deck_uuid}/color` |  |
 | `POST` | `/api/decks/{deck_uuid}/html/interactive` |  |
 | `POST` | `/api/decks/{deck_uuid}/html/reload` |  |
+| `PUT` | `/api/decks/{deck_uuid}/mask` | Set or clear a layer's own mask: a shape cut out of it, or kept alone. |
 | `POST` | `/api/decks/{deck_uuid}/move` |  |
 | `PUT` | `/api/decks/{deck_uuid}/mute` |  |
 | `PUT` | `/api/decks/{deck_uuid}/opacity` |  |
 | `PUT` | `/api/decks/{deck_uuid}/render-fps` |  |
+| `PUT` | `/api/decks/{deck_uuid}/render-scale` |  |
 | `PUT` | `/api/decks/{deck_uuid}/scaling-mode` |  |
 | `PUT` | `/api/decks/{deck_uuid}/solo` |  |
 | `PUT` | `/api/decks/{deck_uuid}/tap/source` |  |
@@ -536,6 +615,8 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `POST` | `/api/decks/{deck_uuid}/effects` |  |
 | `PUT` | `/api/decks/{deck_uuid}/effects/reorder` |  |
 | `DELETE` | `/api/effects/{effect_uuid}` |  |
+| `PUT` | `/api/effects/{effect_uuid}/mask` |  |
+| `POST` | `/api/effects/{effect_uuid}/reset` |  |
 | `POST` | `/api/effects/{effect_uuid}/toggle` |  |
 | `POST` | `/api/master/effects` |  |
 | `PUT` | `/api/master/effects/reorder` |  |
@@ -569,6 +650,17 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `PUT` | `/api/macros/{uuid}/targets/{target_idx}` |  |
 | `DELETE` | `/api/macros/{uuid}/targets/{target_idx}` |  |
 | `PUT` | `/api/macros/{uuid}/value` |  |
+
+### Main
+
+| Method | Path | Description |
+|---|---|---|
+| `PUT` | `/api/channels/{channel_uuid}/overlay` |  |
+| `PUT` | `/api/channels/{channel_uuid}/overlay-on` |  |
+| `PUT` | `/api/main/fade-time` |  |
+| `PUT` | `/api/main/mode` |  |
+| `POST` | `/api/main/take` |  |
+| `PUT` | `/api/main/transition` | What a take to Main that is not a cut does: fade, merge, wipe, slide, zoom or iris. |
 
 ### Mixer
 
@@ -631,24 +723,61 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 |---|---|---|
 | `POST` | `/api/outputs` |  |
 | `POST` | `/api/outputs/headless` |  |
+| `POST` | `/api/outputs/led` |  |
 | `DELETE` | `/api/outputs/{output_uuid}` |  |
+| `PUT` | `/api/outputs/{output_uuid}/audio-bus` |  |
 | `PUT` | `/api/outputs/{output_uuid}/calibration` |  |
 | `PUT` | `/api/outputs/{output_uuid}/display` |  |
 | `PUT` | `/api/outputs/{output_uuid}/edge-blend` |  |
 | `PUT` | `/api/outputs/{output_uuid}/edge-blend-mode` |  |
+| `PUT` | `/api/outputs/{output_uuid}/led` |  |
+| `POST` | `/api/outputs/{output_uuid}/led/screens/{screen_uuid}/bus` |  |
 | `PUT` | `/api/outputs/{output_uuid}/presentation` |  |
+| `PUT` | `/api/outputs/{output_uuid}/source` |  |
 | `POST` | `/api/outputs/{output_uuid}/start` |  |
 | `POST` | `/api/outputs/{output_uuid}/stop` |  |
 | `POST` | `/api/outputs/{output_uuid}/surfaces` |  |
 | `DELETE` | `/api/outputs/{output_uuid}/surfaces/{surface_uuid}` |  |
 | `PUT` | `/api/outputs/{output_uuid}/target` |  |
+| `POST` | `/api/screens/identify` |  |
+| `PUT` | `/api/screens/name` |  |
 
 ### Params
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/decks/{deck_uuid}/params/reset` |  |
-| `PUT` | `/api/params` |  |
+| `POST` | `/api/decks/{deck_uuid}/params/reset` | Put a layer's own generator parameters back to their defaults. |
+| `PUT` | `/api/params` | Set a parameter by path as MIDI and OSC do: a number is a control position. |
+
+### Record
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/record` |  |
+| `PUT` | `/api/record/options` |  |
+| `POST` | `/api/record/start` |  |
+| `POST` | `/api/record/stop` |  |
+
+### Rundown
+
+| Method | Path | Description |
+|---|---|---|
+| `PUT` | `/api/rundown/fade-time` |  |
+| `POST` | `/api/rundown/go` | Take the next step: the one after the step taken last, or the one set as next. |
+| `POST` | `/api/rundown/hold` | Stop a step going on to the next by itself; the rundown stays until told. |
+| `PUT` | `/api/rundown/next` | Make a step the one GO takes next, without taking anything. |
+| `POST` | `/api/rundown/steps` |  |
+| `DELETE` | `/api/rundown/steps/{step_uuid}` |  |
+| `POST` | `/api/rundown/steps/{step_uuid}/capture` | Make the step's picture what is on now, for the parts it sets. |
+| `POST` | `/api/rundown/steps/{step_uuid}/duplicate` | Put a copy of the step right after it; replies with the copy's UUID. |
+| `PUT` | `/api/rundown/steps/{step_uuid}/main` |  |
+| `POST` | `/api/rundown/steps/{step_uuid}/move` |  |
+| `PUT` | `/api/rundown/steps/{step_uuid}/name` |  |
+| `PUT` | `/api/rundown/steps/{step_uuid}/overlays/{channel_uuid}` |  |
+| `PUT` | `/api/rundown/steps/{step_uuid}/plays/{deck_uuid}` |  |
+| `PUT` | `/api/rundown/steps/{step_uuid}/screens/{bus_uuid}` |  |
+| `POST` | `/api/rundown/steps/{step_uuid}/take` | Take a step, all of it or none; refused, the reply says why. |
+| `PUT` | `/api/rundown/steps/{step_uuid}/then` |  |
 
 ### Scene
 
@@ -724,7 +853,7 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `GET` | `/api/state/modulation` | Modulation state: sources, their current output values, and parameter assignments. |
 | `GET` | `/api/state/ndi` | NDI runtime availability and the source names found by the last scan. |
 | `GET` | `/api/state/outputs` | Output state: output windows, surfaces, and connected monitors. |
-| `GET` | `/api/state/performance` | Render loop counters: measured FPS, total frames rendered, and the configured target FPS. |
+| `GET` | `/api/state/performance` | Render loop counters: measured FPS, total frames rendered, the configured target FPS, and `pacing` — what starts frames (a screen's refresh or the timer), the spread of frame intervals over the last five seconds with frames started late, and each output window's presents, pace-skipped and unavailable frames. |
 | `GET` | `/api/state/registry` | Shader registry: generator and filter shader names with their indices. |
 | `GET` | `/api/state/screen_capture` | Screen capture state: enumerated targets, permission state, backend, and active session count. |
 | `GET` | `/api/state/streams` | Active stream receivers with their URL, mode, and connection status. |
@@ -732,6 +861,16 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `GET` | `/api/state/syphon` | Syphon framework availability and the server names found by the last scan. |
 | `GET` | `/api/state/timecode` | Timecode diagnostics: every LTC and MTC input being listened to with its own position and run state, which one is driving the transport, and the current preference and LTC patch. |
 | `GET` | `/api/state/transport` | Transport state: absolute position, timecode, run status, loop region, and follower count. |
+
+### Stream
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/stream` |  |
+| `PUT` | `/api/stream/destinations/{index}` |  |
+| `PUT` | `/api/stream/options` |  |
+| `POST` | `/api/stream/start` |  |
+| `POST` | `/api/stream/stop` |  |
 
 ### Streams
 
@@ -800,6 +939,7 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `POST` | `/api/perf-profile` |  |
 | `POST` | `/api/redo` |  |
 | `PUT` | `/api/resolution` |  |
+| `PUT` | `/api/resolution/auto` |  |
 | `POST` | `/api/shutdown` |  |
 | `GET` | `/api/state` | The full engine state snapshot. |
 | `PUT` | `/api/target-fps` |  |
@@ -833,6 +973,7 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 
 | Method | Path | Description |
 |---|---|---|
+| `PUT` | `/api/decks/{deck_uuid}/video/auto` | What a clip does by itself going on and off air: Auto Play, Auto Pause, |
 | `DELETE` | `/api/decks/{deck_uuid}/video/in-out-points` |  |
 | `PUT` | `/api/decks/{deck_uuid}/video/in-point` |  |
 | `PUT` | `/api/decks/{deck_uuid}/video/loop-mode` |  |

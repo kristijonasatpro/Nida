@@ -140,7 +140,7 @@ pub struct CaptureConfig {
     pub rate: f32,
     pub crop: CropRect,
     pub show_cursor: bool,
-    /// Exclude Varda's own windows from the capture. Display targets only.
+    /// Exclude Nida's own windows from the capture. Display targets only.
     pub exclude_varda: bool,
     /// Ask the OS to scale at capture time. Set to the deck render resolution so
     /// a 4K display does not move 33 MB per frame.
@@ -197,10 +197,22 @@ impl CapturePixelFormat {
 
 /// One captured frame, tightly packed at `width * 4` bytes per row.
 pub struct CaptureFrame {
+    /// The pixels in memory — empty when they are in `surface` instead.
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub format: CapturePixelFormat,
+    /// macOS: the GPU surface the pixels were captured into, copied into the
+    /// capture's texture on the GPU rather than through memory (see
+    /// `screen_capture::surface`).
+    #[cfg(target_os = "macos")]
+    pub surface: Option<super::surface::SurfaceFrame>,
+    /// macOS: when the window server showed what the frame captured, host
+    /// seconds (see `crate::host_clock`) — what each show frame's capture
+    /// frame is picked by (see `crate::frame_picker`). Elsewhere frames are
+    /// timed as they arrive.
+    #[cfg(target_os = "macos")]
+    pub captured_at: Option<f64>,
 }
 
 /// Whether the platform will let us capture at all.
@@ -250,7 +262,7 @@ impl fmt::Display for CaptureError {
             Self::Unavailable(why) => write!(f, "screen capture unavailable: {why}"),
             Self::PermissionDenied => write!(
                 f,
-                "screen recording permission denied — grant access in System Settings and restart Varda"
+                "screen recording permission denied — grant access in System Settings and restart Nida"
             ),
             Self::TargetNotFound(what) => write!(f, "capture target not found: {what}"),
             Self::Backend(why) => write!(f, "screen capture backend error: {why}"),
@@ -393,6 +405,10 @@ impl ScreenCaptureBackend for MockBackend {
             width,
             height,
             format: CapturePixelFormat::Rgba8UnormSrgb,
+            #[cfg(target_os = "macos")]
+            surface: None,
+            #[cfg(target_os = "macos")]
+            captured_at: None,
         })
     }
 
@@ -438,7 +454,7 @@ pub fn mock_targets() -> Vec<CaptureTargetInfo> {
         CaptureTargetInfo {
             kind: CaptureTargetKind::Window,
             platform_id: 101,
-            label: "Varda — Main".into(),
+            label: "Nida — Main".into(),
             app: Some("com.varda.app".into()),
             title: Some("Main".into()),
             width: 1920,
@@ -523,7 +539,7 @@ mod tests {
         let c = CaptureConfig::default();
         assert!(
             c.exclude_varda,
-            "display captures must exclude Varda by default"
+            "display captures must exclude Nida by default"
         );
         assert!(!c.show_cursor);
     }

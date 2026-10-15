@@ -9,5 +9,15 @@ doc-valid-idents = [
     "MadMapper",
     "WebSocket",
     "XWayland",
+    "DeckLink",
+    "UltraStudio",
     "..",
+]
+
+# wgpu refuses a surface's configure when another thread submits meanwhile, and
+# the surface keeps its old size. Both go through `GpuContext`, which keeps them
+# apart — see src/internal/renderer/submit_gate.rs.
+disallowed-methods = [
+    { path = "wgpu::Queue::submit", reason = "submit through GpuContext::submit, which a surface's configure waits out" },
+    { path = "wgpu::Surface::configure", reason = "configure through GpuContext::configure_surface, so no thread submits meanwhile" },
 ]

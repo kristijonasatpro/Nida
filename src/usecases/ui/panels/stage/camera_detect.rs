@@ -222,7 +222,7 @@ pub(super) fn render_camera_detect_live(ui: &mut egui::Ui, data: &UIData, action
                 .push(CameraDetectAction::Capture);
         }
         if ui
-            .button("✕ Cancel")
+            .button("× Cancel")
             .on_hover_text("Exit detection mode")
             .clicked()
         {
@@ -333,7 +333,7 @@ pub(super) fn render_camera_detect_preview(
         ui.separator();
 
         if ui
-            .button(format!("✓ Accept ({selected_count}/{total})"))
+            .button(format!("✔ Accept ({selected_count}/{total})"))
             .on_hover_text("Create surfaces from selected contours")
             .clicked()
         {
@@ -343,7 +343,7 @@ pub(super) fn render_camera_detect_preview(
                 .push(CameraDetectAction::Accept);
         }
         if ui
-            .button("✕ Cancel")
+            .button("× Cancel")
             .on_hover_text("Return to live view")
             .clicked()
         {

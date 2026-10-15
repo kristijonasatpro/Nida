@@ -69,10 +69,13 @@ impl VardaApp {
     pub(crate) fn execute_command_gui(&mut self, cmd: EngineCommand) -> CommandOutcome {
         // A preset load can create several decks at once (a channel preset fills
         // a whole channel), and the count isn't known up front, so diff the deck
-        // set across execution rather than reading a single reported id.
+        // set across execution rather than reading a single reported id. A new
+        // input replies with its channel, not its layer, so it is diffed too.
         let is_preset_load = matches!(
             &cmd,
-            EngineCommand::LoadDeckPreset { .. } | EngineCommand::LoadChannelPreset { .. }
+            EngineCommand::LoadDeckPreset { .. }
+                | EngineCommand::LoadChannelPreset { .. }
+                | EngineCommand::AddInput { .. }
         );
         let is_deck_add = super::actions::command_is_deck_add(&cmd);
         let decks_before = if is_preset_load {
@@ -217,7 +220,8 @@ impl VardaApp {
             EngineCommand::AddCameraDeck {
                 channel_uuid,
                 camera_id,
-            } => wire_id(self.add_camera_deck(&channel_uuid, camera_id)),
+                mode,
+            } => wire_id(self.add_camera_deck(&channel_uuid, camera_id, mode)),
             EngineCommand::AddDepthSensorDeck {
                 channel_uuid,
                 depth_sensor_id,
@@ -249,11 +253,21 @@ impl VardaApp {
             EngineCommand::SetTapSource { deck_uuid, source } => {
                 wire(self.set_tap_source(&deck_uuid, &source))
             }
-            EngineCommand::RemoveDeck { deck_uuid } => wire(self.remove_deck(&deck_uuid)),
+            EngineCommand::RemoveDeck { deck_uuid } => {
+                let result = self.remove_deck(&deck_uuid);
+                // Only after a removal that happened. A failed removal changes
+                // no sources, so reconciling would be pure recomputation — and
+                // recomputation is exactly what re-arms a quarantined route.
+                if result.is_ok() {
+                    self.reconcile_buses();
+                }
+                wire(result)
+            }
             EngineCommand::MoveDeck {
                 deck_uuid,
                 dst_channel_uuid,
-            } => wire(self.move_deck(&deck_uuid, &dst_channel_uuid)),
+                before_deck_uuid,
+            } => wire(self.move_deck(&deck_uuid, &dst_channel_uuid, before_deck_uuid.as_deref())),
             EngineCommand::ReorderDeck {
                 channel_uuid,
                 from_idx,
@@ -288,6 +302,17 @@ impl VardaApp {
                 }
                 Err(e) => not_found(&e),
             },
+            EngineCommand::SetDeckRenderScale { deck_uuid, scale } => {
+                match self.resolve_deck(&deck_uuid) {
+                    Ok((ch, dk)) => {
+                        self.mixer.channels_mut()[ch].decks[dk]
+                            .deck
+                            .set_render_scale(&self.context, scale);
+                        CommandResult::Ok
+                    }
+                    Err(e) => not_found(&e),
+                }
+            }
             EngineCommand::SetDeckScalingMode { deck_uuid, mode } => {
                 let result = wire(self.set_deck_scaling_mode(&deck_uuid, mode));
                 // Scaling belongs to any deck with a source texture, not just a
@@ -305,6 +330,9 @@ impl VardaApp {
                 deck_uuid,
                 transparent,
             } => wire(self.set_deck_transparent(&deck_uuid, transparent)),
+            EngineCommand::SetDeckColor { deck_uuid, color } => {
+                self.cmd_set_deck_color(&deck_uuid, color)
+            }
             EngineCommand::SetChannelOpacity {
                 channel_uuid,
                 opacity,
@@ -322,8 +350,26 @@ impl VardaApp {
                 wire(self.set_channel_blend_mode(&channel_uuid, mode))
             }
             EngineCommand::AddChannel => wire_id(self.add_channel()),
+            EngineCommand::AddInput {
+                source,
+                name,
+                audio,
+            } => self.cmd_add_input(&source, name.as_deref(), audio.as_ref()),
+            EngineCommand::RenameChannel { channel_uuid, name } => {
+                self.cmd_rename_channel(&channel_uuid, &name)
+            }
+            EngineCommand::MoveChannel {
+                channel_uuid,
+                before_channel_uuid,
+            } => self.cmd_move_channel(&channel_uuid, before_channel_uuid.as_deref()),
             EngineCommand::RemoveChannel { channel_uuid } => {
-                wire(self.remove_channel(&channel_uuid))
+                let result = self.remove_channel(&channel_uuid);
+                // Removing a channel also removes its decks, so any bus routed
+                // at either must be re-checked — but only if it happened.
+                if result.is_ok() {
+                    self.reconcile_buses();
+                }
+                wire(result)
             }
             EngineCommand::AddEffect {
                 target,
@@ -454,6 +500,9 @@ impl VardaApp {
                 CommandResult::Ok
             }
             EngineCommand::CloseOutput { output_uuid } => wire(self.close_output(&output_uuid)),
+            EngineCommand::ReopenOutput { output_uuid } => {
+                wire(self.request_reopen_output(&output_uuid))
+            }
             EngineCommand::SetOutputDisplay {
                 output_uuid,
                 monitor_name,
@@ -492,6 +541,218 @@ impl VardaApp {
             }
             EngineCommand::RemoveSurface { uuid } => self.cmd_remove_surface(&uuid),
             EngineCommand::ReorderSurface { uuid, op } => self.cmd_reorder_surface(&uuid, op),
+            // ── Production buses ───────────────────────────────
+            EngineCommand::AddBus {
+                name,
+                width,
+                height,
+            } => self.cmd_add_bus(&name, width, height),
+            EngineCommand::RemoveBus { uuid } => self.cmd_remove_bus(&uuid),
+            EngineCommand::RenameBus { uuid, name } => self.cmd_rename_bus(&uuid, &name),
+            EngineCommand::SetBusPreview { uuid, input } => self.cmd_set_bus_preview(&uuid, input),
+            EngineCommand::SetBusCanvas {
+                uuid,
+                width,
+                height,
+            } => self.cmd_set_bus_canvas(&uuid, width, height),
+            EngineCommand::SetBusCanvasRegion {
+                uuid,
+                width,
+                height,
+                origin_x,
+                origin_y,
+            } => self.cmd_set_bus_canvas_region(&uuid, width, height, origin_x, origin_y),
+            EngineCommand::SetBusAutoDuration {
+                uuid,
+                duration_secs,
+            } => self.cmd_set_bus_auto_duration(&uuid, duration_secs),
+            EngineCommand::BusCut { uuid } => self.cmd_bus_cut(&uuid),
+            EngineCommand::BusAuto {
+                uuid,
+                duration_secs,
+            } => self.cmd_bus_auto(&uuid, duration_secs),
+            EngineCommand::ShowBusOnScreen { uuid, monitor_name } => {
+                self.cmd_show_bus_on_screen(&uuid, monitor_name.as_deref())
+            }
+            EngineCommand::ShowBusOnBlackmagic { uuid, device } => {
+                self.cmd_show_bus_on_blackmagic(&uuid, device.as_deref())
+            }
+            EngineCommand::RenameScreen { monitor_name, name } => {
+                self.cmd_rename_screen(&monitor_name, name.as_deref())
+            }
+            EngineCommand::IdentifyScreens => self.cmd_identify_screens(),
+            EngineCommand::SetOutputLed {
+                output_uuid,
+                layout,
+            } => self.cmd_set_output_led(&output_uuid, layout),
+            EngineCommand::CreateLedOutput {
+                monitor_name,
+                layout,
+            } => self.cmd_create_led_output(monitor_name.as_deref(), layout),
+            EngineCommand::CreateLedScreenBus {
+                output_uuid,
+                screen_uuid,
+            } => self.cmd_create_led_screen_bus(&output_uuid, &screen_uuid),
+            EngineCommand::SetBusLayerHidden {
+                uuid,
+                channel_uuid,
+                hidden,
+            } => self.cmd_set_bus_layer_hidden(&uuid, &channel_uuid, hidden),
+
+            EngineCommand::AddAudioBus { name } => self.cmd_add_audio_bus(&name),
+            EngineCommand::RemoveAudioBus { uuid } => self.cmd_remove_audio_bus(&uuid),
+            EngineCommand::RenameAudioBus { uuid, name } => {
+                self.cmd_edit_audio_bus(&uuid, |b| b.name = name)
+            }
+            EngineCommand::SetAudioBusGain { uuid, gain_db } => {
+                self.cmd_edit_audio_bus(&uuid, |b| b.gain_db = gain_db)
+            }
+            EngineCommand::SetAudioBusMute { uuid, muted } => {
+                self.cmd_edit_audio_bus(&uuid, |b| b.muted = muted)
+            }
+            EngineCommand::SetAudioBusDelay { uuid, delay_ms } => {
+                self.cmd_edit_audio_bus(&uuid, |b| b.delay_ms = delay_ms)
+            }
+            EngineCommand::SetAudioBusDevice {
+                uuid,
+                device,
+                first_channel,
+            } => self.cmd_edit_audio_bus(&uuid, |b| {
+                b.device = device;
+                b.first_channel = first_channel;
+            }),
+            EngineCommand::AddAudioInput {
+                name,
+                device,
+                left,
+                right,
+            } => self.cmd_add_audio_input(&name, &device, left, right),
+            EngineCommand::AddAppSound { app, name } => self.cmd_add_app_sound(&app, &name),
+            EngineCommand::RemoveAudioInput { uuid } => self.cmd_remove_audio_input(&uuid),
+            EngineCommand::SetAudioSourceGain { uuid, gain_db } => {
+                self.cmd_edit_audio_source(&uuid, |s| s.gain_db = gain_db)
+            }
+            EngineCommand::SetAudioSourceMute { uuid, muted } => {
+                self.cmd_edit_audio_source(&uuid, |s| s.muted = muted)
+            }
+            EngineCommand::SetAudioSend { uuid, bus_uuid, on } => {
+                self.cmd_set_audio_send(&uuid, &bus_uuid, on)
+            }
+            EngineCommand::SetAudioFollow { uuid, bus_uuid } => {
+                self.cmd_set_audio_follow(&uuid, bus_uuid)
+            }
+            EngineCommand::SetAudioAuto { uuid, auto } => {
+                self.cmd_edit_audio_source(&uuid, |s| s.auto = auto)
+            }
+            EngineCommand::SetAudioBalance { uuid, balance } => {
+                self.cmd_edit_audio_source(&uuid, |s| s.balance = balance)
+            }
+            EngineCommand::SetAudioSourceDelay { uuid, delay_ms } => {
+                self.cmd_edit_audio_source(&uuid, |s| s.delay_ms = delay_ms)
+            }
+            EngineCommand::SetOutputAudioBus {
+                output_uuid,
+                bus_uuid,
+            } => self.cmd_set_output_audio_bus(&output_uuid, bus_uuid),
+            EngineCommand::RescanAudioDevices => {
+                self.audio_mix.rescan_devices();
+                CommandResult::Ok
+            }
+            EngineCommand::SetAudioSolo { uuid, solo } => self.cmd_set_audio_solo(&uuid, solo),
+            EngineCommand::SetAudioMonitorDevice {
+                device,
+                first_channel,
+            } => self.cmd_edit_audio_monitor(|m| {
+                m.device = device;
+                m.first_channel = first_channel;
+            }),
+            EngineCommand::SetAudioMonitorGain { gain_db } => {
+                self.cmd_edit_audio_monitor(|m| m.gain_db = gain_db)
+            }
+            EngineCommand::SetAudioMonitorListen { bus_uuid } => {
+                self.cmd_edit_audio_monitor(|m| m.listen = bus_uuid)
+            }
+            EngineCommand::SetMixMode { mode } => self.cmd_set_mix_mode(mode),
+            EngineCommand::TakeToMain { source, fade } => self.cmd_take_to_main(source, fade),
+            EngineCommand::SetChannelOverlay {
+                channel_uuid,
+                overlay,
+            } => self.cmd_set_channel_overlay(&channel_uuid, overlay),
+            EngineCommand::SetOverlayOn {
+                channel_uuid,
+                on,
+                fade,
+            } => self.cmd_set_overlay_on(&channel_uuid, on, fade),
+            EngineCommand::SetMainFadeTime { secs } => self.cmd_set_main_fade_time(secs),
+            EngineCommand::SetMainTransition { transition } => {
+                self.mixer.main_mut().transition = transition;
+                CommandResult::Ok
+            }
+            // ── Rundown ───────────────────────────────────────
+            EngineCommand::AddRundownStep { name, buses, main } => {
+                self.cmd_add_rundown_step(&name, buses.as_deref(), main)
+            }
+            EngineCommand::DuplicateRundownStep { uuid } => self.cmd_duplicate_rundown_step(&uuid),
+            EngineCommand::RemoveRundownStep { uuid } => self.cmd_remove_rundown_step(&uuid),
+            EngineCommand::RenameRundownStep { uuid, name } => {
+                self.cmd_rename_rundown_step(&uuid, &name)
+            }
+            EngineCommand::MoveRundownStep { uuid, later } => {
+                self.cmd_move_rundown_step(&uuid, later)
+            }
+            EngineCommand::SetRundownScreen {
+                uuid,
+                bus_uuid,
+                input,
+            } => self.cmd_set_rundown_screen(&uuid, &bus_uuid, input),
+            EngineCommand::SetRundownMain { uuid, main } => self.cmd_set_rundown_main(&uuid, main),
+            EngineCommand::SetRundownOverlay {
+                uuid,
+                channel_uuid,
+                on,
+            } => self.cmd_set_rundown_overlay(&uuid, &channel_uuid, on),
+            EngineCommand::SetRundownPlay {
+                uuid,
+                deck_uuid,
+                action,
+            } => self.cmd_set_rundown_play(&uuid, &deck_uuid, action),
+            EngineCommand::SetRundownThen { uuid, secs } => self.cmd_set_rundown_then(&uuid, secs),
+            EngineCommand::CaptureRundownStep { uuid } => self.cmd_capture_rundown_step(&uuid),
+            EngineCommand::TakeRundownStep { uuid, fade } => {
+                self.cmd_take_rundown_step(&uuid, fade)
+            }
+            EngineCommand::RundownGo { fade, expect } => {
+                self.cmd_rundown_go(fade, expect.as_deref())
+            }
+            EngineCommand::SetRundownNext { uuid } => self.cmd_set_rundown_next(&uuid),
+            EngineCommand::RundownHold => self.cmd_rundown_hold(),
+            EngineCommand::SetRundownFade { secs } => self.cmd_set_rundown_fade(secs),
+            EngineCommand::SetStreamOptions { options } => self.cmd_set_stream_options(options),
+            EngineCommand::SetStreamDestination {
+                index,
+                enabled,
+                name,
+                url,
+                key,
+                username,
+                password,
+            } => self.cmd_set_stream_destination(
+                index,
+                super::state::DestinationEdit {
+                    enabled,
+                    name,
+                    url,
+                    key,
+                    username,
+                    password,
+                },
+            ),
+            EngineCommand::StartStream => self.cmd_start_stream(),
+            EngineCommand::StopStream => self.cmd_stop_stream(),
+            EngineCommand::SetRecordOptions { options } => self.cmd_set_record_options(options),
+            EngineCommand::StartRecording => self.cmd_start_recording(),
+            EngineCommand::StopRecording => self.cmd_stop_recording(),
+
             EngineCommand::SetSurfaceSource { uuid, source } => {
                 self.set_surface_source(&uuid, source);
                 self.recompute_auto_edge_blend();
@@ -734,6 +995,48 @@ impl VardaApp {
             }
             EngineCommand::VideoSetTransportSync { deck_uuid, sync } => {
                 self.exec_on_deck(&deck_uuid, |d| d.video_set_transport_sync(sync))
+            }
+            EngineCommand::VideoSetAutoPlayback { deck_uuid, auto } => {
+                self.exec_on_deck(&deck_uuid, |d| {
+                    let clip = d.playback_snapshot().is_some();
+                    if clip {
+                        d.auto_playback = auto;
+                    }
+                    clip
+                })
+            }
+
+            // ── Playlists ─────────────────────────────────────
+            EngineCommand::AddPlaylistDeck {
+                channel_uuid,
+                items,
+                settings,
+            } => wire_id(self.add_playlist_deck(&channel_uuid, items, settings)),
+            EngineCommand::SetPlaylistItems { deck_uuid, items } => {
+                wire(self.edit_playlist(&deck_uuid, |list| list.set_items(items)))
+            }
+            EngineCommand::SetPlaylistSettings {
+                deck_uuid,
+                settings,
+            } => wire(self.edit_playlist(&deck_uuid, |list| list.set_settings(settings))),
+            EngineCommand::SetPlaylistPlaying { deck_uuid, playing } => {
+                wire(self.edit_playlist(&deck_uuid, |list| list.set_playing(playing)))
+            }
+            EngineCommand::ShowPlaylistItem { deck_uuid, index } => {
+                wire(self.edit_playlist(&deck_uuid, |list| list.show_item(index)))
+            }
+
+            // ── Timers ────────────────────────────────────────
+            EngineCommand::AddTimerDeck {
+                channel_uuid,
+                settings,
+            } => wire_id(self.add_timer_deck(&channel_uuid, settings)),
+            EngineCommand::SetTimerSettings {
+                deck_uuid,
+                settings,
+            } => wire(self.edit_timer(&deck_uuid, |timer| timer.set_settings(settings))),
+            EngineCommand::ControlTimer { deck_uuid, action } => {
+                wire(self.edit_timer(&deck_uuid, |timer| timer.control(action)))
             }
 
             // ── Deck Auto-Transitions ─────────────────────────
@@ -1046,6 +1349,10 @@ impl VardaApp {
                 output_uuid,
                 request,
             } => self.cmd_set_output_presentation(&output_uuid, request),
+            EngineCommand::SetOutputSource {
+                output_uuid,
+                source,
+            } => self.cmd_set_output_source(&output_uuid, source),
 
             // ── Modulation Updates ────────────────────────────────
             EngineCommand::UpdateLfoFrequency { uuid, frequency } => {
@@ -1563,6 +1870,15 @@ impl VardaApp {
                 self.camera_manager.scan_devices();
                 CommandResult::Ok
             }
+            EngineCommand::SetCameraColour { deck_uuid, colour } => {
+                self.cmd_set_camera_colour(&deck_uuid, colour)
+            }
+            EngineCommand::SetCameraProfile { deck_uuid, profile } => {
+                self.cmd_set_camera_profile(&deck_uuid, &profile)
+            }
+            EngineCommand::SetCameraLowestLatency { deck_uuid, on } => {
+                self.cmd_set_camera_lowest_latency(&deck_uuid, on)
+            }
             EngineCommand::RescanDepthSensors => {
                 self.depth_manager.scan_devices();
                 CommandResult::Ok
@@ -1573,6 +1889,10 @@ impl VardaApp {
             }
             EngineCommand::RequestScreenCapturePermission => {
                 self.screen_capture_manager.request_permission();
+                CommandResult::Ok
+            }
+            EngineCommand::ShowCameraVideoEffects => {
+                crate::camera::show_video_effects();
                 CommandResult::Ok
             }
             EngineCommand::RescanMidi => {
@@ -1656,6 +1976,42 @@ impl VardaApp {
                 }
                 Err(e) => e.into(),
             },
+            EngineCommand::SetEffectMask { effect_uuid, mask } => {
+                let mask = match mask {
+                    None => None,
+                    Some(mask) => match mask.sanitized() {
+                        Some(mask) => Some(mask),
+                        None => {
+                            return CommandResult::Err {
+                                code: ErrorCode::InvalidInput,
+                                message: "The mask has no area".into(),
+                            }
+                        }
+                    },
+                };
+                match self.resolve_effect(&effect_uuid) {
+                    Ok(loc) => {
+                        if let Some(effect) = self.mixer.effect_at_mut(loc) {
+                            effect.mask = mask;
+                        }
+                        CommandResult::Ok
+                    }
+                    Err(e) => CommandResult::from(e),
+                }
+            }
+            EngineCommand::SetLayerMask { deck_uuid, mask } => {
+                let mask = match mask.map(crate::engine::value::mask::EffectMask::sanitized) {
+                    None => None,
+                    Some(Some(mask)) => Some(mask),
+                    Some(None) => {
+                        return CommandResult::Err {
+                            code: ErrorCode::InvalidInput,
+                            message: "The mask has no area".into(),
+                        }
+                    }
+                };
+                wire_id(self.set_layer_mask(&deck_uuid, mask))
+            }
             EngineCommand::SetEffectParam {
                 effect_uuid,
                 name,
@@ -1674,6 +2030,21 @@ impl VardaApp {
                 }
                 Err(e) => e.into(),
             },
+            EngineCommand::ResetEffectParams { effect_uuid, names } => {
+                match self.resolve_effect(&effect_uuid) {
+                    Ok(loc) => {
+                        if let Some(effect) = self.mixer.effect_at_mut(loc) {
+                            if names.is_empty() {
+                                effect.params.reset_to_defaults();
+                            } else {
+                                effect.params.reset_named_to_defaults(&names);
+                            }
+                        }
+                        CommandResult::Ok
+                    }
+                    Err(e) => e.into(),
+                }
+            }
             EngineCommand::ResetGeneratorParamsToDefaults { deck_uuid } => {
                 match self.resolve_deck(&deck_uuid) {
                     Ok((ch_idx, dk_idx)) => {
@@ -1688,7 +2059,13 @@ impl VardaApp {
 
             // ── Resolution ────────────────────────────────────────
             EngineCommand::SetRenderResolution { width, height } => {
+                // Picking a size is a decision to stop following the screens.
+                self.set_render_auto(false);
                 self.set_render_resolution(width, height);
+                CommandResult::Ok
+            }
+            EngineCommand::SetRenderResolutionAuto { enabled } => {
+                self.set_render_auto(enabled);
                 CommandResult::Ok
             }
 
@@ -1701,10 +2078,44 @@ impl VardaApp {
                 self.set_target_fps(fps);
                 CommandResult::Ok
             }
+            EngineCommand::SetFramesInFlight { frames } => {
+                self.set_frames_in_flight(frames);
+                CommandResult::Ok
+            }
+            EngineCommand::SetFramePacing { pacing } => {
+                self.set_frame_pacing(pacing);
+                CommandResult::Ok
+            }
+            EngineCommand::SetClockTimestamps { on } => {
+                self.set_clock_timestamps(on);
+                CommandResult::Ok
+            }
+            EngineCommand::SetFrameHold { on } => {
+                self.set_frame_hold(on);
+                CommandResult::Ok
+            }
+            EngineCommand::SetControlScreenRate { on } => {
+                self.set_control_screen_rate(on);
+                CommandResult::Ok
+            }
+            EngineCommand::SetControlVsync { on } => {
+                self.set_control_vsync(on);
+                CommandResult::Ok
+            }
 
             EngineCommand::StartPerfProfile { frames } => {
                 self.mixer.start_perf_profile(frames);
                 CommandResult::Ok
+            }
+            EngineCommand::TracePresents { secs } => {
+                use crate::renderer::present_trace::{trace_path, LONGEST, TRACE};
+                let secs = f64::from(secs).clamp(0.0, LONGEST);
+                let path = trace_path();
+                log::info!("Present trace: {secs:.0} s into {}", path.display());
+                TRACE.start(secs, path.clone());
+                CommandResult::OkWithData {
+                    data: serde_json::json!({ "path": path, "secs": secs }),
+                }
             }
 
             // ── Presets ───────────────────────────────────────────
@@ -1725,16 +2136,10 @@ impl VardaApp {
 
             // ── Persistence ───────────────────────────────────────
             EngineCommand::SaveWorkspace => {
-                // No layout travels with the command, so reuse the last one the
-                // engine saw rather than writing defaults over the user's panels.
-                let layout = self.session.last_layout.clone();
-                match self.save_workspace(&layout) {
-                    Ok(()) => CommandResult::Ok,
-                    Err(e) => CommandResult::Err {
-                        code: ErrorCode::InternalError,
-                        message: e.to_string(),
-                    },
-                }
+                // In the background, with the layout the engine saw last; what
+                // did not land is said when it lands (see `save_for_command`).
+                self.save_for_command(None);
+                CommandResult::Ok
             }
             EngineCommand::LoadWorkspace => match self.load_workspace().error_message() {
                 None => CommandResult::Ok,
@@ -1743,6 +2148,35 @@ impl VardaApp {
                     message,
                 },
             },
+            // As SaveWorkspace, with the layout the engine last saw.
+            // Started here: the show moves once its copy has landed, said
+            // then (see `save_show_as`).
+            EngineCommand::SaveShowAs { folder } => {
+                let layout = self.session.last_layout.clone();
+                wire(self.save_as(&folder, &layout, false, None))
+            }
+            EngineCommand::NewShow { folder } => {
+                let layout = self.session.last_layout.clone();
+                let folder =
+                    folder.unwrap_or_else(|| super::shows::untitled_in(&super::shows::shows_dir()));
+                wire(self.new_show(&folder, &layout))
+            }
+            EngineCommand::OpenShow { folder } => {
+                let layout = self.session.last_layout.clone();
+                match self.open_show(&folder, &layout) {
+                    Ok(loaded) => match loaded.error_message() {
+                        None => CommandResult::Ok,
+                        Some(message) => CommandResult::Err {
+                            code: ErrorCode::InternalError,
+                            message,
+                        },
+                    },
+                    Err(e) => CommandResult::Err {
+                        code: ErrorCode::InvalidInput,
+                        message: format!("{e:#}"),
+                    },
+                }
+            }
 
             // ── History ───────────────────────────────────────────
             // Restore is shared with the windowed runner via `history_undo` /
@@ -1800,6 +2234,66 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
         C::SetCrossfader(..)
             | C::AutoCrossfade { .. }
             | C::BeatCrossfade { .. }
+            // Live bus takes: what is on air right now, not authored content.
+            // Same reasoning as the crossfader above — an operator pressing
+            // undo mid-show must not have a take rewound under them.
+            | C::BusCut { .. }
+            | C::BusAuto { .. }
+            | C::SetBusPreview { .. }
+            // Taking a layer off one bus is an overlay switch, as live as a
+            // take: undo must not put the lower third back on the stream.
+            | C::SetBusLayerHidden { .. }
+            // The audio mixer is a live console. Undoing a deck edit must not
+            // move a fader or unmute a microphone.
+            | C::AddAudioBus { .. }
+            | C::RemoveAudioBus { .. }
+            | C::RenameAudioBus { .. }
+            | C::SetAudioBusGain { .. }
+            | C::SetAudioBusMute { .. }
+            | C::SetAudioBusDelay { .. }
+            | C::SetAudioBusDevice { .. }
+            | C::AddAudioInput { .. }
+            | C::AddAppSound { .. }
+            | C::RemoveAudioInput { .. }
+            | C::SetAudioSourceGain { .. }
+            | C::SetAudioSourceMute { .. }
+            | C::SetAudioSend { .. }
+            | C::SetAudioFollow { .. }
+            | C::SetAudioAuto { .. }
+            | C::SetAudioBalance { .. }
+            | C::SetAudioSourceDelay { .. }
+            | C::SetOutputAudioBus { .. }
+            | C::RescanAudioDevices
+            | C::SetAudioSolo { .. }
+            | C::SetAudioMonitorDevice { .. }
+            | C::SetAudioMonitorGain { .. }
+            | C::SetAudioMonitorListen { .. }
+            // What is on Main is on air: undoing a deck edit must not put the
+            // previous speaker back, or take a logo off. Switching the mode
+            // changes what goes out just as much.
+            | C::SetMixMode { .. }
+            | C::TakeToMain { .. }
+            | C::SetOverlayOn { .. }
+            | C::SetMainFadeTime { .. }
+            | C::SetMainTransition { .. }
+            // Running the rundown is running the show: a step taken, where
+            // the show is, a wait held and the fade time are live. Making
+            // and changing steps is authored, and stays on the timeline.
+            | C::TakeRundownStep { .. }
+            | C::RundownGo { .. }
+            | C::SetRundownNext { .. }
+            | C::RundownHold
+            | C::SetRundownFade { .. }
+            // Going on air, and where to: undoing a deck edit must never stop
+            // the stream or change where it goes.
+            | C::SetStreamOptions { .. }
+            | C::SetStreamDestination { .. }
+            | C::StartStream
+            | C::StopStream
+            // Recording is as live as the stream.
+            | C::SetRecordOptions { .. }
+            | C::StartRecording
+            | C::StopRecording
             // Live macro-knob turn (fans out to targets; config edits stay undoable).
             | C::SetMacroValue { .. }
             // Audio device lifecycle / scanning.
@@ -1817,6 +2311,12 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::VideoSetOutPoint { .. }
             | C::VideoClearInOutPoints { .. }
             | C::VideoSetTransportSync { .. }
+            | C::VideoSetAutoPlayback { .. }
+            // Playlist transport: what plays is live, like a clip's.
+            | C::SetPlaylistPlaying { .. }
+            | C::ShowPlaylistItem { .. }
+            // Starting and stopping a timer is live, like a clip's transport.
+            | C::ControlTimer { .. }
             // ADSR live triggers.
             | C::TriggerAdsr { .. }
             | C::ReleaseAdsr { .. }
@@ -1849,6 +2349,15 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::CreateOutput
             | C::CreateHeadlessOutput { .. }
             | C::CloseOutput { .. }
+            | C::ReopenOutput { .. }
+            | C::ShowBusOnScreen { .. }
+            | C::ShowBusOnBlackmagic { .. }
+            // A screen's name belongs to the computer, not the show.
+            | C::RenameScreen { .. }
+            | C::IdentifyScreens
+            | C::SetOutputLed { .. }
+            | C::CreateLedOutput { .. }
+            | C::CreateLedScreenBus { .. }
             | C::SetOutputDisplay { .. }
             | C::SetOutputTarget { .. }
             | C::StartOutput { .. }
@@ -1856,6 +2365,7 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::SetCalibrationMode { .. }
             | C::SetOutputRotation { .. }
             | C::SetOutputPresentation { .. }
+            | C::SetOutputSource { .. }
             | C::SetEdgeBlend { .. }
             | C::SetEdgeBlendMode { .. }
             // Surface auto-detection produces preview contours only; the scene
@@ -1875,6 +2385,7 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::RescanCameras
             | C::RescanCaptureTargets
             | C::RequestScreenCapturePermission
+            | C::ShowCameraVideoEffects
             | C::RescanMidi
             | C::SetMidiDeviceEnabled { .. }
             | C::ClearMidiMappings
@@ -1902,9 +2413,17 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::SetLaneCollapsed { .. }
             // Global engine settings / profiling.
             | C::SetRenderResolution { .. }
+            | C::SetRenderResolutionAuto { .. }
             | C::SetDomemasterResolution { .. }
             | C::SetTargetFps { .. }
+            | C::SetFramesInFlight { .. }
+            | C::SetFramePacing { .. }
+            | C::SetClockTimestamps { .. }
+            | C::SetFrameHold { .. }
+            | C::SetControlVsync { .. }
+            | C::SetControlScreenRate { .. }
             | C::StartPerfProfile { .. }
+            | C::TracePresents { .. }
             // Param toggle is a live keyboard/shortcut affordance (SetParam edits
             // stay undoable; the two-value toggle does not pollute the timeline).
             | C::ToggleParam { .. }
@@ -1914,6 +2433,9 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             // Persistence, history control, and shutdown are never undoable.
             | C::SaveWorkspace
             | C::LoadWorkspace
+            | C::SaveShowAs { .. }
+            | C::NewShow { .. }
+            | C::OpenShow { .. }
             | C::Undo
             | C::Redo
             | C::Shutdown
@@ -1923,6 +2445,137 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
 #[cfg(test)]
 mod tests {
     use super::command_is_undoable;
+
+    /// Live bus takes are what is on air right now, not authored content.
+    /// Same reasoning as the crossfader: an operator pressing undo mid-show
+    /// must not have a take rewound under them.
+    /// How Main takes, like what is on it, is a live setting: undo must not
+    /// change the fade time or the transition under the operator.
+    #[test]
+    fn mains_take_settings_are_not_undoable() {
+        use crate::engine::EngineCommand as C;
+        for cmd in [
+            C::SetMainFadeTime { secs: 2.0 },
+            C::SetMainTransition {
+                transition: crate::mixer::MainTransition::Merge,
+            },
+        ] {
+            assert!(!command_is_undoable(&cmd), "{cmd:?}");
+        }
+    }
+
+    /// Running the rundown is running the show: undo must not take a step
+    /// back, move where the show is, or start a wait again. Making and
+    /// changing steps is authored: a step removed by mistake comes back.
+    #[test]
+    fn running_the_rundown_is_not_undoable_but_making_it_is() {
+        use crate::engine::EngineCommand as C;
+        let step = || "s".to_string();
+        for cmd in [
+            C::TakeRundownStep {
+                uuid: step(),
+                fade: true,
+            },
+            C::RundownGo {
+                fade: true,
+                expect: None,
+            },
+            C::SetRundownNext { uuid: step() },
+            C::RundownHold,
+            C::SetRundownFade { secs: 2.0 },
+        ] {
+            assert!(!command_is_undoable(&cmd), "{cmd:?}");
+        }
+        for cmd in [
+            C::AddRundownStep {
+                name: "A".into(),
+                buses: None,
+                main: false,
+            },
+            C::DuplicateRundownStep { uuid: step() },
+            C::RemoveRundownStep { uuid: step() },
+            C::RenameRundownStep {
+                uuid: step(),
+                name: "B".into(),
+            },
+            C::MoveRundownStep {
+                uuid: step(),
+                later: true,
+            },
+            C::SetRundownScreen {
+                uuid: step(),
+                bus_uuid: "b".into(),
+                input: None,
+            },
+            C::SetRundownMain {
+                uuid: step(),
+                main: None,
+            },
+            C::SetRundownOverlay {
+                uuid: step(),
+                channel_uuid: "c".into(),
+                on: None,
+            },
+            C::SetRundownPlay {
+                uuid: step(),
+                deck_uuid: "d".into(),
+                action: None,
+            },
+            C::SetRundownThen {
+                uuid: step(),
+                secs: None,
+            },
+            C::CaptureRundownStep { uuid: step() },
+        ] {
+            assert!(command_is_undoable(&cmd), "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn live_bus_takes_are_not_undoable_but_bus_configuration_is() {
+        use crate::engine::EngineCommand as C;
+        for cmd in [
+            C::BusCut { uuid: "b".into() },
+            C::BusAuto {
+                uuid: "b".into(),
+                duration_secs: None,
+            },
+            C::SetBusPreview {
+                uuid: "b".into(),
+                input: crate::bus::BusInputRef::Black,
+            },
+            C::SetBusLayerHidden {
+                uuid: "b".into(),
+                channel_uuid: "c".into(),
+                hidden: true,
+            },
+        ] {
+            assert!(
+                !command_is_undoable(&cmd),
+                "live take {cmd:?} must not create a history entry"
+            );
+        }
+        // Authored bus configuration stays on the undo timeline.
+        assert!(command_is_undoable(&C::AddBus {
+            name: "LED".into(),
+            width: 1920,
+            height: 480,
+        }));
+        assert!(command_is_undoable(&C::RemoveBus { uuid: "b".into() }));
+        assert!(command_is_undoable(&C::RenameBus {
+            uuid: "b".into(),
+            name: "LED".into(),
+        }));
+        assert!(command_is_undoable(&C::SetBusCanvas {
+            uuid: "b".into(),
+            width: 1920,
+            height: 480,
+        }));
+        assert!(command_is_undoable(&C::SetBusAutoDuration {
+            uuid: "b".into(),
+            duration_secs: 2.0,
+        }));
+    }
     use crate::engine::EngineCommand as C;
 
     #[test]
@@ -1983,6 +2636,7 @@ mod tests {
         assert!(!command_is_undoable(&C::SetDomemasterResolution {
             resolution: crate::renderer::dome::DomemasterResolution::R4K,
         }));
+        assert!(!command_is_undoable(&C::SetFramesInFlight { frames: 2 }));
         assert!(!command_is_undoable(&C::SetTargetFps { fps: 30 }));
         // Saving a preset writes to disk; it is not undoable (loading is).
         assert!(!command_is_undoable(&C::SaveChannelPreset {

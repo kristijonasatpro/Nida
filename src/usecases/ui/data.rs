@@ -165,6 +165,12 @@ pub struct VideoPlaybackUI {
     pub out_point: f64,
     pub frame_rate: f64,
     pub transport_sync: crate::video::DeckTransportSync,
+    /// Decoded on the Mac's media engine rather than in software.
+    pub hardware_decode: bool,
+    /// Auto Play / Pause / Restart as it goes on and off air.
+    pub auto: crate::engine::value::video::AutoPlayback,
+    /// A sound file: nothing to see.
+    pub sound_only: bool,
 }
 
 /// Auto-transition state snapshot for UI display
@@ -261,6 +267,17 @@ pub struct DeckUIInfo {
     pub screen_capture: Option<ScreenCaptureUI>,
     /// Tap controls (None = not a tap source).
     pub tap: Option<TapUI>,
+    /// A playlist's items and where it has got (None = not a playlist).
+    pub playlist: Option<crate::engine::value::playlist::PlaylistSnapshot>,
+    /// A timer's settings and what it reads (None = not a timer).
+    pub timer: Option<crate::engine::value::timer::TimerSnapshot>,
+    /// How a camera's picture is read into colours (None = not a camera).
+    pub camera_colour: Option<crate::engine::value::camera::CameraColour>,
+    /// What a camera's picture is coded as (None = not a camera).
+    pub camera_profile: Option<crate::engine::value::camera::CameraProfile>,
+    /// Whether a camera's newest picture is shown every frame (None = not a
+    /// camera).
+    pub camera_lowest_latency: Option<bool>,
     /// True when the interactive window is currently open for this deck.
     pub is_html_interactive: bool,
     pub opacity: f32,
@@ -272,6 +289,10 @@ pub struct DeckUIInfo {
     /// True when this deck preserves source alpha (transparent compositing).
     pub transparent: bool,
     pub scaling_mode: Option<ScalingMode>,
+    /// The source picture's size, for a source a scaling mode fits.
+    pub source_size: Option<[u32; 2]>,
+    /// A colour layer's colour, straight RGBA 0 to 1.
+    pub solid_color: Option<[f32; 4]>,
     pub generator: ShaderParamsUI,
     pub effects: Vec<EffectInfo>,
     /// Video playback state (only present for video decks)
@@ -280,6 +301,8 @@ pub struct DeckUIInfo {
     pub auto_transition: Option<AutoTransitionUI>,
     /// Per-deck render FPS setting
     pub render_fps: DeckRenderFps,
+    /// Resolution the deck renders at, relative to the master.
+    pub render_scale: crate::deck::DeckRenderScale,
     /// Effective render rate this deck is achieving
     pub effective_render_fps: f32,
     /// Smoothed render cost in microseconds
@@ -298,6 +321,8 @@ pub struct ChannelUIInfo {
     pub blend_mode: BlendMode,
     pub decks: Vec<DeckUIInfo>,
     pub effects: Vec<EffectInfo>,
+    /// An overlay in Main mode: switched on and off over Main.
+    pub overlay: bool,
 }
 
 /// Audio input device info for UI display.
@@ -329,6 +354,8 @@ pub struct AudioUIData {
 /// Notification snapshot for UI rendering (avoids borrowing `NotificationSystem` during egui)
 #[derive(Clone)]
 pub struct NotificationUI {
+    /// The notification's id, which putting it away names.
+    pub id: u64,
     pub level: crate::notifications::NotificationLevel,
     pub message: String,
     pub progress: f32,
@@ -337,8 +364,9 @@ pub struct NotificationUI {
 /// Per-channel render statistics for the FPS popover
 pub struct ChannelRenderStats {
     pub name: String,
-    /// Average FPS across active decks in this channel (from deck render pipeline timing)
-    pub avg_deck_fps: f32,
+    /// The channel's frame rate as its motion shows it: the slowest visible
+    /// layer that moves (see `channel_fps`).
+    pub fps: f32,
     /// Number of active (rendered) decks
     pub active_deck_count: u32,
     /// Total channel render time in milliseconds
@@ -388,6 +416,8 @@ pub struct HtmlLibraryEntry {
 pub struct UIData {
     pub generators: Vec<(String, usize)>,
     pub filters: Vec<(String, usize)>,
+    /// Each masked effect's mask, by effect UUID.
+    pub effect_masks: std::collections::HashMap<String, crate::engine::value::mask::EffectMask>,
     pub shader_count: usize,
     pub channels: Vec<ChannelUIInfo>,
     pub master_effect_info: Vec<EffectInfo>,
@@ -415,7 +445,7 @@ pub struct UIData {
     pub auto_crossfade_active: bool,
     /// Progress of auto-crossfade (0.0–1.0), if active
     pub auto_crossfade_progress: f32,
-    /// Current tonemap mode (Bypass or ACES)
+    /// Current tonemap mode
     pub tonemap_mode: crate::renderer::tonemap::TonemapMode,
     /// Active LUT filename (if any)
     pub active_lut_filename: Option<String>,
@@ -495,18 +525,58 @@ pub struct UIData {
     pub library_panel_open: bool,
     /// Whether the right panel (master output sidebar) is open
     pub right_panel_open: bool,
+    /// Which panels the window shows, and where.
+    pub screen: crate::usecases::ui::screen_layout::ScreenLayout,
+    /// The operator's saved layouts, for the Layout menu.
+    pub saved_layouts: std::sync::Arc<Vec<crate::usecases::ui::screen_layout::SavedLayout>>,
+    /// The open show's name (its folder's) and folder.
+    pub show_name: String,
+    pub show_folder: std::path::PathBuf,
+    /// Shows opened lately, the latest first, for the Show menu.
+    pub recent_shows: std::sync::Arc<Vec<std::path::PathBuf>>,
+    /// Choices made in windows, kept for every show (see `window_choices`).
+    pub window_choices: crate::usecases::ui::window_choices::WindowChoices,
+    /// Why another show cannot be opened now (the stream or recording is
+    /// running), if it cannot.
+    pub show_switch_refused: Option<String>,
+    /// Channels folded to a strip in the Inputs panel, by UUID.
+    pub collapsed_channels: Vec<String>,
     /// Stage editor grid size (normalized, e.g. 0.05 = 20 divisions)
     pub stage_editor_grid_size: f32,
     /// Whether snap-to-grid is enabled in the stage editor
     pub stage_editor_snap: bool,
     /// Available display monitors (refreshed each frame)
     pub available_monitors: Vec<MonitorInfo>,
+    /// Production buses, in order.
+    pub buses: Vec<BusUI>,
+    /// The rundown: its steps, where the show is, what comes next.
+    pub rundown: crate::engine::RundownSnapshot,
+    /// The audio mixer: buses, source strips, meters, sound devices.
+    pub audio_mix: crate::audio_mix::AudioMixSnapshot,
+    /// Main, the vMix way: the mode, what is on air, fades, overlays.
+    pub main: crate::mixer::MainSnapshot,
+    /// The stream's settings, keys and passwords included, for its window.
+    pub stream_settings: crate::streaming::StreamSettings,
+    /// How the stream and each destination are doing.
+    pub stream_status: crate::streaming::StreamStatus,
+    /// Recording: settings and how it is doing.
+    pub record: crate::record::RecordSnapshot,
     /// Connected MIDI devices
     pub midi_devices: Vec<MidiDeviceUI>,
     /// Current MIDI mappings (for display)
     pub midi_mappings: Vec<MidiMappingUI>,
     /// Available camera devices (name, id)
     pub cameras: Vec<(String, crate::camera::CameraId)>,
+    /// The OS refuses this app the cameras (Camera access off on a Mac).
+    pub camera_access_denied: bool,
+    /// macOS camera effects on for this app, which change every camera's
+    /// picture on air (see `CameraSnapshot::video_effects`).
+    pub camera_video_effects: Vec<String>,
+    /// The sizes and rates each camera offers, largest and fastest first.
+    pub camera_modes: Vec<(
+        crate::camera::CameraId,
+        Vec<crate::engine::value::camera::CameraMode>,
+    )>,
     /// Detected depth sensors (name, id)
     pub depth_sensors: Vec<(String, crate::depth::DepthSensorId)>,
     /// Capture targets found by the last screen-capture scan.
@@ -519,6 +589,8 @@ pub struct UIData {
     pub screen_capture_available: bool,
     /// Discovered NDI sources (name)
     pub ndi_sources: Vec<String>,
+    /// Blackmagic devices that can put out video (see `crate::decklink`).
+    pub decklink_devices: Vec<crate::decklink::DeckLinkDevice>,
     /// Whether NDI runtime is available
     pub ndi_available: bool,
     /// Discovered Syphon servers (name)
@@ -542,7 +614,7 @@ pub struct UIData {
     pub channel_count: usize,
     /// Pipeline-derived FPS: average of per-channel FPSes (from deck render timing)
     pub fps: f32,
-    /// Per-channel render stats: (`channel_name`, `avg_deck_fps`, `active_deck_count`, `render_time_ms`)
+    /// Per-channel render stats: (`channel_name`, `fps`, `active_deck_count`, `render_time_ms`)
     pub channel_render_stats: Vec<ChannelRenderStats>,
     /// GPU device name (e.g. "Apple M1 Pro")
     pub gpu_device_name: String,
@@ -556,6 +628,9 @@ pub struct UIData {
     pub gpu_device_type: String,
     /// GPU utilization % (0–100), from GPU timestamp data
     pub gpu_utilization: f32,
+    /// Whether `gpu_utilization` is the OS's own figure for how busy the GPU
+    /// is (macOS), rather than Nida's estimate from the layers' costs.
+    pub gpu_utilization_measured: bool,
     /// CPU usage % (0–100)
     pub cpu_usage: f32,
     /// RAM used in bytes
@@ -598,11 +673,18 @@ pub struct UIData {
     pub render_width: u32,
     /// Current master render height
     pub render_height: u32,
+    /// Whether the render resolution follows the output screens.
+    pub render_auto: bool,
     /// GPU's maximum 2D texture dimension — the only bound on custom render
     /// resolution (Varda imposes no artificial cap).
     pub max_render_dimension: u32,
     /// Target FPS (0 = uncapped)
     pub target_fps: u32,
+    /// Latency: frames the GPU may still be drawing when the next starts
+    /// (1 Low, 2 Normal, 3 High).
+    pub frames_in_flight: u32,
+    /// The control window's screen set to the show's rate while Nida runs.
+    pub control_screen_rate: bool,
     /// Whether undo is available
     pub can_undo: bool,
     /// Whether redo is available
@@ -662,13 +744,32 @@ pub enum SequenceStepKindUI {
     },
 }
 
+/// A production bus as the switcher shows it.
+#[derive(Clone)]
+pub struct BusUI {
+    pub bus: crate::engine::BusSnapshot,
+    /// The monitor the bus is shown on, if any — including one it is still
+    /// waiting for.
+    pub screen: Option<String>,
+}
+
 /// Info about an available display monitor (for UI display selector)
 #[derive(Clone)]
 pub struct MonitorInfo {
+    /// What outputs address it by.
     pub name: String,
     pub index: usize,
     pub width: u32,
     pub height: u32,
+    /// The control window is on this screen.
+    pub is_control: bool,
+    /// How it is shown: the name given to it, or what the platform calls
+    /// it, with its size and rate.
+    pub label: String,
+    /// What the platform calls it ("Color LCD").
+    pub model: Option<String>,
+    /// The name given to it on this computer.
+    pub given_name: Option<String>,
 }
 
 /// MIDI device info for UI display.
@@ -738,6 +839,12 @@ pub struct OutputUI {
     /// preview is stretched whenever the two disagree.
     pub preview_width: u32,
     pub preview_height: u32,
+    /// What a headless output sends (`Master` or a bus); `None` for a window.
+    pub source: Option<crate::renderer::context::OutputSource>,
+    /// The audio-mixer bus a recording or stream carries.
+    pub audio_bus: Option<String>,
+    /// The LED screens the output's feed carries, when it is an LED feed.
+    pub led: Option<crate::engine::value::led::LedLayout>,
 }
 
 /// Live audio passthrough health for an active output.

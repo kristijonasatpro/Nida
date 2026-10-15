@@ -54,6 +54,21 @@ fn parse_header(data: &[u8]) -> Result<SectionHeader> {
     })
 }
 
+/// The data of the section `h` heads, at the start of `data`: an error, not
+/// a panic, when a corrupt file says it runs past the end.
+fn body<'a>(data: &'a [u8], h: &SectionHeader) -> Result<&'a [u8]> {
+    part(data, h.header_size, h.data_length)
+}
+
+/// `len` bytes of `data` from `start`, or an error when there are not that
+/// many.
+fn part(data: &[u8], start: usize, len: usize) -> Result<&[u8]> {
+    start
+        .checked_add(len)
+        .and_then(|end| data.get(start..end))
+        .context("HAP section runs past the end of its frame")
+}
+
 /// BC4/RGTC1 nibble (alpha-only, used in Hap Q Alpha's alpha plane)
 const FMT_BC4: u8 = 0x01;
 
@@ -100,13 +115,13 @@ fn decode_chunked(data: &[u8], output: &mut Vec<u8>) -> Result<()> {
     if h.section_type != SECTION_DECODE_INSTRUCTIONS {
         bail!("Expected decode instructions, got 0x{:02X}", h.section_type);
     }
-    let instr = &data[h.header_size..h.header_size + h.data_length];
+    let instr = body(data, &h)?;
     let fdata = &data[h.header_size + h.data_length..];
     let (mut ct, mut st, mut ot): (&[u8], &[u8], Option<&[u8]>) = (&[], &[], None);
     let mut p = 0;
     while p < instr.len() {
         let s = parse_header(&instr[p..])?;
-        let d = &instr[p + s.header_size..p + s.header_size + s.data_length];
+        let d = body(&instr[p..], &s)?;
         match s.section_type {
             CHUNK_COMPRESSOR_TABLE => ct = d,
             CHUNK_SIZE_TABLE => st = d,
@@ -119,6 +134,9 @@ fn decode_chunked(data: &[u8], output: &mut Vec<u8>) -> Result<()> {
     if st.len() < n * 4 {
         bail!("Chunk size table too short");
     }
+    if ot.is_some_and(|o| o.len() < n * 4) {
+        bail!("Chunk offset table too short");
+    }
     output.clear();
     let mut ao: usize = 0;
     let mut tmp = Vec::new();
@@ -128,7 +146,7 @@ fn decode_chunked(data: &[u8], output: &mut Vec<u8>) -> Result<()> {
         let off = ot.map_or(ao, |o| {
             u32::from_le_bytes([o[i * 4], o[i * 4 + 1], o[i * 4 + 2], o[i * 4 + 3]]) as usize
         });
-        let chunk = &fdata[off..off + sz];
+        let chunk = part(fdata, off, sz)?;
         match ct[i] {
             CHUNK_UNCOMPRESSED => output.extend_from_slice(chunk),
             CHUNK_SNAPPY_ID => {
@@ -167,7 +185,7 @@ pub fn decode_hap_frame(
     alpha_out: &mut Vec<u8>,
 ) -> Result<HapFrame> {
     let h = parse_header(packet_data)?;
-    let section_data = &packet_data[h.header_size..h.header_size + h.data_length];
+    let section_data = body(packet_data, &h)?;
 
     if h.section_type == SECTION_MULTI_IMAGE {
         // Multi-image: parse all sub-sections
@@ -177,8 +195,7 @@ pub fn decode_hap_frame(
 
         while pos < section_data.len() {
             let sub = parse_header(&section_data[pos..])?;
-            let sub_data =
-                &section_data[pos + sub.header_size..pos + sub.header_size + sub.data_length];
+            let sub_data = body(&section_data[pos..], &sub)?;
             let fmt = tex_fmt(sub.section_type)?;
 
             match fmt {
@@ -219,7 +236,7 @@ pub fn decode_hap_frame(
 pub fn detect_hap_format(packet_data: &[u8]) -> Result<HapTextureFormat> {
     let h = parse_header(packet_data)?;
     if h.section_type == SECTION_MULTI_IMAGE {
-        let section_data = &packet_data[h.header_size..h.header_size + h.data_length];
+        let section_data = body(packet_data, &h)?;
         let mut pos = 0;
         let mut color_fmt = None;
         while pos < section_data.len() {
@@ -642,6 +659,47 @@ mod tests {
             detect_hap_format(&packet).unwrap(),
             HapTextureFormat::Bc3YCoCg
         );
+    }
+
+    /// Frames a corrupt file could hold: every one cut short, every length
+    /// byte wrong, chunk tables pointing past the data. Each is an error
+    /// (the frame skipped), never a panic, which stopped the clip for good.
+    #[test]
+    fn a_corrupt_frame_is_an_error_not_a_panic() {
+        let color = make_section(COMPRESSOR_NONE | (FMT_YCOCG & 0x0F), &[0xCC; 16]);
+        let alpha = make_section(COMPRESSOR_NONE | (FMT_BC4 & 0x0F), &[0xDD; 8]);
+        let multi = make_section(SECTION_MULTI_IMAGE, &[color.clone(), alpha].concat());
+        // Chunked: instructions (compressors, sizes, offsets) then one chunk.
+        let instructions = [
+            make_section(CHUNK_COMPRESSOR_TABLE, &[CHUNK_UNCOMPRESSED]),
+            make_section(CHUNK_SIZE_TABLE, &16u32.to_le_bytes()),
+            make_section(CHUNK_OFFSET_TABLE, &0u32.to_le_bytes()),
+        ]
+        .concat();
+        let chunked = make_section(
+            COMPRESSOR_COMPLEX | (FMT_BC1 & 0x0F),
+            &[
+                make_section(SECTION_DECODE_INSTRUCTIONS, &instructions),
+                vec![7; 16],
+            ]
+            .concat(),
+        );
+        let (mut out, mut alpha_out) = (Vec::new(), Vec::new());
+        for packet in [&color, &multi, &chunked] {
+            assert!(decode_hap_frame(packet, &mut out, &mut alpha_out).is_ok());
+            for cut in 0..packet.len() {
+                let _ = decode_hap_frame(&packet[..cut], &mut out, &mut alpha_out);
+                let _ = detect_hap_format(&packet[..cut]);
+            }
+            for at in 0..packet.len() {
+                for wrong in [0x00, 0x7F, 0xFF] {
+                    let mut bad = packet.clone();
+                    bad[at] = wrong;
+                    let _ = decode_hap_frame(&bad, &mut out, &mut alpha_out);
+                    let _ = detect_hap_format(&bad);
+                }
+            }
+        }
     }
 
     #[test]

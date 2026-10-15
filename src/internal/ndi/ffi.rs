@@ -94,6 +94,30 @@ pub struct NDIlib_video_frame_v2_t {
     pub timestamp: i64,
 }
 
+/// NDI audio frame (v3): planar 32-bit float, one run of `no_samples` per
+/// channel, `channel_stride_in_bytes` apart.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct NDIlib_audio_frame_v3_t {
+    pub sample_rate: c_int,
+    pub no_channels: c_int,
+    pub no_samples: c_int,
+    /// Timecode (100ns units, `i64::MAX` = synthesize).
+    pub timecode: i64,
+    /// Sample format; [`NDIlib_audio_frame_v3_t::FLTP`] is planar float.
+    pub FourCC: u32,
+    pub p_data: *mut u8,
+    /// Bytes from one channel's samples to the next's (planar formats).
+    pub channel_stride_in_bytes: c_int,
+    pub p_metadata: *const c_char,
+    pub timestamp: i64,
+}
+
+impl NDIlib_audio_frame_v3_t {
+    /// Planar 32-bit float, the format NDI carries sound in.
+    pub const FLTP: u32 = u32::from_le_bytes(*b"FLTp");
+}
+
 /// Frame type returned by `NDIlib_recv_capture_v3`.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

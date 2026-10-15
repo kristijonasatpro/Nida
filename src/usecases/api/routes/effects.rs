@@ -118,6 +118,53 @@ pub async fn toggle_effect(
     }
 }
 
+/// A mask, or `null` for none.
+#[derive(Deserialize, ToSchema)]
+pub struct EffectMaskBody {
+    pub mask: Option<crate::engine::value::mask::EffectMask>,
+}
+
+#[utoipa::path(put, path = "/api/effects/{effect_uuid}/mask", params(("effect_uuid" = String, Path, description = "Effect UUID")), request_body = EffectMaskBody, responses((status = 200, body = CommandResult), (status = 400, description = "The mask has no area"), (status = 404, description = "Effect not found")), tag = "Effects")]
+pub async fn set_effect_mask(
+    State(state): State<SharedState>,
+    Path(effect_uuid): Path<String>,
+    Json(body): Json<EffectMaskBody>,
+) -> impl IntoResponse {
+    match state
+        .send_command(EngineCommand::SetEffectMask {
+            effect_uuid,
+            mask: body.mask,
+        })
+        .await
+    {
+        Ok(result) => command_response(result),
+        Err(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
+#[derive(Deserialize, ToSchema, Default)]
+pub struct ResetEffectBody {
+    /// Parameters to reset; empty or left out resets them all.
+    #[serde(default)]
+    pub names: Vec<String>,
+}
+
+#[utoipa::path(post, path = "/api/effects/{effect_uuid}/reset", params(("effect_uuid" = String, Path, description = "Effect UUID")), request_body = ResetEffectBody, responses((status = 200, body = CommandResult), (status = 404, description = "Effect not found")), tag = "Effects")]
+pub async fn reset_effect(
+    State(state): State<SharedState>,
+    Path(effect_uuid): Path<String>,
+    body: Option<Json<ResetEffectBody>>,
+) -> impl IntoResponse {
+    let names = body.map(|Json(b)| b.names).unwrap_or_default();
+    match state
+        .send_command(EngineCommand::ResetEffectParams { effect_uuid, names })
+        .await
+    {
+        Ok(result) => command_response(result),
+        Err(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
 #[utoipa::path(put, path = "/api/channels/{channel_uuid}/effects/reorder", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ReorderEffectBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Effects")]
 pub async fn reorder_channel_effect(
     State(state): State<SharedState>,

@@ -852,7 +852,7 @@ mod tests {
                 depth_or_array_layers: 1,
             },
         );
-        gpu.queue.submit([encoder.finish()]);
+        gpu.submit([encoder.finish()]);
 
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -889,7 +889,7 @@ mod tests {
         pipeline.update_uniform(&gpu.queue, params, 1.0 / 30.0);
         let mut cmds = Vec::new();
         pipeline.run(&gpu.device, &src, None, &mut cmds);
-        gpu.queue.submit(cmds);
+        gpu.submit(cmds);
         let (depth_tex, _) = pipeline.output(Output::Depth).expect("depth output");
         let depth = read_r16f(gpu, &depth_tex);
         (pipeline, depth)
@@ -1005,7 +1005,7 @@ mod tests {
             pipeline.update_uniform(&gpu.queue, &params, 1.0 / 30.0);
             let mut cmds = Vec::new();
             pipeline.run(&gpu.device, &src, None, &mut cmds);
-            gpu.queue.submit(cmds);
+            gpu.submit(cmds);
         }
 
         let (motion_tex, _) = pipeline.output(Output::Motion).expect("motion output");
@@ -1054,7 +1054,7 @@ mod tests {
                 depth_or_array_layers: 1,
             },
         );
-        gpu.queue.submit([encoder.finish()]);
+        gpu.submit([encoder.finish()]);
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         gpu.device

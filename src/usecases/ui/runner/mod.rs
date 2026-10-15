@@ -18,8 +18,12 @@ use winit::{
 mod camera_detect;
 mod deck_load;
 mod detect;
+mod drag_position;
+mod engine_thread;
 mod event_loop;
 mod preview;
+mod shows;
+mod vsync;
 
 pub(crate) use event_loop::WindowHost;
 
@@ -28,6 +32,9 @@ use preview::PreviewEncoder;
 use deck_load::{apply_deck_texture_outcomes, register_deck_preview_texture, DeckLoadTargets};
 use detect::{spawn_detect_thread, DetectRequest, DetectResponse};
 
+// The flags are unrelated (a frame due, a detection under way, a gesture, the
+// show saved on the way out), not one state enum.
+#[allow(clippy::struct_excessive_bools)]
 pub struct UIRunner {
     // ── Session config (CLI flags + workspace defaults) ──────────────
     config: AppConfig,
@@ -40,7 +47,57 @@ pub struct UIRunner {
     egui_state: Option<egui_winit::State>,
     egui_renderer: Option<egui_wgpu::Renderer>,
     preview_encoder: Option<PreviewEncoder>,
+    /// The textures this frame's UI draws, tessellated: the previews to
+    /// encode (see `encode_previews`).
+    textures_drawn: std::collections::HashSet<egui::TextureId>,
+    /// The largest each texture was drawn at, in pixels: the size its
+    /// preview is made (see `PreviewEncoder::target_size`).
+    drawn_px: std::collections::HashMap<egui::TextureId, [u32; 2]>,
     deck_preview_textures: std::collections::HashMap<String, egui::TextureId>,
+    /// A folder picker for recordings, open on its own thread.
+    record_folder_pick: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
+    /// A Show menu dialog (Open…, Save As…), open on its own thread.
+    show_pick: Option<shows::PendingPick>,
+    /// Wakes the event loop from other threads (the engine thread, after
+    /// each frame).
+    proxy: Option<winit::event_loop::EventLoopProxy<()>>,
+    /// The engine thread has drawn a frame the control window has not shown.
+    ui_due: bool,
+    /// When the control window last drew a frame.
+    last_ui_frame: Option<std::time::Instant>,
+    /// Where the control window's frames' time goes (see `app::frame_parts`).
+    ui_parts: crate::app::frame_parts::FrameParts,
+    /// Control window frames drawn.
+    ui_frames: u32,
+    /// What the operator did in a frame the engine could not be had in time
+    /// to apply it: applied at the next frame.
+    stashed_actions: Option<ui::UIActions>,
+    /// When the engine was last not had in time, for a report now and then.
+    engine_late_reported: Option<std::time::Instant>,
+    /// Test hook: the control window freezes this long once a second —
+    /// holding the engine, or not (see [`UiStall`]).
+    ui_stall: Option<UiStall>,
+    last_ui_stall: Option<std::time::Instant>,
+    /// How long each frame is held on the control window, as last set on
+    /// its surface.
+    ui_frame_hold: Option<f64>,
+    /// How evenly the control window's frames reached its screen.
+    ui_on_screen: crate::renderer::on_screen::OnScreen,
+    /// The control window's frames waiting to be shown, and the most seen
+    /// since the last report.
+    ui_queue: crate::renderer::on_screen::Waiting,
+    ui_waiting_most: u64,
+    /// The control window's screen held at the show's rate (see
+    /// `crate::screen_rate`).
+    screen_rate: crate::screen_rate::ScreenRate,
+    /// Shows opened lately, for the Show menu.
+    recent_shows: std::sync::Arc<Vec<std::path::PathBuf>>,
+    /// The show folder the window is named after (see `show_changed`).
+    named_after: std::path::PathBuf,
+    /// Where the Recent list is kept (see `shows::recent_file`).
+    recent_file: Option<std::path::PathBuf>,
+    /// The saved layouts' writes on their way.
+    layout_writes: LayoutWrites,
     channel_preview_textures: std::collections::HashMap<usize, egui::TextureId>,
     output_preview_textures: std::collections::HashMap<usize, egui::TextureId>,
     main_output_texture: Option<egui::TextureId>,
@@ -58,6 +115,10 @@ pub struct UIRunner {
 
     // ── UI-consumer-owned layout/selection state ─────────────────────
     layout: super::UILayoutState,
+    /// The operator's saved screen layouts, kept for the user.
+    saved_layouts: crate::usecases::ui::screen_layout::SavedLayoutStore,
+    /// Choices made in windows, kept for the user across shows and runs.
+    window_choices: crate::usecases::ui::window_choices::WindowChoiceStore,
 
     // ── File dialog channel (async, non-blocking) ─────────────────────
     file_dialog_tx: std::sync::mpsc::Sender<FileDialogResult>,
@@ -69,9 +130,20 @@ pub struct UIRunner {
     /// Number of deck loads currently in-flight on background threads
     pending_deck_loads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     deck_load_targets: DeckLoadTargets,
+    /// Inputs made for files still loading, each removed again if its file
+    /// fails to open.
+    inputs_awaiting_files: std::collections::HashSet<String>,
 
     // ── Engine (created after GPU init in resumed()) ─────────────────
-    varda: Option<VardaApp>,
+    /// The engine, while this thread holds it: always when headless; in the
+    /// windowed app, only while the control window borrows it from the
+    /// engine thread (see [`engine_thread`]).
+    varda: Option<Box<VardaApp>>,
+    /// The engine thread, in the windowed app.
+    engine: Option<engine_thread::EngineThread>,
+    /// The GPU, for the control window to draw with while the engine is on
+    /// its own thread.
+    gpu: Option<GpuContext>,
 
     // ── Deferred GPU init (avoids Metal dispatch-queue deadlock on Rosetta/Intel) ──
     gpu_init_handle: Option<std::thread::JoinHandle<anyhow::Result<(GpuContext, WindowSurface)>>>,
@@ -100,6 +172,9 @@ pub struct UIRunner {
 
     // ── Signal-driven shutdown (SIGINT/SIGTERM) ─────────────────────
     shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set once the windowed app has saved the show on its way out (see
+    /// `shut_down`), so the window's close and the loop's end save it once.
+    shut_down: bool,
 
     // ── Cached window geometry (avoids XGetGeometry round-trip per frame) ──
     // winit 0.30's Window::inner_size() on X11 issues a synchronous XGetGeometry
@@ -110,7 +185,6 @@ pub struct UIRunner {
     egui_start_time: std::time::Instant,
     cached_screen_size: winit::dpi::PhysicalSize<u32>,
     cached_scale_factor: f32,
-    frame_loop_counter: u32,
 }
 
 impl UIRunner {
@@ -128,7 +202,29 @@ impl UIRunner {
             egui_state: None,
             egui_renderer: None,
             preview_encoder: None,
+            textures_drawn: std::collections::HashSet::new(),
+            drawn_px: std::collections::HashMap::new(),
             deck_preview_textures: std::collections::HashMap::new(),
+            record_folder_pick: None,
+            show_pick: None,
+            proxy: None,
+            ui_due: false,
+            last_ui_frame: None,
+            ui_parts: crate::app::frame_parts::FrameParts::default(),
+            ui_frames: 0,
+            stashed_actions: None,
+            engine_late_reported: None,
+            ui_stall: UiStall::from_env(),
+            last_ui_stall: None,
+            ui_frame_hold: None,
+            ui_on_screen: crate::renderer::on_screen::OnScreen::default(),
+            ui_queue: crate::renderer::on_screen::Waiting::default(),
+            ui_waiting_most: 0,
+            screen_rate: crate::screen_rate::ScreenRate::default(),
+            recent_shows: std::sync::Arc::default(),
+            named_after: std::path::PathBuf::new(),
+            recent_file: crate::app::shows::recent_file(),
+            layout_writes: LayoutWrites::default(),
             channel_preview_textures: std::collections::HashMap::new(),
             output_preview_textures: std::collections::HashMap::new(),
             main_output_texture: None,
@@ -142,13 +238,18 @@ impl UIRunner {
             detect_in_flight: false,
             main_window_id: None,
             layout: super::UILayoutState::default(),
+            saved_layouts: crate::usecases::ui::screen_layout::SavedLayoutStore::open_default(),
+            window_choices: crate::usecases::ui::window_choices::WindowChoiceStore::open_default(),
             file_dialog_tx,
             file_dialog_rx,
             deck_load_tx,
             deck_load_rx,
             pending_deck_loads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             deck_load_targets: DeckLoadTargets::default(),
+            inputs_awaiting_files: std::collections::HashSet::new(),
             varda: None,
+            engine: None,
+            gpu: None,
             gpu_init_handle: None,
             startup_t0: None,
             prev_gesture_active: false,
@@ -156,10 +257,106 @@ impl UIRunner {
             api_handle: None,
             cadence_anchor: None,
             shutdown_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shut_down: false,
             egui_start_time: std::time::Instant::now(),
             cached_screen_size: winit::dpi::PhysicalSize::new(0, 0),
             cached_scale_factor: 1.0,
-            frame_loop_counter: 0,
+        }
+    }
+
+    /// A saved layout whose file did not land is not kept: the menu as the
+    /// file has it, read again here, on the main thread with the engine
+    /// not held — the outputs do not wait for it.
+    fn take_lost_layouts(&mut self) {
+        use std::sync::atomic::Ordering;
+        // Not while one is on its way: it will say again when it lands.
+        let writes = &self.layout_writes;
+        if writes.on_way.load(Ordering::SeqCst) == 0 && writes.lost.swap(false, Ordering::SeqCst) {
+            self.saved_layouts.reload();
+        }
+    }
+
+    /// The panel arrangement the frame left, and saving or forgetting a
+    /// named layout — which writes the user's layouts file, so it happens
+    /// here rather than in the UI.
+    fn apply_screen_layout_actions(&mut self, ui_actions: &mut ui::UIActions) {
+        let session = &mut ui_actions.session;
+        // A fold is kept with the workspace too.
+        let mut changed = session.toggle_collapsed_channel.is_some();
+        if let Some(screen) = session.screen_layout.take() {
+            let old = &self.layout.screen;
+            changed = screen.name != old.name
+                || screen.locked != old.locked
+                || !crate::usecases::ui::screen_layout::same_arrangement(&screen.dock, &old.dock);
+            self.layout.screen = screen;
+        }
+        // The files below are written in the background, as a save is: the
+        // outputs do not wait for the disk (see `persistence::writer`).
+        // Said once the file is there.
+        if let Some(name) = session.save_layout_as.take() {
+            let varda = self.varda.as_deref_mut();
+            let said = ui::screen_layout::valid_name(&name)
+                .ok()
+                .map(|saved| format!("Saved layout \"{saved}\""));
+            let writes = self.layout_writes.clone();
+            let result =
+                self.saved_layouts
+                    .save_as_with(&name, &self.layout.screen.dock, |path, text| {
+                        let failed = ui::screen_layout::not_saved(path);
+                        let then = Some(writes.landing());
+                        keep_file(varda, "the saved layouts", path, text, said, failed, then)
+                    });
+            match result {
+                Ok(saved) => {
+                    self.layout.screen.name = saved;
+                    changed = true;
+                }
+                Err(e) => {
+                    if let Some(varda) = self.varda.as_mut() {
+                        varda.notify_error(e);
+                    }
+                }
+            }
+        }
+        if let Some(name) = session.delete_saved_layout.take() {
+            let varda = self.varda.as_deref_mut();
+            let said = Some(format!("Deleted layout \"{name}\""));
+            let writes = self.layout_writes.clone();
+            let result = self.saved_layouts.delete_with(&name, |path, text| {
+                let failed = ui::screen_layout::not_saved(path);
+                let then = Some(writes.landing());
+                keep_file(varda, "the saved layouts", path, text, said, failed, then)
+            });
+            if let (Err(e), Some(varda)) = (result, self.varda.as_mut()) {
+                varda.notify_error(e);
+            }
+        }
+        if let Some(choices) = session.window_choices.take() {
+            let varda = self.varda.as_deref_mut();
+            let kept = self.window_choices.set_with(choices, |path, text| {
+                let failed = crate::usecases::ui::window_choices::not_kept(path);
+                keep_file(
+                    varda,
+                    "the windows' choices",
+                    path,
+                    text,
+                    None,
+                    failed,
+                    None,
+                )
+            });
+            if let Err(e) = kept {
+                log::warn!("{e}");
+                if let Some(varda) = self.varda.as_mut() {
+                    varda.notify_error(e);
+                }
+            }
+        }
+        // A save through the API carries no layout; it uses this one.
+        if changed {
+            if let Some(varda) = self.varda.as_mut() {
+                varda.remember_layout(&self.layout);
+            }
         }
     }
 
@@ -171,6 +368,7 @@ impl UIRunner {
     /// server, or one already exists on this thread), or if the event loop
     /// itself terminates with an error.
     pub fn run(mut self) -> anyhow::Result<()> {
+        crate::streaming::try_encoders_meanwhile();
         // Install Ctrl-C handler for graceful shutdown (especially useful in headless)
         let flag = self.shutdown_flag.clone();
         let _ = ctrlc::set_handler(move || {
@@ -179,11 +377,94 @@ impl UIRunner {
         });
 
         let event_loop = EventLoop::new()?;
+        self.proxy = Some(event_loop.create_proxy());
         event_loop
             .run_app(&mut self)
             .map_err(|e| anyhow::anyhow!("Event loop error: {e:?}"))?;
         Ok(())
     }
+}
+
+/// Hand a file of Nida's own to the show's writer (see
+/// `VardaApp::keep_file`) — or, with no engine to hand it to, write it now.
+fn keep_file(
+    varda: Option<&mut VardaApp>,
+    label: &str,
+    path: &std::path::Path,
+    text: String,
+    said: Option<String>,
+    failed: String,
+    then: Option<crate::persistence::writer::Then>,
+) -> Result<(), String> {
+    let Some(varda) = varda else {
+        return path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| crate::persistence::atomic_write(path, &text))
+            .map_err(|e| format!("{failed}: {e}"));
+    };
+    varda.keep_file(label, path, text, said, failed, then);
+    Ok(())
+}
+
+/// The saved layouts' writes on their way: how many, and whether the last
+/// to land did not — the menu is then read again from the file, once none
+/// is on its way (see `UIRunner::take_lost_layouts`).
+#[derive(Clone, Default)]
+struct LayoutWrites {
+    on_way: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl LayoutWrites {
+    /// One more on its way; what to tell once it has landed. The last to
+    /// land decides: one that failed leaves the file as it was; one that
+    /// landed wrote the whole list as it is here, an earlier failure's
+    /// change and all.
+    fn landing(&self) -> crate::persistence::writer::Then {
+        use std::sync::atomic::Ordering;
+        self.on_way.fetch_add(1, Ordering::SeqCst);
+        let writes = self.clone();
+        Box::new(move |landed| {
+            if writes.on_way.fetch_sub(1, Ordering::SeqCst) == 1 {
+                writes
+                    .lost
+                    .store(!landed.errors.is_empty(), Ordering::SeqCst);
+            }
+        })
+    }
+}
+
+/// Each `MoveChannel` among `commands`: the channel, where it is, and where
+/// it will be once moved.
+fn channel_moves(
+    varda: &VardaApp,
+    commands: &[crate::engine::EngineCommand],
+) -> Vec<(String, usize, usize)> {
+    let mut order: Vec<String> = varda
+        .mixer_ref()
+        .channels()
+        .iter()
+        .map(|c| c.uuid().to_string())
+        .collect();
+    let mut moves = Vec::new();
+    for command in commands {
+        if let crate::engine::EngineCommand::MoveChannel {
+            channel_uuid,
+            before_channel_uuid,
+        } = command
+        {
+            if let Some((from, to)) =
+                super::state::move_target(&order, channel_uuid, before_channel_uuid.as_deref())
+            {
+                let uuid = order.remove(from);
+                order.insert(to, uuid);
+                moves.push((channel_uuid.clone(), from, to));
+            }
+        }
+    }
+    moves
 }
 
 /// Whether this frame's mutations deserve their own undo entry.
@@ -256,7 +537,7 @@ impl UIRunner {
         // Create engine now that GPU is ready
         log::info!("[STARTUP] Creating engine (audio, MIDI, shaders, mixer)...");
         let mut varda = match VardaApp::new(gpu, &self.config) {
-            Ok(v) => v,
+            Ok(v) => Box::new(v),
             Err(e) => {
                 log::error!("Failed to initialize engine: {e}");
                 event_loop.exit();
@@ -268,12 +549,32 @@ impl UIRunner {
             varda.shader_count(),
             startup_t0.elapsed()
         );
+        // What the first REC or STREAM draws with, made ahead (see
+        // `VardaApp::make_recording_ahead`).
+        varda.make_recording_ahead();
+
+        // The show open last time, unless the command line names one: the
+        // app bundle names the show to start with, not the one to keep.
+        self.recent_shows = std::sync::Arc::new(
+            self.recent_file
+                .as_deref()
+                .map_or_else(Vec::new, crate::app::shows::recent_shows_in),
+        );
+        if !self.config.headless && !workspace_on_command_line() {
+            if let Some(last) = self.recent_shows.first().cloned() {
+                if last != varda.show_folder() {
+                    log::info!("[STARTUP] Reopening the last show: {}", last.display());
+                    varda.start_in_show(&last);
+                }
+            }
+        }
 
         // Load workspace (may replace default mixer with saved scene)
         log::info!("[STARTUP] Loading workspace...");
         let loaded = varda.load_workspace();
         if let Some(loaded_layout) = loaded.layout {
             self.layout = loaded_layout;
+            self.saved_layouts.reconnect(&mut self.layout.screen);
         }
         // `load_workspace` clears the engine-owned undo/redo timeline.
         log::info!("[STARTUP] Workspace loaded ({:.0?})", startup_t0.elapsed());
@@ -287,11 +588,36 @@ impl UIRunner {
             );
         }
 
+        self.gpu = Some(varda.gpu_context().clone());
+        // The show it starts in moves nothing (see `show_moved`).
+        self.named_after = varda.show_folder().to_path_buf();
         self.varda = Some(varda);
 
         // Register GPU textures with egui for previews (windowed only)
         if !self.config.headless {
             self.register_preview_textures();
+            // A show named on the command line (a test, a one-off) is not
+            // one to come back to next time.
+            if !workspace_on_command_line() {
+                self.show_changed();
+            }
+            // Every channel's picture is a tile in the control window: kept
+            // drawn, now and then, while off air.
+            if let Some(varda) = self.varda.as_mut() {
+                varda.set_ui_tiles(true);
+            }
+            // From here the engine runs on a thread of its own, waking the
+            // control window after each frame it draws.
+            if let (Some(varda), Some(proxy), Some(gpu)) =
+                (self.varda.take(), self.proxy.clone(), self.gpu.clone())
+            {
+                let proxy = std::sync::Mutex::new(proxy);
+                self.engine = Some(engine_thread::EngineThread::start(varda, gpu, move || {
+                    if let Ok(proxy) = proxy.lock() {
+                        let _ = proxy.send_event(());
+                    }
+                }));
+            }
         }
         log::info!(
             "[STARTUP] Initialization complete ({:.0?})",
@@ -308,29 +634,17 @@ impl UIRunner {
     /// prevents the burst-pause pattern where multiple short frames fire in
     /// rapid succession after one long frame.
     fn advance_cadence_anchor(&mut self, target_fps: u32) {
-        if target_fps == 0 {
-            self.cadence_anchor = None;
-            return;
-        }
-        let budget = std::time::Duration::from_secs_f64(1.0 / f64::from(target_fps));
-        let now = std::time::Instant::now();
-        self.cadence_anchor = Some(match self.cadence_anchor {
-            Some(anchor) => {
-                let ideal_next = anchor + budget;
-                if ideal_next > now {
-                    // Frame finished before deadline — cadence maintained
-                    ideal_next
-                } else {
-                    // Frame overshot — restart cadence from now
-                    now + budget
-                }
-            }
-            None => now + budget,
-        });
+        self.cadence_anchor = engine_thread::next_cadence_anchor(
+            self.cadence_anchor,
+            target_fps,
+            std::time::Instant::now(),
+        );
     }
 
     /// Headless render loop — engine processing without UI/egui.
     fn render_headless(&mut self, host: &dyn WindowHost) {
+        // The frame's slot on the even cadence the loop sleeps to.
+        let slot = self.cadence_anchor;
         let Some(varda) = self.varda.as_mut() else {
             return;
         };
@@ -345,6 +659,7 @@ impl UIRunner {
             if let Err(e) = varda.save_workspace(&self.layout) {
                 log::error!("{e}");
             }
+            varda.refuse_commands();
             if let Some(api) = self.api_handle.take() {
                 api.shutdown();
             }
@@ -353,9 +668,13 @@ impl UIRunner {
         }
 
         varda.update_frame_timing();
+        varda.set_frame_refresh_at(slot.filter(|_| varda.target_fps() > 0));
         varda.update_notifications();
         varda.process_commands();
         varda.process_inputs();
+        // Per-frame state advances here: after commands, before any render
+        // encode. See `VardaApp::advance_frame_state`.
+        varda.advance_frame_state();
 
         // Create pending output windows (API-driven in headless)
         host.create_pending_outputs(varda);
@@ -365,6 +684,7 @@ impl UIRunner {
 
         // Publish the cued channel(s) so off-air previews render live (issue #72).
         varda.set_preview_channels(self.layout.preview_channels());
+        varda.set_ui_selected_deck(self.layout.selected_deck);
 
         // GPU render (mixer compositing)
         varda.render_mixer_frame();
@@ -393,31 +713,260 @@ impl UIRunner {
         }
     }
 
-    /// Main render loop — delegates all logic to `VardaApp`.
+    /// One frame of the control window, on the main thread.
+    ///
+    /// The engine draws the show on its own thread (see [`engine_thread`]);
+    /// this borrows it twice, briefly: before laying out the UI, to read
+    /// what the UI shows, and after, to apply what the operator did. Laying
+    /// out the UI and waiting for a frame of its own to draw into, it does
+    /// without it — so neither holds up an output.
     fn render(&mut self, event_loop: &ActiveEventLoop) {
-        // 1. Frame timing + notifications + inputs
-        {
-            let Some(varda) = self.varda.as_mut() else {
+        self.take_lost_layouts();
+        let started = std::time::Instant::now();
+        self.last_ui_frame = Some(started);
+        self.ui_parts.begin(started, None);
+        // What the operator did in a frame the engine was not had for.
+        if let Some(stashed) = self.stashed_actions.take() {
+            let mut actions = Some(stashed);
+            if self
+                .with_engine(|this| this.ui_after(actions.take().expect("once")))
+                .is_none()
+            {
+                self.stashed_actions = actions;
+                return;
+            }
+        }
+        let Some(Some(ui_data)) = self.with_engine(|this| this.ui_before(event_loop)) else {
+            return;
+        };
+        let Some(window) = self.window else { return };
+        self.stall_for_test();
+
+        // 5. Run egui frame
+        let t_egui = std::time::Instant::now();
+        // Bypass take_egui_input() to avoid an XGetGeometry round-trip every frame.
+        // winit 0.30's Window::inner_size() on X11 is a synchronous xcb request;
+        // take_egui_input() calls it unconditionally. We replicate what it does
+        // using cached values updated from Resized/ScaleFactorChanged events.
+        let raw_input = {
+            let Some(egui_state) = &mut self.egui_state else {
                 return;
             };
-            varda.update_frame_timing();
-            varda.update_notifications();
-            varda.process_commands();
-            varda.process_inputs();
+            let display_scale = self.cached_scale_factor;
+            let pixels_per_point = self.egui_ctx.zoom_factor() * display_scale;
+            let w = self.cached_screen_size.width as f32 / pixels_per_point;
+            let h = self.cached_screen_size.height as f32 / pixels_per_point;
+            let input = egui_state.egui_input_mut();
+            input.time = Some(self.egui_start_time.elapsed().as_secs_f64());
+            if w > 0.0 && h > 0.0 {
+                input.screen_rect = Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(w, h),
+                ));
+            }
+            input.viewport_id = egui::ViewportId::ROOT;
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .native_pixels_per_point = Some(display_scale);
+            // Files dragged in from another app: give egui the real pointer,
+            // which the OS does not send while the drag is running.
+            if !input.hovered_files.is_empty() || !input.dropped_files.is_empty() {
+                if let Some((x, y)) = self.window.and_then(drag_position::pointer_in_window) {
+                    let zoom = f64::from(self.egui_ctx.zoom_factor());
+                    input.events.push(egui::Event::PointerMoved(egui::pos2(
+                        (x / zoom) as f32,
+                        (y / zoom) as f32,
+                    )));
+                }
+            }
+            input.take()
+        };
+        let mut ui_actions = ui::UIActions::new();
+        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+            ui_actions = ui::panels::render_ui(ui, &ui_data);
+        });
+        {
+            let Some(egui_state) = &mut self.egui_state else {
+                return;
+            };
+            egui_state.handle_platform_output(window, full_output.platform_output);
+        }
+        self.part("ui", t_egui);
+        // Tessellated before the previews are encoded: the meshes say which
+        // textures this frame draws — on screen, not scrolled or clipped
+        // away — and only those previews are encoded.
+        let t_part = std::time::Instant::now();
+        let paint_jobs = self
+            .egui_ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
+        self.textures_drawn.clear();
+        self.drawn_px.clear();
+        let pixels_per_point = full_output.pixels_per_point;
+        for job in &paint_jobs {
+            if let egui::epaint::Primitive::Mesh(mesh) = &job.primitive {
+                self.textures_drawn.insert(mesh.texture_id);
+                let size = mesh.calc_bounds().size() * pixels_per_point;
+                let size = [size.x.ceil() as u32, size.y.ceil() as u32];
+                let largest = self.drawn_px.entry(mesh.texture_id).or_insert(size);
+                *largest = [largest[0].max(size[0]), largest[1].max(size[1])];
+            }
+        }
+        self.part("ui tessellate", t_part);
+
+        let mut actions = Some(ui_actions);
+        let shown = match self.with_engine(|this| this.ui_after(actions.take().expect("once"))) {
+            Some(Some(shown)) => shown,
+            Some(None) => return,
+            // Kept for the next frame, not lost.
+            None => {
+                self.stashed_actions = actions;
+                return;
+            }
+        };
+
+        // The control window's own frame: the show's picture under the UI.
+        let t_submit = std::time::Instant::now();
+        self.submit_frame(
+            &paint_jobs,
+            full_output.pixels_per_point,
+            full_output.textures_delta,
+            &shown,
+        );
+        self.part("ui submit", t_submit);
+        #[allow(clippy::cast_precision_loss)]
+        let frame_ms = 1000.0 / shown.target_fps.max(1) as f32;
+        self.ui_parts.end(std::time::Instant::now(), frame_ms);
+    }
+
+    /// The test hook's freeze, once a second (see [`UiStall`]).
+    fn stall_for_test(&mut self) {
+        let Some(stall) = self.ui_stall else { return };
+        if self
+            .last_ui_stall
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_ui_stall = Some(std::time::Instant::now());
+        if stall.holding_engine {
+            let _ = self.with_engine(|_| std::thread::sleep(stall.freeze));
+        } else {
+            std::thread::sleep(stall.freeze);
+        }
+    }
+
+    /// Borrow the engine for `f`: from the engine thread, waiting for it to
+    /// finish a frame if it is in one — or as held here already (headless,
+    /// tests, before the engine thread starts). Put back after.
+    ///
+    /// `None` when the engine thread keeps it past [`ENGINE_PATIENCE`]: this
+    /// thread then goes back to macOS's event loop rather than wait on — the
+    /// engine thread may be waiting for it (a call only the main thread can
+    /// answer, which the engine should never make), and would never finish.
+    fn with_engine<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let borrowed = match (&self.engine, &self.varda) {
+            (Some(engine), None) => {
+                let t = std::time::Instant::now();
+                let taken = engine.baton().take_within(Some(ENGINE_PATIENCE));
+                self.ui_parts.add("engine wait", t.elapsed());
+                match taken {
+                    engine_thread::Taken::Engine(app) => self.varda = Some(app),
+                    engine_thread::Taken::Late => {
+                        self.report_engine_late();
+                        return None;
+                    }
+                    engine_thread::Taken::Closed => {}
+                }
+                true
+            }
+            _ => false,
+        };
+        let result = f(self);
+        if borrowed {
+            if let (Some(engine), Some(app)) = (&self.engine, self.varda.take()) {
+                engine.baton().put(app);
+            }
+        }
+        Some(result)
+    }
+
+    /// Say — now and then — that the engine thread kept the engine too long,
+    /// and where it was.
+    fn report_engine_late(&mut self) {
+        // Its first frames load the show and build shaders: long, and fine.
+        if self.engine.as_ref().is_some_and(engine_thread::EngineThread::starting) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .engine_late_reported
+            .is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(10))
+        {
+            return;
+        }
+        self.engine_late_reported = Some(now);
+        let phase = self.engine.as_ref().map(engine_thread::EngineThread::phase);
+        log::warn!(
+            "The engine thread kept the show over {ENGINE_PATIENCE:?} (at {phase:?}): \
+             the control window skipped a frame"
+        );
+    }
+
+    /// Time `took` since `since` on `part` of the control window's frame.
+    fn part(&mut self, part: &str, since: std::time::Instant) {
+        self.ui_parts.add(part, since.elapsed());
+    }
+
+    /// Before the UI is laid out, with the engine: the control window's
+    /// settings, preview textures, windows and screens, and what the UI
+    /// shows.
+    fn ui_before(&mut self, event_loop: &ActiveEventLoop) -> Option<crate::usecases::ui::UIData> {
+        if let (Some(ws), Some(varda)) = (&mut self.window_surface, &self.varda) {
+            ws.set_vsync(varda.gpu_context(), varda.control_vsync());
+            let hold = varda.frame_hold_secs();
+            if self.ui_frame_hold != hold {
+                crate::renderer::context::set_frame_hold(&ws.surface, hold);
+                self.ui_frame_hold = hold;
+            }
         }
 
         // 2. Sync egui texture registrations
+        let t_part = std::time::Instant::now();
         self.refresh_textures();
+        self.part("textures", t_part);
 
-        let Some(window) = self.window else { return };
+        let window = self.window?;
 
         // 3. Create pending output windows + refresh monitors
+        let t_part = std::time::Instant::now();
         {
-            let Some(varda) = self.varda.as_mut() else {
-                return;
-            };
+            let varda = self.varda.as_mut()?;
             varda.create_pending_outputs(event_loop);
+            varda.reopen_unshown_outputs(event_loop);
             varda.refresh_monitors(event_loop);
+            varda.note_control_window(window.current_monitor());
+            // The control window's screen at the show's rate (see
+            // `screen_rate`) — with the output windows just made counted, and
+            // every output window's screen asked now, not as last read.
+            let display = || window.current_monitor().and_then(|m| display_id(&m));
+            let outputs = || {
+                varda
+                    .output_screens_now()?
+                    .iter()
+                    .map(display_id)
+                    .collect::<Option<Vec<u32>>>()
+            };
+            let kept = self.screen_rate.keep(
+                display,
+                outputs,
+                varda.target_fps(),
+                varda.control_screen_rate(),
+            );
+            if let Some(kept) = kept {
+                varda.note_screen_rate(&kept);
+            }
             #[cfg(feature = "html")]
             varda.create_pending_interactive(event_loop);
         }
@@ -458,11 +1007,11 @@ impl UIRunner {
         }
 
         self.sync_camera_detect_capture();
+        self.part("windows", t_part);
 
         // 4. Collect UI data snapshot (engine → UI, with UI-owned layout state)
-        let Some(varda_ref) = self.varda.as_ref() else {
-            return;
-        };
+        let t_part = std::time::Instant::now();
+        let varda_ref = self.varda.as_ref()?;
         let mut ui_data = crate::usecases::ui::build_ui_data(
             varda_ref,
             &self.layout,
@@ -471,6 +1020,9 @@ impl UIRunner {
             &self.output_preview_textures,
             self.main_output_texture,
         );
+        ui_data.saved_layouts = self.saved_layouts.layouts();
+        ui_data.window_choices = self.window_choices.choices();
+        ui_data.recent_shows = std::sync::Arc::clone(&self.recent_shows);
         ui_data.can_undo = varda_ref.history_can_undo();
         ui_data.can_redo = varda_ref.history_can_redo();
         ui_data.pending_deck_loads = self
@@ -525,51 +1077,35 @@ impl UIRunner {
         ui_data
             .camera_detect_contours
             .clone_from(&self.camera_detect_contours);
+        self.part("ui data", t_part);
 
-        // 5. Run egui frame
-        let t_egui = std::time::Instant::now();
-        // Bypass take_egui_input() to avoid an XGetGeometry round-trip every frame.
-        // winit 0.30's Window::inner_size() on X11 is a synchronous xcb request;
-        // take_egui_input() calls it unconditionally. We replicate what it does
-        // using cached values updated from Resized/ScaleFactorChanged events.
-        let raw_input = {
-            let Some(egui_state) = &mut self.egui_state else {
-                return;
-            };
-            let display_scale = self.cached_scale_factor;
-            let pixels_per_point = self.egui_ctx.zoom_factor() * display_scale;
-            let w = self.cached_screen_size.width as f32 / pixels_per_point;
-            let h = self.cached_screen_size.height as f32 / pixels_per_point;
-            let input = egui_state.egui_input_mut();
-            input.time = Some(self.egui_start_time.elapsed().as_secs_f64());
-            if w > 0.0 && h > 0.0 {
-                input.screen_rect = Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(w, h),
-                ));
+        // How the control window has been doing, for the performance figures.
+        self.ui_frames += 1;
+        if self.ui_frames.is_multiple_of(10) {
+            if let Some(varda) = self.varda.as_mut() {
+                varda.set_control_on_screen(
+                    self.ui_on_screen.stats(),
+                    crate::engine::ControlQueueStats {
+                        waiting: self.ui_waiting_most,
+                    },
+                );
+                varda.set_control_parts(self.ui_parts.stats(), self.ui_parts.slow_frames());
+                self.ui_waiting_most = 0;
             }
-            input.viewport_id = egui::ViewportId::ROOT;
-            input
-                .viewports
-                .entry(egui::ViewportId::ROOT)
-                .or_default()
-                .native_pixels_per_point = Some(display_scale);
-            input.take()
-        };
-        let mut ui_actions = ui::UIActions::new();
-        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
-            ui_actions = ui::panels::render_ui(ui, &ui_data);
-        });
-        {
-            let Some(egui_state) = &mut self.egui_state else {
-                return;
-            };
-            egui_state.handle_platform_output(window, full_output.platform_output);
         }
+        Some(ui_data)
+    }
+
+    /// After the UI is laid out, with the engine: what the operator did,
+    /// the Show menu, what the engine keeps of the UI, and the previews.
+    /// Returns what the control window shows under the UI.
+    fn ui_after(&mut self, mut ui_actions: ui::UIActions) -> Option<Shown> {
+        let t_part = std::time::Instant::now();
 
         // 6. Apply all UI actions
         // 6a. UI-consumer-owned selection/layout state
         self.layout.apply_selections(&ui_actions);
+        self.apply_screen_layout_actions(&mut ui_actions);
 
         // 6a2. Dome camera actions — apply to renderer (not layout state)
         {
@@ -611,12 +1147,8 @@ impl UIRunner {
 
         // 6b. Engine actions (delegated to VardaApp)
         {
-            let Some(varda) = self.varda.as_mut() else {
-                return;
-            };
-            let Some(egui_renderer) = self.egui_renderer.as_mut() else {
-                return;
-            };
+            let varda = self.varda.as_mut()?;
+            let egui_renderer = self.egui_renderer.as_mut()?;
 
             // ── Undo/redo: snapshot before undoable mutations ──
             // Unified scene+stage timeline with general gesture coalescing
@@ -644,9 +1176,11 @@ impl UIRunner {
             }
 
             // Intercept shader_to_add: resolve and route to background loading
-            if let Some((channel_uuid, gen_idx)) = ui_actions.session.shader_to_add.take() {
+            if let Some((place, gen_idx)) = ui_actions.session.shader_to_add.take() {
                 if let Some(shader) = varda.resolve_generator(gen_idx) {
-                    let token = self.deck_load_targets.record(channel_uuid);
+                    let token = self
+                        .deck_load_targets
+                        .record_before(place.channel_uuid, place.before_deck_uuid);
                     let context = varda.gpu_context();
                     VardaApp::spawn_deck_loads(
                         &self.deck_load_tx,
@@ -661,7 +1195,20 @@ impl UIRunner {
                 }
             }
 
+            // Where each channel moved this frame will end up, found before the
+            // move: the selection is held by position and follows it after.
+            let moves = channel_moves(varda, &ui_actions.commands);
             let engine_outcome = varda.apply_engine_actions(&mut ui_actions);
+            for (uuid, from, to) in moves {
+                if varda
+                    .mixer_ref()
+                    .channels()
+                    .get(to)
+                    .is_some_and(|c| c.uuid() == uuid)
+                {
+                    self.layout.fixup_channel_move(from, to);
+                }
+            }
             apply_deck_texture_outcomes(
                 &engine_outcome.texture_outcomes,
                 egui_renderer,
@@ -690,7 +1237,7 @@ impl UIRunner {
                 let undo = ui_actions.session.undo_requested;
                 let outcome = varda.history_gui(&self.layout, undo);
                 if let crate::engine::CommandOutcome::HistoryRestored {
-                    structural_changed,
+                    structural_changed: _,
                     dome_layout,
                 } = outcome
                 {
@@ -702,158 +1249,146 @@ impl UIRunner {
                     let label = if undo { "↩ Undo" } else { "↪ Redo" };
                     varda.notify_info(label);
 
-                    if structural_changed {
-                        // Structural change: re-register all deck + channel preview textures
-                        self.deck_preview_textures.clear();
-                        self.channel_preview_textures.clear();
-                        let context = varda.gpu_context();
-                        let mixer = varda.mixer_ref();
-                        for (ch_idx, ch) in mixer.channels().iter().enumerate() {
-                            for slot in &ch.decks {
-                                let tex_id = egui_renderer.register_native_texture(
-                                    &context.device,
-                                    &slot.deck.texture_view,
-                                    wgpu::FilterMode::Linear,
-                                );
-                                self.deck_preview_textures
-                                    .insert(slot.deck.uuid().to_string(), tex_id);
-                            }
-                            let ch_tid = egui_renderer.register_native_texture(
-                                &context.device,
-                                &ch.composite_view,
-                                wgpu::FilterMode::Linear,
-                            );
-                            self.channel_preview_textures.insert(ch_idx, ch_tid);
-                        }
-                        if let Some(main_id) = self.main_output_texture {
-                            egui_renderer.update_egui_texture_from_wgpu_texture(
-                                &context.device,
-                                varda.mixer_ref().composite_view(),
-                                wgpu::FilterMode::Linear,
-                                main_id,
-                            );
-                        }
-                        // Re-register output preview textures
-                        self.output_preview_textures.clear();
-                        for (out_idx, output) in varda.outputs_ref().iter().enumerate() {
-                            let view = Self::output_preview_view(output, mixer);
-                            let tid = egui_renderer.register_native_texture(
-                                &context.device,
-                                view,
-                                wgpu::FilterMode::Linear,
-                            );
-                            self.output_preview_textures.insert(out_idx, tid);
-                        }
-                    }
+                    // Previews need nothing here, even when channels or
+                    // decks came and went: each frame's preview sync
+                    // registers new ones, retires gone ones, and keeps the
+                    // rest pointed at their gamma-encoded copies. Pointing
+                    // them at the engine's own linear textures (as this
+                    // once did) showed them dark and over-contrasty until a
+                    // restart.
                 }
             }
 
             varda.apply_ui_actions(&ui_actions);
-            let resolution_changed = engine_outcome.resolution_changed;
             varda.update_controller_leds();
 
-            // After resolution change, all GPU textures were recreated —
-            // re-register them with egui so previews point to the new views.
-            if resolution_changed {
-                let context = varda.gpu_context();
-                let mixer = varda.mixer_ref();
-                for (ch_idx, ch) in mixer.channels().iter().enumerate() {
-                    for slot in &ch.decks {
-                        if let Some(&tex_id) = self.deck_preview_textures.get(slot.deck.uuid()) {
-                            egui_renderer.update_egui_texture_from_wgpu_texture(
-                                &context.device,
-                                &slot.deck.texture_view,
-                                wgpu::FilterMode::Linear,
-                                tex_id,
-                            );
-                        }
-                    }
-                    if let Some(&ch_tid) = self.channel_preview_textures.get(&ch_idx) {
-                        egui_renderer.update_egui_texture_from_wgpu_texture(
-                            &context.device,
-                            &ch.composite_view,
-                            wgpu::FilterMode::Linear,
-                            ch_tid,
-                        );
-                    }
-                }
-                if let Some(main_id) = self.main_output_texture {
-                    egui_renderer.update_egui_texture_from_wgpu_texture(
-                        &context.device,
-                        mixer.composite_view(),
-                        wgpu::FilterMode::Linear,
-                        main_id,
-                    );
-                }
-                // Update output preview textures after resolution change
-                for (out_idx, output) in varda.outputs_ref().iter().enumerate() {
-                    if let Some(&tid) = self.output_preview_textures.get(&out_idx) {
-                        let view = Self::output_preview_view(output, mixer);
-                        egui_renderer.update_egui_texture_from_wgpu_texture(
-                            &context.device,
-                            view,
-                            wgpu::FilterMode::Linear,
-                            tid,
-                        );
-                    }
-                }
-            }
+            // A resolution change recreates the engine's textures, but the
+            // previews show gamma-encoded copies that are re-encoded from
+            // whatever the engine holds each frame, so they need no repair.
+            // Re-pointing them at the new linear textures (as this once did)
+            // showed every preview dark and over-contrasty until a restart.
 
             // Fix up selection state after channel removal
             if let Some(ch_idx) = engine_outcome.removed_channel {
                 self.layout.fixup_channel_removal(ch_idx);
             }
 
-            if ui_actions.session.save_requested && varda.save_workspace(&self.layout).is_ok() {
-                varda.notify_info("💾 Workspace saved");
+            // Written on a thread of its own, the outputs carrying on; "saved"
+            // is said once the files have landed.
+            if ui_actions.session.save_requested {
+                varda.save_in_background(&self.layout);
+            }
+
+            // Where recordings go: a folder picker, off the frame.
+            if std::mem::take(&mut ui_actions.session.choose_record_folder)
+                && self.record_folder_pick.is_none()
+            {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let start = varda.record_settings().options.folder.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(
+                        rfd::FileDialog::new()
+                            .set_title("Where recordings go")
+                            .set_directory(&start)
+                            .pick_folder(),
+                    );
+                });
+                self.record_folder_pick = Some(rx);
+            }
+            if let Some(rx) = &self.record_folder_pick {
+                if let Ok(picked) = rx.try_recv() {
+                    self.record_folder_pick = None;
+                    if let Some(folder) = picked {
+                        let options = crate::record::RecordOptions {
+                            folder,
+                            ..varda.record_settings().options.clone()
+                        };
+                        let _ = varda.cmd_set_record_options(options);
+                    }
+                }
+            }
+            if let Some(file) = ui_actions.session.reveal_file.take() {
+                reveal_in_file_manager(&file);
             }
 
             // Spawn file dialogs on background threads (non-blocking)
             if let Some(uuid) = ui_actions.session.open_image_dialog_for_channel.take() {
-                VardaApp::open_file_dialog(&self.file_dialog_tx, FileDialogKind::Image, uuid);
+                VardaApp::open_file_dialog(&self.file_dialog_tx, FileDialogKind::Image, Some(uuid));
             }
             if let Some(uuid) = ui_actions.session.open_video_dialog_for_channel.take() {
-                VardaApp::open_file_dialog(&self.file_dialog_tx, FileDialogKind::Video, uuid);
+                VardaApp::open_file_dialog(&self.file_dialog_tx, FileDialogKind::Video, Some(uuid));
+            }
+            if std::mem::take(&mut ui_actions.session.open_image_dialog_for_new_inputs) {
+                VardaApp::open_file_dialog(&self.file_dialog_tx, FileDialogKind::Image, None);
+            }
+            if std::mem::take(&mut ui_actions.session.open_video_dialog_for_new_inputs) {
+                VardaApp::open_file_dialog(&self.file_dialog_tx, FileDialogKind::Video, None);
+            }
+
+            // Files dropped in from Finder: decks in drop order, on one loader
+            // thread so they land in that order.
+            for (place, paths) in std::mem::take(&mut ui_actions.session.files_to_add) {
+                deck_load::add_dropped_files(
+                    varda,
+                    &mut self.deck_load_targets,
+                    &self.deck_load_tx,
+                    &self.pending_deck_loads,
+                    &place,
+                    paths,
+                );
             }
 
             // Poll completed file dialog results → spawn background deck loads.
             // The dialog carries a channel UUID rather than an index: the user
             // may have spent minutes browsing while the UI stayed live.
             while let Ok(result) = self.file_dialog_rx.try_recv() {
-                if varda
-                    .mixer_ref()
-                    .find_channel_by_uuid(&result.channel_uuid)
-                    .is_none()
-                {
-                    log::warn!(
-                        "Dropping {} file dialog result(s): channel {} no longer exists",
-                        result.paths.len(),
-                        result.channel_uuid
-                    );
-                    continue;
-                }
-                let mut images = Vec::new();
-                let mut videos = Vec::new();
-                for path in result.paths {
-                    let token = self.deck_load_targets.record(result.channel_uuid.clone());
-                    match result.kind {
-                        FileDialogKind::Image => images.push((token, path)),
-                        FileDialogKind::Video => videos.push((token, path)),
+                let targets: Vec<String> = if let Some(uuid) = &result.channel_uuid {
+                    if varda.mixer_ref().find_channel_by_uuid(uuid).is_none() {
+                        log::warn!(
+                            "Dropping {} file dialog result(s): channel {} no longer exists",
+                            result.paths.len(),
+                            uuid
+                        );
+                        continue;
                     }
-                }
-                if !images.is_empty() || !videos.is_empty() {
-                    let context = varda.gpu_context();
-                    VardaApp::spawn_deck_loads(
-                        &self.deck_load_tx,
-                        context,
-                        &self.pending_deck_loads,
-                        varda.render_width(),
-                        varda.render_height(),
-                        images,
-                        videos,
-                        Vec::new(),
-                    );
-                }
+                    vec![uuid.clone(); result.paths.len()]
+                } else {
+                    // A new input for each file, named after it; one undo
+                    // takes them all away.
+                    let snapshot = varda.history_snapshot(&self.layout);
+                    varda.push_history(snapshot);
+                    result
+                        .paths
+                        .iter()
+                        .filter_map(|path| {
+                            let uuid = deck_load::new_input_for(varda, path)?;
+                            self.inputs_awaiting_files.insert(uuid.clone());
+                            Some(uuid)
+                        })
+                        .collect()
+                };
+                // One loader thread, in the order picked: with a thread per
+                // file, several slides picked together landed shuffled.
+                let files = result
+                    .paths
+                    .into_iter()
+                    .zip(targets)
+                    .map(|(path, channel_uuid)| {
+                        let token = self.deck_load_targets.record(channel_uuid);
+                        let file = match result.kind {
+                            FileDialogKind::Image => crate::app::DeckFile::Image(path),
+                            FileDialogKind::Video => crate::app::DeckFile::Video(path),
+                        };
+                        (token, file)
+                    })
+                    .collect();
+                VardaApp::spawn_ordered_deck_loads(
+                    &self.deck_load_tx,
+                    varda.gpu_context(),
+                    &self.pending_deck_loads,
+                    (varda.render_width(), varda.render_height()),
+                    files,
+                );
             }
 
             // Poll completed background deck loads (non-blocking)
@@ -865,7 +1400,7 @@ impl UIRunner {
                         // can change while a decode or shader compile runs, and an
                         // index captured back then would now name a different
                         // channel. See `/spec/api-addressing.md`.
-                        let Some(channel_uuid) = target else {
+                        let Some((channel_uuid, before_deck)) = target else {
                             log::warn!(
                                 "Dropping background load '{}': no target channel was recorded",
                                 result.name
@@ -893,8 +1428,11 @@ impl UIRunner {
                             continue;
                         }
                         let deck_uuid = deck.uuid().to_string();
+                        self.inputs_awaiting_files.remove(&channel_uuid);
                         if let Some(ch) = varda.mixer_mut().channel_mut(ch_idx) {
-                            let idx = ch.add_deck(deck);
+                            // Before the deck it was dropped in front of, if
+                            // that deck is still in this channel; else last.
+                            let idx = ch.insert_deck_before(deck, before_deck.as_deref());
                             log::info!(
                                 "Background load complete: deck {} to channel {}: {}",
                                 idx,
@@ -913,141 +1451,146 @@ impl UIRunner {
                     }
                     Err(e) => {
                         log::error!("Background deck load failed for '{}': {}", result.name, e);
+                        // An input made for this file goes with it.
+                        if let Some((channel_uuid, _)) = target {
+                            if self.inputs_awaiting_files.remove(&channel_uuid) {
+                                deck_load::remove_if_empty(varda, &channel_uuid);
+                            }
+                        }
                     }
                 }
             }
         }
 
-        let egui_us = t_egui.elapsed().as_micros();
 
-        // 7. GPU sync: drain the previous frame's GPU work BEFORE submitting new work.
-        // This prevents GPU queue buildup that causes get_current_texture()/present()
-        // to block for multiple frames worth of GPU time.
-        let t_poll = std::time::Instant::now();
-        {
-            let Some(varda) = self.varda.as_ref() else {
-                return;
-            };
-            let _ = varda.gpu_context().device.poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: Some(std::time::Duration::from_millis(100)),
-            });
+        // The Show menu: its dialogs, and moving between shows.
+        if let Some(action) = ui_actions.session.show_action.take() {
+            self.start_show_action(action);
         }
-        let poll_us = t_poll.elapsed().as_micros();
+        self.poll_show_pick();
+        self.show_moved();
+        self.part("actions", t_part);
 
-        // 8. GPU: render mixer compositing (offscreen — no surface involved)
-        let t_mixer = std::time::Instant::now();
+        // What the engine keeps of the UI: the cued channels (their off-air
+        // previews render live, issue #72), the deck being edited, and the
+        // dome's content rotation (real-time, MIDI-mappable).
         {
-            let Some(varda) = self.varda.as_mut() else {
-                return;
-            };
-            // Publish the cued channel(s) so off-air previews render live (issue #72).
+            let varda = self.varda.as_mut()?;
             varda.set_preview_channels(self.layout.preview_channels());
-            varda.render_mixer_frame();
-        }
-        let mixer_us = t_mixer.elapsed().as_micros();
-
-        // 9. Output windows FIRST — projectors/displays are latency-critical.
-        // Present outputs before the UI so they aren't gated behind the UI
-        // surface's get_current_texture()/present() cycle.
-        let t_outputs = std::time::Instant::now();
-        {
-            let Some(varda) = self.varda.as_mut() else {
-                return;
-            };
-            // Push content rotation to domemaster renderer each frame (real-time, MIDI-mappable)
-            let c_az = self
-                .layout
-                .dome_geometry
-                .content_azimuth_degrees
-                .to_radians();
-            let c_el = self
-                .layout
-                .dome_geometry
-                .content_elevation_degrees
-                .to_radians();
-            let c_roll = self.layout.dome_geometry.content_roll_degrees.to_radians();
-            varda.set_domemaster_content_rotation(c_az, c_el, c_roll);
-            varda.render_outputs();
+            varda.set_ui_selected_deck(self.layout.selected_deck);
+            let dome = &self.layout.dome_geometry;
+            varda.set_domemaster_content_rotation(
+                dome.content_azimuth_degrees.to_radians(),
+                dome.content_elevation_degrees.to_radians(),
+                dome.content_roll_degrees.to_radians(),
+            );
+            // Interactive HTML windows are winit windows: drawn here, on the
+            // main thread, where winit may be asked for things.
             #[cfg(feature = "html")]
             varda.render_interactive();
-            self.publish_counter += 1;
-            if self.publish_counter.is_multiple_of(10) {
-                varda.publish_state();
-            }
         }
-        let outputs_us = t_outputs.elapsed().as_micros();
 
-        // 9b. Gamma-encode previews. After the mixer render (8) and output
-        // windows (9) — window previews source their intermediate texture — and
-        // before egui paints (10), so thumbnails show this frame and match what
-        // the output window displays.
+        // Previews, gamma-encoded from the engine's latest frame for the
+        // thumbnails the UI draws.
+        let t_part = std::time::Instant::now();
         self.encode_previews();
+        self.part("previews", t_part);
 
-        // 10. UI surface last — operator control surface, latency-tolerant.
-        // The UI blit + egui overlay + present can safely happen after outputs.
-        let t_submit = std::time::Instant::now();
-        self.submit_frame(
-            window,
-            full_output.shapes,
-            full_output.pixels_per_point,
-            &full_output.textures_delta,
+        let varda = self.varda.as_ref()?;
+        crate::renderer::present_trace::TRACE.note(
+            CONTROL,
+            u64::from(self.ui_frames),
+            // The frame drawn last: its count has moved on past it.
+            crate::renderer::present_trace::Step::Sampled {
+                engine_frame: varda.frame_stats.frame_count.saturating_sub(1),
+            },
         );
-        let submit_us = t_submit.elapsed().as_micros();
-
-        // Advance the cadence anchor for adaptive frame pacing.
-        let target_fps = self
-            .varda
-            .as_ref()
-            .map_or(self.config.target_fps, crate::app::VardaApp::target_fps);
-        self.advance_cadence_anchor(target_fps);
-
-        // Frame loop timing (log every 120 frames)
-        self.frame_loop_counter += 1;
-        if self.frame_loop_counter.is_multiple_of(120) {
-            let total_us = mixer_us + submit_us + outputs_us + poll_us;
-            log::debug!(
-                "[PERF] frame_loop | egui={}us mixer={}us outputs={}us submit_ui={}us poll={}us | total={}us ({:.1}ms)",
-                egui_us,
-                mixer_us,
-                outputs_us,
-                submit_us,
-                poll_us,
-                total_us,
-                total_us as f64 / 1000.0,
-            );
-        }
+        Some(Shown {
+            picture: Some(varda.mixer_ref().composite_view().clone()),
+            target_fps: varda.target_fps(),
+        })
     }
 
-    /// Blit mixer output to screen, overlay egui, and present.
+    /// Apply egui's texture changes, draw and present the UI, then release the
+    /// textures egui freed. Both halves run on every frame — including one the
+    /// surface cannot be drawn to (e.g. Occluded at startup) — so the renderer
+    /// never misses an upload (the font atlas is sent only once) or keeps a
+    /// freed texture.
     fn submit_frame(
         &mut self,
-        window: &Window,
-        shapes: Vec<egui::epaint::ClippedShape>,
+        paint_jobs: &[egui::ClippedPrimitive],
         pixels_per_point: f32,
-        textures_delta: &egui::TexturesDelta,
+        mut textures_delta: egui::TexturesDelta,
+        shown: &Shown,
     ) {
-        let Some(varda) = &self.varda else { return };
-        let context = varda.gpu_context();
-        let Some(win_surface) = &self.window_surface else {
-            return;
-        };
-
-        let paint_jobs = self.egui_ctx.tessellate(shapes, pixels_per_point);
-
-        // Always apply texture updates so the egui renderer stays in sync,
-        // even when the surface is unavailable (e.g. Occluded at startup).
-        let Some(egui_renderer) = &mut self.egui_renderer else {
-            return;
-        };
-        for (id, deltas) in &textures_delta.set {
-            for delta in deltas {
-                egui_renderer.update_texture(&context.device, &context.queue, *id, delta);
+        let t_part = std::time::Instant::now();
+        if let (Some(context), Some(egui_renderer)) = (&self.gpu, &mut self.egui_renderer) {
+            for (id, deltas) in &textures_delta.set {
+                for delta in deltas {
+                    egui_renderer.update_texture(&context.device, &context.queue, *id, delta);
+                }
             }
         }
+        self.part("ui textures", t_part);
+        let parts = self.present_ui(paint_jobs, pixels_per_point, shown.picture.as_ref());
+        if let Some(ws) = &self.window_surface {
+            let times = crate::renderer::context::take_presented_times(&ws.surface);
+            self.ui_queue.reported(times.len());
+            self.ui_waiting_most = self.ui_waiting_most.max(self.ui_queue.waiting());
+            if !times.is_empty() {
+                let frame = 1.0 / f64::from(shown.target_fps.max(1));
+                self.ui_on_screen.record(&times, frame);
+                crate::renderer::present_trace::TRACE.note(
+                    CONTROL,
+                    0,
+                    crate::renderer::present_trace::Step::Shown { times },
+                );
+            }
+        }
+        for (part, took) in parts {
+            self.ui_parts.add(part, took);
+        }
+        if let Some(egui_renderer) = &mut self.egui_renderer {
+            for id in &textures_delta.free {
+                egui_renderer.free_texture(id);
+            }
+        }
+        textures_delta.clear();
+    }
 
+    /// Blit mixer output to screen, overlay egui, and present. Returns the
+    /// time each part took, for the frame's parts.
+    fn present_ui(
+        &mut self,
+        paint_jobs: &[egui::ClippedPrimitive],
+        pixels_per_point: f32,
+        picture: Option<&wgpu::TextureView>,
+    ) -> Vec<(&'static str, std::time::Duration)> {
+        use crate::renderer::present_trace::{Step, TRACE};
+        let mut parts = Vec::with_capacity(4);
+        let Some(context) = &self.gpu else {
+            return parts;
+        };
+        let Some(win_surface) = &self.window_surface else {
+            return parts;
+        };
+
+        let Some(egui_renderer) = &mut self.egui_renderer else {
+            return parts;
+        };
+
+        let t_part = std::time::Instant::now();
         let _ = context.device.poll(wgpu::PollType::Poll);
-        let output = match win_surface.surface.get_current_texture() {
+        let acquired = win_surface.surface.get_current_texture();
+        parts.push(("ui acquire", t_part.elapsed()));
+        let had = matches!(
+            acquired,
+            wgpu::CurrentSurfaceTexture::Success(_) | wgpu::CurrentSurfaceTexture::Suboptimal(_)
+        );
+        let step = if had { Step::Acquired } else { Step::NoFrame };
+        TRACE.note(CONTROL, u64::from(self.ui_frames), step);
+        let t_draw = std::time::Instant::now();
+        let output = match acquired {
             wgpu::CurrentSurfaceTexture::Success(o) => o,
             wgpu::CurrentSurfaceTexture::Suboptimal(o) => {
                 log::warn!("UI surface suboptimal, will reconfigure");
@@ -1055,21 +1598,19 @@ impl UIRunner {
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 log::warn!("UI surface outdated, reconfiguring");
-                win_surface
-                    .surface
-                    .configure(&context.device, &win_surface.surface_config);
+                context.configure_surface(&win_surface.surface, &win_surface.surface_config);
                 match win_surface.surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(o)
                     | wgpu::CurrentSurfaceTexture::Suboptimal(o) => o,
                     other => {
                         log::error!("Failed to get surface texture after reconfigure: {other:?}");
-                        return;
+                        return parts;
                     }
                 }
             }
             other => {
                 log::debug!("UI surface unavailable: {other:?}");
-                return;
+                return parts;
             }
         };
         let view = output
@@ -1082,29 +1623,30 @@ impl UIRunner {
                 label: Some("Screen Encoder"),
             });
 
-        let bind_group = if let Some(blit) = &self.blit_pipeline {
-            let mixer = varda.mixer_ref();
-            Some(blit.create_bind_group(&context.device, mixer.composite_view()))
-        } else {
-            None
+        let bind_group = match (&self.blit_pipeline, picture) {
+            (Some(blit), Some(picture)) => Some(blit.create_bind_group(&context.device, picture)),
+            _ => None,
         };
 
+        // The scale egui laid this frame out and read the pointer at — zoom
+        // (Cmd +/−) included. The bare window scale factor drops the zoom, so
+        // at any zoom but 100% the drawn UI and the pointer drift apart.
         let screen_desc = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [win_surface.size.width, win_surface.size.height],
-            pixels_per_point: window.scale_factor() as f32,
+            pixels_per_point,
         };
 
         egui_renderer.update_buffers(
             &context.device,
             &context.queue,
             &mut encoder,
-            &paint_jobs,
+            paint_jobs,
             &screen_desc,
         );
 
         {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Main Render Pass"),
+                label: Some("Control Window Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -1128,15 +1670,104 @@ impl UIRunner {
                 blit.render(&mut rp, bg);
             }
             let mut rp_static = rp.forget_lifetime();
-            egui_renderer.render(&mut rp_static, &paint_jobs, &screen_desc);
-        }
-
-        for id in &textures_delta.free {
-            egui_renderer.free_texture(id);
+            egui_renderer.render(&mut rp_static, paint_jobs, &screen_desc);
         }
 
         context.submit(std::iter::once(encoder.finish()));
+        TRACE.note(CONTROL, u64::from(self.ui_frames), Step::Submitted);
+        parts.push(("ui draw", t_draw.elapsed()));
+        let t_part = std::time::Instant::now();
         context.queue.present(output);
+        TRACE.note(CONTROL, u64::from(self.ui_frames), Step::Presented);
+        self.ui_queue.presented();
+        parts.push(("ui present", t_part.elapsed()));
+        parts
+    }
+}
+
+/// A test hook: the control window freezes `freeze` once a second, as a busy
+/// moment of UI would — `NIDA_TEST_UI_STALL=25` for 25 ms with the engine
+/// left to its thread, `=25:hold` holding the engine meanwhile, as when both
+/// ran on the main thread. The outputs' on-screen hitches
+/// (`/api/state/performance`) show the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UiStall {
+    freeze: std::time::Duration,
+    holding_engine: bool,
+}
+
+impl UiStall {
+    fn from_env() -> Option<Self> {
+        let stall = Self::parse(&std::env::var("NIDA_TEST_UI_STALL").ok()?)?;
+        log::warn!("Test hook: the control window freezes {stall:?} once a second");
+        Some(stall)
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let (ms, hold) = match text.split_once(':') {
+            Some((ms, "hold")) => (ms, true),
+            Some(_) => return None,
+            None => (text, false),
+        };
+        let ms: u64 = ms.trim().parse().ok().filter(|ms| *ms > 0)?;
+        Some(Self {
+            freeze: std::time::Duration::from_millis(ms),
+            holding_engine: hold,
+        })
+    }
+}
+
+/// How long the control window waits for the engine thread to finish a
+/// frame before giving up on its own frame. A frame takes a few
+/// milliseconds; a command that loads a show, longer.
+const ENGINE_PATIENCE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The control window's name in a present trace.
+const CONTROL: &str = "control window";
+
+/// A screen's `CGDirectDisplayID`, where there is one (macOS).
+// `None` off macOS, where there are no display ids.
+#[allow(clippy::unnecessary_wraps)]
+fn display_id(monitor: &winit::monitor::MonitorHandle) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::MonitorHandleExtMacOS as _;
+        Some(monitor.native_id())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = monitor;
+        None
+    }
+}
+
+/// What the control window shows under its UI, taken with the engine.
+struct Shown {
+    /// The show's composited picture.
+    picture: Option<wgpu::TextureView>,
+    target_fps: u32,
+}
+
+/// Whether a show folder was named on the command line (`--workspace`),
+/// rather than by the app bundle's environment.
+fn workspace_on_command_line() -> bool {
+    std::env::args().any(|a| a == "--workspace" || a.starts_with("--workspace="))
+}
+
+/// Show `file` selected in Finder — or open its folder in the file manager
+/// elsewhere.
+fn reveal_in_file_manager(file: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let spawned = std::process::Command::new("open")
+        .arg("-R")
+        .arg(file)
+        .spawn();
+    #[cfg(not(target_os = "macos"))]
+    let spawned = std::process::Command::new("xdg-open")
+        .arg(file.parent().unwrap_or(file))
+        .spawn();
+    if let Err(e) = spawned {
+        log::warn!("Could not show {} in the file manager: {e}", file.display());
     }
 }
 
@@ -1213,10 +1844,16 @@ mod tests {
         runner.advance_cadence_anchor(60);
         let anchor = runner.cadence_anchor.expect("anchor set");
         assert!(
-            anchor >= before + budget,
-            "overshoot restarts from now, not from the stale anchor"
+            anchor >= before && anchor <= std::time::Instant::now(),
+            "an overshot frame is followed at once — a whole budget's wait on \
+             top of the overrun drops a frame every time one runs long"
         );
         assert_ne!(anchor, stale + budget, "must not chase the stale deadline");
+
+        // From there the cadence holds: the next on-time frame is one budget on,
+        // not a burst of catch-up frames.
+        runner.advance_cadence_anchor(60);
+        assert_eq!(runner.cadence_anchor, Some(anchor + budget));
     }
 
     #[test]
@@ -1327,7 +1964,7 @@ mod tests {
         let config = crate::testing::headless_config();
         let varda = VardaApp::new(gpu, &config).expect("VardaApp::new");
         let mut runner = UIRunner::new(config);
-        runner.varda = Some(varda);
+        runner.varda = Some(Box::new(varda));
         Some(runner)
     }
 
@@ -1351,6 +1988,24 @@ mod tests {
             "each frame refreshes the monitor list"
         );
         assert_eq!(runner.publish_counter, 1);
+    }
+
+    /// On the timer, a frame moves what moves by whole frames (a playlist's
+    /// transition) on to its slot on the even cadence, not to the moment the
+    /// loop happened to wake — which may be late.
+    #[test]
+    fn render_headless_moves_frames_on_to_their_cadence_slot() {
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        let host = FakeHost::default();
+        let slot = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(9))
+            .unwrap();
+        runner.cadence_anchor = Some(slot);
+        runner.render_headless(&host);
+        let varda = runner.varda.as_ref().unwrap();
+        assert_eq!(varda.mixer_ref().frame_timing.refresh_at, Some(slot));
     }
 
     /// State publishing is gated to every tenth frame to keep snapshot cost off
@@ -1459,11 +2114,324 @@ mod tests {
         assert_eq!(pushes, 5);
     }
 
+    #[test]
+    fn the_ui_stall_test_hook_reads_a_time_and_whether_it_holds_the_engine() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(
+            UiStall::parse("25"),
+            Some(UiStall {
+                freeze: ms(25),
+                holding_engine: false
+            })
+        );
+        assert_eq!(
+            UiStall::parse("40:hold"),
+            Some(UiStall {
+                freeze: ms(40),
+                holding_engine: true
+            })
+        );
+        assert_eq!(UiStall::parse("0"), None);
+        assert_eq!(UiStall::parse("25:grab"), None);
+        assert_eq!(UiStall::parse("soon"), None);
+    }
+
     /// A frame that changed nothing never takes a snapshot, gesture or not.
     #[test]
     fn a_quiet_frame_records_nothing() {
         let mut prev = false;
         assert!(!wants_history_snapshot(&mut prev, false, true));
         assert!(!wants_history_snapshot(&mut prev, false, false));
+    }
+
+    /// The windowed app saves the show on its way out, and once: closing its
+    /// window saves it and ends the loop, and the loop's end (`exiting`, where
+    /// Quit lands too) must not save it again.
+    #[test]
+    fn the_show_is_saved_once_on_the_way_out() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            return;
+        };
+        let app = VardaApp::new(gpu, &crate::testing::headless_config()).expect("VardaApp::new");
+        let scene = app.session.workspace.scene_path();
+        assert!(!scene.exists(), "a new workspace");
+        let mut runner = runner();
+        runner.varda = Some(Box::new(app));
+
+        runner.shut_down();
+        assert!(scene.exists(), "saved on the way out");
+        std::fs::remove_file(&scene).expect("remove the saved scene");
+        runner.shut_down();
+        assert!(!scene.exists(), "saved once");
+    }
+
+    /// What the operator is told, as the toasts show it.
+    fn said(varda: &VardaApp) -> Vec<String> {
+        varda
+            .session
+            .notifications
+            .visible()
+            .iter()
+            .map(|n| n.message.clone())
+            .collect()
+    }
+
+    fn recent_in(file: &std::path::Path) -> Vec<std::path::PathBuf> {
+        serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap()
+    }
+
+    /// A Save As through the API is answered by the runner's own frames once
+    /// the show has moved: each frame takes in what the writer has landed.
+    #[test]
+    fn the_headless_runner_answers_a_save_as_once_the_show_has_moved() {
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        let host = FakeHost::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("Day 2");
+        let varda = runner.varda.as_mut().unwrap();
+        varda.slow_saves_for_test(std::time::Duration::from_millis(300));
+        let (reply, mut answer) = tokio::sync::oneshot::channel();
+        varda
+            .command_sender()
+            .send((
+                crate::engine::EngineCommand::SaveShowAs {
+                    folder: target.clone(),
+                },
+                Some(reply),
+            ))
+            .unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let result = loop {
+            runner.render_headless(&host);
+            if let Ok(result) = answer.try_recv() {
+                break result;
+            }
+            assert!(std::time::Instant::now() < until, "never answered");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(
+            matches!(result, crate::engine::CommandResult::Ok),
+            "{result:?}"
+        );
+        assert_eq!(runner.varda.as_ref().unwrap().show_folder(), target);
+    }
+
+    /// A show saved on a layout the operator had saved as "Broadcast",
+    /// before Broadcast was a built-in, opens named after that layout — kept
+    /// now as "Broadcast (saved)" — not after the built-in.
+    #[test]
+    fn a_show_opens_on_the_saved_layout_a_builtin_took_the_name_of() {
+        use crate::usecases::ui::screen_layout::{
+            remove_pane, store_saved, Builtin, Pane, SavedLayout, SavedLayoutStore, ScreenLayout,
+        };
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("layouts.json");
+        let mut mine = Builtin::Classic.dock();
+        remove_pane(&mut mine, Pane::Setup);
+        let saved = SavedLayout {
+            name: "Broadcast".into(),
+            dock: mine.clone(),
+            was: None,
+        };
+        store_saved(&path, &[saved]).unwrap();
+        runner.saved_layouts = SavedLayoutStore::open(path);
+        // As Nida 0.5 saved it, when "Broadcast" was the operator's own.
+        runner.layout.screen = ScreenLayout {
+            name: "Broadcast".into(),
+            dock: mine,
+            locked: false,
+            naming: 0,
+        };
+        let varda = runner.varda.as_mut().unwrap();
+        varda.save_workspace(&runner.layout).unwrap();
+        varda.flush_saves();
+        let folder = varda.show_folder().to_path_buf();
+        runner.open_show(&folder);
+        assert_eq!(runner.layout.screen.name, "Broadcast (saved)");
+        assert!(!runner.layout.screen.has(Pane::Setup), "its panels");
+    }
+
+    /// "Layout ▸ Save as" keeps the layout at once and hands its file to the
+    /// show's writer: the outputs do not wait for the disk, and it is said
+    /// to be saved once it is there.
+    #[test]
+    fn a_layout_saved_is_written_in_the_background_and_said_once_there() {
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("layouts.json");
+        runner.saved_layouts =
+            crate::usecases::ui::screen_layout::SavedLayoutStore::open(path.clone());
+        runner
+            .varda
+            .as_mut()
+            .unwrap()
+            .slow_saves_for_test(std::time::Duration::from_millis(300));
+        let mut actions = ui::UIActions::new();
+        actions.session.save_layout_as = Some("Show day".into());
+        let t = std::time::Instant::now();
+        runner.apply_screen_layout_actions(&mut actions);
+        assert!(t.elapsed() < std::time::Duration::from_millis(150));
+        assert_eq!(runner.saved_layouts.layouts().len(), 1, "kept at once");
+        assert_eq!(runner.layout.screen.name, "Show day");
+        assert!(!path.exists(), "not written yet");
+        let varda = runner.varda.as_mut().unwrap();
+        assert!(!said(varda).iter().any(|m| m.contains("Saved layout")));
+        varda.flush_saves();
+        assert!(path.is_file());
+        assert!(said(varda).contains(&"Saved layout \"Show day\"".to_string()));
+    }
+
+    /// A saved layout whose file does not land is not kept: once it is
+    /// known, the menu is read again from the file, as a restart would.
+    #[test]
+    fn a_layout_whose_file_does_not_land_is_not_kept() {
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        // A file where the layouts' folder should be.
+        std::fs::write(tmp.path().join("settings"), "").unwrap();
+        let path = tmp.path().join("settings").join("layouts.json");
+        runner.saved_layouts =
+            crate::usecases::ui::screen_layout::SavedLayoutStore::open(path.clone());
+        let mut actions = ui::UIActions::new();
+        actions.session.save_layout_as = Some("Show day".into());
+        runner.apply_screen_layout_actions(&mut actions);
+        assert_eq!(runner.saved_layouts.layouts().len(), 1, "kept at once");
+        let varda = runner.varda.as_mut().unwrap();
+        varda.flush_saves();
+        assert!(said(varda)
+            .iter()
+            .any(|m| m.starts_with("Could not save layouts to")));
+        runner.take_lost_layouts();
+        assert!(
+            runner.saved_layouts.layouts().is_empty(),
+            "as the file has it"
+        );
+    }
+
+    /// A layout write that breaks is a failure like any other: once it has
+    /// landed the menu is as the file has it, and later ones still recover.
+    #[test]
+    fn a_layout_write_that_breaks_is_recovered_from() {
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("layouts.json");
+        runner.saved_layouts =
+            crate::usecases::ui::screen_layout::SavedLayoutStore::open(path.clone());
+        let save = |runner: &mut UIRunner, name: &str| {
+            let mut actions = ui::UIActions::new();
+            actions.session.save_layout_as = Some(name.into());
+            runner.apply_screen_layout_actions(&mut actions);
+        };
+        for _ in 0..2 {
+            runner.varda.as_mut().unwrap().break_files_for_test(1);
+            save(&mut runner, "Broken");
+            runner.varda.as_mut().unwrap().flush_saves();
+            runner.take_lost_layouts();
+            assert!(
+                runner.saved_layouts.layouts().is_empty(),
+                "as the file has it"
+            );
+        }
+    }
+
+    /// A layout write that failed is not undone while a later one is on its
+    /// way: that one wrote the whole list, the failed change with it, and
+    /// once it lands the menu and the file agree.
+    #[test]
+    fn a_failed_layout_write_waits_for_the_one_after_it() {
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("layouts.json");
+        runner.saved_layouts =
+            crate::usecases::ui::screen_layout::SavedLayoutStore::open(path.clone());
+        let save = |runner: &mut UIRunner, name: &str| {
+            let mut actions = ui::UIActions::new();
+            actions.session.save_layout_as = Some(name.into());
+            runner.apply_screen_layout_actions(&mut actions);
+        };
+        runner.varda.as_mut().unwrap().refuse_files_for_test(1);
+        save(&mut runner, "Refused");
+        runner.varda.as_mut().unwrap().flush_saves();
+        runner
+            .varda
+            .as_mut()
+            .unwrap()
+            .slow_saves_for_test(std::time::Duration::from_millis(300));
+        save(&mut runner, "Later");
+        runner.take_lost_layouts();
+        assert_eq!(
+            runner.saved_layouts.layouts().len(),
+            2,
+            "not while one is on its way"
+        );
+        runner.varda.as_mut().unwrap().flush_saves();
+        runner.take_lost_layouts();
+        assert_eq!(runner.saved_layouts.layouts().len(), 2);
+        let on_disk = crate::usecases::ui::screen_layout::SavedLayoutStore::open(path);
+        assert_eq!(on_disk.layouts().len(), 2, "the later write carried both");
+    }
+
+    /// A Save As that has landed puts the show it moved to at the head of
+    /// the Recent list, written in the background; a show that has not
+    /// moved writes nothing.
+    #[test]
+    fn a_show_that_moved_heads_the_recent_list() {
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let recent = tmp.path().join("recent-shows.json");
+        runner.recent_file = Some(recent.clone());
+        runner.named_after = runner.varda.as_ref().unwrap().show_folder().to_path_buf();
+        runner.show_moved();
+        runner.varda.as_mut().unwrap().flush_saves();
+        assert!(!recent.exists(), "nothing moved, nothing written");
+        let target = tmp.path().join("Day 2");
+        let varda = runner.varda.as_mut().unwrap();
+        varda
+            .save_show_as(&target, &crate::usecases::ui::UILayoutState::default())
+            .unwrap();
+        varda.flush_saves();
+        runner.show_moved();
+        assert_eq!(runner.named_after, target);
+        runner.varda.as_mut().unwrap().flush_saves();
+        assert_eq!(recent_in(&recent).first(), Some(&target));
+    }
+
+    /// Quitting while a Save As copies the show: the show it moves to is
+    /// the one the Recent list keeps, to open next time.
+    #[test]
+    fn quitting_mid_save_as_keeps_the_new_show_for_next_time() {
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        // As the window's runner quits.
+        runner.config.headless = false;
+        let tmp = tempfile::tempdir().unwrap();
+        let recent = tmp.path().join("recent-shows.json");
+        runner.recent_file = Some(recent.clone());
+        runner.named_after = runner.varda.as_ref().unwrap().show_folder().to_path_buf();
+        let target = tmp.path().join("Day 2");
+        let varda = runner.varda.as_mut().unwrap();
+        varda.slow_saves_for_test(std::time::Duration::from_millis(300));
+        varda
+            .save_show_as(&target, &crate::usecases::ui::UILayoutState::default())
+            .unwrap();
+        runner.shut_down();
+        assert_eq!(recent_in(&recent).first(), Some(&target));
+        assert!(target.join(".varda/scene.json").is_file());
     }
 }

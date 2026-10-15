@@ -3,9 +3,18 @@
 use super::super::VardaApp;
 use crate::engine::{CommandResult, ErrorCode};
 use crate::renderer::context::{
-    AudioPassthrough, CalibrationMode, HeadlessOutput, OutputSource, OutputTarget, UnifiedOutput,
+    AudioPassthrough, AwaitedDisplay, CalibrationMode, HeadlessOutput, OutputSource, OutputTarget,
+    UnifiedOutput,
 };
 use crate::renderer::edge_blend::EdgeBlendMode;
+
+/// How often Blackmagic outputs waiting for their device look for it.
+const LOOK_FOR_DEVICE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long a Blackmagic output saved running waits for its device, as the
+/// stage opens, before it is said missing: discovery tells of a connected
+/// device within a second or so.
+const DEVICE_MISSING_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl VardaApp {
     /// Set the output target for a windowed or headless output.
@@ -29,15 +38,38 @@ impl VardaApp {
             match output {
                 UnifiedOutput::Window(w) => {
                     if target.is_windowed() {
-                        let monitor = match &target {
-                            OutputTarget::Display { monitor_index, .. } => self
-                                .output
-                                .cached_monitors
-                                .get(*monitor_index)
-                                .map(|(_, h)| h.clone()),
-                            _ => None,
-                        };
-                        w.set_target(target, monitor);
+                        match &target {
+                            // Addressed by name, as restore and adoption are: the
+                            // index a client sends is stale once a monitor is
+                            // plugged or unplugged, and would put the output on
+                            // whichever screen now has that position.
+                            OutputTarget::Display { name, .. } => {
+                                if let Some((monitor_index, handle)) =
+                                    crate::app::monitors::find(&self.output.cached_monitors, name)
+                                {
+                                    w.set_target(
+                                        OutputTarget::Display {
+                                            name: name.clone(),
+                                            monitor_index,
+                                        },
+                                        Some(handle.clone()),
+                                    );
+                                } else {
+                                    w.set_target(OutputTarget::Windowed, None);
+                                    w.awaiting_display = Some(AwaitedDisplay {
+                                        monitor: name.clone(),
+                                        screen: None,
+                                        was_missing: true,
+                                    });
+                                    self.session.notifications.warn(format!(
+                                        "Monitor '{name}' not connected — output '{}' \
+                                         moves there when it connects",
+                                        w.name
+                                    ));
+                                }
+                            }
+                            _ => w.set_target(target, None),
+                        }
                         if let Err(error) =
                             w.set_presentation_request(&self.context, w.presentation_request)
                         {
@@ -51,17 +83,42 @@ impl VardaApp {
                     }
                 }
                 UnifiedOutput::Headless(h) => {
-                    if target.is_headless() {
+                    // A running Blackmagic output's levels: taken up live,
+                    // the output running on.
+                    let levels_only = match (&h.target, &target) {
+                        (
+                            OutputTarget::DeckLink { device, mode, .. },
+                            OutputTarget::DeckLink {
+                                device: to_device,
+                                mode: to_mode,
+                                ..
+                            },
+                        ) => device == to_device && mode == to_mode,
+                        _ => false,
+                    };
+                    if levels_only && h.active {
+                        if let (Some(sender), OutputTarget::DeckLink { full_range, .. }) =
+                            (&h.decklink, &target)
+                        {
+                            sender.set_full_range(*full_range);
+                        }
+                        log::info!("Output '{}' now {target}", h.name);
+                        h.target = target;
+                    } else if target.is_headless() {
                         if h.active {
+                            log::info!("Output '{}' stopped: its target changed to {target}", h.name);
                             if let Some(mut sub) = h.subprocess.take() {
                                 sub.stop();
                             }
+                            // A Blackmagic device is let go as its sender drops;
+                            // stopped by the change, as by hand.
+                            h.decklink = None;
+                            h.keep_running = false;
                             let passthrough = h.audio_pcm.take();
                             h.active = false;
                             h.started_at = None;
                             if let Some(pass) = passthrough {
-                                self.audio_manager
-                                    .unsubscribe_pcm(pass.source_id, pass.token);
+                                pass.release(&mut self.audio_manager);
                             }
                         }
                         h.target = target;
@@ -90,6 +147,8 @@ impl VardaApp {
             self.render_width,
             self.render_height,
         );
+        // Like vMix, a new recording or stream carries the first audio bus.
+        headless.audio_bus = self.audio_mix.default_bus().map(str::to_string);
         if is_ndi {
             let resolved = self
                 .external_io
@@ -133,6 +192,11 @@ impl VardaApp {
             if h.width == width && h.height == height {
                 continue;
             }
+            // A Blackmagic output keeps its format's size, the show scaled
+            // to it.
+            if h.decklink.is_some() {
+                continue;
+            }
             if let Some(mut sub) = h.subprocess.take() {
                 sub.stop();
                 h.active = false;
@@ -165,30 +229,39 @@ impl VardaApp {
         // workspace loader applying a scene's resolution.
         let (render_width, render_height) = (self.render_width, self.render_height);
         let device = &self.context.device;
-        let (target, name, width, height, presentation_request, mut readback_format, stale) =
-            match self.output.outputs.get_mut(idx) {
-                Some(UnifiedOutput::Headless(h)) => {
-                    if h.active {
-                        return CommandResult::Ok; // already active
-                    }
-                    h.resize(device, render_width, render_height);
-                    (
-                        h.target.clone(),
-                        h.name.clone(),
-                        h.width,
-                        h.height,
-                        h.presentation_request,
-                        h.readback.format(),
-                        h.audio_pcm.take(),
-                    )
+        let (
+            target,
+            name,
+            width,
+            height,
+            presentation_request,
+            mut readback_format,
+            stale,
+            audio_bus,
+        ) = match self.output.outputs.get_mut(idx) {
+            Some(UnifiedOutput::Headless(h)) => {
+                if h.active {
+                    return CommandResult::Ok; // already active
                 }
-                _ => {
-                    return CommandResult::Err {
-                        code: ErrorCode::NotFound,
-                        message: "Output not found or not headless".into(),
-                    }
+                h.resize(device, render_width, render_height);
+                (
+                    h.target.clone(),
+                    h.name.clone(),
+                    h.width,
+                    h.height,
+                    h.presentation_request,
+                    h.readback.format(),
+                    h.audio_pcm.take(),
+                    h.audio_bus.clone(),
+                )
+            }
+            _ => {
+                return CommandResult::Err {
+                    code: ErrorCode::NotFound,
+                    message: "Output not found or not headless".into(),
                 }
-            };
+            }
+        };
         if let OutputTarget::Recording { codec, .. } = &target {
             let resolved = match crate::renderer::FfmpegSubprocess::probe_recording_presentation(
                 codec,
@@ -218,8 +291,12 @@ impl VardaApp {
         // to video-only if the device is missing — Decision 6).
         let (audio_input, passthrough) = resolve_output_audio(
             &mut self.audio_manager,
+            &self.audio_mix,
             &mut self.session.notifications,
-            target.audio_device(),
+            OutputAudio {
+                bus: audio_bus.as_deref(),
+                device: target.audio_device(),
+            },
             &name,
         );
 
@@ -293,7 +370,8 @@ impl VardaApp {
                 audio_input,
             ),
             OutputTarget::NdiSend { .. } => {
-                // No ffmpeg subprocess; NDI doesn't carry passthrough audio.
+                // No ffmpeg subprocess. The sender carries its audio bus
+                // (see `NdiManager::keep_audio`), not device passthrough.
                 self.release_passthrough(passthrough);
                 if let Some(UnifiedOutput::Headless(h)) = self.output.outputs.get_mut(idx) {
                     h.active = true;
@@ -322,6 +400,35 @@ impl VardaApp {
                         message: "Syphon is only available on macOS".into(),
                     };
                 }
+            }
+            OutputTarget::DeckLink {
+                device,
+                mode,
+                full_range,
+            } => {
+                // No ffmpeg subprocess and, for now, no sound: the device's
+                // own thread puts each picture up (see `crate::decklink`), at
+                // its format's size, the show scaled to it.
+                self.release_passthrough(passthrough);
+                return match crate::decklink::DeckLinkSender::start(&name, device, mode, *full_range) {
+                    Ok(sender) => {
+                        let device = &self.context.device;
+                        if let Some(UnifiedOutput::Headless(h)) = self.output.outputs.get_mut(idx) {
+                            h.resize(device, sender.width, sender.height);
+                            h.decklink = Some(Box::new(sender));
+                            h.keep_running = true;
+                            h.waiting_since = None;
+                            h.active = true;
+                            h.started_at = Some(std::time::Instant::now());
+                        }
+                        log::info!("Blackmagic output '{name}' on {target}");
+                        CommandResult::Ok
+                    }
+                    Err(e) => CommandResult::Err {
+                        code: ErrorCode::Unavailable,
+                        message: format!("Blackmagic output '{name}': {e}"),
+                    },
+                };
             }
             _ => {
                 self.release_passthrough(passthrough);
@@ -357,34 +464,227 @@ impl VardaApp {
         }
     }
 
+    /// Once a frame, at most every [`LOOK_FOR_DEVICE`]: look at the Blackmagic
+    /// devices connected, and start each Blackmagic output kept running but
+    /// stopped — its device unplugged, or missing as the stage opened — once
+    /// its device appears again, as an output's window goes to its screen
+    /// when the screen is plugged in; and let each running one tell the log
+    /// how it fares, when due.
+    pub(crate) fn poll_blackmagic_outputs(&mut self) {
+        let any = self.output.outputs.iter().any(|o| {
+            matches!(o, UnifiedOutput::Headless(h)
+                if matches!(h.target, OutputTarget::DeckLink { .. }))
+        });
+        if !any {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .output
+            .blackmagic_looked
+            .is_some_and(|at| now.duration_since(at) < LOOK_FOR_DEVICE)
+        {
+            return;
+        }
+        self.output.blackmagic_looked = Some(now);
+        self.start_outputs_whose_device_is_back(&crate::decklink::known_devices());
+        self.tell_outputs_still_waiting(now);
+        for output in &self.output.outputs {
+            if let UnifiedOutput::Headless(h) = output {
+                if let Some(sender) = &h.decklink {
+                    sender.tell_if_due();
+                }
+            }
+        }
+    }
+
+    /// Say, once, which Blackmagic outputs saved running still have no
+    /// device [`DEVICE_MISSING_AFTER`] after the stage opened, as of `now`.
+    pub(crate) fn tell_outputs_still_waiting(&mut self, now: std::time::Instant) {
+        let mut told = Vec::new();
+        for output in &mut self.output.outputs {
+            let UnifiedOutput::Headless(h) = output else {
+                continue;
+            };
+            let Some(since) = h.waiting_since else {
+                continue;
+            };
+            if h.active {
+                h.waiting_since = None;
+            } else if now.saturating_duration_since(since) >= DEVICE_MISSING_AFTER {
+                h.waiting_since = None;
+                if let OutputTarget::DeckLink { device, .. } = &h.target {
+                    told.push(format!(
+                        "Blackmagic output '{}': '{device}' is not connected — it starts once it is",
+                        h.name
+                    ));
+                }
+            }
+        }
+        for message in told {
+            log::warn!("{message}");
+            self.session.notifications.warn(message);
+        }
+    }
+
+    /// The Blackmagic devices connected now being `devices`: start each
+    /// output kept running but stopped whose device was not connected at
+    /// the last look. Only then — a device there all along that will not
+    /// take pictures is not tried again and again; unplug and plug it in.
+    pub(crate) fn start_outputs_whose_device_is_back(
+        &mut self,
+        devices: &[crate::decklink::DeckLinkDevice],
+    ) {
+        let names: Vec<String> = devices.iter().map(|d| d.name.clone()).collect();
+        let before = self.output.blackmagic_seen.replace(names.clone());
+        let back = |device: &str| {
+            names.iter().any(|n| n == device)
+                && !before.as_ref().is_some_and(|b| b.iter().any(|n| n == device))
+        };
+        let starting: Vec<(String, String)> = self
+            .output
+            .outputs
+            .iter()
+            .filter_map(|o| match o {
+                UnifiedOutput::Headless(h) if h.keep_running && !h.active => match &h.target {
+                    OutputTarget::DeckLink { device, .. } if back(device) => {
+                        Some((h.uuid.clone(), h.name.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        for (uuid, name) in starting {
+            match self.cmd_start_output(&uuid) {
+                CommandResult::Ok
+                | CommandResult::OkWithId { .. }
+                | CommandResult::OkWithData { .. } => {
+                    self.session.notifications.info(format!(
+                        "Blackmagic output '{name}': its device is connected — started"
+                    ));
+                }
+                CommandResult::Err { message, .. } => {
+                    log::warn!("{message}");
+                    self.session.notifications.warn(message);
+                }
+            }
+        }
+    }
+
+    /// Give the screen outputs address as `monitor` a name of the operator's
+    /// own, kept on this computer — or, with none or a blank one, take its
+    /// name away.
+    pub fn cmd_rename_screen(&mut self, monitor: &str, name: Option<&str>) -> CommandResult {
+        match self.screen_name_file(monitor, name) {
+            Ok(file) => {
+                if let Some(file) = file {
+                    self.write_for_command(file, None);
+                }
+                CommandResult::Ok
+            }
+            Err(refused) => refused,
+        }
+    }
+
+    /// The screen named at once, and the file its name is kept in — written
+    /// in the background (see `persistence::writer`) — or why not.
+    pub(crate) fn screen_name_file(
+        &mut self,
+        monitor: &str,
+        name: Option<&str>,
+    ) -> Result<Option<crate::persistence::writer::FileSave>, CommandResult> {
+        let Some(at) = self.output.cached_monitors.iter().position(|(n, _)| n == monitor) else {
+            return Err(CommandResult::Err {
+                code: ErrorCode::NotFound,
+                message: format!("no screen named '{monitor}' is connected"),
+            });
+        };
+        let Some(identity) = self.output.screen_facts.get(at).map(|f| f.identity.clone()) else {
+            return Err(CommandResult::Err {
+                code: ErrorCode::Unavailable,
+                message: format!("'{monitor}' is not known well enough to name yet"),
+            });
+        };
+        log::info!("Screen '{monitor}' named {name:?}");
+        Ok(self
+            .output
+            .screen_names
+            .name(&identity, name)
+            .map(|(path, content)| crate::persistence::writer::FileSave {
+                label: "the screens' names".into(),
+                path,
+                content,
+                said: None,
+                failed: Some("The screen's name could not be kept".into()),
+                presets: false,
+                then: None,
+            }))
+    }
+
+    /// Put each screen's name big on it for a few seconds.
+    pub fn cmd_identify_screens(&mut self) -> CommandResult {
+        let keys: Vec<String> = self.output.cached_monitors.iter().map(|(n, _)| n.clone()).collect();
+        let sizes: Vec<(u32, u32)> = (0..keys.len())
+            .map(|i| {
+                let size = self.output.monitor_sizes.get(i).copied().unwrap_or_default();
+                (size.width, size.height)
+            })
+            .collect();
+        let labels = crate::app::screens::labels(
+            &keys,
+            &self.output.screen_facts,
+            &self.output.screen_names,
+            &sizes,
+        );
+        let shown: Vec<(u32, String)> = self
+            .output
+            .screen_facts
+            .iter()
+            .zip(labels)
+            .filter_map(|(fact, label)| fact.display_id.map(|id| (id, label)))
+            .collect();
+        crate::app::screens::identify(shown);
+        CommandResult::Ok
+    }
+
     /// Release a reserved PCM subscription (used when an output fails to start or
     /// is a non-ffmpeg target that can't carry passthrough audio).
     fn release_passthrough(&mut self, passthrough: Option<AudioPassthrough>) {
         if let Some(pass) = passthrough {
-            self.audio_manager
-                .unsubscribe_pcm(pass.source_id, pass.token);
+            pass.release(&mut self.audio_manager);
         }
     }
 
-    /// Stop a headless output (kill subprocess and deactivate).
+    /// Stop a headless output (kill subprocess and deactivate), as asked —
+    /// ⏹ Stop, or the API.
     pub fn cmd_stop_output(&mut self, output_uuid: &str) -> CommandResult {
+        self.stop_output(output_uuid, "asked (⏹ Stop, or the API)")
+    }
+
+    /// Stop a headless output, saying in the log why.
+    fn stop_output(&mut self, output_uuid: &str, why: &str) -> CommandResult {
         let idx = match self.resolve_output(output_uuid) {
             Ok(idx) => idx,
             Err(e) => return e.into(),
         };
         if let Some(UnifiedOutput::Headless(h)) = self.output.outputs.get_mut(idx) {
+            // Stopped by hand: not to be started again by itself.
+            h.keep_running = false;
             if h.active {
+                log::info!("Output '{}' stopped: {why}", h.name);
                 if let Some(mut sub) = h.subprocess.take() {
                     sub.stop();
                 }
+                // A Blackmagic device is let go as its sender drops.
+                h.decklink = None;
                 let passthrough = h.audio_pcm.take();
                 h.active = false;
                 h.started_at = None;
                 // Disjoint field borrow (audio_manager vs. output): release the
                 // PCM subscription so the cpal callback stops fanning to it.
                 if let Some(pass) = passthrough {
-                    self.audio_manager
-                        .unsubscribe_pcm(pass.source_id, pass.token);
+                    pass.release(&mut self.audio_manager);
                 }
             }
             CommandResult::Ok
@@ -406,14 +706,27 @@ impl VardaApp {
             Ok(idx) => idx,
             Err(e) => return e.into(),
         };
-        if let Some(UnifiedOutput::Window(w)) = self.output.outputs.get_mut(idx) {
-            w.calibration_mode = mode;
-            CommandResult::Ok
-        } else {
-            CommandResult::Err {
-                code: ErrorCode::NotFound,
-                message: "Output not found or not windowed".into(),
+        match self.output.outputs.get_mut(idx) {
+            Some(UnifiedOutput::Window(w)) => {
+                w.calibration_mode = mode;
+                CommandResult::Ok
             }
+            // A recording, stream or Blackmagic output: the whole test card,
+            // or its picture — it has no surfaces of its own to card.
+            Some(UnifiedOutput::Headless(h)) if mode != CalibrationMode::Surfaces => {
+                h.calibration_mode = mode;
+                CommandResult::Ok
+            }
+            Some(UnifiedOutput::Headless(_)) => CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                message: "an output without a window shows the whole test card \
+                          (Projector), or its picture"
+                    .into(),
+            },
+            None => CommandResult::Err {
+                code: ErrorCode::NotFound,
+                message: "Output not found".into(),
+            },
         }
     }
 
@@ -664,6 +977,97 @@ impl VardaApp {
         }
     }
 
+    /// Route a headless output from the master or from one bus's program.
+    ///
+    /// This is vMix's per-output source: the stream can follow a bus that
+    /// carries the lower third while the recording follows one that does not.
+    /// Only `Master` and `BusProgram` are accepted — both are named without
+    /// indices, so a saved route cannot drift onto another channel — and the
+    /// bus must exist now. A window is refused: its picture comes from its
+    /// surfaces, and a bus reaches a screen through the switcher.
+    pub fn cmd_set_output_source(
+        &mut self,
+        output_uuid: &str,
+        source: OutputSource,
+    ) -> CommandResult {
+        let idx = match self.resolve_output(output_uuid) {
+            Ok(idx) => idx,
+            Err(e) => return e.into(),
+        };
+        match &source {
+            OutputSource::Master => {}
+            OutputSource::BusProgram(bus) if self.production_buses.contains(bus) => {}
+            OutputSource::BusProgram(bus) => {
+                return CommandResult::Err {
+                    code: ErrorCode::NotFound,
+                    message: format!("no bus with uuid '{bus}'"),
+                };
+            }
+            other => {
+                return CommandResult::Err {
+                    code: ErrorCode::InvalidInput,
+                    message: format!(
+                        "an output can send Master or a bus's program, not {other}; \
+                         put that source on a bus and route the bus"
+                    ),
+                };
+            }
+        }
+        match self.output.outputs.get_mut(idx) {
+            Some(UnifiedOutput::Headless(h)) => {
+                h.source = source;
+                CommandResult::Ok
+            }
+            Some(UnifiedOutput::Window(_)) => CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                message: "a window shows its surfaces; send a bus to a screen with the \
+                          switcher's Screen picker"
+                    .into(),
+            },
+            None => CommandResult::Err {
+                code: ErrorCode::NotFound,
+                message: "Output not found".into(),
+            },
+        }
+    }
+
+    /// Choose the audio-mixer bus a recording, stream or NDI sender carries,
+    /// or none. An NDI sender changes over at once; a recording or stream the
+    /// next time it starts, since the encoder's audio input is fixed while it
+    /// runs.
+    pub fn cmd_set_output_audio_bus(
+        &mut self,
+        output_uuid: &str,
+        bus: Option<String>,
+    ) -> CommandResult {
+        let idx = match self.resolve_output(output_uuid) {
+            Ok(idx) => idx,
+            Err(e) => return e.into(),
+        };
+        if let Some(bus) = &bus {
+            if !self.audio_mix.has_bus(bus) {
+                return CommandResult::Err {
+                    code: ErrorCode::NotFound,
+                    message: format!("no audio bus with uuid '{bus}'"),
+                };
+            }
+        }
+        match self.output.outputs.get_mut(idx) {
+            Some(UnifiedOutput::Headless(h)) => {
+                h.audio_bus = bus;
+                CommandResult::Ok
+            }
+            Some(UnifiedOutput::Window(_)) => CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                message: "a window carries no sound; play an audio bus on a sound device".into(),
+            },
+            None => CommandResult::Err {
+                code: ErrorCode::NotFound,
+                message: "Output not found".into(),
+            },
+        }
+    }
+
     /// Set requested SDR precision and dithering, preserving any fallback status.
     pub fn cmd_set_output_presentation(
         &mut self,
@@ -678,7 +1082,7 @@ impl VardaApp {
             |output| matches!(output, UnifiedOutput::Headless(headless) if headless.active),
         );
         if restart {
-            let stopped = self.cmd_stop_output(output_uuid);
+            let stopped = self.stop_output(output_uuid, "to start again with a new precision");
             if !matches!(stopped, CommandResult::Ok) {
                 return stopped;
             }
@@ -771,6 +1175,14 @@ pub(crate) fn encoder_fps(target_fps: u32) -> u32 {
     }
 }
 
+/// Where a recording or stream's sound comes from: an audio-mixer bus, else
+/// the target's own capture device, else nothing.
+#[derive(Clone, Copy)]
+pub(crate) struct OutputAudio<'a> {
+    pub bus: Option<&'a str>,
+    pub device: Option<&'a str>,
+}
+
 /// Resolve a persisted audio device name to a live PCM subscription for output
 /// passthrough. Returns `(AudioInput for ffmpeg, AudioPassthrough to retain for
 /// teardown)`. On a missing/unopenable device, emits a warning and returns
@@ -779,14 +1191,39 @@ pub(crate) fn encoder_fps(target_fps: u32) -> u32 {
 /// off disjoint field borrows rather than `&mut self`.
 pub(crate) fn resolve_output_audio(
     audio_manager: &mut crate::audio::AudioManager,
+    audio_mix: &crate::audio_mix::AudioEngine,
     notifications: &mut crate::notifications::NotificationSystem,
-    device_name: Option<&str>,
+    audio: OutputAudio<'_>,
     output_name: &str,
 ) -> (
     Option<crate::renderer::AudioInput>,
     Option<AudioPassthrough>,
 ) {
-    let Some(device_name) = device_name else {
+    if let Some(bus) = audio.bus {
+        let label = format!("Bus: {}", audio_mix.bus_name(bus).unwrap_or("?"));
+        let Some(tap) = audio_mix.tap(bus) else {
+            notifications.warn(format!(
+                "Audio bus for output '{output_name}' no longer exists; recording/streaming video-only"
+            ));
+            return (None, None);
+        };
+        return (
+            Some(crate::renderer::AudioInput {
+                rx: tap.receiver,
+                sample_rate: crate::audio_mix::SAMPLE_RATE,
+                channels: 2,
+                lost_samples: tap.lost_samples,
+                started: tap.opened,
+            }),
+            Some(AudioPassthrough {
+                source_id: None,
+                token: tap.token,
+                dropped: tap.dropped,
+                label,
+            }),
+        );
+    }
+    let Some(device_name) = audio.device else {
         return (None, None);
     };
     let source_id = audio_manager
@@ -806,11 +1243,13 @@ pub(crate) fn resolve_output_audio(
             sample_rate: sub.format.sample_rate,
             channels: sub.format.channels,
             lost_samples: sub.lost_samples,
+            started: std::time::Instant::now(),
         };
         let passthrough = AudioPassthrough {
-            source_id,
+            source_id: Some(source_id),
             token: sub.token,
             dropped: sub.dropped,
+            label: device_name.to_string(),
         };
         (Some(input), Some(passthrough))
     } else {
@@ -851,5 +1290,104 @@ mod tests {
     #[test]
     fn an_uncapped_renderer_falls_back_to_a_declarable_rate() {
         assert_eq!(encoder_fps(0), 60);
+    }
+
+    fn headless_app() -> Option<super::VardaApp> {
+        let gpu = crate::renderer::context::GpuContext::new_headless().ok()?;
+        super::VardaApp::new(gpu, &crate::testing::headless_config()).ok()
+    }
+
+    /// A screen for these tests: takes every picture, at once.
+    struct Taker;
+
+    impl crate::decklink::Screen for Taker {
+        fn show(&mut self, _uyvy: &[u8], _row_bytes: usize) -> Result<(), crate::decklink::Refused> {
+            Ok(())
+        }
+    }
+
+    /// A running Blackmagic output, on a stand-in device.
+    fn running_blackmagic(app: &mut super::VardaApp) -> String {
+        use crate::renderer::context::{HeadlessOutput, OutputSource, OutputTarget, UnifiedOutput};
+        let mut output = HeadlessOutput::new(
+            &app.context.device,
+            "Box".into(),
+            OutputSource::Master,
+            OutputTarget::DeckLink {
+                device: "Test Box".into(),
+                mode: "1080p60".into(),
+                full_range: false,
+            },
+            64,
+            36,
+        );
+        let sender = crate::decklink::DeckLinkSender::start_with("Box", 64, 36, false, None, || {
+            Ok(Box::new(Taker) as Box<dyn crate::decklink::Screen>)
+        })
+        .expect("started");
+        output.decklink = Some(Box::new(sender));
+        output.active = true;
+        output.keep_running = true;
+        let uuid = output.uuid.clone();
+        app.output.outputs.push(UnifiedOutput::Headless(output));
+        uuid
+    }
+
+    /// A running Blackmagic output's Levels change at once, the output
+    /// running on — its device kept, not let go and opened again; another
+    /// format still stops it, as before.
+    #[test]
+    fn a_running_blackmagic_outputs_levels_change_without_stopping_it() {
+        use crate::engine::{CommandResult, EngineCommand};
+        use crate::renderer::context::{OutputTarget, UnifiedOutput};
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let uuid = running_blackmagic(&mut app);
+        let set = |app: &mut super::VardaApp, mode: &str, full_range: bool| {
+            app.execute_command(EngineCommand::SetOutputTarget {
+                output_uuid: uuid.clone(),
+                target: OutputTarget::DeckLink {
+                    device: "Test Box".into(),
+                    mode: mode.into(),
+                    full_range,
+                },
+            })
+        };
+        let state = |app: &super::VardaApp| match &app.output.outputs[0] {
+            UnifiedOutput::Headless(h) => (
+                h.active,
+                h.decklink.is_some(),
+                matches!(h.target, OutputTarget::DeckLink { full_range: true, .. }),
+            ),
+            UnifiedOutput::Window(_) => panic!("headless"),
+        };
+        assert!(matches!(set(&mut app, "1080p60", true), CommandResult::Ok));
+        assert_eq!(state(&app), (true, true, true), "running on, at full levels");
+        assert!(matches!(set(&mut app, "1080p50", true), CommandResult::Ok));
+        assert_eq!(state(&app), (false, false, true), "another format stops it");
+    }
+
+    /// An output without a window — a Blackmagic output, say — shows the
+    /// whole test card on asking, not surfaces' cards.
+    #[test]
+    fn an_output_without_a_window_shows_the_test_card() {
+        use crate::engine::{CommandResult, EngineCommand};
+        use crate::renderer::context::CalibrationMode;
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let uuid = running_blackmagic(&mut app);
+        let set = |app: &mut super::VardaApp, mode| {
+            app.execute_command(EngineCommand::SetCalibrationMode {
+                output_uuid: uuid.clone(),
+                mode,
+            })
+        };
+        assert!(matches!(set(&mut app, CalibrationMode::Projector), CommandResult::Ok));
+        let shown = app.build_engine_state().outputs.windows[0].calibration_mode;
+        assert_eq!(shown, CalibrationMode::Projector);
+        assert!(matches!(set(&mut app, CalibrationMode::Surfaces), CommandResult::Err { .. }));
+        assert!(matches!(set(&mut app, CalibrationMode::Off), CommandResult::Ok));
     }
 }

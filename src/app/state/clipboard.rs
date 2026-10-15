@@ -205,12 +205,7 @@ impl VardaApp {
             .mixer
             .effect_at(location)
             .ok_or_else(|| missing("effect", effect_uuid))?;
-        let config = EffectConfig {
-            uuid: effect.uuid().to_owned(),
-            path: effect.shader.file_path.clone().unwrap_or_default(),
-            enabled: effect.enabled,
-            params: effect.params.values.clone(),
-        };
+        let config = EffectConfig::of(effect);
         let modulation = extract_modulation_recipes(
             self.mixer.modulation(),
             None,
@@ -339,6 +334,19 @@ impl VardaApp {
         };
         let at = at.unwrap_or(chain_effects.len()).min(chain_effects.len());
         chain_effects.insert(at, effect);
+        if let EffectChain::Deck {
+            channel_idx,
+            deck_idx,
+        } = chain
+        {
+            if let Some(slot) = self
+                .mixer
+                .channel_mut(channel_idx)
+                .and_then(|c| c.decks.get_mut(deck_idx))
+            {
+                slot.deck.settle_layer_mask();
+            }
+        }
 
         apply_modulation_recipes(&modulation, "", self.mixer.modulation_mut());
         CommandResult::OkWithId { uuid }
@@ -804,6 +812,104 @@ mod tests {
         assert!((lane.regions[0].end - 4.0).abs() < f64::EPSILON);
     }
 
+    /// A duplicate draws as the original does: its transparency — an
+    /// operator's duplicated layout came back with every tap flattening over
+    /// black, and each merge into it faded — its pace, its size and its
+    /// auto-transition; a layer of a duplicated input too. Not keeping its
+    /// input's transparency, it stays so.
+    #[test]
+    fn a_duplicate_keeps_how_each_layer_draws() {
+        use crate::channel::DeckRenderFps;
+        use crate::deck::DeckRenderScale;
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        while app.mixer_snapshot().channels.len() < 2 {
+            app.execute_command(C::AddChannel);
+        }
+        let channels: Vec<String> =
+            app.mixer_snapshot().channels.iter().map(|c| c.uuid.clone()).collect();
+        let added = |app: &mut VardaApp, command: C| match app.execute_command(command) {
+            CommandResult::OkWithId { uuid } => uuid,
+            other => panic!("nothing made: {other:?}"),
+        };
+        let tap = added(
+            &mut app,
+            C::AddTapDeck {
+                channel_uuid: channels[0].clone(),
+                source: crate::scene::TapSourceConfig::Channel {
+                    uuid: channels[1].clone(),
+                },
+            },
+        );
+        for command in [
+            C::SetDeckRenderFps {
+                deck_uuid: tap.clone(),
+                render_fps: DeckRenderFps::Fixed(25),
+            },
+            C::SetDeckRenderScale {
+                deck_uuid: tap.clone(),
+                scale: DeckRenderScale::Half,
+            },
+            C::SetAutoTransitionEnabled {
+                deck_uuid: tap.clone(),
+                enabled: true,
+            },
+        ] {
+            app.execute_command(command);
+        }
+        let drawn = |app: &VardaApp, uuid: &str| {
+            let slot = app
+                .mixer_ref()
+                .channels()
+                .iter()
+                .flat_map(|c| &c.decks)
+                .find(|slot| slot.deck.uuid() == uuid)
+                .expect("the layer");
+            (
+                slot.deck.transparent(),
+                slot.render_fps,
+                slot.deck.render_scale(),
+                slot.auto_transition.as_ref().is_some_and(|a| a.enabled),
+            )
+        };
+        let original = drawn(&app, &tap);
+        assert_eq!(original, (true, DeckRenderFps::Fixed(25), DeckRenderScale::Half, true));
+
+        let copy = added(
+            &mut app,
+            C::Duplicate {
+                source: ClipboardSource::Deck(tap.clone()),
+            },
+        );
+        assert_eq!(drawn(&app, &copy), original, "the duplicated layer");
+
+        let input = added(
+            &mut app,
+            C::Duplicate {
+                source: ClipboardSource::Channel(channels[0].clone()),
+            },
+        );
+        let snapshot = app.mixer_snapshot();
+        let layers = &snapshot.channels.iter().find(|c| c.uuid == input).unwrap().decks;
+        assert_eq!(layers.len(), 2);
+        for layer in layers {
+            assert_eq!(drawn(&app, &layer.uuid), original, "a layer of the duplicated input");
+        }
+
+        app.execute_command(C::SetDeckTransparent {
+            deck_uuid: tap.clone(),
+            transparent: false,
+        });
+        let flattened = added(
+            &mut app,
+            C::Duplicate {
+                source: ClipboardSource::Deck(tap),
+            },
+        );
+        assert!(!drawn(&app, &flattened).0, "flattening, as set");
+    }
+
     /// `Cmd+D` must not destroy what was copied a minute ago.
     #[test]
     fn duplicating_leaves_the_clipboard_alone() {
@@ -863,10 +969,14 @@ mod tests {
             .iter()
             .map(|e| e.uuid.clone())
             .collect();
-        assert_eq!(chain.len(), 3);
-        assert_eq!(chain[0], first);
-        assert_eq!(chain[1], pasted);
-        assert_ne!(chain[2], pasted, "the copy is its own effect");
+        // After the deck's default crop and transform.
+        assert_eq!(chain.len(), 5);
+        let at = chain
+            .iter()
+            .position(|u| *u == first)
+            .expect("original stays");
+        assert_eq!(chain[at + 1], pasted);
+        assert_ne!(chain[at + 2], pasted, "the copy is its own effect");
     }
 
     /// A channel's own effects had no way to carry their modulation: only decks

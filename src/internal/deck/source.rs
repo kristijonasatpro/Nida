@@ -414,6 +414,12 @@ impl Deck {
             effects: Vec::new(),
             opacity: 1.0,
             transparent: false,
+            auto_playback: crate::engine::value::video::AutoPlayback::default(),
+            camera_mode: None,
+            camera_device: None,
+            camera_colour: crate::engine::value::camera::CameraColour::default(),
+            camera_lowest_latency: false,
+            camera_profile: crate::engine::value::camera::CameraProfile::Normal,
             render_time: 0.0,
             render_dt: 1.0 / 60.0,
             frame_count: 0,
@@ -432,6 +438,13 @@ impl Deck {
             generator_phase_inputs,
             analyzers: crate::analyzer::DeckAnalyzers::new(),
             gpu_error: None,
+            rendered_still: None,
+            visible: None,
+            drawn_visible: None,
+            drawn_share: 1.0,
+            placed: None,
+            render_scale: super::DeckRenderScale::Full,
+            master_size: (width, height),
         })
     }
 
@@ -464,9 +477,32 @@ impl Deck {
         }
     }
 
-    /// Add an effect (ISF filter) to this deck's effect chain
+    /// Add an effect (ISF filter) to this deck's effect chain: at its end,
+    /// but before the layer's own mask, which stays last.
     pub fn add_effect(&mut self, effect: Effect) {
         self.effects.push(effect);
+        self.settle_layer_mask();
+    }
+
+    /// Keep the layer's own mask whole, whatever moved, pasted or restored
+    /// the chain: one effect carrying it — the first with a mask, else the
+    /// first — last in the chain, the hole going through all before it.
+    pub fn settle_layer_mask(&mut self) {
+        use crate::engine::value::mask::LAYER_MASK_EFFECT;
+        let mut carriers = Vec::new();
+        let mut at = 0;
+        while at < self.effects.len() {
+            if self.effects[at].shader.name() == LAYER_MASK_EFFECT {
+                carriers.push(self.effects.remove(at));
+            } else {
+                at += 1;
+            }
+        }
+        if carriers.is_empty() {
+            return;
+        }
+        let kept = carriers.iter().position(|e| e.mask.is_some()).unwrap_or(0);
+        self.effects.push(carriers.swap_remove(kept));
     }
 
     /// Remove an effect from this deck's effect chain
@@ -510,16 +546,23 @@ impl Deck {
         };
 
         let source = if let Some(hap_fmt) = hap_format {
-            let player = HapPlayer::new(&path, hap_fmt)?;
+            let mut player = HapPlayer::new(&path, hap_fmt)?;
+            // A clip waits on its first frame until it is played or goes on
+            // air, as vMix adds one.
+            player.set_playing(false);
+            player.playback.show_frame = true;
             let vid_w = player.width();
             let vid_h = player.height();
             let tex_format = hap_fmt.wgpu_format();
+            // Compressed textures come in whole 4×4 blocks: a picture of
+            // another size (1918 wide, say) fills part of a larger one.
+            let (tex_w, tex_h) = (vid_w.div_ceil(4) * 4, vid_h.div_ceil(4) * 4);
 
             let video_texture = context.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("HAP Video Texture"),
                 size: wgpu::Extent3d {
-                    width: vid_w,
-                    height: vid_h,
+                    width: tex_w,
+                    height: tex_h,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -537,8 +580,8 @@ impl Deck {
                     let alpha_tex = context.device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("HAP Alpha Texture"),
                         size: wgpu::Extent3d {
-                            width: vid_w,
-                            height: vid_h,
+                            width: tex_w,
+                            height: tex_h,
                             depth_or_array_layers: 1,
                         },
                         mip_level_count: 1,
@@ -614,9 +657,11 @@ impl Deck {
             };
 
             let handle = VideoDecodeHandle::spawn_hap(player);
+            let audio = open_clip_audio(path.as_ref(), &handle);
 
             DeckSource::HapVideo {
                 handle,
+                audio,
                 texture: video_texture,
                 texture_view: video_texture_view,
                 alpha_texture,
@@ -627,14 +672,29 @@ impl Deck {
                 hap_format: hap_fmt,
                 source_width: vid_w,
                 source_height: vid_h,
-                scaling_mode: ScalingMode::default(),
+                // A new picture fits the frame whole, as vMix adds it: nothing
+                // cut off, the bars left transparent.
+                scaling_mode: ScalingMode::Fit,
                 staging,
                 alpha_staging,
             }
         } else {
-            let player = VideoPlayer::new(&path)?;
-            let vid_w = player.width();
-            let vid_h = player.height();
+            // A clip waits on its first frame until it is played or goes on
+            // air, as vMix adds one. A sound file is a clip with a clear
+            // picture.
+            let sound_only = crate::video::is_sound_only(path.as_ref());
+            let (handle, vid_w, vid_h) = if sound_only {
+                let mut player = crate::video::SoundOnlyPlayer::open(path.as_ref())?;
+                player.playback.playing = false;
+                let side = crate::video::SOUND_PICTURE_SIZE;
+                (VideoDecodeHandle::spawn_sound_only(player), side, side)
+            } else {
+                let mut player = VideoPlayer::new(&path)?;
+                player.set_playing(false);
+                player.playback.show_frame = true;
+                let (w, h) = (player.width(), player.height());
+                (VideoDecodeHandle::spawn_video(player), w, h)
+            };
             let video_texture = context.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Video Frame Texture"),
                 size: wgpu::Extent3d {
@@ -660,16 +720,20 @@ impl Deck {
                 "Video",
             );
 
-            let handle = VideoDecodeHandle::spawn_video(player);
+            let audio = open_clip_audio(path.as_ref(), &handle);
 
             DeckSource::Video {
                 handle,
+                audio,
+                sound_only,
                 texture: video_texture,
                 texture_view: video_texture_view,
                 blit_pipeline,
                 source_width: vid_w,
                 source_height: vid_h,
-                scaling_mode: ScalingMode::default(),
+                // A new picture fits the frame whole, as vMix adds it: nothing
+                // cut off, the bars left transparent.
+                scaling_mode: ScalingMode::Fit,
                 staging,
             }
         };
@@ -736,6 +800,51 @@ impl Deck {
         )
     }
 
+    /// A playlist of clips and pictures (see [`super::playlist`]), stopped
+    /// on its first item.
+    pub fn new_playlist(
+        context: &GpuContext,
+        items: Vec<crate::engine::value::playlist::PlaylistItem>,
+        settings: crate::engine::value::playlist::PlaylistSettings,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let list = super::playlist::Playlist::new(context, items, settings, (width, height));
+        Self::build_media_deck(
+            context,
+            "Playlist".to_string(),
+            None,
+            DeckSource::Playlist(Box::new(list)),
+            width,
+            height,
+        )
+    }
+
+    /// A timer (see [`super::timer`]) that has run `elapsed` seconds, paused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pipeline that places its numbers cannot be
+    /// made.
+    pub fn new_timer(
+        context: &GpuContext,
+        settings: crate::engine::value::timer::TimerSettings,
+        elapsed: f64,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let name = format!("⏱ {}", settings.mode.label());
+        let timer = super::timer::Timer::new(context, settings, elapsed, (width, height))?;
+        Ok(Self::build_media_deck(
+            context,
+            name,
+            None,
+            DeckSource::Timer(Box::new(timer)),
+            width,
+            height,
+        ))
+    }
+
     /// Create a new deck from decoded pixels. `tree` is carried by SVG decks so
     /// a later resolution change can re-render the artwork instead of scaling
     /// up the pixels it happened to be rasterized at first.
@@ -758,7 +867,12 @@ impl Deck {
             blit_pipeline,
             source_width: img_w,
             source_height: img_h,
-            scaling_mode: ScalingMode::default(),
+            // A new picture fits the frame whole, as vMix adds it: nothing
+            // cut off, the bars left transparent.
+            scaling_mode: ScalingMode::Fit,
+            // Vector art is redrawn at other sizes, where antialiased edges
+            // can turn translucent, so only raster images are trusted.
+            opaque: tree.is_none() && rgba.pixels().all(|p| p[3] == u8::MAX),
             svg: tree.map(Box::new),
         };
 
@@ -784,12 +898,7 @@ impl Deck {
         width: u32,
         height: u32,
     ) -> Result<Self> {
-        let source_name = format!(
-            "#{:02X}{:02X}{:02X}",
-            (color[0] * 255.0) as u8,
-            (color[1] * 255.0) as u8,
-            (color[2] * 255.0) as u8,
-        );
+        let source_name = super::colour_name(color);
 
         let source = DeckSource::SolidColor {
             color: [
@@ -932,7 +1041,7 @@ impl Deck {
         width: u32,
         height: u32,
     ) -> Result<Self> {
-        let source_name = format!("🛰 {sensor_name}");
+        let source_name = format!("📡 {sensor_name}");
         let (blit_pipeline, blit_pipeline_over_black) = external_blit_pipelines(context)?;
 
         let source = DeckSource::ExternalSource {
@@ -1019,6 +1128,12 @@ impl Deck {
             effects: Vec::new(),
             opacity: 1.0,
             transparent: false,
+            auto_playback: crate::engine::value::video::AutoPlayback::default(),
+            camera_mode: None,
+            camera_device: None,
+            camera_colour: crate::engine::value::camera::CameraColour::default(),
+            camera_lowest_latency: false,
+            camera_profile: crate::engine::value::camera::CameraProfile::Normal,
             render_time: 0.0,
             render_dt: 1.0 / 60.0,
             frame_count: 0,
@@ -1037,6 +1152,13 @@ impl Deck {
             generator_phase_inputs: None,
             analyzers: crate::analyzer::DeckAnalyzers::new(),
             gpu_error: None,
+            rendered_still: None,
+            visible: None,
+            drawn_visible: None,
+            drawn_share: 1.0,
+            placed: None,
+            render_scale: super::DeckRenderScale::Full,
+            master_size: (width, height),
         }
     }
 
@@ -1362,6 +1484,12 @@ impl Deck {
             effects: Vec::new(),
             opacity: 1.0,
             transparent: false,
+            auto_playback: crate::engine::value::video::AutoPlayback::default(),
+            camera_mode: None,
+            camera_device: None,
+            camera_colour: crate::engine::value::camera::CameraColour::default(),
+            camera_lowest_latency: false,
+            camera_profile: crate::engine::value::camera::CameraProfile::Normal,
             render_time: 0.0,
             render_dt: 1.0 / 60.0,
             frame_count: 0,
@@ -1380,7 +1508,27 @@ impl Deck {
             generator_phase_inputs,
             analyzers: crate::analyzer::DeckAnalyzers::new(),
             gpu_error: None,
+            rendered_still: None,
+            visible: None,
+            drawn_visible: None,
+            drawn_share: 1.0,
+            placed: None,
+            render_scale: super::DeckRenderScale::Full,
+            master_size: (width, height),
         })
+    }
+}
+
+/// The soundtrack of a video deck, following its playhead, or `None` for a
+/// silent file. A soundtrack that cannot be opened costs the clip its sound,
+/// never its picture.
+fn open_clip_audio(path: &Path, handle: &VideoDecodeHandle) -> Option<crate::audio_mix::ClipAudio> {
+    match crate::audio_mix::ClipAudio::open(path, handle.snapshot_cell()) {
+        Ok(audio) => audio,
+        Err(e) => {
+            log::warn!("No sound for '{}': {e}", path.display());
+            None
+        }
     }
 }
 

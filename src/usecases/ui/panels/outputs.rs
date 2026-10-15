@@ -4,11 +4,11 @@ use std::fmt::Write as _;
 
 use super::super::{UIActions, UIData};
 use crate::engine::EngineCommand;
-use crate::renderer::context::OutputTarget;
+use crate::renderer::context::{CalibrationMode, OutputTarget};
 
 pub(super) fn render_output_section(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
     // New output buttons
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui.button("+ Windowed").clicked() {
             actions.commands.push(EngineCommand::CreateOutput);
         }
@@ -25,9 +25,52 @@ pub(super) fn render_output_section(ui: &mut egui::Ui, data: &UIData, actions: &
         if ui.button("+ Stream").clicked() {
             actions.commands.push(EngineCommand::CreateHeadlessOutput {
                 target: OutputTarget::NdiSend {
-                    sender_name: "Varda NDI".to_string(),
+                    sender_name: "Nida NDI".to_string(),
                 },
             });
+        }
+        // A Blackmagic device's video out — HDMI and SDI — in the format
+        // nearest the show's rate (see `crate::decklink`).
+        for device in &data.decklink_devices {
+            let Some(mode) = device.mode_for(data.target_fps) else {
+                continue;
+            };
+            if ui
+                .button(format!("+ {}", device.name))
+                .on_hover_text(format!(
+                    "A Blackmagic output: its HDMI and SDI, {}; Start puts the show on it",
+                    mode.name
+                ))
+                .clicked()
+            {
+                actions.commands.push(EngineCommand::CreateHeadlessOutput {
+                    target: OutputTarget::DeckLink {
+                        device: device.name.clone(),
+                        mode: mode.name.clone(),
+                        full_range: false,
+                    },
+                });
+            }
+        }
+        if ui
+            .button("Screens…")
+            .on_hover_text(
+                "The screens connected: name each one (kept on this computer) and \
+                 Identify them",
+            )
+            .clicked()
+        {
+            super::screens::open(ui.ctx());
+        }
+        if ui
+            .button("LED screens…")
+            .on_hover_text(
+                "Several LED screens on one signal to the LED processor, each at its \
+                 own pixels, showing Main or a bus",
+            )
+            .clicked()
+        {
+            super::led::open(ui.ctx());
         }
     });
 
@@ -147,7 +190,11 @@ pub(super) fn render_output_section(ui: &mut egui::Ui, data: &UIData, actions: &
                         // Headless output controls (recording/SRT/NDI/Syphon)
                         render_headless_controls(ui, &output.uuid, output, data, actions);
                     }
-                    render_presentation_controls(ui, &output.uuid, output, actions);
+                    // A Blackmagic output is 8-bit YUV whatever is asked:
+                    // its card has its own Levels instead.
+                    if !matches!(output.target, OutputTarget::DeckLink { .. }) {
+                        render_presentation_controls(ui, &output.uuid, output, actions);
+                    }
                 });
             ui.add_space(4.0);
         }
@@ -178,7 +225,7 @@ fn render_presentation_controls(
                             output_uuid: output_uuid.to_string(),
                             request: PresentationRequest {
                                 depth,
-                                dither: output.presentation_request.dither,
+                                ..output.presentation_request
                             },
                         });
                     }
@@ -193,12 +240,47 @@ fn render_presentation_controls(
             actions.commands.push(EngineCommand::SetOutputPresentation {
                 output_uuid: output_uuid.to_string(),
                 request: PresentationRequest {
-                    depth: output.presentation_request.depth,
                     dither,
+                    ..output.presentation_request
                 },
             });
         }
     });
+    // A screen's levels: only a screen's — a recording or a stream is video
+    // levels already, and a Blackmagic output too.
+    if output.is_windowed {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Levels:").small());
+            let current = output.presentation_request.video_levels;
+            let label = |video: bool| if video { "Video (16–235)" } else { "Full (0–255)" };
+            egui::ComboBox::from_id_salt(format!("presentation_levels_{output_uuid}"))
+                .selected_text(egui::RichText::new(label(current)).small())
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for video in [false, true] {
+                        if ui.selectable_label(current == video, label(video)).clicked()
+                            && current != video
+                        {
+                            actions.commands.push(EngineCommand::SetOutputPresentation {
+                                output_uuid: output_uuid.to_string(),
+                                request: PresentationRequest {
+                                    video_levels: video,
+                                    ..output.presentation_request
+                                },
+                            });
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Full: black at 0, white at 255, as a computer monitor takes it. Video: \
+                     black at 16, white at 235 — for gear that reads video levels (some LED \
+                     processors, a monitor set to limited range), which otherwise crushes the \
+                     blacks and clips the whites. Check with the test card's 0/16/235/255 \
+                     patches.",
+                );
+        });
+    }
 
     let resolved = &output.resolved_presentation;
     let status = format!(
@@ -230,10 +312,19 @@ fn render_windowed_controls(
     actions: &mut UIActions,
 ) {
     // Display target selector
+    // A screen shown as it is called (see `app::screens`).
+    let shown = match &output.target {
+        OutputTarget::Display { name, .. } => data
+            .available_monitors
+            .iter()
+            .find(|m| &m.name == name)
+            .map_or_else(|| output.target_label.clone(), |m| m.label.clone()),
+        _ => output.target_label.clone(),
+    };
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Display:").small());
         egui::ComboBox::from_id_salt(format!("output_target_{output_uuid}"))
-            .selected_text(egui::RichText::new(&output.target_label).small())
+            .selected_text(egui::RichText::new(shown).small())
             .width(160.0)
             .show_ui(ui, |ui| {
                 let is_windowed = matches!(output.target, OutputTarget::Windowed);
@@ -244,7 +335,7 @@ fn render_windowed_controls(
                     });
                 }
                 for monitor in &data.available_monitors {
-                    let label = format!("{} ({}x{})", monitor.name, monitor.width, monitor.height);
+                    let label = super::switcher::screen_label(monitor);
                     if ui.selectable_label(false, &label).clicked() {
                         actions.commands.push(EngineCommand::SetOutputTarget {
                             output_uuid: output_uuid.to_string(),
@@ -282,7 +373,6 @@ fn render_windowed_controls(
     // Calibration mode selector (Off / Projector test card / per-Surface cards).
     // Warp editing itself now lives in the stage editor's bottom detail bar.
     ui.horizontal(|ui| {
-        use crate::renderer::context::CalibrationMode;
         ui.label(egui::RichText::new("🔧 Calibrate:").small());
         for (label, mode) in [
             ("Off", CalibrationMode::Off),
@@ -351,6 +441,8 @@ fn render_headless_controls(
     actions: &mut UIActions,
 ) {
     use crate::renderer::context::RecordingCodec;
+
+    render_source_picker(ui, output_uuid, output, data, actions);
 
     // Inline config for Recording outputs
     if let OutputTarget::Recording {
@@ -433,6 +525,21 @@ fn render_headless_controls(
     if is_stream {
         render_stream_config(ui, output_uuid, output, actions);
     }
+    if let OutputTarget::DeckLink {
+        device,
+        mode,
+        full_range,
+    } = &output.target
+    {
+        render_blackmagic_config(
+            ui,
+            output_uuid,
+            output.is_active,
+            (device, mode, *full_range),
+            data,
+            actions,
+        );
+    }
 
     // Audio passthrough device selector (ffmpeg targets only; locked while active)
     let is_ffmpeg = matches!(
@@ -447,27 +554,124 @@ fn render_headless_controls(
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Audio:").small());
             let current = output.target.audio_device();
-            let selected_text = current.unwrap_or("None (silent)");
+            let bus_name = output.audio_bus.as_ref().map(|uuid| {
+                data.audio_mix
+                    .buses
+                    .iter()
+                    .find(|b| &b.config.uuid == uuid)
+                    .map_or_else(
+                        || "⚠ removed bus".to_string(),
+                        |b| format!("Bus: {}", b.config.name),
+                    )
+            });
+            let selected_text = bus_name
+                .clone()
+                .unwrap_or_else(|| current.unwrap_or("None (silent)").to_string());
+            // A bus and a direct device are alternatives: picking one clears
+            // the other.
+            let clear_bus = |actions: &mut UIActions| {
+                if output.audio_bus.is_some() {
+                    actions.commands.push(EngineCommand::SetOutputAudioBus {
+                        output_uuid: output_uuid.to_string(),
+                        bus_uuid: None,
+                    });
+                }
+            };
             egui::ComboBox::from_id_salt(format!("out_audio_{output_uuid}"))
                 .selected_text(egui::RichText::new(selected_text).small())
                 .width(160.0)
                 .show_ui(ui, |ui| {
                     if ui
-                        .selectable_label(current.is_none(), "None (silent)")
+                        .selectable_label(
+                            current.is_none() && output.audio_bus.is_none(),
+                            "None (silent)",
+                        )
                         .clicked()
                     {
+                        clear_bus(actions);
                         actions.commands.push(EngineCommand::SetOutputTarget {
                             output_uuid: output_uuid.to_string(),
                             target: output.target.with_audio_device(None),
                         });
                     }
+                    for bus in &data.audio_mix.buses {
+                        let on = output.audio_bus.as_deref() == Some(bus.config.uuid.as_str());
+                        if ui
+                            .selectable_label(on, format!("Bus: {}", bus.config.name))
+                            .on_hover_text("The audio mixer's bus, as mixed")
+                            .clicked()
+                            && !on
+                        {
+                            actions.commands.push(EngineCommand::SetOutputAudioBus {
+                                output_uuid: output_uuid.to_string(),
+                                bus_uuid: Some(bus.config.uuid.clone()),
+                            });
+                            if current.is_some() {
+                                actions.commands.push(EngineCommand::SetOutputTarget {
+                                    output_uuid: output_uuid.to_string(),
+                                    target: output.target.with_audio_device(None),
+                                });
+                            }
+                        }
+                    }
                     for dev in &data.audio.devices {
-                        let selected = current == Some(dev.name.as_str());
+                        let selected =
+                            output.audio_bus.is_none() && current == Some(dev.name.as_str());
                         if ui.selectable_label(selected, &dev.name).clicked() {
+                            clear_bus(actions);
                             actions.commands.push(EngineCommand::SetOutputTarget {
                                 output_uuid: output_uuid.to_string(),
                                 target: output.target.with_audio_device(Some(dev.name.clone())),
                             });
+                        }
+                    }
+                });
+        });
+    }
+
+    // An NDI sender carries an audio bus, changed over at once, on air too.
+    if matches!(output.target, OutputTarget::NdiSend { .. }) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Audio:").small());
+            let bus_name = |uuid: &str| {
+                data.audio_mix
+                    .buses
+                    .iter()
+                    .find(|b| b.config.uuid == uuid)
+                    .map_or_else(
+                        || "⚠ removed bus".to_string(),
+                        |b| format!("Bus: {}", b.config.name),
+                    )
+            };
+            let selected_text = output
+                .audio_bus
+                .as_deref()
+                .map_or_else(|| "None (silent)".to_string(), bus_name);
+            egui::ComboBox::from_id_salt(format!("ndi_audio_{output_uuid}"))
+                .selected_text(egui::RichText::new(selected_text).small())
+                .width(160.0)
+                .show_ui(ui, |ui| {
+                    let mut choose = |bus_uuid: Option<String>| {
+                        actions.commands.push(EngineCommand::SetOutputAudioBus {
+                            output_uuid: output_uuid.to_string(),
+                            bus_uuid,
+                        });
+                    };
+                    if ui
+                        .selectable_label(output.audio_bus.is_none(), "None (silent)")
+                        .clicked()
+                    {
+                        choose(None);
+                    }
+                    for bus in &data.audio_mix.buses {
+                        let on = output.audio_bus.as_deref() == Some(bus.config.uuid.as_str());
+                        if ui
+                            .selectable_label(on, format!("Bus: {}", bus.config.name))
+                            .on_hover_text("Sent with the picture, as the audio mixer mixes it")
+                            .clicked()
+                            && !on
+                        {
+                            choose(Some(bus.config.uuid.clone()));
                         }
                     }
                 });
@@ -558,6 +762,171 @@ fn render_headless_controls(
 }
 
 /// Unified stream output config with protocol dropdown (SRT, HLS, DASH, RTMP, NDI, Syphon).
+/// What a recording, stream or NDI output sends: the master, or one bus's
+/// program — vMix's per-output source. Changing it mid-recording is fine; it
+/// only changes which picture is copied in.
+fn render_source_picker(
+    ui: &mut egui::Ui,
+    output_uuid: &str,
+    output: &super::super::OutputUI,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
+    use crate::renderer::context::OutputSource;
+
+    let Some(source) = &output.source else {
+        return;
+    };
+    let current = match source {
+        OutputSource::BusProgram(uuid) => {
+            data.buses.iter().find(|b| &b.bus.uuid == uuid).map_or_else(
+                || "⚠ removed bus — black".to_string(),
+                |b| b.bus.name.clone(),
+            )
+        }
+        _ => "Master".to_string(),
+    };
+    let mut pick = |source: OutputSource| {
+        actions.commands.push(EngineCommand::SetOutputSource {
+            output_uuid: output_uuid.to_string(),
+            source,
+        });
+    };
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Source:").small());
+        egui::ComboBox::from_id_salt(format!("out_source_{output_uuid}"))
+            .selected_text(egui::RichText::new(current).small())
+            .width(140.0)
+            .show_ui(ui, |ui| {
+                let on_master = *source == OutputSource::Master;
+                if ui
+                    .selectable_label(on_master, "Master")
+                    .on_hover_text("The main output, every layer")
+                    .clicked()
+                    && !on_master
+                {
+                    pick(OutputSource::Master);
+                }
+                for bus_ui in &data.buses {
+                    let bus = &bus_ui.bus;
+                    let on_it = matches!(source, OutputSource::BusProgram(u) if *u == bus.uuid);
+                    if ui
+                        .selectable_label(on_it, &bus.name)
+                        .on_hover_text(format!("Whatever {} has on Program", bus.name))
+                        .clicked()
+                        && !on_it
+                    {
+                        pick(OutputSource::BusProgram(bus.uuid.clone()));
+                    }
+                }
+            });
+    });
+    if !output.surface_assignments.is_empty() {
+        ui.label(
+            egui::RichText::new("Sends its assigned surfaces instead")
+                .small()
+                .weak(),
+        );
+    }
+}
+
+/// A Blackmagic output's format, picked from its device's, while it is
+/// stopped; whether the device is there at all.
+fn render_blackmagic_config(
+    ui: &mut egui::Ui,
+    output_uuid: &str,
+    active: bool,
+    (device, mode, full_range): (&str, &str, bool),
+    data: &UIData,
+    actions: &mut UIActions,
+) {
+    let target = |mode: String, full_range: bool| OutputTarget::DeckLink {
+        device: device.to_string(),
+        mode,
+        full_range,
+    };
+    // Levels: chosen per output, running or not — taken up at once.
+    ui.horizontal(|ui| {
+        let label = ui.label(egui::RichText::new("Levels:").small());
+        let shown = |full: bool| if full { "Full (0–255)" } else { "Video (16–235)" };
+        egui::ComboBox::from_id_salt(format!("blackmagic_levels_{output_uuid}"))
+            .selected_text(egui::RichText::new(shown(full_range)).small())
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                for full in [false, true] {
+                    if ui.selectable_label(full_range == full, shown(full)).clicked()
+                        && full != full_range
+                    {
+                        actions.commands.push(EngineCommand::SetOutputTarget {
+                            output_uuid: output_uuid.to_string(),
+                            target: target(mode.to_string(), full),
+                        });
+                    }
+                }
+            })
+            .response
+            .labelled_by(label.id)
+            .on_hover_text(
+                "Video: black at 16, white at 235, as video gear takes it. Full: black at 0, \
+                 white at 255, for a display set to take full levels (its HDMI black level \
+                 at Full or High).",
+            );
+    });
+    // The test card on the device — its levels strip shows them there.
+    let mut card = data.outputs.iter().any(|o| {
+        o.uuid == output_uuid && o.calibration_mode == CalibrationMode::Projector
+    });
+    if ui
+        .checkbox(&mut card, egui::RichText::new("Test card").small())
+        .on_hover_text(
+            "The calibration card on the device in place of the picture: its strip of \
+             codes 0, 16, 235 and 255 shows how the Levels come out there",
+        )
+        .changed()
+    {
+        actions.commands.push(EngineCommand::SetCalibrationMode {
+            output_uuid: output_uuid.to_string(),
+            mode: if card {
+                CalibrationMode::Projector
+            } else {
+                CalibrationMode::Off
+            },
+        });
+    }
+    let Some(found) = data.decklink_devices.iter().find(|d| d.name == device) else {
+        ui.label(
+            egui::RichText::new(format!("⚠ {device} is not connected"))
+                .small()
+                .color(egui::Color32::from_rgb(255, 180, 80)),
+        );
+        return;
+    };
+    if active {
+        ui.label(egui::RichText::new(format!("Format: {mode}")).small().weak());
+        return;
+    }
+    ui.horizontal(|ui| {
+        let label = ui.label(egui::RichText::new("Format:").small());
+        let mut chosen = mode.to_string();
+        egui::ComboBox::from_id_salt(format!("blackmagic_mode_{output_uuid}"))
+            .selected_text(egui::RichText::new(mode).small())
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                for m in &found.modes {
+                    ui.selectable_value(&mut chosen, m.name.clone(), &m.name);
+                }
+            })
+            .response
+            .labelled_by(label.id);
+        if chosen != mode {
+            actions.commands.push(EngineCommand::SetOutputTarget {
+                output_uuid: output_uuid.to_string(),
+                target: target(chosen, full_range),
+            });
+        }
+    });
+}
+
 fn render_stream_config(
     ui: &mut egui::Ui,
     output_uuid: &str,
@@ -632,7 +1001,7 @@ fn render_stream_config(
                         (
                             "NDI",
                             OutputTarget::NdiSend {
-                                sender_name: "Varda NDI".to_string(),
+                                sender_name: "Nida NDI".to_string(),
                             },
                         ),
                     ];
@@ -640,7 +1009,7 @@ fn render_stream_config(
                     protocols.push((
                         "Syphon",
                         OutputTarget::SyphonServer {
-                            server_name: "Varda".to_string(),
+                            server_name: "Nida".to_string(),
                         },
                     ));
                     for (label, default_target) in &protocols {
@@ -1193,6 +1562,9 @@ mod tests {
             delivery: None,
             preview_width: 1920,
             preview_height: 1080,
+            source: None,
+            audio_bus: None,
+            led: None,
         }
     }
 
@@ -1267,5 +1639,229 @@ mod tests {
         harness.run();
         harness.get_by_label("Delivering 8-bit SDR · BGRA8");
         harness.get_by_label("10-bit fallback: Syphon interoperability is limited to BGRA8");
+    }
+
+    #[test]
+    fn a_recording_can_follow_a_bus() {
+        let mut data = UIData::test_fixture();
+        let mut output =
+            sample_output(crate::engine::value::render::ResolvedPresentation::default());
+        output.is_windowed = false;
+        output.target = OutputTarget::NdiSend {
+            sender_name: "Nida NDI".into(),
+        };
+        output.source = Some(crate::renderer::context::OutputSource::Master);
+        data.outputs = vec![output];
+        let mut actions = UIActions::new();
+        {
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(420.0, 900.0))
+                .build_ui(|ui| render_output_section(ui, &data, &mut actions));
+            harness.get_by_value("Master").click();
+            harness.run_steps(2);
+            harness.get_by_label("TV").click();
+            harness.run_steps(2);
+        }
+        assert!(
+            actions.commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetOutputSource {
+                    output_uuid,
+                    source: crate::renderer::context::OutputSource::BusProgram(bus),
+                } if output_uuid == "out00001" && bus == "bus00001"
+            )),
+            "{:?}",
+            actions.commands
+        );
+    }
+
+    /// A screen's Levels are picked on its card — Video for video gear —
+    /// keeping its precision and dither; a recording or stream has none.
+    #[test]
+    fn a_screens_levels_are_picked_on_its_card() {
+        let mut data = UIData::test_fixture();
+        data.outputs.push(sample_output(
+            crate::engine::value::render::ResolvedPresentation::default(),
+        ));
+        let mut actions = UIActions::new();
+        {
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(420.0, 900.0))
+                .build_ui(|ui| render_output_section(ui, &data, &mut actions));
+            harness.get_by_value("Full (0–255)").click();
+            harness.run_steps(2);
+            harness.get_by_label("Video (16–235)").click();
+            harness.run_steps(2);
+        }
+        assert!(
+            actions.commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetOutputPresentation { output_uuid, request }
+                    if output_uuid == "out00001" && request.video_levels && request.dither
+            )),
+            "{:?}",
+            actions.commands
+        );
+        // A Blackmagic output, say: no Levels.
+        data.outputs = vec![blackmagic_output(false)];
+        let harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 900.0))
+            .build_ui(|ui| render_output_section(ui, &data, &mut actions));
+        assert!(harness.query_by_value("Full (0–255)").is_none());
+    }
+
+    fn ultrastudio() -> crate::decklink::DeckLinkDevice {
+        let mode = |name: &str, fps| crate::decklink::DeckLinkMode {
+            name: name.into(),
+            width: 1920,
+            height: 1080,
+            fps,
+            code: 0,
+        };
+        crate::decklink::DeckLinkDevice {
+            name: "UltraStudio Monitor 3G".into(),
+            arrival: 0,
+            modes: vec![mode("1080i50", 25.0), mode("1080p50", 50.0), mode("1080p60", 60.0)],
+        }
+    }
+
+    /// A Blackmagic device that is connected is offered as an output, in
+    /// 1080p at the show's rate; with none connected, nothing is offered.
+    #[test]
+    fn a_connected_blackmagic_device_is_offered_as_an_output() {
+        let mut data = UIData::test_fixture();
+        let mut actions = UIActions::new();
+        {
+            let harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(640.0, 400.0))
+                .build_ui(|ui| render_output_section(ui, &data, &mut actions));
+            assert!(harness.query_by_label("+ UltraStudio Monitor 3G").is_none());
+        }
+        data.decklink_devices = vec![ultrastudio()];
+        data.target_fps = 60;
+        {
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(640.0, 400.0))
+                .build_ui(|ui| render_output_section(ui, &data, &mut actions));
+            harness.get_by_label("+ UltraStudio Monitor 3G").click();
+            harness.run();
+        }
+        assert!(
+            actions.commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::CreateHeadlessOutput {
+                    target: OutputTarget::DeckLink { device, mode, .. },
+                } if device == "UltraStudio Monitor 3G" && mode == "1080p60"
+            )),
+            "{:?}",
+            actions.commands
+        );
+    }
+
+    fn blackmagic_output(active: bool) -> crate::usecases::ui::OutputUI {
+        let mut output =
+            sample_output(crate::engine::value::render::ResolvedPresentation::default());
+        output.is_windowed = false;
+        output.is_active = active;
+        output.target = OutputTarget::DeckLink {
+            device: "UltraStudio Monitor 3G".into(),
+            mode: "1080p60".into(),
+            full_range: false,
+        };
+        output.source = Some(crate::renderer::context::OutputSource::Master);
+        output
+    }
+
+    /// A stopped Blackmagic output's format is picked from its device's.
+    #[test]
+    fn a_blackmagic_outputs_format_is_picked_while_it_is_stopped() {
+        let mut data = UIData::test_fixture();
+        data.decklink_devices = vec![ultrastudio()];
+        data.outputs = vec![blackmagic_output(false)];
+        let mut actions = UIActions::new();
+        {
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(420.0, 900.0))
+                .build_ui(|ui| render_output_section(ui, &data, &mut actions));
+            harness.get_by_value("1080p60").click();
+            harness.run_steps(2);
+            harness.get_by_label("1080p50").click();
+            harness.run_steps(2);
+        }
+        assert!(
+            actions.commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetOutputTarget {
+                    output_uuid,
+                    target: OutputTarget::DeckLink { device, mode, .. },
+                } if output_uuid == "out00001" && device == "UltraStudio Monitor 3G" && mode == "1080p50"
+            )),
+            "{:?}",
+            actions.commands
+        );
+    }
+
+    /// A Blackmagic output's Levels are picked on its card, running or not —
+    /// Video by default, Full for a display set to take it; its test card
+    /// put on the device from there too.
+    #[test]
+    fn a_blackmagic_outputs_levels_and_test_card_are_picked_on_its_card() {
+        let mut data = UIData::test_fixture();
+        data.decklink_devices = vec![ultrastudio()];
+        data.outputs = vec![blackmagic_output(true)];
+        let mut actions = UIActions::new();
+        {
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(420.0, 900.0))
+                .build_ui(|ui| render_output_section(ui, &data, &mut actions));
+            harness.get_by_value("Video (16–235)").click();
+            harness.run_steps(2);
+            harness.get_by_label("Full (0–255)").click();
+            harness.run_steps(2);
+            harness.get_by_label("Test card").click();
+            harness.run_steps(2);
+        }
+        assert!(
+            actions.commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetOutputTarget {
+                    output_uuid,
+                    target: OutputTarget::DeckLink { mode, full_range: true, .. },
+                } if output_uuid == "out00001" && mode == "1080p60"
+            )),
+            "{:?}",
+            actions.commands
+        );
+        assert!(
+            actions.commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetCalibrationMode { output_uuid, mode: CalibrationMode::Projector }
+                    if output_uuid == "out00001"
+            )),
+            "{:?}",
+            actions.commands
+        );
+    }
+
+    /// Running, its format is shown, not offered; its device unplugged, that
+    /// is said.
+    #[test]
+    fn a_running_or_unplugged_blackmagic_output_says_so() {
+        let mut data = UIData::test_fixture();
+        data.decklink_devices = vec![ultrastudio()];
+        data.outputs = vec![blackmagic_output(true)];
+        let mut actions = UIActions::new();
+        {
+            let harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(420.0, 900.0))
+                .build_ui(|ui| render_output_section(ui, &data, &mut actions));
+            harness.get_by_label("Format: 1080p60");
+            assert!(harness.query_by_value("1080p60").is_none(), "not offered while running");
+        }
+        data.decklink_devices.clear();
+        let harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 900.0))
+            .build_ui(|ui| render_output_section(ui, &data, &mut actions));
+        harness.get_by_label("⚠ UltraStudio Monitor 3G is not connected");
     }
 }

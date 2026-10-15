@@ -2,7 +2,7 @@
 
 ## The Signal Flow
 
-Varda routes video through a five-layer hierarchy inspired by broadcast video switchers: **Sources → Decks → Channels → Mixer → Surfaces → Outputs**.
+Nida routes video through a five-layer hierarchy inspired by broadcast video switchers: **Sources → Decks → Channels → Mixer → Surfaces → Outputs**.
 
 ```
 [Deck] → [Deck FX] ─┐
@@ -39,11 +39,11 @@ Renders assigned surfaces onto a display target such as a monitor/projector wind
 
 ### Clip Triggering Without Clip Triggering
 
-Most VJ software uses a clip-launch paradigm: press a button, a clip starts playing; press another, the previous one stops. Varda doesn't have clip triggers, but it doesn't need them, because the broadcast mixer model gives you the same result with more control.
+Most VJ software uses a clip-launch paradigm: press a button, a clip starts playing; press another, the previous one stops. Nida doesn't have clip triggers, but it doesn't need them, because the broadcast mixer model gives you the same result with more control.
 
 Load your sources into decks across your channels. What makes a deck live is its **opacity**. Map your MIDI controller buttons to deck mute or deck opacity. Press a button, a deck's opacity goes from 0 to 1, it's live. Press another, that deck goes to 0, it's gone. From the audience's perspective, you just triggered a clip. Under the hood, zero-opacity decks are **culled from the render pass entirely**, so they cost nothing. Only decks with non-zero opacity are actually rendered. When you bring a deck's opacity up, its source starts producing frames immediately. You're not "stopping and starting clips," you're mixing a live signal path where the GPU only pays for what's visible.
 
-This is how broadcast video works. A switcher doesn't start and stop cameras. Every camera is always hot, and the director cuts between them by routing signals onto buses. Varda applies the same idea: your decks are always ready, and you perform by controlling which signals are live in the mix. The result is instant transitions (no clip load latency), full MIDI control over the routing, and a mental model that scales.
+This is how broadcast video works. A switcher doesn't start and stop cameras. Every camera is always hot, and the director cuts between them by routing signals onto buses. Nida applies the same idea: your decks are always ready, and you perform by controlling which signals are live in the mix. The result is instant transitions (no clip load latency), full MIDI control over the routing, and a mental model that scales.
 
 ---
 
@@ -64,7 +64,7 @@ This is how broadcast video works. A switcher doesn't start and stop cameras. Ev
 | Compute Shader | GLSL compute shader (`.comp`) — particle systems, simulations, GPU-native generators |
 | Syphon | macOS inter-app texture sharing (receive from other apps) |
 | Screen Capture | An OS display or a single application window, captured live (macOS) |
-| Program Tap | Varda's own master program or a channel composite, one frame behind |
+| Program Tap | Nida's own master program (one frame behind) or a channel composite (this frame, unless in a loop) |
 | HTML | Web page (HTML/CSS/JS) rendered by the embedded Servo browser engine |
 | Solid Color | Flat RGBA color |
 
@@ -72,7 +72,7 @@ This is how broadcast video works. A switcher doesn't start and stop cameras. Ev
 
 ## Blend Modes
 
-Each deck composites onto its channel using a blend mode (and the same set is available for per-channel mixing with 3+ channels). Varda implements 15 modes:
+Each deck composites onto its channel using a blend mode (and the same set is available for per-channel mixing with 3+ channels). Nida implements 15 modes:
 
 | Group | Modes |
 |-------|-------|
@@ -98,7 +98,7 @@ Effects can be reordered via drag-and-drop and toggled on/off individually.
 
 ## Tonemapping & Color Grading
 
-Varda works in **linear-light HDR** (`Rgba16Float`) from the moment a source enters a
+Nida works in **linear-light HDR** (`Rgba16Float`) from the moment a source enters a
 deck all the way to the output boundary
 
 Before frames reach outputs, two optional color transforms are applied in order:
@@ -109,8 +109,8 @@ Compresses HDR values into displayable [0, 1] range. Nine algorithmic presets ar
 
 | Preset | Character |
 |--------|-----------|
-| **Bypass** | No compression — values >1.0 clamp at the output boundary |
-| **ACES Filmic** (default) | Cinematic rolloff with warm highlight shift |
+| **Off (pixel-exact)** (default) | No compression — pictures leave as they came in; values >1.0 clip |
+| **ACES Filmic** | Cinematic rolloff with warm highlight shift |
 | **Reinhard** | Gentle curve, never reaches pure white |
 | **Reinhard Extended** | Reinhard with configurable white point |
 | **Hable Filmic** | Game-industry standard with nice toe and shoulder |
@@ -119,7 +119,12 @@ Compresses HDR values into displayable [0, 1] range. Nine algorithmic presets ar
 | **AgX** | Neutral, minimal hue shift |
 | **PBR Neutral** | Color-accurate, minimal look modification |
 
-Select via the **🎨 Tonemap** section in the right panel, under the main output preview, or `PUT /api/mixer/tonemap`.
+Off is the default because every curve re-grades every pixel — ACES turns
+file white into 80% grey — which a switcher passing slides and cameras through
+must not do unasked. Pick a curve only for generative content that
+deliberately drives values above 1.0.
+
+Select via the **🎨 Tonemap** section in the **Setup** panel or `PUT /api/mixer/tonemap`.
 
 ### 3D LUT
 
@@ -168,8 +173,8 @@ A paste lands directly after whatever you right-clicked, or at the end when you 
 
 ---
 
-## The Varda workspace
-Varda treats the current working directory as a workspace. All state lives in a `.varda/` directory created automatically:
+## The Nida workspace
+Nida treats the current working directory as a workspace. All state lives in a `.varda/` directory created automatically:
 
 ```
 your-show/
@@ -189,7 +194,7 @@ your-show/
     streams/              # HLS/DASH output files
 ```
 
-Run Varda from different directories to maintain separate workspaces per show, venue, or project. Each workspace has its own scene, stage layout, and MIDI mappings.
+Run Nida from different directories to maintain separate workspaces per show, venue, or project. Each workspace has its own scene, stage layout, and MIDI mappings.
 
 Save with **Cmd+S** or auto-save on clean exit. Reload everything at a different venue or share your setup with others by copying the entire `.varda/` directory. Note that the scene (your show) is separate from the stage (the venue's physical layout).
 

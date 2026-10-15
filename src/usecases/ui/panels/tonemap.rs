@@ -11,7 +11,7 @@ use crate::engine::EngineCommand;
 use crate::renderer::tonemap::TonemapMode;
 
 const TONEMAP_PRESETS: &[(&str, TonemapMode)] = &[
-    ("Bypass (clamp)", TonemapMode::Bypass),
+    ("Off (pixel-exact)", TonemapMode::Bypass),
     ("ACES Filmic", TonemapMode::Aces),
     ("Reinhard", TonemapMode::Reinhard),
     ("Reinhard Extended", TonemapMode::ReinhardExtended),
@@ -32,7 +32,7 @@ pub(super) fn tonemap_name(mode: TonemapMode) -> &'static str {
 
 fn tonemap_description(mode: TonemapMode) -> &'static str {
     match mode {
-        TonemapMode::Bypass => "Values >1.0 are clamped at the output boundary",
+        TonemapMode::Bypass => "Pictures leave exactly as they came in; values above 1.0 clip",
         TonemapMode::Aces => "Cinematic rolloff, warm highlight shift",
         TonemapMode::Reinhard => "Gentle curve, never reaches pure white",
         TonemapMode::ReinhardExtended => "Reinhard with white point, full SDR range",

@@ -27,6 +27,10 @@ pub enum ReadbackFormat {
     Uyvy,
     /// Planar 4:2:2 ten-bit video in sixteen-bit words.
     P216,
+    /// Eight-bit 4:2:0 video: a Y plane, then U and V interleaved at half
+    /// size — made on the GPU by [`super::nv12::Nv12Converter`], not read
+    /// back through a [`ReadbackBuffer`].
+    Nv12,
 }
 
 impl ReadbackFormat {
@@ -35,6 +39,8 @@ impl ReadbackFormat {
             Self::Rgba8 | Self::Bgra8 | Self::Rgb10A2 | Self::P216 => 4,
             Self::Rgba16Float | Self::Rgba16Unorm => 8,
             Self::Uyvy => 2,
+            // The Y plane's; the half-size U V plane follows it.
+            Self::Nv12 => 1,
         }
     }
 }
@@ -54,6 +60,8 @@ pub struct ReadbackFrame {
     stride: u32,
     color_profile: crate::engine::value::render::PresentationColorProfile,
     alpha_mode: crate::engine::value::render::AlphaMode,
+    /// When the frame was drawn (see [`ReadbackBuffer::begin_readback`]).
+    made: std::time::Instant,
     bytes: Vec<u8>,
 }
 
@@ -88,6 +96,11 @@ impl ReadbackFrame {
         self.alpha_mode
     }
 
+    /// When the frame was drawn: what an encoder times it by.
+    pub fn made(&self) -> std::time::Instant {
+        self.made
+    }
+
     /// Tightly packed frame bytes.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -108,6 +121,8 @@ enum SlotState {
     Copied,
     /// `map_async` has been issued; awaiting the completion callback.
     Mapping(Receiver<Result<(), wgpu::BufferAsyncError>>),
+    /// Mapped and not yet read: another finished frame was read first.
+    Mapped,
 }
 
 /// Double-buffered GPU→CPU readback. Alternates two staging buffers
@@ -128,6 +143,8 @@ pub struct ReadbackBuffer {
     padded_bytes_per_row: u32,
     /// Non-blocking state machine state for each staging buffer.
     slots: [SlotState; 2],
+    /// When the frame copied into each staging buffer was drawn.
+    made: [std::time::Instant; 2],
 }
 
 impl ReadbackBuffer {
@@ -180,6 +197,7 @@ impl ReadbackBuffer {
             unpadded_bytes_per_row,
             padded_bytes_per_row,
             slots: [SlotState::Free, SlotState::Free],
+            made: [std::time::Instant::now(); 2],
         }
     }
 
@@ -208,8 +226,8 @@ impl ReadbackBuffer {
         self.alpha_mode
     }
 
-    /// Enqueue a texture→buffer copy for this frame. Call during command encoding.
-    /// The source texture must have `COPY_SRC` usage.
+    /// Enqueue a texture→buffer copy for this frame, drawn at `made`. Call
+    /// during command encoding. The source texture must have `COPY_SRC` usage.
     ///
     /// Picks any buffer currently in the `Free` state as the copy target. If both
     /// buffers are still in flight (GPU behind), the copy is skipped this frame
@@ -218,6 +236,7 @@ impl ReadbackBuffer {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         source_texture: &wgpu::Texture,
+        made: std::time::Instant,
     ) {
         let Some(idx) = self.slots.iter().position(|s| matches!(s, SlotState::Free)) else {
             return;
@@ -246,27 +265,30 @@ impl ReadbackBuffer {
         );
 
         self.slots[idx] = SlotState::Copied;
+        self.made[idx] = made;
     }
 
-    /// Non-blocking attempt to read back a previously copied frame.
-    ///
-    /// Returns a typed, tightly packed frame for the most recent buffer whose
-    /// map has completed, or `None` if nothing is ready yet. This never
-    /// blocks the render thread: it advances pending maps with a non-blocking
-    /// `poll(Poll)` and checks completion with `try_recv`, accepting a couple
-    /// frames of latency. Works regardless of whether the copy was submitted in a
-    /// prior frame (analyzer path) or immediately before this call (headless path).
-    pub fn try_read(&mut self, device: &wgpu::Device) -> Option<ReadbackFrame> {
-        // Give wgpu a chance to fire any completed map callbacks (non-blocking).
-        let _ = device.poll(wgpu::PollType::Poll);
+    /// Every frame whose readback has finished, in the order drawn: both,
+    /// when both finished together (see [`Self::try_read`]) — what a
+    /// recording takes, as each is a moment of its own.
+    pub fn try_read_all(&mut self, device: &wgpu::Device) -> Vec<ReadbackFrame> {
+        let mut frames = Vec::new();
+        while let Some(frame) = self.try_read_one(device) {
+            frames.push(frame);
+        }
+        frames.sort_by_key(ReadbackFrame::made);
+        frames
+    }
 
-        let mut result = None;
+    /// One finished frame — the earliest drawn — leaving any other finished
+    /// one for the next call; `None` when none has finished.
+    fn try_read_one(&mut self, device: &wgpu::Device) -> Option<ReadbackFrame> {
+        let _ = device.poll(wgpu::PollType::Poll);
+        let mut done: Option<usize> = None;
         for idx in 0..self.slots.len() {
             match std::mem::replace(&mut self.slots[idx], SlotState::Free) {
                 SlotState::Free => {}
                 SlotState::Copied => {
-                    // The copy has been submitted by now; issue the async map and
-                    // check for completion on a subsequent call.
                     let (tx, rx) = std::sync::mpsc::channel();
                     self.buffers[idx]
                         .slice(..)
@@ -277,35 +299,57 @@ impl ReadbackBuffer {
                 }
                 SlotState::Mapping(rx) => match rx.try_recv() {
                     Ok(Ok(())) => {
-                        result = Some(ReadbackFrame {
-                            format: self.format,
-                            width: self.width,
-                            height: self.height,
-                            stride: self.unpadded_bytes_per_row,
-                            color_profile: self.color_profile,
-                            alpha_mode: self.alpha_mode,
-                            bytes: self.copy_out(idx),
-                        });
-                        self.buffers[idx].unmap();
-                        // slot left Free
+                        if done.is_none_or(|d| self.made[idx] < self.made[d]) {
+                            if let Some(d) = done.replace(idx) {
+                                self.slots[d] = SlotState::Mapped;
+                            }
+                        } else {
+                            self.slots[idx] = SlotState::Mapped;
+                        }
                     }
-                    Err(TryRecvError::Empty) => {
-                        // Still in flight — restore state and check next frame.
-                        self.slots[idx] = SlotState::Mapping(rx);
-                    }
+                    Err(TryRecvError::Empty) => self.slots[idx] = SlotState::Mapping(rx),
                     Ok(Err(e)) => {
                         log::warn!("GPU readback map failed: {e}");
                         self.buffers[idx].unmap();
-                        // slot left Free
                     }
-                    Err(TryRecvError::Disconnected) => {
-                        self.buffers[idx].unmap();
-                        // slot left Free
-                    }
+                    Err(TryRecvError::Disconnected) => self.buffers[idx].unmap(),
                 },
+                SlotState::Mapped => {
+                    if done.is_none_or(|d| self.made[idx] < self.made[d]) {
+                        if let Some(d) = done.replace(idx) {
+                            self.slots[d] = SlotState::Mapped;
+                        }
+                    } else {
+                        self.slots[idx] = SlotState::Mapped;
+                    }
+                }
             }
         }
-        result
+        let idx = done?;
+        let frame = ReadbackFrame {
+            format: self.format,
+            width: self.width,
+            height: self.height,
+            stride: self.unpadded_bytes_per_row,
+            color_profile: self.color_profile,
+            alpha_mode: self.alpha_mode,
+            made: self.made[idx],
+            bytes: self.copy_out(idx),
+        };
+        self.buffers[idx].unmap();
+        Some(frame)
+    }
+
+    /// Non-blocking attempt to read back a previously copied frame.
+    ///
+    /// Returns a typed, tightly packed frame for the most recently drawn
+    /// buffer whose map has completed, or `None` if nothing is ready yet. This never
+    /// blocks the render thread: it advances pending maps with a non-blocking
+    /// `poll(Poll)` and checks completion with `try_recv`, accepting a couple
+    /// frames of latency. Works regardless of whether the copy was submitted in a
+    /// prior frame (analyzer path) or immediately before this call (headless path).
+    pub fn try_read(&mut self, device: &wgpu::Device) -> Option<ReadbackFrame> {
+        self.try_read_all(device).pop()
     }
 
     /// Copy the mapped contents of buffer `idx` into a tightly-packed RGBA vec,
@@ -334,7 +378,7 @@ impl ReadbackBuffer {
 
 #[cfg(test)]
 mod tests {
-    use super::{row_layout, ReadbackFormat, ReadbackFrame};
+    use super::{row_layout, ReadbackBuffer, ReadbackFormat, ReadbackFrame};
     use crate::engine::value::render::{AlphaMode, PresentationColorProfile};
 
     #[test]
@@ -384,6 +428,49 @@ mod tests {
         );
     }
 
+    /// Two frames whose readbacks finish together are both handed over, in
+    /// the order drawn — keeping only the later once left a gap in a
+    /// recording.
+    #[test]
+    fn frames_read_back_together_are_all_handed_over_in_order() {
+        let Ok(context) = crate::renderer::context::GpuContext::new_headless() else {
+            return;
+        };
+        let texture = context.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut readback = ReadbackBuffer::new(&context.device, 64, 32, ReadbackFormat::Rgba8);
+        let first = std::time::Instant::now();
+        let second = first + std::time::Duration::from_millis(17);
+        // The later drawing into the first buffer, the earlier into the second.
+        for made in [second, first] {
+            let mut encoder = context
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            readback.begin_readback(&mut encoder, &texture, made);
+            context.submit(std::iter::once(encoder.finish()));
+        }
+        assert!(readback.try_read_all(&context.device).is_empty(), "asynchronous");
+        let _ = context.device.poll(wgpu::PollType::wait_indefinitely());
+        let made: Vec<_> = readback
+            .try_read_all(&context.device)
+            .iter()
+            .map(ReadbackFrame::made)
+            .collect();
+        assert_eq!(made, [first, second]);
+    }
+
     #[test]
     fn frame_keeps_storage_color_and_alpha_metadata_together() {
         let frame = ReadbackFrame {
@@ -393,6 +480,7 @@ mod tests {
             stride: 7680,
             color_profile: PresentationColorProfile::Rec709Limited,
             alpha_mode: AlphaMode::Opaque,
+            made: std::time::Instant::now(),
             bytes: Vec::new(),
         };
 

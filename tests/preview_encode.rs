@@ -144,7 +144,7 @@ fn encode_solid(ctx: &GpuContext, linear: [f64; 3], encode: bool) -> [u8; 4] {
             depth_or_array_layers: 1,
         },
     );
-    ctx.queue.submit(std::iter::once(enc.finish()));
+    ctx.submit(std::iter::once(enc.finish()));
 
     let (tx, rx) = mpsc::channel();
     buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {

@@ -24,6 +24,48 @@ pub enum LoopMode {
     HoldLast,
 }
 
+/// What a clip does by itself as it goes on air and comes off — vMix's Auto
+/// Play, Auto Pause and Auto Restart. On air is on Main or on any bus's
+/// Program (on Main only with [`AutoPlayback::main_only`]), as a layer of
+/// what is there too.
+// Four independent switches, each a checkbox; not a state machine.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+pub struct AutoPlayback {
+    /// Start playing when it goes on air.
+    #[serde(default = "yes")]
+    pub play: bool,
+    /// Pause when it comes off air.
+    #[serde(default = "yes")]
+    pub pause: bool,
+    /// Go back to the start (the in-point) when it comes off air, ready for
+    /// next time.
+    #[serde(default = "yes")]
+    pub restart: bool,
+    /// Only Main counts as on air: on a bus the clip neither starts nor
+    /// stops by itself — for one played on the LED but not on the stream.
+    #[serde(default)]
+    pub main_only: bool,
+}
+
+const fn yes() -> bool {
+    true
+}
+
+impl Default for AutoPlayback {
+    /// All three on, as vMix sets a new video input.
+    fn default() -> Self {
+        Self {
+            play: true,
+            pause: true,
+            restart: true,
+            main_only: false,
+        }
+    }
+}
+
 /// Whether a video deck maps its playhead onto the show transport.
 ///
 /// See /spec/timecode.md § Consumer 2.

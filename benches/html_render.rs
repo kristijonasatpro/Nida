@@ -63,7 +63,7 @@ fn poll(ctx: &GpuContext) {
 /// the upload actually executes and the wgpu staging belt is recalled.
 fn frame(gpu: &GpuContext, mgr: &mut HtmlManager) {
     mgr.update(&gpu.device, &gpu.queue);
-    gpu.queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
+    gpu.submit(std::iter::empty::<wgpu::CommandBuffer>());
     poll(gpu);
 }
 

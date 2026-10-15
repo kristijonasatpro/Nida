@@ -32,8 +32,11 @@ struct BlitParams {
     quantization_levels: f32,
     /// 1 enables deterministic destination-aware RGB dithering.
     dither_enabled: u32,
+    /// 1 puts the picture in video levels: black at code 16, white at 235
+    /// (64 and 940 at ten bits) — a screen's `PresentationRequest::video_levels`.
+    video_levels: u32,
     /// Uniform structs are padded to a 16-byte multiple for WGSL layout.
-    _padding: [u32; 2],
+    _padding: u32,
 }
 
 pub struct BlitPipeline {
@@ -67,7 +70,99 @@ fn presentation_encoding(
     (quantization_levels, explicit_srgb_encode, dither)
 }
 
+/// Add over premultiplied colour: `dst + src`. With a straight source drawn
+/// premultiplied, that is `dst + s·α` — the composite shader's Add exactly.
+pub const ADD_BLENDING: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent::OVER,
+};
+
+/// One weighted picture added to another, colour and coverage alike — two
+/// opaque pictures weighted ½ each make an opaque one, not three quarters
+/// with what is under them showing (as [`ADD_BLENDING`]'s coverage would).
+/// A crossfade as a weighted sum: Main's dissolve, and a merge's last step.
+pub const SUM_BLENDING: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+};
+
+/// Screen over premultiplied colour: `src + dst·(1 − src)`, which is
+/// `dst + s·α·(1 − dst)` — the composite shader's `mix(d, 1−(1−s)(1−d), α)`.
+pub const SCREEN_BLENDING: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::OneMinusSrc,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent::OVER,
+};
+
 impl BlitPipeline {
+    /// Draw `source` over `target` through this pipeline's blend state, using
+    /// the params already written to `slot` — the target is loaded, not
+    /// cleared, so the blend unit combines the two. The cheap way to composite
+    /// a layer whose blend mode the fixed-function unit can express: no
+    /// snapshot copy of the target, no second read of it.
+    pub fn blend_onto(
+        &self,
+        device: &wgpu::Device,
+        source: &wgpu::TextureView,
+        target: &wgpu::TextureView,
+        slot: usize,
+        label: &str,
+    ) -> wgpu::CommandBuffer {
+        self.blend_onto_within(device, source, target, slot, label, None)
+    }
+
+    /// [`Self::blend_onto`] drawing only through the scissor rectangles
+    /// `within` (which must not overlap: a pixel blended twice comes out
+    /// wrong), or everywhere for `None`.
+    pub fn blend_onto_within(
+        &self,
+        device: &wgpu::Device,
+        source: &wgpu::TextureView,
+        target: &wgpu::TextureView,
+        slot: usize,
+        label: &str,
+        within: Option<&[super::region::Pixels]>,
+    ) -> wgpu::CommandBuffer {
+        let bind_group = self.create_ring_bind_group(device, source, slot);
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            self.render_at_slot_within(&mut pass, &bind_group, within);
+        }
+        encoder.finish()
+    }
+
     /// Create a new blit pipeline with REPLACE blend (for final screen output)
     ///
     /// # Errors
@@ -138,7 +233,8 @@ impl BlitPipeline {
                 srgb_encode: 0,
                 quantization_levels: 0.0,
                 dither_enabled: 0,
-                _padding: [0; 2],
+                video_levels: 0,
+                _padding: 0,
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -284,7 +380,8 @@ impl BlitPipeline {
                 srgb_encode: 0,
                 quantization_levels: 0.0,
                 dither_enabled: 0,
-                _padding: [0; 2],
+                video_levels: 0,
+                _padding: 0,
             }]),
         );
     }
@@ -297,6 +394,20 @@ impl BlitPipeline {
         uv_scale: [f32; 2],
         uv_offset: [f32; 2],
     ) {
+        self.set_uv_transform_of(queue, opacity, uv_scale, uv_offset, false);
+    }
+
+    /// [`Self::set_uv_transform`] for a source that holds premultiplied
+    /// colour when `premultiplied` — a channel's composite or the master —
+    /// drawn out as straight colour, the way a deck holds it.
+    pub fn set_uv_transform_of(
+        &self,
+        queue: &wgpu::Queue,
+        opacity: f32,
+        uv_scale: [f32; 2],
+        uv_offset: [f32; 2],
+        premultiplied: bool,
+    ) {
         queue.write_buffer(
             &self.params_buffer,
             0,
@@ -305,11 +416,12 @@ impl BlitPipeline {
                 rotation: 0,
                 uv_scale,
                 uv_offset,
-                premultiplied: 0,
+                premultiplied: if premultiplied { 3 } else { 0 },
                 srgb_encode: 0,
                 quantization_levels: 0.0,
                 dither_enabled: 0,
-                _padding: [0; 2],
+                video_levels: 0,
+                _padding: 0,
             }]),
         );
     }
@@ -338,7 +450,8 @@ impl BlitPipeline {
                 srgb_encode: u32::from(encode),
                 quantization_levels: 0.0,
                 dither_enabled: 0,
-                _padding: [0; 2],
+                video_levels: 0,
+                _padding: 0,
             }]),
         );
     }
@@ -357,9 +470,16 @@ impl BlitPipeline {
                 srgb_encode: 0,
                 quantization_levels: 0.0,
                 dither_enabled: 0,
-                _padding: [0; 2],
+                video_levels: 0,
+                _padding: 0,
             }]),
         );
+    }
+
+    /// The pipeline itself, for a draw recorded elsewhere with a bind group
+    /// from [`Self::create_bind_group`] (see `context::PresentJob`).
+    pub fn render_pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.pipeline
     }
 
     /// Configure the final SDR transfer, quantization depth, dither, and rotation.
@@ -369,6 +489,48 @@ impl BlitPipeline {
         rotation: u32,
         presentation: &crate::engine::value::render::ResolvedPresentation,
     ) {
+        self.set_presentation_of_region(queue, rotation, presentation, ([1.0, 1.0], [0.0, 0.0]));
+    }
+
+    /// [`Self::set_presentation`] for a screen, in video levels when
+    /// `video_levels` (see `PresentationRequest::video_levels`).
+    pub fn set_screen_presentation(
+        &self,
+        queue: &wgpu::Queue,
+        rotation: u32,
+        presentation: &crate::engine::value::render::ResolvedPresentation,
+        video_levels: bool,
+    ) {
+        self.write_presentation(
+            queue,
+            rotation,
+            presentation,
+            ([1.0, 1.0], [0.0, 0.0]),
+            video_levels,
+        );
+    }
+
+    /// [`Self::set_presentation`] for one region of the source, given as a UV
+    /// scale and offset — how an output following a bus sends only that bus's
+    /// part of the master.
+    pub fn set_presentation_of_region(
+        &self,
+        queue: &wgpu::Queue,
+        rotation: u32,
+        presentation: &crate::engine::value::render::ResolvedPresentation,
+        region: ([f32; 2], [f32; 2]),
+    ) {
+        self.write_presentation(queue, rotation, presentation, region, false);
+    }
+
+    fn write_presentation(
+        &self,
+        queue: &wgpu::Queue,
+        rotation: u32,
+        presentation: &crate::engine::value::render::ResolvedPresentation,
+        (uv_scale, uv_offset): ([f32; 2], [f32; 2]),
+        video_levels: bool,
+    ) {
         let (quantization_levels, explicit_srgb_encode, dither_enabled) =
             presentation_encoding(presentation);
         queue.write_buffer(
@@ -377,15 +539,16 @@ impl BlitPipeline {
             bytemuck::cast_slice(&[BlitParams {
                 opacity: 1.0,
                 rotation,
-                uv_scale: [1.0, 1.0],
-                uv_offset: [0.0, 0.0],
+                uv_scale,
+                uv_offset,
                 premultiplied: 0,
                 srgb_encode: u32::from(explicit_srgb_encode),
                 quantization_levels,
                 // NDI P216 dithers Y, U and V immediately before ten-bit
                 // quantization in its dedicated GPU conversion pass.
                 dither_enabled: u32::from(dither_enabled),
-                _padding: [0; 2],
+                video_levels: u32::from(video_levels),
+                _padding: 0,
             }]),
         );
     }
@@ -396,9 +559,20 @@ impl BlitPipeline {
         render_pass: &mut wgpu::RenderPass<'a>,
         bind_group: &'a wgpu::BindGroup,
     ) {
+        self.render_within(render_pass, bind_group, None);
+    }
+
+    /// Render a texture to a render pass, only through the scissor
+    /// rectangles `within`, or everywhere for `None`.
+    pub fn render_within<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        bind_group: &'a wgpu::BindGroup,
+        within: Option<&[super::region::Pixels]>,
+    ) {
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, bind_group, &[]);
-        render_pass.draw(0..3, 0..1);
+        super::region::draw_within(render_pass, within);
     }
 
     /// Render with specific opacity (updates buffer and renders)
@@ -442,6 +616,47 @@ impl BlitPipeline {
         uv_offset: [f32; 2],
         premultiplied: bool,
     ) {
+        self.write_slot(
+            queue,
+            slot,
+            opacity,
+            uv_scale,
+            uv_offset,
+            u32::from(premultiplied),
+        );
+    }
+
+    /// As [`Self::write_params_slot`] with the source's alpha handling
+    /// named: 0 straight, 1 premultiplied, 2 straight drawn premultiplied,
+    /// 3 premultiplied drawn straight (see `blit.wgsl`).
+    pub fn write_params_slot_mode(
+        &self,
+        queue: &wgpu::Queue,
+        slot: usize,
+        opacity: f32,
+        uv_scale: [f32; 2],
+        uv_offset: [f32; 2],
+        mode: u32,
+    ) {
+        self.write_slot(queue, slot, opacity, uv_scale, uv_offset, mode);
+    }
+
+    /// As [`Self::write_params_slot`] for a straight-alpha source that must
+    /// reach the blend unit premultiplied — what [`ADD_BLENDING`] and
+    /// [`SCREEN_BLENDING`] need.
+    pub fn write_params_slot_premultiplying(&self, queue: &wgpu::Queue, slot: usize, opacity: f32) {
+        self.write_slot(queue, slot, opacity, [1.0, 1.0], [0.0, 0.0], 2);
+    }
+
+    fn write_slot(
+        &self,
+        queue: &wgpu::Queue,
+        slot: usize,
+        opacity: f32,
+        uv_scale: [f32; 2],
+        uv_offset: [f32; 2],
+        premultiplied: u32,
+    ) {
         queue.write_buffer(
             &self.ring_buffer.borrow(),
             slot as u64 * self.ring_stride,
@@ -450,11 +665,12 @@ impl BlitPipeline {
                 rotation: 0,
                 uv_scale,
                 uv_offset,
-                premultiplied: u32::from(premultiplied),
+                premultiplied,
                 srgb_encode: 0,
                 quantization_levels: 0.0,
                 dither_enabled: 0,
-                _padding: [0; 2],
+                video_levels: 0,
+                _padding: 0,
             }]),
         );
     }
@@ -506,9 +722,20 @@ impl BlitPipeline {
         render_pass: &mut wgpu::RenderPass<'a>,
         bind_group: &'a wgpu::BindGroup,
     ) {
+        self.render_at_slot_within(render_pass, bind_group, None);
+    }
+
+    /// [`Self::render_at_slot`] only through the scissor rectangles
+    /// `within`, or everywhere for `None`.
+    pub fn render_at_slot_within<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        bind_group: &'a wgpu::BindGroup,
+        within: Option<&[super::region::Pixels]>,
+    ) {
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, bind_group, &[]);
-        render_pass.draw(0..3, 0..1);
+        super::region::draw_within(render_pass, within);
     }
 }
 
@@ -876,9 +1103,20 @@ impl CompositeBlitPipeline {
         render_pass: &mut wgpu::RenderPass<'a>,
         bind_group: &'a wgpu::BindGroup,
     ) {
+        self.render_at_slot_within(render_pass, bind_group, None);
+    }
+
+    /// [`Self::render_at_slot`] only through the scissor rectangles
+    /// `within`, or everywhere for `None`.
+    pub fn render_at_slot_within<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        bind_group: &'a wgpu::BindGroup,
+        within: Option<&[super::region::Pixels]>,
+    ) {
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, bind_group, &[]);
-        render_pass.draw(0..3, 0..1);
+        super::region::draw_within(render_pass, within);
     }
 }
 
@@ -1996,7 +2234,7 @@ mod tests {
                 depth_or_array_layers: 1,
             },
         );
-        ctx.queue.submit([encoder.finish()]);
+        ctx.submit([encoder.finish()]);
         let (tx, rx) = std::sync::mpsc::channel();
         readback
             .slice(..)
@@ -2151,7 +2389,7 @@ mod tests {
                 depth_or_array_layers: 1,
             },
         );
-        ctx.queue.submit([encoder.finish()]);
+        ctx.submit([encoder.finish()]);
         let (tx, rx) = std::sync::mpsc::channel();
         readback
             .slice(..)
@@ -2180,10 +2418,35 @@ mod tests {
         linear: f32,
         dither: bool,
     ) -> Vec<u32> {
+        blit_constant_to(
+            ctx,
+            pipeline,
+            width,
+            linear,
+            dither,
+            wgpu::TextureFormat::Rgb10a2Unorm,
+            false,
+        )
+    }
+
+    /// Blit a constant grey, `linear` light, into a row `width` wide of
+    /// `format` — RGB10A2 at ten bits, else an 8-bit sRGB target as a screen
+    /// has — as a screen's final pass does, in video levels when
+    /// `video_levels`; the row's pixels as read back, packed.
+    fn blit_constant_to(
+        ctx: &GpuContext,
+        pipeline: &BlitPipeline,
+        width: u32,
+        linear: f32,
+        dither: bool,
+        format: wgpu::TextureFormat,
+        video_levels: bool,
+    ) -> Vec<u32> {
         use crate::engine::value::render::{
             AlphaMode, PresentationColorProfile, PresentationDepth, PresentationPixelFormat,
             ResolvedPresentation,
         };
+        let ten_bit = format == wgpu::TextureFormat::Rgb10a2Unorm;
         let row_bytes = width
             .saturating_mul(4)
             .div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
@@ -2236,25 +2499,31 @@ mod tests {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgb10a2Unorm,
+            format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = pipeline.create_bind_group(&ctx.device, &source_view);
-        pipeline.set_presentation(
+        let (depth, pixel_format) = if ten_bit {
+            (PresentationDepth::Sdr10, PresentationPixelFormat::Rgb10A2)
+        } else {
+            (PresentationDepth::Sdr8, PresentationPixelFormat::Rgba8)
+        };
+        pipeline.set_screen_presentation(
             &ctx.queue,
             0,
             &ResolvedPresentation {
-                requested: PresentationDepth::Sdr10,
-                resolved: PresentationDepth::Sdr10,
-                pixel_format: PresentationPixelFormat::Rgb10A2,
+                requested: depth,
+                resolved: depth,
+                pixel_format,
                 color_profile: PresentationColorProfile::SrgbFull,
                 alpha_mode: AlphaMode::Opaque,
                 dither,
                 fallback_reason: None,
             },
+            video_levels,
         );
         let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("RGB10 Dither Readback"),
@@ -2307,7 +2576,7 @@ mod tests {
                 depth_or_array_layers: 1,
             },
         );
-        ctx.queue.submit([encoder.finish()]);
+        ctx.submit([encoder.finish()]);
         let (tx, rx) = std::sync::mpsc::channel();
         readback
             .slice(..)
@@ -2318,6 +2587,37 @@ mod tests {
         rx.recv().unwrap().unwrap();
         let mapped = readback.slice(..).get_mapped_range().unwrap();
         bytemuck::cast_slice::<u8, u32>(&mapped[..(width * 4) as usize]).to_vec()
+    }
+
+    /// A screen in video levels gets black at code 16 and white at 235 —
+    /// 64 and 940 at ten bits — and grey in proportion; at full levels, 0 and
+    /// 255 (1023), as before.
+    #[test]
+    fn video_levels_put_black_at_16_and_white_at_235() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        let eight = BlitPipeline::new(&ctx.device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let ten = BlitPipeline::new(&ctx.device, wgpu::TextureFormat::Rgb10a2Unorm);
+        let (Ok(eight), Ok(ten)) = (eight, ten) else {
+            return;
+        };
+        let red8 = |linear: f32, video: bool| {
+            blit_constant_to(&ctx, &eight, 4, linear, false, wgpu::TextureFormat::Rgba8UnormSrgb, video)
+                [0]
+                & 0xff
+        };
+        let red10 = |linear: f32, video: bool| {
+            blit_constant_to(&ctx, &ten, 4, linear, false, wgpu::TextureFormat::Rgb10a2Unorm, video)[0]
+                & 0x3ff
+        };
+        assert_eq!((red8(0.0, false), red8(1.0, false)), (0, 255), "full levels");
+        assert_eq!((red8(0.0, true), red8(1.0, true)), (16, 235), "video levels");
+        // sRGB mid grey, code 128 at full levels: 16 + 128 · 219/255 ≈ 126.
+        let grey = red8(0.215_861, true);
+        assert!((125..=127).contains(&grey), "grey at {grey}");
+        assert_eq!((red10(0.0, false), red10(1.0, false)), (0, 1023), "full, ten bits");
+        assert_eq!((red10(0.0, true), red10(1.0, true)), (64, 940), "video, ten bits");
     }
 
     #[test]

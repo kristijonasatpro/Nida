@@ -6,19 +6,28 @@
 //! The main.rs `App` struct owns window/egui state and holds a `VardaApp`.
 
 mod actions;
+pub(crate) mod app_id;
+mod bus_dissolve;
 mod commands;
 mod engine_impl;
+pub(crate) mod frame_parts;
 pub(crate) mod history;
 mod inputs;
 /// Interactive mode for HTML decks (feature `html`). See /spec/html-source.md §4.
 #[cfg(feature = "html")]
 pub(crate) mod interactive;
+mod keep_awake;
+pub(crate) mod monitors;
 mod outputs;
 pub(crate) mod render;
+pub mod shows;
+pub use render::{DeckFile, DeckLoadResult, DeckLoadToken};
 pub(crate) mod resolve;
+pub mod screens;
 mod snapshot;
 pub(crate) mod state;
 mod surfaces;
+pub mod tool_path;
 mod workspace;
 
 pub use workspace::WorkspaceLoad;
@@ -49,16 +58,17 @@ pub struct AppConfig {
     #[arg(long)]
     pub headless: bool,
 
-    /// HTTP API port
-    #[arg(long = "port", default_value_t = 8080)]
+    /// HTTP API port (or `VARDA_PORT`, which an app bundle can set)
+    #[arg(long = "port", env = "VARDA_PORT", default_value_t = 8080)]
     pub api_port: u16,
 
     /// Target render FPS (default: 60, 0 = uncapped)
     #[arg(long = "fps", default_value_t = 60)]
     pub target_fps: u32,
 
-    /// Workspace root directory (default: current working directory)
-    #[arg(long = "workspace")]
+    /// Workspace root directory (default: current working directory; or
+    /// `VARDA_WORKSPACE`)
+    #[arg(long = "workspace", env = "VARDA_WORKSPACE")]
     pub workspace_root: Option<std::path::PathBuf>,
 
     /// Scene file to load (overrides workspace default)
@@ -98,11 +108,26 @@ pub struct AppConfig {
     #[arg(long = "no-screen-capture")]
     pub screen_capture_disabled: bool,
 
+    /// Disable camera deck sources (skips device enumeration entirely, so no
+    /// Camera permission is ever requested)
+    ///
+    /// Enumeration is what raises the OS permission dialog, and it happens when
+    /// the app is constructed — before any camera is opened, and whether or not
+    /// a camera is ever used. On macOS an unanswered dialog does not block the
+    /// next one, so anything that constructs the app repeatedly (a test suite,
+    /// a batch of headless runs) stacks them, and a backlog of unanswered TCC
+    /// prompts can stop unrelated permission requests from being presented at
+    /// all. Every other source already has an off switch; this completes the
+    /// set.
+    #[arg(long = "no-camera")]
+    pub camera_disabled: bool,
+
     /// Additional shader library directory (repeatable). Scanned and
     /// hot-reloaded alongside the built-in locations. Added last, so a
     /// shader here overrides a built-in shader of the same name — useful
     /// for pointing at show- or rig-specific shader folders in the field.
-    #[arg(long = "shader-dir")]
+    /// `VARDA_SHADER_DIRS` gives them too, separated by `:`.
+    #[arg(long = "shader-dir", env = "VARDA_SHADER_DIRS", value_delimiter = ':')]
     pub shader_dirs: Vec<std::path::PathBuf>,
 }
 
@@ -160,6 +185,9 @@ use crate::surface::SurfaceManager;
 
 use crate::engine::{CommandEnvelope, CommandResult, EngineState, ErrorCode};
 
+/// Where a command's answer goes: an HTTP request waiting, say.
+pub(crate) type Reply = tokio::sync::oneshot::Sender<CommandResult>;
+
 // ── Domain sub-structs ──────────────────────────────────────────
 
 /// Input subsystem: OSC, MIDI, keyboard shortcuts, clock.
@@ -198,6 +226,11 @@ pub(crate) struct OutputSubsystem {
     pub outputs: Vec<UnifiedOutput>,
     pub surface_manager: SurfaceManager,
     pub calibration_textures: Vec<(wgpu::Texture, wgpu::TextureView)>,
+    /// Test cards of the LED feeds showing them.
+    pub led_cards: crate::renderer::led_card::LedCards,
+    /// Test cards of the outputs showing theirs (calibration `Projector`),
+    /// each at its own pixels.
+    pub output_cards: crate::renderer::led_card::OutputCards,
     pub domemaster: Option<crate::renderer::dome::DomemasterRenderer>,
     /// Size the domemaster renderer is built at. Held alongside the renderer
     /// rather than inside it because it outlives it: the setting is restored
@@ -206,6 +239,34 @@ pub(crate) struct OutputSubsystem {
     pub domemaster_resolution: crate::renderer::dome::DomemasterResolution,
     pub pending_output_creates: Vec<crate::scene::OutputConfig>,
     pub cached_monitors: Vec<(String, winit::monitor::MonitorHandle)>,
+    /// Each of `cached_monitors`' size in pixels, read with it on the main
+    /// thread: asked from another, macOS answers through the main thread.
+    pub monitor_sizes: Vec<winit::dpi::PhysicalSize<u32>>,
+    /// What else is known of each of `cached_monitors`, read with it (see
+    /// `screens`) — again only when the screens change, or a second on.
+    pub screen_facts: Vec<screens::ScreenFacts>,
+    /// The screens, by name and place, `screen_facts` were read for, and when.
+    screen_facts_for: Vec<(String, (i32, i32))>,
+    screen_facts_at: Option<std::time::Instant>,
+    /// The names given to screens on this computer.
+    pub screen_names: screens::ScreenNames,
+    /// Render targets for buses fading between two pictures.
+    pub bus_dissolves: bus_dissolve::BusDissolves,
+    /// Keeps the computer and displays awake while Varda runs.
+    keep_awake: keep_awake::KeepAwake,
+    /// The screen the control window is on, by monitor name.
+    control_screen: Option<String>,
+    /// When output screens' refresh rates are next checked against the show's.
+    rate_check_at: Option<std::time::Instant>,
+    /// (output, screen millihertz, show fps) already warned about.
+    rate_warned: std::collections::HashSet<(String, u32, u32)>,
+    /// Output windows made again because their screen stopped showing their
+    /// frames, by output uuid (see `reopen_unshown_outputs`).
+    reopened: std::collections::HashMap<String, outputs::Reopened>,
+    /// When the Blackmagic devices connected were last looked at, and which
+    /// they were (see `poll_blackmagic_outputs`).
+    blackmagic_looked: Option<std::time::Instant>,
+    blackmagic_seen: Option<Vec<String>>,
 }
 
 /// External I/O managers: NDI, Syphon, SRT/HLS/DASH/RTMP streams.
@@ -241,6 +302,243 @@ pub(crate) struct FrameStats {
     /// per frame in `update_frame_timing`. Commits are not free — see
     /// `renderer::submit_stats`.
     pub last_frame_submits: u32,
+    /// When the process started, the origin of [`FrameStats::frame_time_secs`].
+    pub start_instant: std::time::Instant,
+    /// Monotonic frame clock: seconds since `start_instant`, sampled once at
+    /// the top of each frame.
+    ///
+    /// Time-based engine state reads this rather than a per-frame delta.
+    /// Commands run at different points relative to the frame tick — queued API
+    /// commands before it, native UI commands after — so a delta cannot be
+    /// attributed correctly without knowing which side a command landed on.
+    /// A shared timestamp needs no such knowledge.
+    pub frame_time_secs: f64,
+    /// Milliseconds between the starts of the last frames, the latest last.
+    pub intervals: std::collections::VecDeque<f32>,
+    /// What starts frames: a screen's refresh, or the timer.
+    pub clock: String,
+    /// The screen whose refresh starts frames, when one does: outputs on it
+    /// present every frame.
+    pub clock_display: Option<u32>,
+    /// Where each frame's time goes (see [`frame_parts`]).
+    pub parts: frame_parts::FrameParts,
+    /// An output window showed the last frame: its screen's refresh can
+    /// hold the loop back when frames are drawn ahead.
+    pub windows_presented: bool,
+    /// When the screen's refresh that called for this frame came, when a
+    /// refresh starts frames (see `FrameTiming::refresh_at`).
+    pub refresh_at: Option<std::time::Instant>,
+    /// When the frame being drawn was drawn, for the recording and stream
+    /// to time it by: set as the mixer draws it — which takes
+    /// `refresh_at` — and taken by the outputs (see `VardaApp::frame_drawn`).
+    pub drawn_at: Option<std::time::Instant>,
+    /// The display link's figures, from the frame loop.
+    pub display_link: Option<crate::engine::DisplayLinkSnapshot>,
+    /// How evenly the control window's frames reached its screen, from the
+    /// frame loop.
+    pub control_on_screen: crate::engine::OnScreenStats,
+    /// The control window's queue, from the frame loop: frames waiting to be
+    /// shown (most over the last ten frames).
+    pub control_queue: crate::engine::ControlQueueStats,
+    /// Where the control window's frames' time goes, and its slow frames.
+    pub control_parts: Vec<crate::engine::PartStats>,
+    pub control_slow_frames: Vec<crate::engine::SlowFrame>,
+    /// Where the GPU's time goes, by part of the app, a second at a time.
+    pub gpu_time: crate::renderer::gpu_time::GpuTime,
+}
+
+/// Frame intervals the performance figures cover: five seconds at 60.
+pub(crate) const PACING_FRAMES: usize = 300;
+
+/// What a bus is putting on air this frame, and which part of the master it is.
+///
+/// `source` is the composited image the bus's program resolves to; `uv_scale`
+/// and `uv_offset` select the bus's region out of it. A destination following
+/// the bus uses this mapping instead of its own, so the operator configures the
+/// crop once on the bus rather than on every destination that shows it.
+#[derive(Debug, Clone)]
+pub struct BusFeed {
+    /// What the bus has on air.
+    pub picture: FeedPicture,
+    /// UV scale selecting the bus's region of that source.
+    pub uv_scale: [f32; 2],
+    /// UV offset selecting the bus's region of that source.
+    pub uv_offset: [f32; 2],
+}
+
+/// The picture a bus puts on air this frame.
+#[derive(Debug, Clone)]
+pub enum FeedPicture {
+    /// A composited source, shown as it is.
+    Source(crate::engine::value::render::OutputSource),
+    /// An `AUTO` in flight: `from` dissolving into `to` by the eased `mix`
+    /// (0.0 = all `from`). `None` is black.
+    Dissolve {
+        from: Option<crate::engine::value::render::OutputSource>,
+        to: Option<crate::engine::value::render::OutputSource>,
+        mix: f32,
+    },
+    /// That dissolve, rendered this frame into the bus's own target.
+    Rendered(wgpu::TextureView),
+}
+
+impl FeedPicture {
+    /// The concrete sources this picture reads.
+    pub fn sources(&self) -> impl Iterator<Item = &crate::engine::value::render::OutputSource> {
+        let (a, b) = match self {
+            Self::Source(source) => (Some(source), None),
+            Self::Dissolve { from, to, .. } => (from.as_ref(), to.as_ref()),
+            Self::Rendered(_) => (None, None),
+        };
+        a.into_iter().chain(b)
+    }
+}
+
+/// The external sessions a deck holds open.
+///
+/// Read out of a deck before its owner is dropped, so the release can run
+/// without holding a borrow on the mixer. Dropping a `DeckSlot` frees its GPU
+/// textures, but camera, depth-sensor, screen-capture, SRT, NDI and Syphon
+/// sessions belong to managers outside the deck: without this, a capture thread
+/// and its USB handle outlive the last deck that used them.
+pub(crate) struct HeldResources {
+    camera: Option<crate::camera::CameraId>,
+    depth: Vec<crate::depth::DepthSensorId>,
+    screen_capture: Option<crate::screen_capture::CaptureId>,
+    srt: Option<usize>,
+    ndi: Option<usize>,
+    #[cfg(target_os = "macos")]
+    syphon: Option<usize>,
+}
+
+/// What a set of live decks still holds, for holder reconciliation.
+///
+/// Only the shared-uncounted kinds are tracked: see [`HeldResources::minus`]
+/// for why reference-counted devices must not be filtered this way.
+#[derive(Default)]
+pub(crate) struct HeldSet {
+    srt: std::collections::HashSet<usize>,
+}
+
+#[cfg(test)]
+impl HeldResources {
+    /// Build a holding set directly, for policy tests.
+    pub(crate) fn for_test(
+        camera: Option<crate::camera::CameraId>,
+        depth: Vec<crate::depth::DepthSensorId>,
+        screen_capture: Option<crate::screen_capture::CaptureId>,
+        srt: Option<usize>,
+        ndi: Option<usize>,
+    ) -> Self {
+        Self {
+            camera,
+            depth,
+            screen_capture,
+            srt,
+            ndi,
+            #[cfg(target_os = "macos")]
+            syphon: None,
+        }
+    }
+
+    pub(crate) fn clone_for_test(&self) -> Self {
+        Self::for_test(
+            self.camera,
+            self.depth.clone(),
+            self.screen_capture,
+            self.srt,
+            self.ndi,
+        )
+    }
+
+    pub(crate) fn camera_for_test(&self) -> Option<crate::camera::CameraId> {
+        self.camera
+    }
+    pub(crate) fn depth_for_test(&self) -> Vec<crate::depth::DepthSensorId> {
+        self.depth.clone()
+    }
+    pub(crate) fn screen_capture_for_test(&self) -> Option<crate::screen_capture::CaptureId> {
+        self.screen_capture
+    }
+    pub(crate) fn srt_for_test(&self) -> Option<usize> {
+        self.srt
+    }
+    pub(crate) fn ndi_for_test(&self) -> Option<usize> {
+        self.ndi
+    }
+}
+
+impl HeldResources {
+    /// Everything held across `all`.
+    pub(crate) fn union(all: &[HeldResources]) -> HeldSet {
+        let mut set = HeldSet::default();
+        for h in all {
+            set.srt.extend(h.srt);
+        }
+        set
+    }
+
+    /// This deck's holdings, with sessions a survivor still owns removed.
+    ///
+    /// The policy differs by manager, and getting it uniform in either
+    /// direction is a bug:
+    ///
+    /// - **Cameras and depth sensors are reference counted** — every
+    ///   acquisition increments, so every retiring holder must release exactly
+    ///   once. Suppressing a release because a survivor holds the same device
+    ///   leaves the count permanently high and the capture thread running
+    ///   forever. These pass through untouched.
+    /// - **Stream receivers are shared and uncounted** —
+    ///   `StreamManager::start_receive` hands back the index of an existing
+    ///   receiver for the same URL, and `stop_receive` stops it globally. Only
+    ///   this one is suppressed when a survivor still holds it; stopping it
+    ///   would freeze an on-air deck.
+    /// - **NDI and Syphon create a fresh receiver per deck**, so an index has
+    ///   exactly one holder and there is nothing to suppress.
+    /// - **Screen capture** is reference counted like cameras, so it passes
+    ///   through and is released here too. It additionally has a per-frame
+    ///   `reconcile_holders` pass, which repairs any holder it misses.
+    pub(crate) fn minus(self, keep: &HeldSet) -> Self {
+        Self {
+            camera: self.camera,
+            depth: self.depth,
+            screen_capture: self.screen_capture,
+            srt: self.srt.filter(|idx| !keep.srt.contains(idx)),
+            ndi: self.ndi,
+            #[cfg(target_os = "macos")]
+            syphon: self.syphon,
+        }
+    }
+
+    /// Snapshot what this deck currently holds.
+    pub(crate) fn of(deck: &crate::deck::Deck) -> Self {
+        Self {
+            camera: deck.camera_id(),
+            // Depth sensors were once missing from teardown, so the capture
+            // thread and USB handle outlived the last deck using them. Covers
+            // both point-cloud sources and shader preprocessors.
+            // See spec/depth-sensors.md § Known defect.
+            depth: deck.held_depth_sensors(),
+            screen_capture: deck.screen_capture_id(),
+            srt: deck.srt_receiver_idx(),
+            ndi: deck.ndi_receiver_idx(),
+            #[cfg(target_os = "macos")]
+            syphon: deck.syphon_client_idx(),
+        }
+    }
+}
+
+impl FrameStats {
+    /// The monotonic clock right now, in seconds since `start_instant`.
+    ///
+    /// Distinct from [`FrameStats::frame_time_secs`], which is the reading
+    /// taken at the top of the current frame. Anything that starts or advances
+    /// timed state must read live: commands execute at different points
+    /// relative to the frame tick, and a cached reading would charge a take for
+    /// time that elapsed before it began.
+    pub fn now_secs(&self) -> f64 {
+        self.start_instant.elapsed().as_secs_f64()
+    }
 }
 
 /// Session persistence: workspace, presets, undo/redo, notifications.
@@ -294,7 +592,44 @@ pub(crate) struct MessageBus {
 pub struct VardaApp {
     // ── Engine core ──────────────────────────────────────────────
     mixer: Mixer,
+    /// Independent production buses (PVW/PGM switching per destination).
+    ///
+    /// Named in full to keep it distinct from `bus`, which is the cross-thread
+    /// `MessageBus` and an entirely unrelated concept.
+    production_buses: crate::bus::BusBank,
+    /// The show in order, as steps taken with one press (see
+    /// `state/rundown.rs`).
+    rundown: crate::rundown::Rundown,
+    /// Clips the rundown step taken last paused or stopped — by deck UUID,
+    /// with the decoder they had then and the on-air updates they are still
+    /// held for: Auto Play does not start them as that step brings them on
+    /// air (see `state/on_air.rs`, `state/rundown.rs`).
+    clips_held: Vec<(String, usize, u8)>,
+    /// Writes the show's files on a thread of their own, so the outputs never
+    /// wait for the disk (see `persistence::writer`).
+    show_writer: crate::persistence::writer::ShowWriter,
+    /// A Save As on its way: the show moves once its copy has landed.
+    saving_as: Option<shows::SavingAs>,
+    /// Presets whose files are on their way, by the writer's number (see
+    /// `state/presets.rs`).
+    presets_on_way: Vec<(u64, state::presets::PresetOnWay)>,
     audio_manager: AudioManager,
+    /// The audio mixer: clips and inputs on strips, sent to buses that play on
+    /// sound devices and feed recordings and streams.
+    audio_mix: crate::audio_mix::AudioEngine,
+    /// Which clips were on air last frame, by deck UUID, with their decode
+    /// thread's identity, to see them go on and off (see `state::on_air`).
+    clips_on_air: std::collections::HashMap<String, (bool, usize)>,
+    /// Whether sound devices have been listed. Done once a real event loop
+    /// runs, not in every test engine.
+    audio_devices_listed: bool,
+    /// The sound inputs' listing, when it had not finished as the app
+    /// started (see `AudioManager::new_waiting_at_most`).
+    audio_inputs_pending: Option<crate::audio::InputListing>,
+    /// The stream: settings, and its encoder and destinations while on.
+    streaming: state::streaming::Streaming,
+    /// Recording: settings, and its encoder while recording.
+    recording: state::record::Recording,
     camera_manager: CameraManager,
     /// Depth-sensor capture manager (Kinect/LIDAR point-cloud sources).
     depth_manager: DepthSensorManager,
@@ -327,14 +662,41 @@ pub struct VardaApp {
     // ── Render resolution (configurable, scene-level) ───────
     render_width: u32,
     render_height: u32,
+    /// Auto: the master follows the largest screen an output is on.
+    render_auto: bool,
+    /// A size Auto wants, and for how many frames running it has wanted it.
+    auto_resolution_pending: Option<((u32, u32), u32)>,
 
     // ── Frame pacing (global, runtime-mutable) ──────────
     target_fps: u32,
+    /// Frames the GPU may still be drawing when the next starts (1–3).
+    frames_in_flight: u32,
+    /// What starts each frame.
+    frame_pacing: crate::engine::value::render::FramePacing,
+    /// Frames asked for by the refresh each display-link callback is stamped
+    /// for, rather than by counting callbacks.
+    clock_timestamps: bool,
+    /// Each frame held on screen for a frame's time (see `set_frame_hold`).
+    frame_hold: bool,
+    /// The control window presents in step with its screen's refresh.
+    control_vsync: bool,
+    /// The control window's screen set to the show's rate while Nida runs
+    /// (see `screen_rate`).
+    control_screen_rate: bool,
 
     // ── Channel preview / cue (ephemeral, published by UI each frame) ──
     // Channels force-rendered for off-air preview. Never persisted; affects the
     // render gate only, never the compositor. See /spec/channel-preview.md.
     preview_channels: Vec<usize>,
+    /// The deck selected in the UI (channel, deck), whose own picture the
+    /// settings show while it is edited. Set by the runner each frame.
+    ui_selected_deck: Option<(usize, usize)>,
+    /// When decks waiting for their camera are next looked for.
+    camera_retry_at: Option<std::time::Instant>,
+    /// The control window is up, showing every channel's picture as a tile:
+    /// off-air channels are drawn now and then for it (see
+    /// `Mixer::tile_previews`), their cameras kept live.
+    ui_tiles: bool,
 
     // ── Pending MIDI-triggered actions (consumed by runner) ──
     pub(crate) midi_pending_undo: bool,
@@ -344,6 +706,14 @@ pub struct VardaApp {
     // ── Shutdown request flag ──────────────────────────────────
     pub(crate) shutdown_requested: bool,
 }
+
+// In the windowed app the engine runs on a thread of its own and is handed
+// to the main thread and back (see `usecases::ui::runner::engine_thread`), so
+// it must be `Send`: a part that is not stops the build here.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<VardaApp>();
+};
 
 impl VardaApp {
     /// Create a new `VardaApp` with all subsystems initialized.
@@ -358,7 +728,8 @@ impl VardaApp {
     /// fails to start.
     pub fn new(gpu: GpuContext, config: &AppConfig) -> anyhow::Result<Self> {
         log::info!("[STARTUP]   Audio init...");
-        let audio_manager = AudioManager::new();
+        let (audio_manager, audio_inputs_pending) =
+            AudioManager::new_waiting_at_most(std::time::Duration::from_secs(3));
 
         log::info!("[STARTUP]   Workspace init...");
         let workspace = Workspace::new(config.effective_workspace_root());
@@ -501,10 +872,21 @@ impl VardaApp {
         let mixer = Mixer::new(&gpu, DEFAULT_RENDER_WIDTH, DEFAULT_RENDER_HEIGHT)?;
         let preset_library = crate::persistence::presets::PresetLibrary::load(&workspace);
 
-        Ok(Self {
+        let waiting_for_sound = audio_inputs_pending.is_some();
+        let mut app = Self {
             mixer,
             audio_manager,
-            camera_manager: CameraManager::new(),
+            audio_mix: crate::audio_mix::AudioEngine::new(),
+            clips_on_air: std::collections::HashMap::new(),
+            audio_devices_listed: false,
+            audio_inputs_pending,
+            streaming: state::streaming::Streaming::default(),
+            recording: state::record::Recording::default(),
+            camera_manager: if config.camera_disabled {
+                CameraManager::disabled()
+            } else {
+                CameraManager::new()
+            },
             depth_manager: DepthSensorManager::new(),
             // Constructed disabled rather than merely inert, so `--no-screen-capture`
             // never triggers the macOS TCC prompt.
@@ -535,10 +917,30 @@ impl VardaApp {
                 outputs: Vec::new(),
                 surface_manager: SurfaceManager::new(),
                 calibration_textures,
+                led_cards: crate::renderer::led_card::LedCards::default(),
+                output_cards: crate::renderer::led_card::OutputCards::default(),
                 domemaster: None,
                 domemaster_resolution: crate::renderer::dome::DomemasterResolution::default(),
                 pending_output_creates: Vec::new(),
                 cached_monitors: Vec::new(),
+                monitor_sizes: Vec::new(),
+                screen_facts: Vec::new(),
+                screen_facts_for: Vec::new(),
+                screen_facts_at: None,
+                // A test engine never reads or writes this computer's names.
+                screen_names: if cfg!(test) {
+                    screens::ScreenNames::load_from(None)
+                } else {
+                    screens::ScreenNames::load()
+                },
+                bus_dissolves: bus_dissolve::BusDissolves::default(),
+                keep_awake: keep_awake::KeepAwake::default(),
+                control_screen: None,
+                rate_check_at: None,
+                rate_warned: std::collections::HashSet::new(),
+                reopened: std::collections::HashMap::new(),
+                blackmagic_looked: None,
+                blackmagic_seen: None,
             },
             external_io: ExternalIO {
                 ndi_manager: if config.ndi_disabled {
@@ -577,6 +979,21 @@ impl VardaApp {
                 frame_count: 0,
                 system_monitor: crate::sysmon::SystemMonitor::new(),
                 last_frame_submits: 0,
+                start_instant: std::time::Instant::now(),
+                frame_time_secs: 0.0,
+                intervals: std::collections::VecDeque::with_capacity(PACING_FRAMES),
+                clock: String::new(),
+                clock_display: None,
+                parts: frame_parts::FrameParts::default(),
+                windows_presented: false,
+                refresh_at: None,
+                drawn_at: None,
+                display_link: None,
+                control_on_screen: crate::engine::OnScreenStats::default(),
+                control_parts: Vec::new(),
+                control_slow_frames: Vec::new(),
+                control_queue: crate::engine::ControlQueueStats::default(),
+                gpu_time: crate::renderer::gpu_time::GpuTime::default(),
             },
             session: SessionState {
                 workspace,
@@ -599,15 +1016,43 @@ impl VardaApp {
             audio_textures,
             #[cfg(feature = "html")]
             interactive: interactive::InteractiveHtmlState::default(),
+            production_buses: crate::bus::BusBank::with_legacy_default(),
+            rundown: crate::rundown::Rundown::default(),
+            clips_held: Vec::new(),
+            show_writer: crate::persistence::writer::ShowWriter::default(),
+            saving_as: None,
+            presets_on_way: Vec::new(),
             render_width: DEFAULT_RENDER_WIDTH,
             render_height: DEFAULT_RENDER_HEIGHT,
+            render_auto: false,
+            auto_resolution_pending: None,
             target_fps: config.target_fps,
+            frames_in_flight: 1,
+            frame_pacing: crate::engine::value::render::FramePacing::default(),
+            clock_timestamps: false,
+            // On, where there is a hold to give (macOS): measured on a Mac
+            // mini, presents not held let the display link skip one refresh
+            // in ten or twenty — a slow slide stuttered — and on a ProMotion
+            // MacBook they pulled the screen's own refresh about.
+            frame_hold: cfg!(target_os = "macos"),
+            control_vsync: false,
+            control_screen_rate: true,
             preview_channels: Vec::new(),
+            ui_selected_deck: None,
+            camera_retry_at: None,
+            ui_tiles: false,
             midi_pending_undo: false,
             midi_pending_redo: false,
             midi_pending_save: false,
             shutdown_requested: false,
-        })
+        };
+        if waiting_for_sound {
+            app.session.notifications.warn(
+                "Sound inputs are not ready: macOS may be asking whether Nida may use the \
+                 microphone — look for its prompt, which can hide behind full-screen windows",
+            );
+        }
+        Ok(app)
     }
 
     /// Get a command sender for cross-thread consumers (HTTP API, CLI).
@@ -638,9 +1083,70 @@ impl VardaApp {
                 let snapshot = self.history_snapshot_default();
                 self.push_history(snapshot);
             }
-            let result = self.execute_command(cmd);
+            // Saves are written on a thread of their own: the reply waits
+            // for the files, the engine does not.
+            let result = match cmd {
+                crate::engine::EngineCommand::SaveWorkspace => {
+                    self.save_for_command(reply_tx);
+                    continue;
+                }
+                crate::engine::EngineCommand::SaveShowAs { folder } => {
+                    self.save_show_as_for_command(&folder, reply_tx);
+                    continue;
+                }
+                crate::engine::EngineCommand::SaveDeckPreset { deck_uuid, name } => {
+                    match self.deck_preset_file(&deck_uuid, &name) {
+                        Ok(save) => {
+                            self.save_preset(save, reply_tx);
+                            continue;
+                        }
+                        Err(refused) => refused,
+                    }
+                }
+                crate::engine::EngineCommand::SaveChannelPreset { channel_uuid, name } => {
+                    match self.channel_preset_file(&channel_uuid, &name) {
+                        Ok(save) => {
+                            self.save_preset(save, reply_tx);
+                            continue;
+                        }
+                        Err(refused) => refused,
+                    }
+                }
+                crate::engine::EngineCommand::RenameScreen { monitor_name, name } => {
+                    match self.screen_name_file(&monitor_name, name.as_deref()) {
+                        Ok(Some(file)) => {
+                            self.write_for_command(file, reply_tx);
+                            continue;
+                        }
+                        Ok(None) => CommandResult::Ok,
+                        Err(refused) => refused,
+                    }
+                }
+                cmd => self.execute_command(cmd),
+            };
             if let Some(tx) = reply_tx {
                 let _ = tx.send(result);
+            }
+        }
+    }
+
+    /// Nida is quitting, its engine stopped: a command still waiting is
+    /// answered that it is, and none is taken from now. An HTTP request left
+    /// waiting for an answer would keep the API server from closing, and
+    /// Nida from quitting. On the main thread as Nida quits — not inside an
+    /// async runtime, where the blocking receive would panic.
+    pub fn refuse_commands(&mut self) {
+        self.bus.command_rx.close();
+        // After the close a receive hands over every command sent before
+        // it, one still on its way in included, then says there are no
+        // more. (`try_recv` would call the channel empty while a send is
+        // half way in, and that request would wait for ever.)
+        while let Some((_, reply)) = self.bus.command_rx.blocking_recv() {
+            if let Some(reply) = reply {
+                let _ = reply.send(CommandResult::Err {
+                    code: ErrorCode::Unavailable,
+                    message: "Nida is quitting".into(),
+                });
             }
         }
     }
@@ -751,6 +1257,37 @@ impl VardaApp {
         &self.mixer
     }
 
+    /// Release the external sessions a deck was holding.
+    ///
+    /// Shared by normal deck removal and by the structural restore that retires
+    /// pooled runtimes, so both free managers-owned resources identically.
+    pub(crate) fn release_held_resources(&mut self, held: HeldResources) {
+        if let Some(cam_id) = held.camera {
+            self.camera_manager.release_camera(cam_id);
+        }
+        for sensor_id in held.depth {
+            self.depth_manager.release(sensor_id);
+        }
+        if let Some(capture_id) = held.screen_capture {
+            self.screen_capture_manager.release(capture_id);
+        }
+        if let Some(idx) = held.srt {
+            self.external_io.stream_manager.stop_receive(idx);
+        }
+        if let Some(idx) = held.ndi {
+            self.external_io.ndi_manager.stop_receive(idx);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(idx) = held.syphon {
+            self.external_io.syphon_manager.stop_receive(idx);
+        }
+    }
+
+    /// Read-only access to the production buses.
+    pub fn production_buses(&self) -> &crate::bus::BusBank {
+        &self.production_buses
+    }
+
     /// Read-only access to the camera manager.
     pub fn camera_manager(&self) -> &CameraManager {
         &self.camera_manager
@@ -768,7 +1305,8 @@ impl VardaApp {
     /// Returns an error if no camera with `id` is present, if the OS refuses
     /// access to the device, or if its GPU textures cannot be allocated.
     pub fn open_camera(&mut self, id: crate::camera::CameraId) -> anyhow::Result<(u32, u32)> {
-        self.camera_manager.open_camera(id, &self.context.device)
+        self.camera_manager
+            .open_camera(id, &self.context.device, None)
     }
 
     /// Read-only access to the screen-capture manager.
@@ -801,9 +1339,20 @@ impl VardaApp {
         &mut self.depth_manager
     }
 
+    /// The audio mixer.
+    pub fn audio_mix(&self) -> &crate::audio_mix::AudioEngine {
+        &self.audio_mix
+    }
+
     /// Read-only access to the outputs.
     pub fn outputs_ref(&self) -> &[crate::renderer::context::UnifiedOutput] {
         &self.output.outputs
+    }
+
+    /// Outputs loaded from the stage file that open on the next turn of the
+    /// event loop.
+    pub fn pending_outputs(&self) -> &[crate::scene::OutputConfig] {
+        &self.output.pending_output_creates
     }
 
     /// Mutable access to the mixer (for deck insertion from background loads).
@@ -924,6 +1473,19 @@ impl VardaApp {
         self.preview_channels = channels;
     }
 
+    /// The control window is up and shows every channel's picture as a tile
+    /// (see `Mixer::tile_previews`). Set once by the windowed app.
+    pub fn set_ui_tiles(&mut self, on: bool) {
+        self.ui_tiles = on;
+    }
+
+    /// Publish the deck selected in the UI, (channel, deck) by position:
+    /// its own picture keeps rendering while it is edited, even under a
+    /// deck that covers its channel. Called by the runner each frame.
+    pub fn set_ui_selected_deck(&mut self, deck: Option<(usize, usize)>) {
+        self.ui_selected_deck = deck;
+    }
+
     /// Number of loaded shaders.
     pub fn shader_count(&self) -> usize {
         self.registry.count()
@@ -940,6 +1502,7 @@ impl VardaApp {
 
     /// Tick notification expiry timers.
     pub fn update_notifications(&mut self) {
+        self.report_saves();
         self.session.notifications.update();
     }
 
@@ -977,6 +1540,79 @@ impl VardaApp {
     }
 
     /// Resize an output window by its winit `WindowId`.
+    /// Take the output in `window_id` off its screen, back to an ordinary
+    /// window — what Esc on an output does, so one sent to the wrong screen
+    /// (the control screen above all) can always be got out of. Returns its
+    /// name if it was on a screen.
+    pub fn take_output_off_screen_by_id(
+        &mut self,
+        window_id: winit::window::WindowId,
+    ) -> Option<String> {
+        let idx = self.output.outputs.iter().position(|o| {
+            matches!(o, UnifiedOutput::Window(w)
+                if w.window.id() == window_id
+                    && matches!(w.configured_target(), crate::renderer::context::OutputTarget::Display { .. }))
+        })?;
+        let name = self.output.outputs[idx].name().to_string();
+        let _ = self.cmd_set_output_target(idx, crate::renderer::context::OutputTarget::Windowed);
+        self.session.notifications.info(format!(
+            "Output '{name}' taken off its screen (Esc) — pick a screen for it in the Switcher"
+        ));
+        Some(name)
+    }
+
+    /// Record which screen the control window is on, so the screen pickers
+    /// can mark it. Called by the runner every frame.
+    pub fn note_control_window(&mut self, monitor: Option<winit::monitor::MonitorHandle>) {
+        self.output.control_screen = monitor.and_then(|m| {
+            self.output
+                .cached_monitors
+                .iter()
+                .find(|(_, handle)| *handle == m)
+                .map(|(name, _)| name.clone())
+        });
+    }
+
+    /// The screen the control window is on, by monitor name.
+    pub fn control_screen(&self) -> Option<&str> {
+        self.output.control_screen.as_deref()
+    }
+
+    /// The screen the control window is on, as the main thread last saw it.
+    pub fn control_monitor(&self) -> Option<winit::monitor::MonitorHandle> {
+        let name = self.output.control_screen.as_deref()?;
+        monitors::find(&self.output.cached_monitors, name).map(|(_, handle)| handle.clone())
+    }
+
+    /// An output window was hidden or shown again (main thread): its surface
+    /// is told, as the engine thread may not ask the window.
+    pub fn occlude_output_window_by_id(&mut self, window_id: winit::window::WindowId, hidden: bool) {
+        for o in &self.output.outputs {
+            if let UnifiedOutput::Window(w) = o {
+                if w.window.id() == window_id {
+                    crate::renderer::context::set_occluded(&w.surface, Some(hidden));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// An output window moved on the desktop (main thread): kept for saving.
+    pub fn move_output_window_by_id(
+        &mut self,
+        window_id: winit::window::WindowId,
+        position: winit::dpi::PhysicalPosition<i32>,
+    ) {
+        for o in &mut self.output.outputs {
+            if let UnifiedOutput::Window(w) = o {
+                if w.window.id() == window_id {
+                    w.position = Some(position);
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn resize_output_window_by_id(
         &mut self,
         window_id: winit::window::WindowId,
@@ -985,7 +1621,7 @@ impl VardaApp {
         for o in &mut self.output.outputs {
             if let UnifiedOutput::Window(w) = o {
                 if w.window.id() == window_id {
-                    w.resize(&self.context.device, new_size);
+                    w.resize(&self.context, new_size);
                     return;
                 }
             }
@@ -1000,6 +1636,18 @@ impl VardaApp {
     /// Current render height.
     pub fn render_height(&self) -> u32 {
         self.render_height
+    }
+
+    /// Whether the render resolution follows the output screens.
+    pub fn render_auto(&self) -> bool {
+        self.render_auto
+    }
+
+    /// Turn Auto on or off. On, the master follows the largest screen an
+    /// output is on (see `follow_output_screens`); off, it stays where it is.
+    pub fn set_render_auto(&mut self, enabled: bool) {
+        self.render_auto = enabled;
+        self.auto_resolution_pending = None;
     }
 
     /// Maximum render dimension (width or height) the GPU can allocate a
@@ -1031,8 +1679,11 @@ impl VardaApp {
             width,
             height
         );
+        let from = (self.render_width, self.render_height);
         self.render_width = width;
         self.render_height = height;
+        self.production_buses
+            .rescale_canvases(from, (width, height));
         self.mixer.resize(&self.context, width, height);
         // Clear sub-mix cache since textures were recreated
         self.mixer.clear_sub_mix_cache();
@@ -1056,6 +1707,169 @@ impl VardaApp {
     /// Current target FPS (0 = uncapped).
     pub fn target_fps(&self) -> u32 {
         self.target_fps
+    }
+
+    /// How many frames the GPU may still be drawing when the next starts:
+    /// at 1 a frame starts once the GPU has finished the one before, at 2
+    /// the next is prepared while the GPU draws the last.
+    pub fn frames_in_flight(&self) -> u32 {
+        self.frames_in_flight
+    }
+
+    /// What starts each frame (see [`crate::engine::value::render::FramePacing`]).
+    pub fn frame_pacing(&self) -> crate::engine::value::render::FramePacing {
+        self.frame_pacing
+    }
+
+    pub fn set_frame_pacing(&mut self, pacing: crate::engine::value::render::FramePacing) {
+        if pacing != self.frame_pacing {
+            log::info!("Frame pacing: {pacing:?}");
+        }
+        self.frame_pacing = pacing;
+    }
+
+    /// Whether frames are asked for by the refresh each display-link
+    /// callback is stamped for (see the `SetClockTimestamps` command).
+    pub fn clock_timestamps(&self) -> bool {
+        self.clock_timestamps
+    }
+
+    pub fn set_clock_timestamps(&mut self, on: bool) {
+        if on != self.clock_timestamps {
+            log::info!("Frames asked for by refresh timestamps: {on}");
+        }
+        self.clock_timestamps = on;
+    }
+
+    /// Whether each frame is held on screen for a frame's time — macOS's own
+    /// pacing (Metal's `presentDrawable:afterMinimumDuration:`), which on a
+    /// variable-refresh screen keeps every frame up equally long whatever its
+    /// refresh signal does — and what moves by whole frames steps a frame
+    /// per frame.
+    pub fn frame_hold(&self) -> bool {
+        self.frame_hold
+    }
+
+    pub fn set_frame_hold(&mut self, on: bool) {
+        if on != self.frame_hold {
+            log::info!("Each frame held on screen a frame's time: {on}");
+        }
+        self.frame_hold = on;
+    }
+
+    /// Whether the control window presents in step with its screen's refresh
+    /// (see the `SetControlVsync` command).
+    pub fn control_vsync(&self) -> bool {
+        self.control_vsync
+    }
+
+    pub fn set_control_vsync(&mut self, on: bool) {
+        self.control_vsync = on;
+    }
+
+    /// Whether the control window's screen is set to the show's rate while
+    /// Nida runs (see `crate::screen_rate` and `SetControlScreenRate`).
+    pub fn control_screen_rate(&self) -> bool {
+        self.control_screen_rate
+    }
+
+    pub fn set_control_screen_rate(&mut self, on: bool) {
+        if on != self.control_screen_rate {
+            log::info!("The control window's screen set to the show's rate: {on}");
+        }
+        self.control_screen_rate = on;
+    }
+
+    /// Tell the log, and the operator once, what was done to the control
+    /// window's screen (see `crate::screen_rate`).
+    pub fn note_screen_rate(&mut self, kept: &crate::screen_rate::Kept) {
+        match kept {
+            crate::screen_rate::Kept::Set { display, from, to } => {
+                let text = format!(
+                    "This screen now refreshes at {to:.0} Hz, the show's rate (it was {from:.0} Hz), \
+                     for as long as Nida runs: at a faster rate macOS missed frames on every \
+                     screen while a screen was captured. macOS puts it back when Nida quits. \
+                     Turn it off in the frame-rate menu (Keep this screen at the show's rate)."
+                );
+                log::info!("Control window's screen (display {display}): {text}");
+                self.session.notifications.info(text);
+            }
+            crate::screen_rate::Kept::SetAgain { display, found, to } => {
+                log::info!(
+                    "Control window's screen (display {display}) found at {found:.0} Hz, set to \
+                     {to:.0} Hz again (macOS gives screens back their own refresh as screens \
+                     come and go)"
+                );
+            }
+            crate::screen_rate::Kept::GivenBack { display, rate } => {
+                let at = rate.map(|hz| format!(", {hz:.0} Hz")).unwrap_or_default();
+                log::info!(
+                    "The control window's screen (display {display}) was given back its own \
+                     refresh{at}"
+                );
+            }
+        }
+    }
+
+    /// Whether a screen's refresh starts each frame (see `check_display_clock`):
+    /// then each is shown once, in turn, and what moves with time — a
+    /// playlist's slide — moves one frame a frame. Not whether frames are
+    /// held on screen: turning the hold off once brought back a slow slide's
+    /// double steps (a jittery clock rounded to two frames, then none) while
+    /// it cut an LED wall's missed refreshes (a laptop, 2026-10-02).
+    pub fn frames_follow_a_screen(&self) -> bool {
+        self.target_fps > 0 && self.frame_stats.clock_display.is_some()
+    }
+
+    /// How long each frame is held on screen, when it is: a frame's time —
+    /// only while a screen's refresh starts frames, the rate a whole number
+    /// of its refreshes. Held a frame's time where the rate does not fit (50
+    /// on a 60 Hz screen), each frame would stay up two refreshes: half the
+    /// rate.
+    pub fn frame_hold_secs(&self) -> Option<f64> {
+        (self.frame_hold && self.target_fps > 0 && self.frame_stats.clock_display.is_some())
+            .then(|| 1.0 / f64::from(self.target_fps))
+    }
+
+    /// The display link's figures, for the performance figures.
+    pub fn set_display_link_stats(&mut self, stats: Option<crate::engine::DisplayLinkSnapshot>) {
+        self.frame_stats.display_link = stats;
+    }
+
+    /// How evenly the control window's frames reached its screen, and its
+    /// queue of frames waiting to be shown.
+    pub fn set_control_on_screen(
+        &mut self,
+        stats: crate::engine::OnScreenStats,
+        queue: crate::engine::ControlQueueStats,
+    ) {
+        self.frame_stats.control_on_screen = stats;
+        self.frame_stats.control_queue = queue;
+    }
+
+    /// Where the control window's frames' time goes, and its slow frames
+    /// (it draws on the main thread, apart from the engine).
+    pub fn set_control_parts(
+        &mut self,
+        parts: Vec<crate::engine::PartStats>,
+        slow: Vec<crate::engine::SlowFrame>,
+    ) {
+        self.frame_stats.control_parts = parts;
+        self.frame_stats.control_slow_frames = slow;
+    }
+
+    /// Whether an output window showed the last frame: its screen's refresh
+    /// can then hold the frame loop back when frames are drawn ahead.
+    pub fn output_windows_presenting(&self) -> bool {
+        self.frame_stats.windows_presented
+    }
+
+    pub fn set_frames_in_flight(&mut self, frames: u32) {
+        let frames = frames.clamp(1, 3);
+        if frames != self.frames_in_flight {
+            log::info!("Frames in flight: {frames}");
+        }
+        self.frames_in_flight = frames;
     }
 
     /// Set the target FPS. 0 = uncapped.
@@ -1108,6 +1922,33 @@ mod tests {
             vec![
                 std::path::PathBuf::from("/srv/shaders/show-a"),
                 std::path::PathBuf::from("/media/usb/shaders"),
+            ]
+        );
+    }
+
+    /// An app bundle, opened from the Finder, passes no flags: it sets these
+    /// in its environment instead.
+    #[test]
+    fn port_workspace_and_shader_folders_can_come_from_the_environment() {
+        use clap::CommandFactory;
+        let command = AppConfig::command();
+        let env_of = |id: &str| {
+            command
+                .get_arguments()
+                .find(|a| a.get_id() == id)
+                .and_then(|a| a.get_env())
+                .map(|e| e.to_string_lossy().into_owned())
+        };
+        assert_eq!(env_of("api_port").as_deref(), Some("VARDA_PORT"));
+        assert_eq!(env_of("workspace_root").as_deref(), Some("VARDA_WORKSPACE"));
+        assert_eq!(env_of("shader_dirs").as_deref(), Some("VARDA_SHADER_DIRS"));
+        // Several shader folders in one variable, as a PATH lists them.
+        let config = parse_args(&["--shader-dir", "/a/shaders:/b/shaders"]);
+        assert_eq!(
+            config.shader_dirs,
+            vec![
+                std::path::PathBuf::from("/a/shaders"),
+                std::path::PathBuf::from("/b/shaders")
             ]
         );
     }
@@ -1637,6 +2478,66 @@ mod tests {
         // Verify no crash
     }
 
+    /// Add Input that fails says why, rather than adding nothing silently —
+    /// a camera the OS will not open, say.
+    #[test]
+    fn an_input_that_cannot_be_added_says_why() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let mut actions = crate::usecases::ui::UIActions::new();
+        actions
+            .commands
+            .push(crate::engine::EngineCommand::AddInput {
+                source: crate::engine::InputSource::Camera {
+                    camera_id: 3,
+                    mode: None,
+                },
+                name: None,
+                audio: None,
+            });
+        let _ = app.apply_engine_actions(&mut actions);
+        let shown: Vec<&str> = app
+            .session
+            .notifications
+            .visible()
+            .iter()
+            .map(|n| n.message.as_str())
+            .collect();
+        assert!(
+            shown.iter().any(|m| m.starts_with("Input not added:")),
+            "{shown:?}"
+        );
+    }
+
+    /// A stream that cannot start says why, as an input that cannot be
+    /// added does: the STREAM button alone just stays off.
+    #[test]
+    fn a_stream_that_cannot_start_says_why() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let mut actions = crate::usecases::ui::UIActions::new();
+        // No destination switched on.
+        actions
+            .commands
+            .push(crate::engine::EngineCommand::StartStream);
+        let _ = app.apply_engine_actions(&mut actions);
+        let shown: Vec<&str> = app
+            .session
+            .notifications
+            .visible()
+            .iter()
+            .map(|n| n.message.as_str())
+            .collect();
+        assert!(
+            shown
+                .iter()
+                .any(|m| m.starts_with("Stream not started:") && m.contains("destination")),
+            "{shown:?}"
+        );
+    }
+
     // ── Extended smoke tests ───────────────────────────────────────
 
     /// Helper: send command with reply, process, return result.
@@ -1943,5 +2844,42 @@ mod tests {
             state.mixer.channels[0].blend_mode,
             crate::engine::BlendMode::Add
         );
+    }
+
+    /// Auto moves the master only once a screen size has held for the settle
+    /// window, and starts counting again whenever the answer changes, so a
+    /// display renegotiating its mode does not rebuild every texture twice.
+    #[test]
+    fn auto_resolution_waits_for_the_screen_size_to_settle() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let hd = (1920, 1080);
+        let uhd = (3840, 2160);
+        assert_eq!((app.render_width, app.render_height), hd);
+        let settle = outputs::AUTO_RESOLUTION_SETTLE_FRAMES;
+
+        for _ in 1..settle {
+            app.settle_auto_resolution(Some(uhd));
+        }
+        assert_eq!((app.render_width, app.render_height), hd, "not yet settled");
+        // A flicker to another size restarts the count.
+        app.settle_auto_resolution(Some((2560, 1440)));
+        for _ in 1..settle {
+            app.settle_auto_resolution(Some(uhd));
+        }
+        assert_eq!(
+            (app.render_width, app.render_height),
+            hd,
+            "the count restarted"
+        );
+        app.settle_auto_resolution(Some(uhd));
+        assert_eq!((app.render_width, app.render_height), uhd, "settled on 4K");
+
+        // Nothing wanted (Auto off, or no output on a screen) holds the size.
+        for _ in 0..settle * 2 {
+            app.settle_auto_resolution(None);
+        }
+        assert_eq!((app.render_width, app.render_height), uhd);
     }
 }

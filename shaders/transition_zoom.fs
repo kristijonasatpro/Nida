@@ -55,12 +55,9 @@ void main() {
     vec4 fromColor = texture(sampler2D(startImage, texSampler), fromUV);
     vec4 toColor = texture(sampler2D(endImage, texSampler), toUV);
 
-    // Fade based on progress with smooth crossover
-    float fade = smoothstep(0.3, 0.7, progress);
-
-    // Fade out source as it zooms
-    fromColor.a *= 1.0 - smoothstep(0.0, 0.6, progress);
-    toColor.a *= smoothstep(0.4, 1.0, progress);
-
+    // A crossfade of the two as they zoom: colour and coverage together, so
+    // premultiplied pictures stay premultiplied and opaque ones opaque —
+    // no dip through what is underneath halfway.
+    float fade = smoothstep(0.2, 0.8, progress);
     fragColor = mix(fromColor, toColor, fade);
 }

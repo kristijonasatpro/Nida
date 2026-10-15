@@ -1,6 +1,6 @@
 # Modulation & Audio Reactivity
 
-Any numeric parameter in Varda can be automated by one or more modulation sources. You **create** sources in the modulation panel (right sidebar) and **assign** them to parameters with the `〰` button next to any slider. Multiple sources targeting the same parameter are summed additively.
+Any numeric parameter in Nida can be automated by one or more modulation sources. You **create** sources in the modulation panel (right sidebar) and **assign** them to parameters with the `〰` button next to any slider. Multiple sources targeting the same parameter are summed additively.
 
 ## Creating Sources
 
@@ -163,7 +163,7 @@ An analyzer runs on a background thread at its own cadence (it never blocks the 
 
 Multiple modulation sources can share one running analyzer on a deck (it is reference-counted), so mapping several outputs costs only one analysis pass.
 
-> The Analyzer source is one of two ways Varda turns a picture into data — the same engine also feeds depth/face textures to shaders. For the whole subsystem (full output tables, the depth sensor, lifecycle, and the HTTP API) see [Frame Analysis & Preprocessors](14-frame-analysis.md).
+> The Analyzer source is one of two ways Nida turns a picture into data — the same engine also feeds depth/face textures to shaders. For the whole subsystem (full output tables, the depth sensor, lifecycle, and the HTTP API) see [Frame Analysis & Preprocessors](14-frame-analysis.md).
 
 ---
 
@@ -327,7 +327,7 @@ Mod-on-mod chains are limited to **4 levels deep** to prevent infinite loops. Th
 
 ### FFT Analysis
 
-Varda runs a 2048-point FFT on the audio input at 48 kHz, producing 1024 magnitude bins with ~23 Hz/bin resolution. A Hann window is applied before analysis.
+Nida runs a 2048-point FFT on the audio input at 48 kHz, producing 1024 magnitude bins with ~23 Hz/bin resolution. A Hann window is applied before analysis.
 
 ### Beat Detection
 

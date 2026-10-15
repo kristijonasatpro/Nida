@@ -11,7 +11,7 @@ pub mod sdk;
 
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -49,12 +49,23 @@ pub struct NdiManager {
     send_capability: sdk::NdiSendCapability,
     sources: Vec<NdiSource>,
     receivers: Vec<NdiReceiver>,
-    textures: Vec<(wgpu::Texture, wgpu::TextureView)>,
+    /// Each receiver's texture; `None` once it is stopped, its memory given
+    /// back (receivers are kept in place: decks know them by position).
+    textures: Vec<Option<(wgpu::Texture, wgpu::TextureView)>>,
     /// Active NDI senders keyed by sender name.
     senders: HashMap<String, NdiSender>,
     /// GPU P216 conversion/readback state keyed by sender name.
     p216_converters: HashMap<String, p216::P216Converter>,
+    /// Watches the network for sources from the first look on, so a look
+    /// never waits: null until then.
+    finder: ffi::NDIlib_find_instance_t,
 }
+
+// SAFETY: the NDI SDK's finder, receiver and sender instances are not tied
+// to the thread that made them: any thread may use one, one at a time. The
+// manager owns them and is used by one thread at a time — the engine moves
+// between the main thread and the engine thread with it.
+unsafe impl Send for NdiManager {}
 
 /// Shared frame payload passed from receive thread → main thread.
 struct NdiFrame {
@@ -63,10 +74,97 @@ struct NdiFrame {
     height: u32,
 }
 
+/// A receiver's sound: its format once some has arrived, and where it goes.
+#[derive(Default)]
+struct NdiAudio {
+    /// Sample rate << 16 | channels; 0 until the first sound arrives.
+    format: AtomicU64,
+    /// Counts format changes: whoever listens picks the sound up afresh.
+    generation: AtomicU32,
+    /// The audio mixer's end, once it listens.
+    sink: Mutex<Option<crossbeam_channel::Sender<crate::audio::PcmChunk>>>,
+}
+
+impl NdiAudio {
+    /// Pass one frame of sound on, noting a change of format.
+    fn take(&self, frame: &ffi::NDIlib_audio_frame_v3_t) {
+        let (Ok(rate), Ok(channels), Ok(samples), Ok(stride)) = (
+            u32::try_from(frame.sample_rate),
+            u16::try_from(frame.no_channels),
+            usize::try_from(frame.no_samples),
+            usize::try_from(frame.channel_stride_in_bytes),
+        ) else {
+            return;
+        };
+        if rate == 0
+            || channels == 0
+            || samples == 0
+            || frame.p_data.is_null()
+            || frame.FourCC != ffi::NDIlib_audio_frame_v3_t::FLTP
+            || stride < samples * std::mem::size_of::<f32>()
+        {
+            return;
+        }
+        let format = u64::from(rate) << 16 | u64::from(channels);
+        let Ok(mut sink) = self.sink.lock() else {
+            return;
+        };
+        if self.format.swap(format, Ordering::SeqCst) != format {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            *sink = None;
+            log::info!("NDI sound: {rate} Hz, {channels} channels");
+        }
+        let Some(tx) = sink.as_ref() else {
+            return;
+        };
+        // Read as bytes: nothing promises the buffer is aligned for floats.
+        let planes: Vec<Vec<f32>> = (0..usize::from(channels))
+            .map(|c| {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(frame.p_data.add(c * stride), samples * 4)
+                };
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_ne_bytes(*b))
+                    .collect()
+            })
+            .collect();
+        let planes: Vec<&[f32]> = planes.iter().map(Vec::as_slice).collect();
+        let chunk = crate::audio::PcmChunk {
+            samples: interleave(&planes),
+            lost_before: 0,
+        };
+        if let Err(crossbeam_channel::TrySendError::Disconnected(_)) = tx.try_send(chunk) {
+            *sink = None;
+        }
+    }
+
+    /// (sample rate, channels, generation), once sound has arrived.
+    fn format(&self) -> Option<(u32, u16, u32)> {
+        let format = self.format.load(Ordering::SeqCst);
+        let rate = u32::try_from(format >> 16).ok()?;
+        let channels = u16::try_from(format & 0xffff).ok()?;
+        (rate > 0 && channels > 0).then(|| (rate, channels, self.generation.load(Ordering::SeqCst)))
+    }
+}
+
+/// Planar sound (a run of samples per channel) as interleaved frames.
+fn interleave(planes: &[&[f32]]) -> Vec<f32> {
+    let frames = planes.iter().map(|p| p.len()).min().unwrap_or(0);
+    let mut out = Vec::with_capacity(frames * planes.len());
+    for i in 0..frames {
+        out.extend(planes.iter().map(|p| p[i]));
+    }
+    out
+}
+
 struct NdiReceiver {
     #[allow(dead_code)]
     source_name: String,
     frame_data: Arc<Mutex<Option<NdiFrame>>>,
+    audio: Arc<NdiAudio>,
     stop_flag: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -80,6 +178,99 @@ struct NdiSender {
     instance: ffi::NDIlib_send_instance_t,
     /// Reusable UYVY conversion buffer (avoids per-frame allocation).
     uyvy_buf: Vec<u8>,
+    /// The audio bus it carries, sent from a thread of its own.
+    audio: Option<NdiAudioSend>,
+}
+
+/// A sender's sound: an audio bus's mix, sent as it is made.
+struct NdiAudioSend {
+    bus: String,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl NdiAudioSend {
+    /// Send `tap`'s blocks — interleaved stereo at the mix rate — on
+    /// `instance`, until stopped. NDI takes sound and pictures from
+    /// different threads, so the render thread never waits on it.
+    fn start(
+        bus: &str,
+        tap: crate::audio_mix::BusTap,
+        instance: ffi::NDIlib_send_instance_t,
+        send_audio: unsafe extern "C" fn(
+            ffi::NDIlib_send_instance_t,
+            *const ffi::NDIlib_audio_frame_v3_t,
+        ),
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let instance = instance as usize;
+        let thread = {
+            let stop = stop.clone();
+            std::thread::Builder::new()
+                .name("ndi-send-audio".into())
+                .spawn(move || {
+                    let instance = instance as ffi::NDIlib_send_instance_t;
+                    let rate = i32::try_from(crate::audio_mix::SAMPLE_RATE).unwrap_or(48_000);
+                    while !stop.load(Ordering::Relaxed) {
+                        let Ok(chunk) = tap
+                            .receiver
+                            .recv_timeout(std::time::Duration::from_millis(100))
+                        else {
+                            continue;
+                        };
+                        let mut planar = deinterleave(&chunk.samples, 2);
+                        let samples = chunk.samples.len() / 2;
+                        let (Ok(no_samples), Ok(stride)) =
+                            (i32::try_from(samples), i32::try_from(samples * 4))
+                        else {
+                            continue;
+                        };
+                        if samples == 0 {
+                            continue;
+                        }
+                        let frame = ffi::NDIlib_audio_frame_v3_t {
+                            sample_rate: rate,
+                            no_channels: 2,
+                            no_samples,
+                            // NDIlib_send_timecode_synthesize
+                            timecode: i64::MAX,
+                            FourCC: ffi::NDIlib_audio_frame_v3_t::FLTP,
+                            p_data: planar.as_mut_ptr().cast(),
+                            channel_stride_in_bytes: stride,
+                            p_metadata: std::ptr::null(),
+                            timestamp: 0,
+                        };
+                        unsafe { send_audio(instance, &raw const frame) };
+                    }
+                })
+                .ok()
+        };
+        log::info!("NDI sender carries audio bus {bus}");
+        Self {
+            bus: bus.to_string(),
+            stop,
+            thread,
+        }
+    }
+
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Interleaved frames as planar sound: each channel's samples in a run.
+fn deinterleave(samples: &[f32], channels: usize) -> Vec<f32> {
+    let frames = samples.len() / channels.max(1);
+    let mut out = vec![0.0; frames * channels];
+    for (i, frame) in samples.chunks_exact(channels.max(1)).enumerate() {
+        for (c, s) in frame.iter().enumerate() {
+            out[c * frames + i] = *s;
+        }
+    }
+    out
 }
 
 impl Default for NdiManager {
@@ -123,6 +314,7 @@ impl NdiManager {
             textures: Vec::new(),
             senders: HashMap::new(),
             p216_converters: HashMap::new(),
+            finder: std::ptr::null_mut(),
         }
     }
 
@@ -136,6 +328,7 @@ impl NdiManager {
             textures: Vec::new(),
             senders: HashMap::new(),
             p216_converters: HashMap::new(),
+            finder: std::ptr::null_mut(),
         }
     }
 
@@ -185,27 +378,26 @@ impl NdiManager {
         self.sources.iter().map(|s| s.name.clone()).collect()
     }
 
-    /// Scan for NDI sources on the network (2s timeout).
+    /// The NDI sources on the network now. The first look starts watching
+    /// the network, and sources show up as they announce themselves, within
+    /// a second or two; a look never waits, so it can be made mid-show
+    /// without holding up a frame.
     pub fn discover(&mut self) {
         let Some(sdk) = &self.sdk else {
             return;
         };
-        self.sources.clear();
-
-        unsafe {
+        if self.finder.is_null() {
             let find_settings = ffi::NDIlib_find_create_t::default();
-            let finder = (sdk.find_create_v2)(&raw const find_settings);
-            if finder.is_null() {
+            self.finder = unsafe { (sdk.find_create_v2)(&raw const find_settings) };
+            if self.finder.is_null() {
                 log::warn!("NDI find_create_v2 returned null");
                 return;
             }
-
-            // Wait up to 2 seconds for sources to appear
-            (sdk.find_wait_for_sources)(finder, 2000);
-
+        }
+        let mut sources = Vec::new();
+        unsafe {
             let mut count: std::os::raw::c_uint = 0;
-            let sources_ptr = (sdk.find_get_current_sources)(finder, &raw mut count);
-
+            let sources_ptr = (sdk.find_get_current_sources)(self.finder, &raw mut count);
             if !sources_ptr.is_null() && count > 0 {
                 let sources_slice = std::slice::from_raw_parts(sources_ptr, count as usize);
                 for src in sources_slice {
@@ -213,13 +405,15 @@ impl NdiManager {
                         let name = std::ffi::CStr::from_ptr(src.p_ndi_name)
                             .to_string_lossy()
                             .into_owned();
-                        self.sources.push(NdiSource { name });
+                        sources.push(NdiSource { name });
                     }
                 }
             }
-            log::info!("NDI discovery found {} sources", self.sources.len());
-            (sdk.find_destroy)(finder);
         }
+        if sources.len() != self.sources.len() {
+            log::info!("NDI: {} sources on the network", sources.len());
+        }
+        self.sources = sources;
     }
 
     /// Start receiving from a named NDI source.
@@ -227,7 +421,7 @@ impl NdiManager {
     ///
     /// # Panics
     ///
-    /// Panics only if the fixed receiver-name literal `"Varda Receiver"` cannot be
+    /// Panics only if the fixed receiver-name literal `"Nida Receiver"` cannot be
     /// converted to a `CString`, which is impossible for that literal.
     pub fn start_receive(&mut self, source_name: &str, device: &wgpu::Device) -> Option<usize> {
         let Some(sdk) = &self.sdk else {
@@ -236,6 +430,7 @@ impl NdiManager {
         };
 
         let frame_data: Arc<Mutex<Option<NdiFrame>>> = Arc::new(Mutex::new(None));
+        let audio = Arc::new(NdiAudio::default());
         let stop_flag = Arc::new(AtomicBool::new(false));
         let (width, height) = (1920u32, 1080u32);
 
@@ -246,7 +441,7 @@ impl NdiManager {
             p_url_address: std::ptr::null(),
         };
 
-        let recv_name = std::ffi::CString::new("Varda Receiver").unwrap();
+        let recv_name = std::ffi::CString::new("Nida Receiver").unwrap();
         let recv_settings = ffi::NDIlib_recv_create_v3_t {
             source_to_connect_to: ndi_source,
             color_format: 0, // BGRX/BGRA — most reliable for conversion
@@ -291,6 +486,8 @@ impl NdiManager {
         let recv_destroy_fn = sdk.recv_destroy as usize;
         let recv_capture_fn = sdk.recv_capture_v3 as usize;
         let recv_free_fn = sdk.recv_free_video_v2 as usize;
+        let free_audio_fn = sdk.recv_free_audio_v3;
+        let audio_clone = Arc::clone(&audio);
 
         let source_name_log = source_name.to_string();
         let thread = std::thread::Builder::new()
@@ -307,8 +504,15 @@ impl NdiManager {
 
                 while !stop_clone.load(Ordering::SeqCst) {
                     let mut video_frame = std::mem::MaybeUninit::<ffi::NDIlib_video_frame_v2_t>::zeroed();
+                    let mut audio_frame = std::mem::MaybeUninit::<ffi::NDIlib_audio_frame_v3_t>::zeroed();
+                    // Sound is only asked for when it can be handed back.
+                    let audio_out = if free_audio_fn.is_some() {
+                        audio_frame.as_mut_ptr().cast::<std::ffi::c_void>()
+                    } else {
+                        std::ptr::null_mut()
+                    };
                     let frame_type = unsafe {
-                        capture_fn(recv, video_frame.as_mut_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), 100)
+                        capture_fn(recv, video_frame.as_mut_ptr(), audio_out, std::ptr::null_mut(), 100)
                     };
 
                     if frame_type == ffi::NDIlib_frame_type_e::VIDEO {
@@ -328,6 +532,12 @@ impl NdiManager {
                             }
                         }
                         unsafe { free_fn(recv, &raw const vf) };
+                    } else if frame_type == ffi::NDIlib_frame_type_e::AUDIO {
+                        let af = unsafe { audio_frame.assume_init() };
+                        audio_clone.take(&af);
+                        if let Some(free_audio) = free_audio_fn {
+                            unsafe { free_audio(recv, &raw const af) };
+                        }
                     } else if frame_type == ffi::NDIlib_frame_type_e::NONE {
                         none_count += 1;
                         if none_count == 30 {
@@ -355,6 +565,7 @@ impl NdiManager {
         self.receivers.push(NdiReceiver {
             source_name: source_name.to_string(),
             frame_data,
+            audio,
             stop_flag,
             connected,
             thread,
@@ -362,7 +573,7 @@ impl NdiManager {
             width,
             height,
         });
-        self.textures.push((texture, texture_view));
+        self.textures.push(Some((texture, texture_view)));
         log::info!("NDI receiver started for '{source_name}'");
         Some(idx)
     }
@@ -379,6 +590,9 @@ impl NdiManager {
                 }
             };
             if let Some(frame) = new_frame {
+                if self.textures[i].is_none() {
+                    continue;
+                }
                 let fw = frame.width;
                 let fh = frame.height;
                 let expected = (fw * fh * 4) as usize;
@@ -412,13 +626,16 @@ impl NdiManager {
                         view_formats: &[],
                     });
                     let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                    self.textures[i] = (texture, texture_view);
+                    self.textures[i] = Some((texture, texture_view));
                     self.receivers[i].width = fw;
                     self.receivers[i].height = fh;
                 }
+                let Some((texture, _)) = &self.textures[i] else {
+                    continue;
+                };
                 queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
-                        texture: &self.textures[i].0,
+                        texture,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
@@ -440,7 +657,7 @@ impl NdiManager {
     }
 
     pub fn texture_view(&self, idx: usize) -> Option<&wgpu::TextureView> {
-        self.textures.get(idx).map(|(_, v)| v)
+        self.textures.get(idx)?.as_ref().map(|(_, v)| v)
     }
 
     pub fn receiver_dimensions(&self, idx: usize) -> Option<(u32, u32)> {
@@ -569,6 +786,7 @@ impl NdiManager {
             NdiSender {
                 instance,
                 uyvy_buf: vec![0u8; width as usize * height as usize * 2],
+                audio: None,
             },
         );
         log::info!("NDI sender created: '{sender_name}'");
@@ -632,7 +850,11 @@ impl NdiManager {
     /// Destroy a specific sender by name.
     pub fn destroy_sender(&mut self, sender_name: &str) {
         self.p216_converters.remove(sender_name);
-        if let Some(sender) = self.senders.remove(sender_name) {
+        if let Some(mut sender) = self.senders.remove(sender_name) {
+            // Its sound stops first: the thread sends on this instance.
+            if let Some(audio) = sender.audio.take() {
+                audio.stop();
+            }
             if let Some(ref sdk) = self.sdk {
                 unsafe { (sdk.send_destroy)(sender.instance) };
             }
@@ -640,12 +862,70 @@ impl NdiManager {
         }
     }
 
+    /// Keep a sender carrying `bus` of the audio mixer, or no sound with
+    /// `None`. Called every frame the sender sends; it only acts on a
+    /// change, and not before the sender's first picture has made it.
+    pub fn keep_audio(
+        &mut self,
+        sender_name: &str,
+        bus: Option<&str>,
+        audio_mix: &crate::audio_mix::AudioEngine,
+    ) {
+        let Some(send_audio) = self.sdk.as_ref().and_then(|sdk| sdk.send_send_audio_v3) else {
+            return;
+        };
+        let Some(sender) = self.senders.get_mut(sender_name) else {
+            return;
+        };
+        if sender.audio.as_ref().map(|a| a.bus.as_str()) == bus {
+            return;
+        }
+        if let Some(old) = sender.audio.take() {
+            old.stop();
+        }
+        let Some(bus) = bus else {
+            return;
+        };
+        let Some(tap) = audio_mix.tap(bus) else {
+            log::warn!("NDI '{sender_name}': no audio bus {bus} to carry");
+            return;
+        };
+        sender.audio = Some(NdiAudioSend::start(bus, tap, sender.instance, send_audio));
+    }
+
+    /// A receiver's sound format once sound has arrived: (sample rate,
+    /// channels, generation — which changes with the format).
+    pub fn audio_format(&self, idx: usize) -> Option<(u32, u16, u32)> {
+        self.receivers.get(idx)?.audio.format()
+    }
+
+    /// Send a receiver's sound to `sink` from now on, as interleaved frames
+    /// in its [`Self::audio_format`]. Dropped when the format changes.
+    pub fn set_audio_sink(
+        &self,
+        idx: usize,
+        sink: crossbeam_channel::Sender<crate::audio::PcmChunk>,
+    ) {
+        if let Some(receiver) = self.receivers.get(idx) {
+            if let Ok(mut slot) = receiver.audio.sink.lock() {
+                *slot = Some(sink);
+            }
+        }
+    }
+
+    /// Stop a receiver, and give back its texture and last picture.
     pub fn stop_receive(&mut self, idx: usize) {
         if let Some(r) = self.receivers.get_mut(idx) {
             r.stop_flag.store(true, Ordering::SeqCst);
             if let Some(t) = r.thread.take() {
                 let _ = t.join();
             }
+            if let Ok(mut frame) = r.frame_data.lock() {
+                frame.take();
+            }
+        }
+        if let Some(texture) = self.textures.get_mut(idx) {
+            *texture = None;
         }
     }
 }
@@ -699,6 +979,9 @@ impl Drop for NdiManager {
         }
         // Destroy NDI SDK
         if let Some(ref sdk) = self.sdk {
+            if !self.finder.is_null() {
+                unsafe { (sdk.find_destroy)(self.finder) };
+            }
             unsafe { (sdk.destroy)() };
         }
     }
@@ -726,6 +1009,9 @@ fn convert_ndi_frame_to_rgba(vf: &ffi::NDIlib_video_frame_v2_t, w: u32, h: u32) 
             w as usize * 4
         };
         let bgra_data = unsafe { std::slice::from_raw_parts(vf.p_data, h as usize * stride) };
+        // A source sending transparency (a keyed graphic) sends BGRA, its
+        // alpha straight; BGRX's fourth byte means nothing, so it is opaque.
+        let keeps_alpha = vf.FourCC == ffi::NDIlib_FourCC_video_type_e::BGRA;
         for y in 0..h as usize {
             for x in 0..w as usize {
                 let src = y * stride + x * 4;
@@ -733,7 +1019,7 @@ fn convert_ndi_frame_to_rgba(vf: &ffi::NDIlib_video_frame_v2_t, w: u32, h: u32) 
                 rgba[dst] = bgra_data[src + 2]; // R
                 rgba[dst + 1] = bgra_data[src + 1]; // G
                 rgba[dst + 2] = bgra_data[src]; // B
-                rgba[dst + 3] = 255; // Alpha (forced opaque — BGRX has undefined alpha)
+                rgba[dst + 3] = if keeps_alpha { bgra_data[src + 3] } else { 255 };
             }
         }
     } else if vf.FourCC == ffi::NDIlib_FourCC_video_type_e::RGBA {
@@ -749,37 +1035,55 @@ fn convert_ndi_frame_to_rgba(vf: &ffi::NDIlib_video_frame_v2_t, w: u32, h: u32) 
 
 /// Convert UYVY 4:2:2 to RGBA.
 fn uyvy_to_rgba(uyvy: &[u8], rgba: &mut [u8], w: u32, h: u32, stride: usize) {
+    // As `rgba_to_uyvy` writes it: video levels, BT.709 for HD and up.
+    let (kr, kb) = if h >= 720 {
+        (0.2126, 0.0722)
+    } else {
+        (0.299, 0.114)
+    };
+    let kg = 1.0 - kr - kb;
+    let luma = |y: u8| (f32::from(y) - 16.0) * 255.0 / 219.0;
+    let chroma = |c: u8| (f32::from(c) - 128.0) * 255.0 / 224.0;
+    let to_u8 = |v: f32| (v + 0.5).clamp(0.0, 255.0) as u8;
+    let rgb = |luma: f32, cb: f32, cr: f32| {
+        let red = luma + 2.0 * (1.0 - kr) * cr;
+        let blue = luma + 2.0 * (1.0 - kb) * cb;
+        let green = (luma - kr * red - kb * blue) / kg;
+        [to_u8(red), to_u8(green), to_u8(blue), 255]
+    };
     for y in 0..h as usize {
         for x in (0..w as usize).step_by(2) {
             let src = y * stride + x * 2;
             if src + 3 >= uyvy.len() {
                 break;
             }
-            let u = f32::from(uyvy[src]) - 128.0;
-            let y0 = f32::from(uyvy[src + 1]);
-            let v = f32::from(uyvy[src + 2]) - 128.0;
-            let y1 = f32::from(uyvy[src + 3]);
+            let cb = chroma(uyvy[src]);
+            let cr = chroma(uyvy[src + 2]);
 
             let dst0 = (y * w as usize + x) * 4;
             let dst1 = dst0 + 4;
-
-            rgba[dst0] = (y0 + 1.402 * v).clamp(0.0, 255.0) as u8;
-            rgba[dst0 + 1] = (y0 - 0.344 * u - 0.714 * v).clamp(0.0, 255.0) as u8;
-            rgba[dst0 + 2] = (y0 + 1.772 * u).clamp(0.0, 255.0) as u8;
-            rgba[dst0 + 3] = 255;
-
+            rgba[dst0..dst0 + 4].copy_from_slice(&rgb(luma(uyvy[src + 1]), cb, cr));
             if x + 1 < w as usize && dst1 + 3 < rgba.len() {
-                rgba[dst1] = (y1 + 1.402 * v).clamp(0.0, 255.0) as u8;
-                rgba[dst1 + 1] = (y1 - 0.344 * u - 0.714 * v).clamp(0.0, 255.0) as u8;
-                rgba[dst1 + 2] = (y1 + 1.772 * u).clamp(0.0, 255.0) as u8;
-                rgba[dst1 + 3] = 255;
+                rgba[dst1..dst1 + 4].copy_from_slice(&rgb(luma(uyvy[src + 3]), cb, cr));
             }
         }
     }
 }
 
-/// Convert RGBA to UYVY 4:2:2 for NDI sending.
-fn rgba_to_uyvy(rgba: &[u8], uyvy: &mut [u8], w: u32, h: u32) {
+/// Convert RGBA to UYVY 4:2:2 for NDI sending, as NDI reads it: video
+/// levels (16–235), BT.709 for HD and up, BT.601 for standard definition.
+/// Each pair of pixels shares the average of their colour.
+pub(crate) fn rgba_to_uyvy(rgba: &[u8], uyvy: &mut [u8], w: u32, h: u32) {
+    // (Kr, Kb) of the picture's colour space.
+    let (kr, kb) = if h >= 720 {
+        (0.2126, 0.0722)
+    } else {
+        (0.299, 0.114)
+    };
+    let kg = 1.0 - kr - kb;
+    let luma = |r: f32, g: f32, b: f32| kr * r + kg * g + kb * b;
+    let to_y = |l: f32| (16.0 + l * 219.0 / 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+    let to_c = |c: f32| (128.0 + c * 224.0 / 255.0 + 0.5).clamp(0.0, 255.0) as u8;
     for y in 0..h as usize {
         for x in (0..w as usize).step_by(2) {
             let src0 = (y * w as usize + x) * 4;
@@ -799,17 +1103,17 @@ fn rgba_to_uyvy(rgba: &[u8], uyvy: &mut [u8], w: u32, h: u32) {
                 (r0, g0, b0)
             };
 
-            let y0 = (0.299 * r0 + 0.587 * g0 + 0.114 * b0).clamp(0.0, 255.0);
-            let y1 = (0.299 * r1 + 0.587 * g1 + 0.114 * b1).clamp(0.0, 255.0);
-            let u = (-0.169 * r0 - 0.331 * g0 + 0.500 * b0 + 128.0).clamp(0.0, 255.0);
-            let v = (0.500 * r0 - 0.419 * g0 - 0.081 * b0 + 128.0).clamp(0.0, 255.0);
+            let (l0, l1) = (luma(r0, g0, b0), luma(r1, g1, b1));
+            let pair_luma = f32::midpoint(l0, l1);
+            let cb = (f32::midpoint(b0, b1) - pair_luma) / (2.0 * (1.0 - kb));
+            let cr = (f32::midpoint(r0, r1) - pair_luma) / (2.0 * (1.0 - kr));
 
             let dst = y * w as usize * 2 + x * 2;
             if dst + 3 < uyvy.len() {
-                uyvy[dst] = u as u8;
-                uyvy[dst + 1] = y0 as u8;
-                uyvy[dst + 2] = v as u8;
-                uyvy[dst + 3] = y1 as u8;
+                uyvy[dst] = to_c(cb);
+                uyvy[dst + 1] = to_y(l0);
+                uyvy[dst + 2] = to_c(cr);
+                uyvy[dst + 3] = to_y(l1);
             }
         }
     }
@@ -819,6 +1123,87 @@ fn rgba_to_uyvy(rgba: &[u8], uyvy: &mut [u8], w: u32, h: u32) {
 mod tests {
     use super::*;
     use crate::engine::value::render::{PresentationDepth, PresentationPixelFormat};
+
+    #[test]
+    fn ndi_pictures_are_sent_at_video_levels_in_their_colour_space() {
+        // A picture two pixels wide, `h` high, all one colour: its first pair.
+        let px = |rgba: [u8; 4], h: u32| {
+            let picture = rgba.repeat(2 * h as usize);
+            let mut out = vec![0u8; 4 * h as usize];
+            rgba_to_uyvy(&picture, &mut out, 2, h);
+            out[..4].to_vec()
+        };
+        // Black and white at 16 and 235, no colour.
+        assert_eq!(px([0, 0, 0, 255], 1080), vec![128, 16, 128, 16]);
+        assert_eq!(px([255, 255, 255, 255], 1080), vec![128, 235, 128, 235]);
+        // Red in HD is BT.709's: Y 63, Cb 102, Cr 240.
+        assert_eq!(px([255, 0, 0, 255], 1080), vec![102, 63, 240, 63]);
+        // In standard definition, BT.601's: Y 81, Cb 90, Cr 240.
+        assert_eq!(px([255, 0, 0, 255], 576), vec![90, 81, 240, 81]);
+    }
+
+    #[test]
+    fn interleaved_sound_is_sent_planar() {
+        let interleaved = [0.1, -0.1, 0.2, -0.2, 0.3, -0.3];
+        let planar = deinterleave(&interleaved, 2);
+        assert_eq!(planar, vec![0.1, 0.2, 0.3, -0.1, -0.2, -0.3]);
+        let (left, right) = planar.split_at(3);
+        assert_eq!(interleave(&[left, right]), interleaved);
+    }
+
+    #[test]
+    fn planar_sound_is_interleaved_frame_by_frame() {
+        let left = [0.1, 0.2, 0.3];
+        let right = [-0.1, -0.2, -0.3];
+        assert_eq!(
+            interleave(&[&left, &right]),
+            vec![0.1, -0.1, 0.2, -0.2, 0.3, -0.3]
+        );
+        assert_eq!(interleave(&[&left]), vec![0.1, 0.2, 0.3]);
+        assert!(interleave(&[]).is_empty());
+    }
+
+    /// One NDI audio frame over `planes`, as the SDK hands it out.
+    fn frame(rate: i32, planes: &mut [Vec<f32>]) -> (Vec<f32>, ffi::NDIlib_audio_frame_v3_t) {
+        let samples = planes[0].len();
+        let mut data: Vec<f32> = planes.iter().flat_map(|p| p.iter().copied()).collect();
+        let af = ffi::NDIlib_audio_frame_v3_t {
+            sample_rate: rate,
+            no_channels: i32::try_from(planes.len()).unwrap(),
+            no_samples: i32::try_from(samples).unwrap(),
+            timecode: 0,
+            FourCC: ffi::NDIlib_audio_frame_v3_t::FLTP,
+            p_data: data.as_mut_ptr().cast(),
+            channel_stride_in_bytes: i32::try_from(samples * 4).unwrap(),
+            p_metadata: std::ptr::null(),
+            timestamp: 0,
+        };
+        (data, af)
+    }
+
+    #[test]
+    fn a_receivers_sound_reaches_its_listener_and_a_new_format_drops_it() {
+        let audio = NdiAudio::default();
+        assert_eq!(audio.format(), None, "nothing until sound arrives");
+        let (_keep, af) = frame(48_000, &mut [vec![0.5, 0.25], vec![-0.5, -0.25]]);
+        audio.take(&af);
+        let (rate, channels, first) = audio.format().expect("known after the first frame");
+        assert_eq!((rate, channels), (48_000, 2));
+
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        *audio.sink.lock().unwrap() = Some(tx);
+        audio.take(&af);
+        assert_eq!(rx.try_recv().unwrap().samples, vec![0.5, -0.5, 0.25, -0.25]);
+
+        // A different rate: the listener has to pick it up afresh.
+        let (_keep, af) = frame(44_100, &mut [vec![0.1], vec![0.2]]);
+        audio.take(&af);
+        let (rate, _, second) = audio.format().unwrap();
+        assert_eq!(rate, 44_100);
+        assert_ne!(first, second);
+        assert!(audio.sink.lock().unwrap().is_none());
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn ndi_manager_new_no_crash() {
@@ -879,6 +1264,7 @@ mod tests {
         let request = PresentationRequest {
             depth: PresentationDepth::Sdr10,
             dither: true,
+            video_levels: false,
         };
         let capability = sdk::NdiSendCapability::from_runtime_evidence(Some("NDI SDK 6.3.1"), true);
 
@@ -914,6 +1300,7 @@ mod tests {
         let request = PresentationRequest {
             depth: PresentationDepth::Sdr10,
             dither: true,
+            video_levels: false,
         };
         let capability = sdk::NdiSendCapability::from_runtime_evidence(Some("NDI SDK 5.6.0"), true);
 
@@ -968,13 +1355,53 @@ mod tests {
         let uyvy = vec![128, 235, 128, 235];
         let mut rgba = vec![0u8; 2 * 4]; // 2 pixels
         uyvy_to_rgba(&uyvy, &mut rgba, 2, 1, 4);
-        // Y=235, U=0 (128-128), V=0 (128-128) → R=235, G=235, B=235
-        assert_eq!(rgba[0], 235); // R
-        assert_eq!(rgba[1], 235); // G
-        assert_eq!(rgba[2], 235); // B
+        // Y=235 is video white, no colour → full white
+        assert_eq!(rgba[0], 255); // R
+        assert_eq!(rgba[1], 255); // G
+        assert_eq!(rgba[2], 255); // B
         assert_eq!(rgba[3], 255); // A
-        assert_eq!(rgba[4], 235); // R (second pixel)
+        assert_eq!(rgba[4], 255); // R (second pixel)
         assert_eq!(rgba[7], 255); // A
+    }
+
+    /// A keyed graphic sent as BGRA keeps its transparency; BGRX, whose
+    /// fourth byte means nothing, is opaque. Rows padded out are read row
+    /// by row.
+    #[test]
+    fn bgra_keeps_its_alpha_and_bgrx_is_opaque() {
+        let frame = |fourcc, data: &mut Vec<u8>| ffi::NDIlib_video_frame_v2_t {
+            xres: 2,
+            yres: 2,
+            FourCC: fourcc,
+            frame_rate_N: 30,
+            frame_rate_D: 1,
+            picture_aspect_ratio: 0.0,
+            frame_format_type: 1,
+            timecode: 0,
+            p_data: data.as_mut_ptr(),
+            line_stride_in_bytes: 12,
+            p_metadata: std::ptr::null(),
+            timestamp: 0,
+        };
+        // Two rows of two pixels, blue then half-transparent red, each row
+        // padded by four bytes.
+        let mut data = vec![
+            255, 0, 0, 255, 0, 0, 255, 128, 9, 9, 9, 9, //
+            255, 0, 0, 255, 0, 0, 255, 128, 9, 9, 9, 9,
+        ];
+        let keyed = convert_ndi_frame_to_rgba(
+            &frame(ffi::NDIlib_FourCC_video_type_e::BGRA, &mut data),
+            2,
+            2,
+        );
+        assert_eq!(&keyed[..8], &[0, 0, 255, 255, 255, 0, 0, 128]);
+        assert_eq!(&keyed[8..], &keyed[..8], "the second row, past the padding");
+        let plain = convert_ndi_frame_to_rgba(
+            &frame(ffi::NDIlib_FourCC_video_type_e::BGRX, &mut data),
+            2,
+            2,
+        );
+        assert_eq!(&plain[4..8], &[255, 0, 0, 255]);
     }
 
     #[test]
@@ -1019,9 +1446,9 @@ mod tests {
         let rgba = vec![0u8; 2 * 4]; // 2 black pixels
         let mut uyvy = vec![0u8; 4]; // 1 macropixel
         rgba_to_uyvy(&rgba, &mut uyvy, 2, 1);
-        // Black: Y≈0, U≈128, V≈128
-        assert_eq!(uyvy[1], 0); // Y0
-        assert_eq!(uyvy[3], 0); // Y1
+        // Black: Y at video black, 16; U and V at 128
+        assert_eq!(uyvy[1], 16); // Y0
+        assert_eq!(uyvy[3], 16); // Y1
         assert_eq!(uyvy[0], 128); // U
         assert_eq!(uyvy[2], 128); // V
     }
@@ -1031,9 +1458,9 @@ mod tests {
         let rgba = vec![255, 255, 255, 255, 255, 255, 255, 255];
         let mut uyvy = vec![0u8; 4];
         rgba_to_uyvy(&rgba, &mut uyvy, 2, 1);
-        // White: Y≈255, U≈128, V≈128
-        assert_eq!(uyvy[1], 255); // Y0
-        assert_eq!(uyvy[3], 255); // Y1
+        // White: Y at video white, 235; U and V at 128
+        assert_eq!(uyvy[1], 235); // Y0
+        assert_eq!(uyvy[3], 235); // Y1
         assert_eq!(uyvy[0], 128); // U
         assert_eq!(uyvy[2], 128); // V
     }
@@ -1082,6 +1509,27 @@ mod tests {
     }
 
     #[test]
+    fn an_hd_picture_comes_back_as_it_went() {
+        // BT.709 both ways at 720 lines and up: colours survive the trip.
+        let (w, h) = (2u32, 720u32);
+        for colour in [[255, 0, 0, 255], [0, 200, 60, 255], [30, 60, 220, 255]] {
+            let picture = colour.repeat((w * h) as usize);
+            let mut uyvy = vec![0u8; (w * h * 2) as usize];
+            rgba_to_uyvy(&picture, &mut uyvy, w, h);
+            let mut back = vec![0u8; (w * h * 4) as usize];
+            uyvy_to_rgba(&uyvy, &mut back, w, h, (w * 2) as usize);
+            for c in 0..3 {
+                let (sent, got) = (i32::from(colour[c]), i32::from(back[c]));
+                assert!(
+                    (sent - got).abs() <= 2,
+                    "{colour:?} came back {:?}",
+                    &back[..4]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn uyvy_to_rgba_stride_larger_than_width() {
         // Stride can be larger than width*2 (padding)
         let w = 2u32;
@@ -1097,7 +1545,8 @@ mod tests {
 
         let mut rgba = vec![0u8; 2 * 4];
         uyvy_to_rgba(&uyvy, &mut rgba, w, h, stride);
-        assert_eq!(rgba[0], 200); // R = Y + 0 = 200
+        // No colour: R = (200 - 16) × 255 / 219, video levels to full
+        assert_eq!(rgba[0], 214);
         assert_eq!(rgba[3], 255); // A
     }
 }

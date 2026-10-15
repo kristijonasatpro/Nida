@@ -46,7 +46,13 @@ pub trait MixerCommands {
     /// # Errors
     /// Returns an error if `channel_uuid` names no channel, if the camera
     /// cannot be opened, or if the deck's GPU resources cannot be allocated.
-    fn add_camera_deck(&mut self, channel_uuid: &str, camera_id: CameraId) -> Result<String>;
+    /// Opened at `mode`, or at its best when `None`.
+    fn add_camera_deck(
+        &mut self,
+        channel_uuid: &str,
+        camera_id: CameraId,
+        mode: Option<crate::engine::value::camera::CameraMode>,
+    ) -> Result<String>;
     /// # Errors
     /// Returns an error if `channel_uuid` names no channel, if the depth sensor
     /// cannot be opened, or if the deck's GPU resources cannot be allocated.
@@ -93,10 +99,18 @@ pub trait MixerCommands {
     /// # Errors
     /// Returns an error if `deck_uuid` names no deck.
     fn remove_deck(&mut self, deck_uuid: &str) -> Result<()>;
+    /// Move a deck into `dst_channel_uuid` — its own channel included — just
+    /// before the deck `before_deck_uuid`, or at the end with `None`.
+    ///
     /// # Errors
-    /// Returns an error if `deck_uuid` names no deck or `dst_channel_uuid`
-    /// names no channel.
-    fn move_deck(&mut self, deck_uuid: &str, dst_channel_uuid: &str) -> Result<()>;
+    /// Returns an error if `deck_uuid` names no deck, `dst_channel_uuid` no
+    /// channel, or `before_deck_uuid` no deck in that channel.
+    fn move_deck(
+        &mut self,
+        deck_uuid: &str,
+        dst_channel_uuid: &str,
+        before_deck_uuid: Option<&str>,
+    ) -> Result<()>;
     /// Reposition a deck within `channel_uuid`. The indices are ordinals.
     ///
     /// # Errors

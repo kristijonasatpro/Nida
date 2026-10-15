@@ -2,6 +2,7 @@
 
 use super::{
     Deck, DeckSource, Effect, ExternalSourceKind, PassBuffer, PreprocessorSlot, ScalingMode,
+    VideoStagingBuffers,
 };
 use crate::analyzer::traits::TextureData;
 use crate::analyzer::{AnalyzerRegistry, DeckAnalyzers, PreprocessorCategory};
@@ -9,11 +10,55 @@ use crate::audio::AudioData;
 use crate::isf::{ISFPass, PhaseInput};
 use crate::modulation::ModulationEngine;
 use crate::params::ShaderParams;
+use crate::renderer::region::{draw_within, scissors_for, Area, Pixels};
 use crate::renderer::BlitPipeline;
 use crate::renderer::{GpuContext, ISFUniforms, UnifiedPipeline};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::time::Instant;
+
+/// A deck's whole picture as one placed draw of its live source (see
+/// [`Deck::framing`]).
+pub(crate) struct Framing<'a> {
+    pub placed: crate::renderer::placed_picture::Placed,
+    /// The source, once one is bound.
+    pub source: Option<&'a wgpu::TextureView>,
+    /// The deck's own frame, as its render scale makes it: the picture
+    /// drawn at this size, then shown at the master's, as the deck is.
+    pub size: (u32, u32),
+}
+
+/// The effects the pass drawing a deck's source does too (see
+/// `Deck::fold`): a crop, then a move and scale.
+struct Fold {
+    crop: Option<crate::renderer::placed_picture::Crop>,
+    /// The picture's centre moved by this, and its scale (none: 0 and 1).
+    pos: [f32; 2],
+    scale: [f32; 2],
+    /// Mirrored left for right, top for bottom.
+    flip: [bool; 2],
+    /// 1: the source drawn over black, as the deck flattens it (see
+    /// `Deck::source_draws`); 0: as it comes.
+    over_black: f32,
+    /// How many of the enabled effects, from the first, it does.
+    effects: usize,
+}
+
+/// Pixels drawn round each part a pass is limited to, beyond those it
+/// touches: the next pass, or the composite, reads it with filtering.
+const PART_MARGIN: u32 = 2;
+
+/// How a pass drawing only `within` starts: keeping what its target held
+/// outside those parts — the last picture drawn there, which is what the
+/// deck's thumbnail shows of a part covered on air — or cleared when it
+/// draws everything.
+fn keep_or_clear(within: Option<&[Pixels]>, clear: wgpu::Color) -> wgpu::LoadOp<wgpu::Color> {
+    if within.is_some() {
+        wgpu::LoadOp::Load
+    } else {
+        wgpu::LoadOp::Clear(clear)
+    }
+}
 
 /// Upload analyzer texture data to a preprocessor slot's GPU texture.
 ///
@@ -118,12 +163,16 @@ impl Deck {
     /// staging-buffer allocation becomes fallible.
     pub fn update_video_frame(&mut self, encoder: &mut wgpu::CommandEncoder) -> Result<()> {
         match &mut self.source {
+            // A frame is taken only when it can be uploaded; one taken while
+            // the staging buffer is still on its way back would be lost. A
+            // playing clip sends another at once, but a paused one has sent
+            // its only frame — the one it is paused on.
             DeckSource::Video {
                 ref handle,
                 ref texture,
                 ref mut staging,
                 ..
-            } => {
+            } if staging.ready() => {
                 if let Some(frame) = handle.take_frame() {
                     let width = handle.width;
                     let height = handle.height;
@@ -132,16 +181,21 @@ impl Deck {
                 }
             }
             DeckSource::HapVideo {
-                ref handle,
+                ref mut handle,
                 ref texture,
                 ref alpha_texture,
                 ref mut staging,
                 ref mut alpha_staging,
                 ..
-            } => {
+            } if staging.ready()
+                && alpha_staging
+                    .as_ref()
+                    .is_none_or(VideoStagingBuffers::ready) =>
+            {
                 if let Some(frame) = handle.take_frame() {
-                    let width = handle.width;
-                    let height = handle.height;
+                    // Whole 4×4 blocks, as the texture was made.
+                    let width = handle.width.div_ceil(4) * 4;
+                    let height = handle.height.div_ceil(4) * 4;
                     staging.upload(&frame.color_data, texture, width, height, encoder);
 
                     if let (Some(alpha_data), Some(_alpha_fmt), Some(alpha_tex)) = (
@@ -151,11 +205,15 @@ impl Deck {
                     ) {
                         if let Some(ref mut a_staging) = alpha_staging {
                             a_staging.upload(alpha_data, alpha_tex, width, height, encoder);
+                            // Hap Q Alpha: its transparency from here on.
+                            handle.is_dual_plane = true;
                         }
                     }
                     handle.recycle(frame);
                 }
             }
+            DeckSource::Playlist(list) => list.tick(encoder),
+            DeckSource::Timer(timer) => timer.tick(),
             _ => {}
         }
         Ok(())
@@ -177,6 +235,7 @@ impl Deck {
                     a.request_remap();
                 }
             }
+            DeckSource::Playlist(list) => list.for_each_deck_mut(Deck::request_video_remap),
             _ => {}
         }
     }
@@ -287,9 +346,18 @@ impl Deck {
             return Ok(());
         }
 
+        // A still image whose inputs have not changed already has this
+        // frame's picture in its texture.
+        let still = self.still_frame(modulation);
+        if still.is_some() && still == self.rendered_still {
+            return Ok(());
+        }
+
         let before = cmd_buffers.len();
         let result = {
             let scope = context.errors.scope(&format!("deck {}", self.uuid));
+            // A still image is drawn whole: it is kept until its settings
+            // change, whatever comes to cover or uncover it meanwhile.
             let result = self.render_with_prefix_inner(
                 context,
                 audio_data,
@@ -297,6 +365,7 @@ impl Deck {
                 param_prefix,
                 cmd_buffers,
                 gpu_timing,
+                still.is_none(),
             );
             match scope.faulted() {
                 Some(message) => Err(message),
@@ -305,8 +374,13 @@ impl Deck {
         };
 
         match result {
-            Ok(inner) => inner,
+            Ok(inner) => {
+                // Remembered only once it rendered, so a failure retries.
+                self.rendered_still = if inner.is_ok() { still } else { None };
+                inner
+            }
             Err(message) => {
+                self.rendered_still = None;
                 // Drop anything this deck encoded before failing: submitting a
                 // partial frame from a deck we are about to quarantine risks
                 // raising the same error again downstream.
@@ -332,6 +406,7 @@ impl Deck {
         param_prefix: &str,
         cmd_buffers: &mut Vec<wgpu::CommandBuffer>,
         gpu_timing: Option<(&wgpu::QuerySet, u32, u32)>,
+        in_parts: bool,
     ) -> Result<()> {
         // Update preprocessor textures from analyzer snapshots before rendering
         if self.analyzers.has_active_instances() {
@@ -383,15 +458,31 @@ impl Deck {
         );
         let generator_phase_times = self.phase_accumulators;
 
-        let enabled_effects: Vec<usize> = self
-            .effects
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.enabled)
-            .map(|(i, _)| i)
-            .collect();
+        let mut enabled_effects = self.drawn_effects(modulation);
+        // A picture cropped, moved and scaled is drawn straight into its
+        // place: the pass that draws it does those, not passes after it.
+        let folded = self.fold(&enabled_effects, modulation);
+        if let Some(fold) = &folded {
+            for effect in enabled_effects.drain(..fold.effects) {
+                self.effects[effect].runs += 1;
+            }
+        }
 
         let source_to_b = enabled_effects.len() % 2 == 1;
+
+        // Each pass draws only what the frame shows of the deck, when its
+        // channel has worked that out; see `draw_plan`.
+        let plan = self.draw_plan(&enabled_effects, in_parts, modulation);
+        self.drawn_visible = plan
+            .iter()
+            .any(Option::is_some)
+            .then(|| self.visible.clone())
+            .flatten();
+        let source_within = plan[0].as_deref();
+        self.drawn_share = source_within.map_or(1.0, |rects| {
+            let all = Pixels::all(self.texture.width(), self.texture.height()).count();
+            (rects.iter().map(Pixels::count).sum::<u64>() as f64 / all.max(1) as f64) as f32
+        });
 
         // Depth-sensor decks render via a point-cloud pass, which needs mutable
         // access to `self.point_cloud_pipeline` (a field separate from
@@ -466,6 +557,7 @@ impl Deck {
                         &preprocessor_views,
                         generator_phase_times,
                         cmd_buffers,
+                        source_within,
                     );
                 }
             }
@@ -481,8 +573,10 @@ impl Deck {
                 let (uv_scale, uv_offset) = scaling_mode.compute_uv_transform(
                     *source_width,
                     *source_height,
-                    self.texture.width(),
-                    self.texture.height(),
+                    // The master, not this deck's texture: at a reduced
+                    // render scale, Center still means native size on air.
+                    self.master_size.0,
+                    self.master_size.1,
                 );
                 blit_pipeline.set_uv_transform(&context.queue, 1.0, uv_scale, uv_offset);
 
@@ -500,7 +594,7 @@ impl Deck {
                             view: generator_target,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                load: keep_or_clear(source_within, wgpu::Color::BLACK),
                                 store: wgpu::StoreOp::Store,
                             },
                             depth_slice: None,
@@ -510,7 +604,7 @@ impl Deck {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    blit_pipeline.render(&mut render_pass, &bind_group);
+                    blit_pipeline.render_within(&mut render_pass, &bind_group, source_within);
                 }
                 cmd_buffers.push(encoder.finish());
             }
@@ -531,9 +625,13 @@ impl Deck {
                 let (uv_scale, uv_offset) = scaling_mode.compute_uv_transform(
                     *source_width,
                     *source_height,
-                    self.texture.width(),
-                    self.texture.height(),
+                    // The master, not this deck's texture: at a reduced
+                    // render scale, Center still means native size on air.
+                    self.master_size.0,
+                    self.master_size.1,
                 );
+                // The picture's part of its texture, made in whole 4×4 blocks.
+                let extent = |size: u32| size as f32 / (size.div_ceil(4) * 4).max(1) as f32;
                 convert_pipeline.set_params_with_uv(
                     &context.queue,
                     1.0,
@@ -541,6 +639,7 @@ impl Deck {
                     has_alpha,
                     uv_scale,
                     uv_offset,
+                    [extent(*source_width), extent(*source_height)],
                 );
 
                 let alpha_view = if let Some(ref av) = alpha_texture_view {
@@ -563,7 +662,7 @@ impl Deck {
                             view: generator_target,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                load: keep_or_clear(source_within, wgpu::Color::BLACK),
                                 store: wgpu::StoreOp::Store,
                             },
                             depth_slice: None,
@@ -573,7 +672,7 @@ impl Deck {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    convert_pipeline.draw(&mut render_pass, &bind_group);
+                    convert_pipeline.draw_within(&mut render_pass, &bind_group, source_within);
                 }
                 cmd_buffers.push(encoder.finish());
             }
@@ -588,8 +687,10 @@ impl Deck {
                 let (uv_scale, uv_offset) = scaling_mode.compute_uv_transform(
                     *source_width,
                     *source_height,
-                    self.texture.width(),
-                    self.texture.height(),
+                    // The master, not this deck's texture: at a reduced
+                    // render scale, Center still means native size on air.
+                    self.master_size.0,
+                    self.master_size.1,
                 );
                 blit_pipeline.set_uv_transform(&context.queue, 1.0, uv_scale, uv_offset);
 
@@ -607,7 +708,7 @@ impl Deck {
                             view: generator_target,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                load: keep_or_clear(source_within, wgpu::Color::BLACK),
                                 store: wgpu::StoreOp::Store,
                             },
                             depth_slice: None,
@@ -617,7 +718,7 @@ impl Deck {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    blit_pipeline.render(&mut render_pass, &bind_group);
+                    blit_pipeline.render_within(&mut render_pass, &bind_group, source_within);
                 }
                 cmd_buffers.push(encoder.finish());
             }
@@ -664,7 +765,43 @@ impl Deck {
                 // DepthSensor decks were already reprojected above via the
                 // point-cloud pass; the plain blit only applies to flat sources.
                 if !matches!(kind, ExternalSourceKind::DepthSensor(_)) {
-                    if let Some(ext_view) = &self.external_source_view {
+                    if let (Some(ext_view), Some(fold)) = (&self.external_source_view, &folded) {
+                        let (uv_scale, uv_offset) = scaling_mode.compute_uv_transform(
+                            *source_width,
+                            *source_height,
+                            self.master_size.0,
+                            self.master_size.1,
+                        );
+                        let placed = crate::renderer::placed_picture::Placed {
+                            uv_scale,
+                            uv_offset,
+                            pos: fold.pos,
+                            scale: fold.scale,
+                            flip: fold.flip,
+                            crop: fold.crop,
+                            premultiplied: matches!(kind, ExternalSourceKind::Tap),
+                            over_black: fold.over_black,
+                        };
+                        let pipeline = self.placed.get_or_insert_with(|| {
+                            crate::renderer::placed_picture::PlacedPicturePipeline::new(
+                                &context.device,
+                                context.compositing_format,
+                            )
+                        });
+                        let frame = (self.texture.width(), self.texture.height());
+                        let drawn = pipeline.draw(
+                            &context.device,
+                            &context.queue,
+                            cmd_buffers,
+                            &placed,
+                            ext_view,
+                            generator_target,
+                            frame,
+                            source_within,
+                        );
+                        let all = Pixels::all(frame.0, frame.1).count().max(1);
+                        self.drawn_share = (drawn as f64 / all as f64) as f32;
+                    } else if let Some(ext_view) = &self.external_source_view {
                         Self::blit_external_source(
                             context,
                             blit_pipeline,
@@ -673,12 +810,16 @@ impl Deck {
                             ext_view,
                             *source_width,
                             *source_height,
-                            self.texture.width(),
-                            self.texture.height(),
+                            // The master: Center means native size on air.
+                            self.master_size.0,
+                            self.master_size.1,
                             *scaling_mode,
                             generator_target,
                             kind.label(),
                             cmd_buffers,
+                            source_within,
+                            // Nida's own pictures, composited premultiplied.
+                            matches!(kind, ExternalSourceKind::Tap),
                         );
                     }
                 }
@@ -786,13 +927,24 @@ impl Deck {
 
                 cmd_buffers.push(copy_encoder.finish());
             }
+            DeckSource::Playlist(list) => {
+                list.render(
+                    audio_data,
+                    modulation,
+                    param_prefix,
+                    cmd_buffers,
+                    generator_target,
+                );
+            }
+            DeckSource::Timer(timer) => timer.render(cmd_buffers, generator_target),
         }
 
         // Apply effect chain (ping-pong between textures)
         let mut read_from_b = source_to_b;
-        for &effect_idx in &enabled_effects {
+        for (run, &effect_idx) in enabled_effects.iter().enumerate() {
             // Accumulate phase times for this effect
             let effect = &mut self.effects[effect_idx];
+            effect.runs += 1;
             let Effect {
                 phase_accumulators,
                 phase_inputs_config,
@@ -830,13 +982,14 @@ impl Deck {
             } else {
                 (&self.texture_view, &self.texture_b_view)
             };
-            self.effects[effect_idx].apply_with_modulation(
+            self.effects[effect_idx].apply_within(
                 context,
                 input_view,
                 output_view,
                 &uniforms,
                 Some(modulation),
                 cmd_buffers,
+                plan[run + 1].as_deref(),
             )?;
             read_from_b = !read_from_b;
         }
@@ -858,6 +1011,221 @@ impl Deck {
         }
 
         Ok(())
+    }
+
+    /// The scissor rectangles each pass draws through this frame — the
+    /// source first, then each effect run — so that between them they get
+    /// right the parts of the frame that show of the deck (see
+    /// [`Deck::set_visible`]); `None` for a pass that draws whole.
+    ///
+    /// Worked back from the last pass: a pointwise effect needs its input in
+    /// the same parts, a transform in the parts it moves them from, and any
+    /// other effect all of it, which leaves every pass before it whole. The
+    /// source draws in parts only when its shader or blit reads nothing of
+    /// its own from before — not a multi-pass or compute shader, a depth
+    /// sensor or a plain colour. Nothing is limited while analyzers read the
+    /// texture, or when `in_parts` is off.
+    fn draw_plan(
+        &self,
+        enabled_effects: &[usize],
+        in_parts: bool,
+        modulation: &ModulationEngine,
+    ) -> Vec<Option<Vec<Pixels>>> {
+        let mut plan = vec![None; enabled_effects.len() + 1];
+        let Some(visible) = self.visible.as_ref().filter(|_| in_parts) else {
+            return plan;
+        };
+        if self.analyzers.has_active_instances() {
+            return plan;
+        }
+        let (width, height) = (self.texture.width(), self.texture.height());
+        let aspect = self.master_size.0 as f32 / self.master_size.1.max(1) as f32;
+        let mut needed: Vec<Area> = visible.clone();
+        for stage in (0..plan.len()).rev() {
+            plan[stage] = scissors_for(&needed, width, height, PART_MARGIN);
+            let Some(&effect) = stage.checked_sub(1).and_then(|i| enabled_effects.get(i)) else {
+                break;
+            };
+            if let Some(input) = self.effects[effect].input_needed(&needed, aspect, modulation) {
+                needed = input;
+            } else {
+                // Everything before it draws whole, as it already stands.
+                break;
+            }
+        }
+        let source_in_parts = match &self.source {
+            DeckSource::Shader { pipeline, .. } => pipeline.num_pass_buffers == 0,
+            DeckSource::Video { .. } | DeckSource::HapVideo { .. } | DeckSource::Image { .. } => {
+                true
+            }
+            DeckSource::ExternalSource { kind, .. } => {
+                !matches!(kind, ExternalSourceKind::DepthSensor(_))
+            }
+            // Mixed from the items' own pictures, whole.
+            DeckSource::SolidColor { .. }
+            | DeckSource::ComputeShader { .. }
+            | DeckSource::Playlist(_)
+            | DeckSource::Timer(_) => false,
+        };
+        if !source_in_parts {
+            plan[0] = None;
+        }
+        plan
+    }
+
+    /// What the pass that draws the source can do of the effects after it,
+    /// when the source is a plain picture — another input, a camera, a
+    /// screen or a stream: a crop (with its border and rounded corners) and
+    /// a move and scale, in that order, first in the chain. The picture is
+    /// then drawn straight into its place (see
+    /// [`crate::renderer::placed_picture`]) rather than whole, then cropped
+    /// whole, then shrunk. A picture-in-picture a third across draws a
+    /// ninth of the frame, once, instead of all of it three times.
+    ///
+    /// A source the deck flattens over black is flattened there too, as the
+    /// blit does it — black bars and see-through parts black — so a layer
+    /// draws the same whether it keeps its source's transparency or not,
+    /// and a Merge's picture of it (see `framing`) ends where the layer is.
+    fn fold(&self, enabled_effects: &[usize], modulation: &ModulationEngine) -> Option<Fold> {
+        let over_black = self.source_draws().ok()?;
+        self.external_source_view.as_ref()?;
+        let fold = self.foldable(enabled_effects, modulation)?;
+        Some(Fold { over_black, ..fold })
+    }
+
+    /// The effects a deck draws, by index. Crop and transform at their
+    /// neutral settings leave every pixel as it was (`render_correctness`
+    /// proves it), so they are not run: every new deck carries both, and on
+    /// anything that moves — video, generators, cameras — each was a
+    /// full-frame pass per frame, ~130 MB at 4K.
+    fn drawn_effects(&self, modulation: &ModulationEngine) -> Vec<usize> {
+        self.effects
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.enabled && !e.is_neutral_framing(modulation) && !e.is_idle_layer_mask()
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The crop, then move and scale, first among `enabled_effects` that the
+    /// pass drawing the source does too (see [`Self::fold`]).
+    fn foldable(&self, enabled_effects: &[usize], modulation: &ModulationEngine) -> Option<Fold> {
+        let crop = enabled_effects
+            .first()
+            .and_then(|&effect| self.effects[effect].plain_crop(modulation));
+        let mut effects = usize::from(crop.is_some());
+        let placement = enabled_effects.get(effects).and_then(|&effect| {
+            let effect = &self.effects[effect];
+            effect
+                .plain_placement(modulation)
+                .map(|(pos, scale)| (pos, scale, effect.flips()))
+        });
+        effects += usize::from(placement.is_some());
+        let (pos, scale, flip) = placement.unwrap_or(([0.0; 2], [1.0; 2], [false; 2]));
+        (effects > 0).then_some(Fold {
+            crop,
+            pos,
+            scale,
+            flip,
+            over_black: 0.0,
+            effects,
+        })
+    }
+
+    /// How the pass drawing a picture into its place (see [`Self::fold`])
+    /// draws this deck's live source as the deck shows it: as it comes (0) —
+    /// its transparency kept, or a picture with none filling the frame — or
+    /// over black (1), as the deck flattens one with see-through parts or
+    /// not filling the frame. Else why it cannot: the source not flat, or
+    /// not live.
+    fn source_draws(&self) -> Result<f32, &'static str> {
+        let DeckSource::ExternalSource {
+            kind,
+            source_width,
+            source_height,
+            scaling_mode,
+            ..
+        } = &self.source
+        else {
+            return Err("not a live input — a picture, clip or generator moves only when drawn alike in both");
+        };
+        if self.analyzers.has_active_instances() {
+            return Err("analysed for modulation");
+        }
+        let opaque = matches!(
+            kind,
+            ExternalSourceKind::Camera(_)
+                | ExternalSourceKind::ScreenCapture(_)
+                | ExternalSourceKind::Srt(_)
+                | ExternalSourceKind::Hls(_)
+                | ExternalSourceKind::Dash(_)
+                | ExternalSourceKind::Rtmp(_)
+        ) && super::fills_the_frame(
+            *scaling_mode,
+            (*source_width, *source_height),
+            self.master_size,
+        );
+        if matches!(kind, ExternalSourceKind::DepthSensor(_)) {
+            return Err("a depth sensor's picture, drawn in 3D");
+        }
+        Ok(if self.transparent || opaque { 0.0 } else { 1.0 })
+    }
+
+    /// This deck's whole picture as one placed draw of its live source — the
+    /// source fitted, then cropped, bordered, moved and scaled — where that
+    /// is all it is: no other effect, nothing modulated, a source drawn as the
+    /// deck shows it — flattened over black where the deck flattens it. What
+    /// a Merge draws a pair showing one source from, at every framing
+    /// between theirs (see `mixer::main_transition`) — known before the
+    /// source is bound, as when a take starts on a deck just added. Else why
+    /// not, for the operator.
+    pub(crate) fn framing(&self, modulation: &ModulationEngine) -> Result<Framing<'_>, &'static str> {
+        let over_black = self.source_draws()?;
+        let DeckSource::ExternalSource {
+            kind,
+            source_width,
+            source_height,
+            scaling_mode,
+            ..
+        } = &self.source
+        else {
+            return Err("not a live input");
+        };
+        let drawn = self.drawn_effects(modulation);
+        let others = "effects other than its crop and Transform, or a crop or Transform modulated, \
+                      masked, inverted, turned or wrapped";
+        let (crop, pos, scale, flip) = if drawn.is_empty() {
+            (None, [0.0; 2], [1.0; 2], [false; 2])
+        } else {
+            let fold = self.foldable(&drawn, modulation).ok_or(others)?;
+            if fold.effects != drawn.len() {
+                return Err(others);
+            }
+            (fold.crop, fold.pos, fold.scale, fold.flip)
+        };
+        // As the deck fits it: the master's size, where Center is native.
+        let (uv_scale, uv_offset) = scaling_mode.compute_uv_transform(
+            *source_width,
+            *source_height,
+            self.master_size.0,
+            self.master_size.1,
+        );
+        Ok(Framing {
+            placed: crate::renderer::placed_picture::Placed {
+                uv_scale,
+                uv_offset,
+                pos,
+                scale,
+                flip,
+                crop,
+                premultiplied: matches!(kind, ExternalSourceKind::Tap),
+                over_black,
+            },
+            source: self.external_source_view.as_ref(),
+            size: (self.texture.width(), self.texture.height()),
+        })
     }
 
     /// Upload analyzer texture data into preprocessor slots.
@@ -916,6 +1284,7 @@ impl Deck {
         preprocessor_views: &[&wgpu::TextureView],
         phase_times: [f32; 4],
         cmd_buffers: &mut Vec<wgpu::CommandBuffer>,
+        within: Option<&[Pixels]>,
     ) {
         let uniforms = ISFUniforms {
             time,
@@ -967,7 +1336,7 @@ impl Deck {
                     view: target_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: keep_or_clear(within, wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -980,7 +1349,7 @@ impl Deck {
 
             render_pass.set_pipeline(&pipeline.pipeline);
             render_pass.set_bind_group(0, &bind_group, &[]);
-            render_pass.draw(0..3, 0..1);
+            draw_within(&mut render_pass, within);
         }
 
         cmd_buffers.push(encoder.finish());
@@ -1326,15 +1695,25 @@ impl Deck {
         generator_target: &wgpu::TextureView,
         label: &str,
         cmd_buffers: &mut Vec<wgpu::CommandBuffer>,
+        within: Option<&[Pixels]>,
+        premultiplied: bool,
     ) {
         // Flagged transparent → REPLACE over a transparent clear, preserving the
         // source's straight alpha (and leaving letterbox transparent). Default →
         // ALPHA_BLENDING over an opaque black clear, flattening to opaque so an
         // HTML source with alpha<1 doesn't punch holes (/spec/html-source.md §2).
-        let (pipeline, clear) = if transparent {
-            (blit_pipeline, wgpu::Color::TRANSPARENT)
+        let (pipeline, load) = if transparent {
+            (
+                blit_pipeline,
+                keep_or_clear(within, wgpu::Color::TRANSPARENT),
+            )
         } else {
-            (blit_pipeline_over_black, wgpu::Color::BLACK)
+            // Blended over black, so black is cleared under the part drawn
+            // too: drawn over last frame's picture it would come out wrong.
+            (
+                blit_pipeline_over_black,
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+            )
         };
 
         let (uv_scale, uv_offset) = scaling_mode.compute_uv_transform(
@@ -1343,7 +1722,7 @@ impl Deck {
             target_width,
             target_height,
         );
-        pipeline.set_uv_transform(&context.queue, 1.0, uv_scale, uv_offset);
+        pipeline.set_uv_transform_of(&context.queue, 1.0, uv_scale, uv_offset, premultiplied);
 
         let bind_group = pipeline.create_bind_group(&context.device, source_view);
         let mut encoder = context
@@ -1358,7 +1737,7 @@ impl Deck {
                     view: generator_target,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear),
+                        load,
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -1368,15 +1747,39 @@ impl Deck {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pipeline.render(&mut render_pass, &bind_group);
+            pipeline.render_within(&mut render_pass, &bind_group, within);
         }
         cmd_buffers.push(encoder.finish());
     }
 
     /// Resize the deck's render targets
+    /// Resize for a master of `width × height`; the deck's own textures come
+    /// out at its render scale of that.
     pub fn resize(&mut self, context: &GpuContext, width: u32, height: u32) {
-        let width = width.max(1);
-        let height = height.max(1);
+        self.master_size = (width, height);
+        // A playlist's items are drawn at the master's size.
+        match &mut self.source {
+            DeckSource::Playlist(list) => list.resize(width, height),
+            // Its numbers are sized and placed against the master.
+            DeckSource::Timer(timer) => timer.resize(width, height),
+            // A tap shows a channel's picture or the master's, the master's
+            // size now: left at the old one, it would fit the new picture as
+            // if it were that size — bars round it, or cut off.
+            DeckSource::ExternalSource {
+                kind: ExternalSourceKind::Tap,
+                source_width,
+                source_height,
+                ..
+            } => {
+                *source_width = width;
+                *source_height = height;
+            }
+            _ => {}
+        }
+        let (width, height) = self.render_scale.apply(width.max(1), height.max(1));
+        // Fresh textures are empty, whatever their size: a still image must
+        // render into them again.
+        self.rendered_still = None;
         // Include COPY_DST so compute shader decks survive resize
         let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
@@ -1428,6 +1831,8 @@ impl Deck {
     /// A failed re-render keeps the existing texture, so the deck goes soft
     /// rather than black.
     fn rerasterize_svg(&mut self, context: &GpuContext, width: u32, height: u32) {
+        // The artwork texture is about to be replaced.
+        self.rendered_still = None;
         let DeckSource::Image {
             texture,
             texture_view,

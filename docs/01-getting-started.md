@@ -2,43 +2,29 @@
 
 ## Install
 
-Download the latest release from the [Releases page](https://github.com/im-knots/varda/releases). All releases bundle FFmpeg and NDI.
+On a Mac, build the release and wrap it in an app:
 
-### macOS (Universal DMG)
+```bash
+cargo build --release --no-default-features --features screen-capture
+scripts/make-local-app.sh --workspace ~/path/to/show --port 8080
+open ~/Applications/Nida.app
+```
 
-1. Download `Varda-macOS-universal.dmg`
-2. Open the DMG and drag **Varda.app** to `/Applications`
-3. Before first launch, open Terminal and run:
-   ```bash
-   xattr -cr /Applications/Varda.app
-   ```
-   This removes the macOS quarantine flag. Varda is not yet signed with an Apple Developer certificate, so Gatekeeper will block it without this step.
-4. Launch Varda — on first run it will prompt for your password to install the `varda` CLI command to `/usr/local/bin/`
+`Nida.app` opens from the Finder or the Dock like any Mac app. The first time,
+macOS asks it for the microphone, the camera, files in folders such as
+Downloads (where a show's media may be), screen recording and the local
+network (NDI) — allow each. Its log is `~/Library/Logs/Nida/nida.log`.
 
-### Linux (Portable Tarball)
+The app is signed without a developer certificate, so after an update macOS
+may ask again. The script's options set the API port, the show's workspace and
+extra shader folders (`--shader-dir`); run it again after each build.
 
-1. Download `Varda-Linux-x86_64.tar.gz`
-2. Extract and run:
-   ```bash
-   tar xzf Varda-Linux-x86_64.tar.gz
-   cd Varda-Linux-x86_64
-   ./varda
-   ```
-   Put the folder anywhere — on a USB drive, in your home directory, wherever. FFmpeg and codec libs are bundled.
-
-### Windows (Portable ZIP)
-
-1. Download `Varda-Windows-x64.zip`
-2. Extract the ZIP to any folder (e.g. `C:\Varda`)
-3. Run `varda.exe`
-
-No installer required. FFmpeg DLLs and shaders are bundled in the ZIP.
-
-> **Note:** Windows may show a SmartScreen warning because the binary is not code-signed. Click **"More info"** then **"Run anyway"**. You may also need the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) if it's not already installed (most Windows 10/11 systems have it).
+Nida is built on [Varda](https://github.com/im-knots/varda); Varda's own
+releases are the original project, without Nida's conference features.
 
 ## Workspace & Content
 
-Varda treats the current directory (or `--workspace` path) as the workspace root. Create a project folder and put your content in it:
+Nida treats the current directory (or `--workspace` path) as the workspace root. Create a project folder and put your content in it:
 
 ```
 my-show/
@@ -59,7 +45,7 @@ Shaders in `shaders/` appear automatically in the Library panel under **Generato
 | **Images** | PNG, JPG/JPEG, BMP, TIFF, TGA, WebP |
 | **Vector** | SVG/SVGZ — redrawn at your render resolution, so it stays sharp at any size |
 
-The table above covers local file content. Varda can also route live and network inputs like cameras, NDI, SRT, HLS, DASH, RTMP, screen and window captures, compute shaders, and more. See [Source Types](02-concepts.md#source-types) for the complete list.
+The table above covers local file content. Nida can also route live and network inputs like cameras, NDI, SRT, HLS, DASH, RTMP, screen and window captures, compute shaders, and more. See [Source Types](02-concepts.md#source-types) for the complete list.
 
 ## Build from Source
 
@@ -121,15 +107,19 @@ cargo run --release
 
 ## UI Layout
 
-![Varda UI](img/screenshot.png)
+![Nida UI](img/screenshot.png)
 
-- **Top bar** — undo, redo, and save on the left. On the right, reading right to left: the **BPM / clock** readout, the **transport position** as timecode, the **📐 render resolution**, and the **🎯 target frame rate**. Each one is clickable and opens its settings.
+- **Top bar** — undo, redo, save and the **🎬** show menu (New, Open, Save As) on the left, then **Arrange**, **Layout**, **STREAM**, **REC** — while live, each with its figures beside it, as OBS's status bar shows them — and the live performance metrics (frame rate against its target, `50/50 FPS`, GPU, CPU, RAM). On the right, reading right to left: the **BPM / clock** readout, the **transport position** as timecode, the **📐 render resolution**, and the **🎯 target frame rate**. Each one is clickable and opens its settings.
+- Below it, **panels** as tabs, arranged by the screen layout — **Classic** (shown), **Broadcast**, **VJ** or your own. See [Screen Layouts](20-layouts.md).
+
+In the Classic layout:
+
 - **Library** (left, toggle with **L**) — content browser: shaders, video, images, cameras, screen capture targets, taps, NDI, SRT, HLS/DASH sources, and presets. See [Library Panel](03-library-panel.md).
-- **Center** — channel/deck grid with mixer crossfader. Toggle to **Stage Editor** for surface drawing.
-- **Right** — the main output preview at the top, then collapsible sections: **🎨 Tonemap** (curve and 3D LUT), **〰 Modulation**, **🎹 MIDI**, **🗺 Stage Layout**, and **📺 Outputs**. Live performance metrics (frame rate, GPU, CPU, RAM) sit at the very bottom.
-- **Bottom** (resizable) — context-sensitive: shows the selected deck's parameters, effect chains, or sequence editor
+- **Channels** (center) — channel/deck grid with mixer crossfader. Toggle to **Stage Editor** for surface drawing.
+- **Main Output**, **Switcher** (the **Rundown** a tab behind it), **Audio Mixer** and **Setup** (right) — the output picture, the buses, the show's steps in order (see [Rundown](25-rundown.md)), the sound, and in Setup: **🎨 Tonemap** (curve and 3D LUT), **〰 Modulation**, **🎹 MIDI**, **🗺 Stage Layout**, and **📺 Outputs**.
+- **Properties** (under the channels) — context-sensitive: shows the selected deck's parameters, effect chains, or sequence editor
 
-All panel dividers are draggable to resize. Left and right panels can be collapsed. Collapsing the right panel keeps the performance metrics visible, stacked down the narrow strip that remains.
+Drag a divider to resize; drag a panel's tab to move it anywhere.
 
 ## Load Content
 
@@ -140,6 +130,60 @@ All panel dividers are draggable to resize. Left and right panels can be collaps
 The shader renders immediately in the deck's preview thumbnail and the main output.
 
 To load **video or images**, use the Video or Image sections in the Library — a file browser opens to select files from your workspace.
+
+### Drop files in from Finder
+
+Drag images, videos, ISF shaders (`.fs`) or whole folders from Finder onto the
+Nida window. While you drag, the place they will land is highlighted with a
+label such as **2 images, 1 video → Ch B**:
+
+- over a **channel column** — they become decks in that channel, placed where
+  the blue line shows: before the card whose upper half you are over, or after
+  the last card;
+- over **Drop here to add channel** — a new channel is made for them;
+- anywhere else — they go to the selected channel (the first channel if none
+  is selected).
+
+Deck cards move the same way: drag a card within its channel or into another
+channel, and it lands at the line — between two cards, at the top, or at the
+end. Generators dragged from the Library do too.
+
+Several files arrive in the order they were dropped, and a folder adds the
+files directly inside it sorted the way Finder sorts them (slide 2 before
+slide 10), so a folder of numbered speaker slides lands in order. Files Nida
+cannot use (PDFs, documents, audio-only files) are skipped and named in a
+notification. Each new deck gets crop and transform, like any other.
+
+Pointing at a channel while dragging needs macOS; on Linux, dropped files go
+to the selected channel.
+
+### Adjusting a deck against the result
+
+Selecting a deck or a channel fills the **bottom bar**. Its left-hand preview
+always shows the **channel's result** — every deck in it composited — so a
+change to any deck is judged against the picture it ends up in, whichever deck
+is selected.
+
+Beside that preview, **Send to** lists every bus with **Cut** and **Fade**
+buttons for the channel: the right-click "Cut to / Fade to" menu, always open.
+Cut puts the channel on that bus now; Fade takes it with the bus's AUTO time.
+A bus name is **red** where the channel is on air and **green** where it waits
+on Preview; a bus already showing it has both buttons greyed out.
+
+To work on one deck, **double-click its card** (or right-click it →
+**Adjust…**, or **Adjust…** in the bottom bar). Its channel's **Input
+Settings** window opens with that deck — that layer — picked: the channel's
+result and its layers down the left, and on the right a preview to drag the
+layer on (Shift-drag or scroll to resize) with its Position, Colour, Key and
+Effects. Double-clicking a channel's name opens the same window on the whole
+channel. See [Input Settings](21-input-settings.md).
+
+## Main mode
+
+For live events, switch to **Main mode…** (top of the mixer's centre
+column): one channel on air at a time, the way vMix works — select it, **Space** cuts, **Enter**
+fades — with overlay channels on top, the channels in one wide row, and
+**+ Channel** to add one. See [Main mode](18-main.md).
 
 ## Add a Second Channel
 
@@ -157,7 +201,7 @@ To load **video or images**, use the Video or Image sections in the Library — 
 
 ## Output to a Display
 
-1. In the right panel, open the **📺 Outputs** section and click **"+ Windowed"** to create a new output window
+1. In the **Setup** panel, open the **📺 Outputs** section and click **"+ Windowed"** to create a new output window
 2. A floating window appears — this is your output
 3. In the output settings, select a **display target** (enumerate monitors from the dropdown)
 4. Click **Fullscreen** to send the output to the selected projector or display
@@ -166,7 +210,7 @@ For rotation, source routing, and multi-output recording, see [Outputs](07-outpu
 
 ## Audio Reactivity
 
-Varda analyzes audio input for beat detection and frequency-band modulation. To get started:
+Nida analyzes audio input for beat detection and frequency-band modulation. To get started:
 
 1. In the **modulation panel** (right sidebar), add an **Audio** modulation source
 2. In the source's **device dropdown**, select the audio input receiving your music feed (line-in, USB interface, etc.)
@@ -192,12 +236,53 @@ Once you have content playing on a display, explore deeper capabilities:
 
 ## Save Your Work
 
-Press **Cmd+S** or click the **💾 Save** button to save the current state. Varda persists:
+Press **Cmd+S** or click the **💾 Save** button to save the current state. Nida persists:
 
 - `scene.json` — your show (channels, decks, effects, modulation)
 - `stage.json` — the venue (surfaces, outputs, warp calibration)
 - `midi.json` — controller mappings
 - `keymap.json` — keyboard shortcuts
+
+Nida also saves the show whenever it closes — its window closed, or Quit
+(⌘Q, or Quit in the Dock).
+
+Saving on air is safe: the show's files are written on a thread of their
+own, so the outputs, the stream and the recording carry on while they are
+written — **💾 “show” saved** says when they are there. (A nearly full disk
+once took half a second over one small file, and every output stood still
+that long.) **Save As** is copied the same way: the show carries on in the
+folder it was saved from until the copy is there, then moves to the new one
+— **💾 Saved as “name”** — and whatever you save meanwhile goes into the new
+show, not the old. A preset, a saved layout and the Recent list are written
+on that thread too.
+
+### Shows: New, Open, Save As
+
+A show is a folder (holding `.varda/`), like one of vMix's presets. The
+**🎬** menu beside **💾 Save** is named after the show open:
+
+- **New show** — a fresh show, as one never set up: two empty inputs,
+  nothing on Main, no outputs (their windows close), the one bus, the sound
+  mixer's Master with no inputs, and the stream, recording and timecode
+  settings as new. The show open is saved first, and the new one gets a
+  folder of its own — **Untitled** (then Untitled 2, …) in `Documents/Nida
+  Shows` — so it can never be saved over the one before. What belongs to the
+  desk comes along: MIDI mappings, keys, OSC, the presets, LUTs and shaders;
+  the size and frame rate stay. It asks before it starts.
+- **Open…** — pick a show's folder. The show open is saved first. The
+  show's screens that are already open stay up as they are (not opened
+  twice), and screens it does not have close; a show made at another size
+  switches Nida to that size.
+- **Open recent** — the shows opened lately.
+- **Save As…** — save the show under a new name (a new folder, or an empty
+  one) and carry on in it; its presets, LUTs and shaders go with it. The
+  show it was before stays as it was. One at a time: a second Save As asked
+  for before the first is there is refused — ask again a moment later.
+- **Show in Finder** — the show's folder.
+
+New and Open are greyed out while the stream or a recording is running:
+opening another show would stop them. Nida opens the show it had open last
+— unless `--workspace` on the command line names one.
 
 ## CLI Flags
 

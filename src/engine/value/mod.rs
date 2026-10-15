@@ -9,9 +9,14 @@
 //! types from here directly rather than reaching into `internal`.
 //!
 //! See /spec/engine-value-types.md
+pub mod camera;
 pub mod detect;
 pub mod dome;
+pub mod led;
+pub mod mask;
+pub mod playlist;
 pub mod render;
 pub mod surface;
+pub mod timer;
 pub mod video;
 pub mod warp;

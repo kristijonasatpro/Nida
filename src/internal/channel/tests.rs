@@ -319,7 +319,8 @@ fn render_updates_timing_fields() {
     let gpu = headless_gpu();
     let mut ch = test_channel(&gpu, "Test");
     add_solid_deck(&mut ch, &gpu, [1.0, 0.0, 0.0, 1.0]);
-    add_solid_deck(&mut ch, &gpu, [0.0, 1.0, 0.0, 1.0]);
+    // Translucent: an opaque deck on top would hide the one below.
+    add_solid_deck(&mut ch, &gpu, [0.0, 1.0, 0.0, 0.5]);
 
     let audio = crate::audio::AudioData::default();
     let modulation = crate::modulation::ModulationEngine::new();
@@ -333,6 +334,7 @@ fn render_updates_timing_fields() {
         60,
         2,
         1.0,
+        false,
         &mut Vec::new(),
         None,
         None,
@@ -343,6 +345,62 @@ fn render_updates_timing_fields() {
     assert!(ch.render_time_ms > 0.0);
     // Both decks are active (opacity 1.0, not muted)
     assert_eq!(ch.active_deck_count, 2);
+}
+
+/// Render one frame of `ch` with nothing else going on.
+fn render_once(ch: &mut Channel, gpu: &GpuContext) {
+    let audio = crate::audio::AudioData::default();
+    let modulation = crate::modulation::ModulationEngine::new();
+    ch.render(
+        gpu,
+        &audio,
+        &modulation,
+        0,
+        0.0,
+        1.0 / 60.0,
+        60,
+        2,
+        1.0,
+        false,
+        &mut Vec::new(),
+        None,
+        None,
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_deck_hidden_under_one_covering_the_frame_is_not_rendered() {
+    // A generator under a full-screen picture: nothing of it shows, and at
+    // 4K it cost a whole frame. Here a solid stands in for both.
+    let gpu = headless_gpu();
+    let mut ch = test_channel(&gpu, "Test");
+    add_solid_deck(&mut ch, &gpu, [1.0, 0.0, 0.0, 1.0]);
+    add_solid_deck(&mut ch, &gpu, [0.0, 0.0, 1.0, 1.0]);
+    render_once(&mut ch, &gpu);
+    assert_eq!(ch.active_deck_count, 1, "only the covering deck renders");
+    assert_eq!(ch.composited_deck_count, 1);
+
+    // Uncovered, it renders again.
+    ch.decks[1].opacity = 0.5;
+    render_once(&mut ch, &gpu);
+    assert_eq!(ch.active_deck_count, 2);
+}
+
+#[test]
+fn a_hidden_deck_shown_on_its_own_elsewhere_still_renders() {
+    let gpu = headless_gpu();
+    let mut ch = test_channel(&gpu, "Test");
+    add_solid_deck(&mut ch, &gpu, [1.0, 0.0, 0.0, 1.0]);
+    add_solid_deck(&mut ch, &gpu, [0.0, 0.0, 1.0, 1.0]);
+    // Alone on a bus, say: its own picture has to keep up.
+    ch.shown_alone = vec![ch.decks[0].deck.uuid().to_string()];
+    render_once(&mut ch, &gpu);
+    assert_eq!(ch.active_deck_count, 2);
+    assert_eq!(
+        ch.composited_deck_count, 1,
+        "still hidden in the channel's own picture"
+    );
 }
 
 #[test]
@@ -365,6 +423,7 @@ fn muted_decks_not_counted_as_active() {
         60,
         2,
         1.0,
+        false,
         &mut Vec::new(),
         None,
         None,
@@ -394,6 +453,7 @@ fn zero_opacity_decks_not_counted_as_active() {
         60,
         2,
         1.0,
+        false,
         &mut Vec::new(),
         None,
         None,
@@ -424,6 +484,7 @@ fn render_time_smooths_over_frames() {
             60,
             2,
             1.0,
+            false,
             &mut Vec::new(),
             None,
             None,
@@ -444,6 +505,7 @@ fn render_time_smooths_over_frames() {
             60,
             2,
             1.0,
+            false,
             &mut Vec::new(),
             None,
             None,
@@ -475,6 +537,7 @@ fn empty_channel_render_timing() {
         60,
         2,
         1.0,
+        false,
         &mut Vec::new(),
         None,
         None,
@@ -516,6 +579,7 @@ fn deck_fps_becomes_positive_after_renders() {
             60,
             2,
             1.0,
+            false,
             &mut Vec::new(),
             None,
             None,
@@ -551,6 +615,7 @@ fn deck_fps_ignores_huge_first_frame_delta() {
         60,
         2,
         1.0,
+        false,
         &mut Vec::new(),
         None,
         None,
@@ -570,7 +635,8 @@ fn multiple_decks_have_independent_fps() {
     let gpu = headless_gpu();
     let mut ch = test_channel(&gpu, "Test");
     add_solid_deck(&mut ch, &gpu, [1.0, 0.0, 0.0, 1.0]);
-    add_solid_deck(&mut ch, &gpu, [0.0, 1.0, 0.0, 1.0]);
+    // Translucent, so the deck below is not hidden (and not rendered).
+    add_solid_deck(&mut ch, &gpu, [0.0, 1.0, 0.0, 0.5]);
 
     let audio = crate::audio::AudioData::default();
     let modulation = crate::modulation::ModulationEngine::new();
@@ -586,6 +652,7 @@ fn multiple_decks_have_independent_fps() {
             60,
             2,
             1.0,
+            false,
             &mut Vec::new(),
             None,
             None,
@@ -621,6 +688,7 @@ fn skipped_deck_keeps_old_fps() {
             60,
             2,
             1.0,
+            false,
             &mut Vec::new(),
             None,
             None,
@@ -641,6 +709,7 @@ fn skipped_deck_keeps_old_fps() {
         60,
         2,
         1.0,
+        false,
         &mut Vec::new(),
         None,
         None,
@@ -650,4 +719,40 @@ fn skipped_deck_keeps_old_fps() {
     // FPS should remain unchanged (deck wasn't rendered, no EMA update)
     let fps_after = ch.decks[0].deck.fps();
     assert!((fps_before - fps_after).abs() < 1e-5);
+}
+
+// ── Auto deck skipping ─────────────────────────────────────────────
+
+/// A dozen decks share a 60 fps frame: 1.39 ms each. One costing more
+/// than its share is still drawn every frame while the frame as a whole
+/// keeps its time — skipping it made a moving picture stutter on Preview
+/// with the frame well within its time.
+#[test]
+fn a_deck_over_its_share_is_drawn_every_frame_while_the_frame_keeps_its_time() {
+    let share = 1_000_000.0 / 60.0 / 12.0;
+    for frame in 0..12 {
+        assert!(super::auto_draws(2000.0, share, false, frame), "frame {frame}");
+    }
+}
+
+/// Only when the frame runs over is an expensive deck drawn less often:
+/// every Nth frame, N its cost over its share, rounded up.
+#[test]
+fn an_expensive_deck_is_drawn_less_often_only_when_the_frame_runs_over() {
+    let share = 1_000_000.0 / 60.0 / 12.0;
+    let drawn: Vec<u32> = (0..9)
+        .filter(|&frame| super::auto_draws(3000.0, share, true, frame))
+        .collect();
+    assert_eq!(drawn, [0, 3, 6], "every third frame");
+    assert!(
+        (0..6).all(|frame| super::auto_draws(1000.0, share, true, frame)),
+        "a deck within its share is drawn every frame"
+    );
+}
+
+#[test]
+fn decks_run_over_a_frames_time_only_together() {
+    assert!(!super::decks_over_budget([1500.0; 10], 60), "15 ms of 16.7");
+    assert!(super::decks_over_budget([1500.0; 12], 60), "18 ms of 16.7");
+    assert!(!super::decks_over_budget([50_000.0], 0), "uncapped: no budget");
 }

@@ -171,6 +171,7 @@ fn cross_channel_move_preserves_addressability() {
         EngineCommand::MoveDeck {
             deck_uuid: deck.clone(),
             dst_channel_uuid: ch1.clone(),
+            before_deck_uuid: None,
         },
     );
     fire(
@@ -349,9 +350,22 @@ fn effect_removal_does_not_repoint_a_pending_write() {
 
     let state = app.build_engine_state();
     let chain = &state.mixer.channels[0].decks[0].effects;
-    assert_eq!(chain.len(), 1);
-    assert_eq!(chain[0].uuid, effects[1]);
-    assert!(!chain[0].enabled, "toggle hit the wrong effect");
+    assert!(
+        !chain.iter().any(|e| e.uuid == effects[0]),
+        "the removed effect is gone"
+    );
+    let survivor = chain
+        .iter()
+        .find(|e| e.uuid == effects[1])
+        .expect("the other effect stays");
+    assert!(!survivor.enabled, "toggle hit the wrong effect");
+    assert!(
+        chain
+            .iter()
+            .filter(|e| e.uuid != effects[1])
+            .all(|e| e.enabled),
+        "and nothing else was toggled"
+    );
 }
 
 // ── Sequences ──────────────────────────────────────────────────────

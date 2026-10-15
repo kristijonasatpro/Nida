@@ -55,7 +55,8 @@ fn timebase_selector(
 // Waveform/envelope plotting uses t/x/y, the idiomatic names for this math.
 #[allow(clippy::many_single_char_names)]
 pub(super) fn render_modulation_section(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
-    ui.horizontal(|ui| {
+    // Wrapped: the panel can be docked narrow.
+    ui.horizontal_wrapped(|ui| {
         if ui.button("➕ LFO").clicked() {
             actions.commands.push(EngineCommand::AddLfo {
                 waveform: LFOWaveform::Sine,

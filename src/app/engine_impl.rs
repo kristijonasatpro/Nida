@@ -22,6 +22,9 @@ use crate::modulation::ModulationSource;
 
 use anyhow::{Context as _, Result};
 
+/// Effects every new deck starts with, in chain order. See `add_default_effects`.
+const DEFAULT_DECK_EFFECTS: [&str; 2] = ["crop", "transform"];
+
 /// Sanitize a float to the 0.0..=1.0 range with a fallback for NaN/Inf.
 /// Used at every command boundary that accepts a unit-range float.
 #[inline]
@@ -34,6 +37,53 @@ fn sanitize_unit(value: f32, fallback: f32) -> f32 {
 }
 
 impl VardaApp {
+    /// Cut the layer `deck_uuid`'s own mask, or take it away (see
+    /// [`EngineCommand::SetLayerMask`]): the UUID of the effect carrying it,
+    /// empty once none does.
+    ///
+    /// [`EngineCommand::SetLayerMask`]: crate::engine::EngineCommand::SetLayerMask
+    pub(crate) fn set_layer_mask(
+        &mut self,
+        deck_uuid: &str,
+        mask: Option<crate::engine::value::mask::EffectMask>,
+    ) -> Result<String> {
+        use crate::engine::value::mask::LAYER_MASK_EFFECT;
+        let (ch, dk) = self.resolve_deck(deck_uuid)?;
+        let carrier = self.layer_mask_carrier(ch, dk);
+        let Some(mask) = mask else {
+            // Every one: a carrier left without a mask would do nothing, but
+            // one with a mask would still cut.
+            while let Some(uuid) = self.layer_mask_carrier(ch, dk) {
+                self.remove_effect(&uuid)?;
+            }
+            return Ok(String::new());
+        };
+        let uuid = match carrier {
+            Some(uuid) => uuid,
+            None => self.add_effect(EffectTarget::Deck(deck_uuid.to_string()), LAYER_MASK_EFFECT)?,
+        };
+        let location = self.resolve_effect(&uuid)?;
+        if let Some(effect) = self.mixer.effect_at_mut(location) {
+            effect.mask = Some(mask);
+        }
+        Ok(uuid)
+    }
+
+    /// The effect carrying the layer at `(ch, dk)`'s own mask, if any.
+    fn layer_mask_carrier(&self, ch: usize, dk: usize) -> Option<String> {
+        self.mixer
+            .channels()
+            .get(ch)
+            .and_then(|c| c.decks.get(dk))
+            .and_then(|slot| {
+                slot.deck
+                    .effects
+                    .iter()
+                    .find(|e| e.shader.name() == crate::engine::value::mask::LAYER_MASK_EFFECT)
+                    .map(|e| e.uuid().to_owned())
+            })
+    }
+
     /// Post-construction wiring every new shader deck needs before it joins a
     /// channel: start its CPU analyzers and acquire any device its
     /// `PREPROCESSORS` block requires.
@@ -48,6 +98,7 @@ impl VardaApp {
     /// Returns `Err` when a required preprocessor cannot be satisfied; the
     /// caller must discard the deck and surface the message.
     pub(crate) fn finalize_new_deck(&mut self, deck: &mut Deck) -> Result<()> {
+        self.add_default_effects(deck);
         deck.ensure_preprocessor_analyzers(&self.analyzer_registry);
         let Some(metadata) = deck.shader().map(|s| s.metadata.clone()) else {
             return Ok(());
@@ -62,6 +113,28 @@ impl VardaApp {
             );
         }
         Ok(())
+    }
+
+    /// Give a newly made deck the effects every deck starts with — crop, then
+    /// transform, both identity at their defaults — so framing a source is
+    /// always one click away rather than a trip to the effect library.
+    ///
+    /// Only for decks made new: a deck restored from a show, a preset, or a
+    /// duplicate keeps exactly the chain it was saved with. Best effort — a
+    /// shader library without one of these leaves it out rather than failing
+    /// the deck.
+    pub(crate) fn add_default_effects(&self, deck: &mut Deck) {
+        let filters = self.registry.filters();
+        for name in DEFAULT_DECK_EFFECTS {
+            let Some(shader) = filters.iter().find(|s| s.name() == name) else {
+                log::warn!("Default effect '{name}' is not in the shader library");
+                continue;
+            };
+            match Effect::new(&self.context, (*shader).clone()) {
+                Ok(effect) => deck.add_effect(effect),
+                Err(e) => log::warn!("Default effect '{name}' could not be built: {e}"),
+            }
+        }
     }
 
     /// Acquire the depth sensor a shader's `PREPROCESSORS` block requires.
@@ -174,9 +247,10 @@ impl MixerCommands for VardaApp {
 
     fn add_image_deck(&mut self, channel_uuid: &str, path: &std::path::Path) -> Result<String> {
         let channel_idx = self.resolve_channel(channel_uuid)?;
-        let deck =
+        let mut deck =
             Deck::new_from_image(&self.context, path, self.render_width, self.render_height)?;
         let uuid = deck.uuid().to_string();
+        self.add_default_effects(&mut deck);
         let ch = self
             .mixer
             .channel_mut(channel_idx)
@@ -189,9 +263,10 @@ impl MixerCommands for VardaApp {
 
     fn add_video_deck(&mut self, channel_uuid: &str, path: &std::path::Path) -> Result<String> {
         let channel_idx = self.resolve_channel(channel_uuid)?;
-        let deck =
+        let mut deck =
             Deck::new_from_video(&self.context, path, self.render_width, self.render_height)?;
         let uuid = deck.uuid().to_string();
+        self.add_default_effects(&mut deck);
         let ch = self
             .mixer
             .channel_mut(channel_idx)
@@ -204,9 +279,10 @@ impl MixerCommands for VardaApp {
 
     fn add_solid_color_deck(&mut self, channel_uuid: &str, color: [f32; 4]) -> Result<String> {
         let channel_idx = self.resolve_channel(channel_uuid)?;
-        let deck =
+        let mut deck =
             Deck::new_solid_color(&self.context, color, self.render_width, self.render_height)?;
         let uuid = deck.uuid().to_string();
+        self.add_default_effects(&mut deck);
         let ch = self
             .mixer
             .channel_mut(channel_idx)
@@ -217,7 +293,12 @@ impl MixerCommands for VardaApp {
         Ok(uuid)
     }
 
-    fn add_camera_deck(&mut self, channel_uuid: &str, camera_id: CameraId) -> Result<String> {
+    fn add_camera_deck(
+        &mut self,
+        channel_uuid: &str,
+        camera_id: CameraId,
+        mode: Option<crate::engine::value::camera::CameraMode>,
+    ) -> Result<String> {
         let channel_idx = self.resolve_channel(channel_uuid)?;
         let cam_name = self
             .camera_manager
@@ -225,10 +306,10 @@ impl MixerCommands for VardaApp {
             .iter()
             .find(|d| d.id == camera_id)
             .map_or_else(|| format!("Camera {camera_id}"), |d| d.name.clone());
-        let (src_w, src_h) = self
-            .camera_manager
-            .open_camera(camera_id, &self.context.device)?;
-        let deck = Deck::new_from_camera(
+        let (src_w, src_h) =
+            self.camera_manager
+                .open_camera(camera_id, &self.context.device, mode)?;
+        let mut deck = Deck::new_from_camera(
             &self.context,
             camera_id,
             &cam_name,
@@ -237,7 +318,11 @@ impl MixerCommands for VardaApp {
             self.render_width,
             self.render_height,
         )?;
+        deck.camera_mode = mode;
+        deck.camera_device = self.camera_manager.unique_id(camera_id).map(str::to_string);
+        self.read_as_its_camera_is(&mut deck);
         let uuid = deck.uuid().to_string();
+        self.add_default_effects(&mut deck);
         let ch = self
             .mixer
             .channel_mut(channel_idx)
@@ -287,7 +372,7 @@ impl MixerCommands for VardaApp {
             .screen_capture_manager
             .open(&info, config.clone(), &self.context.device)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let deck = Deck::new_from_screen_capture(
+        let mut deck = Deck::new_from_screen_capture(
             &self.context,
             crate::deck::ScreenCaptureState {
                 capture_id,
@@ -303,6 +388,7 @@ impl MixerCommands for VardaApp {
         )
         .inspect_err(|_| self.screen_capture_manager.release(capture_id))?;
         let uuid = deck.uuid().to_string();
+        self.add_default_effects(&mut deck);
         let ch = self
             .mixer
             .channel_mut(channel_idx)
@@ -323,7 +409,7 @@ impl MixerCommands for VardaApp {
         let channel_idx = self.resolve_channel(channel_uuid)?;
         let tap_source = crate::deck::TapSource::from(source);
         let label = tap_source.label(&self.channel_labels());
-        let deck = Deck::new_from_tap(
+        let mut deck = Deck::new_from_tap(
             &self.context,
             tap_source,
             &label,
@@ -331,6 +417,12 @@ impl MixerCommands for VardaApp {
             self.render_height,
         )?;
         let uuid = deck.uuid().to_string();
+        self.add_default_effects(&mut deck);
+        // Another input as a layer shows what is under it wherever that input
+        // is clear, as the input does on air.
+        if matches!(source, crate::scene::TapSourceConfig::Channel { .. }) {
+            deck.set_transparent(true);
+        }
         let ch = self
             .mixer
             .channel_mut(channel_idx)
@@ -378,7 +470,7 @@ impl MixerCommands for VardaApp {
             depth_sensor_id,
             &self.context.device,
         )?;
-        let deck = Deck::new_from_depth_sensor(
+        let mut deck = Deck::new_from_depth_sensor(
             &self.context,
             depth_sensor_id,
             &name,
@@ -388,6 +480,7 @@ impl MixerCommands for VardaApp {
             self.render_height,
         )?;
         let uuid = deck.uuid().to_string();
+        self.add_default_effects(&mut deck);
         let ch = self
             .mixer
             .channel_mut(channel_idx)
@@ -399,33 +492,37 @@ impl MixerCommands for VardaApp {
 
     fn remove_deck(&mut self, deck_uuid: &str) -> Result<()> {
         let (channel_idx, deck_idx) = self.resolve_deck(deck_uuid)?;
-        // Release external resources before removal
-        if let Some(ch) = self.mixer.channels().get(channel_idx) {
-            if let Some(slot) = ch.decks.get(deck_idx) {
-                if let Some(cam_id) = slot.deck.camera_id() {
-                    self.camera_manager.release_camera(cam_id);
-                }
-                // Depth sensors were missing from this teardown, so the capture
-                // thread and USB handle outlived the last deck that used them.
-                // Covers both point-cloud sources and shader preprocessors.
-                // See spec/depth-sensors.md § Known defect.
-                for sensor_id in slot.deck.held_depth_sensors() {
-                    self.depth_manager.release(sensor_id);
-                }
-                if let Some(capture_id) = slot.deck.screen_capture_id() {
-                    self.screen_capture_manager.release(capture_id);
-                }
-                if let Some(idx) = slot.deck.srt_receiver_idx() {
-                    self.external_io.stream_manager.stop_receive(idx);
-                }
-                if let Some(idx) = slot.deck.ndi_receiver_idx() {
-                    self.external_io.ndi_manager.stop_receive(idx);
-                }
-                #[cfg(target_os = "macos")]
-                if let Some(idx) = slot.deck.syphon_client_idx() {
-                    self.external_io.syphon_manager.stop_receive(idx);
-                }
-            }
+        // Release external resources before removal. The held identifiers are
+        // read out first so the mixer borrow ends before the managers are
+        // touched.
+        //
+        // Reconciled against every other live deck, not released outright: a
+        // stream receiver is shared by URL, so stopping it because *this* deck
+        // is going away would freeze another deck that is on air from the same
+        // feed. See `HeldResources::minus`.
+        let held = self
+            .mixer
+            .channels()
+            .get(channel_idx)
+            .and_then(|ch| ch.decks.get(deck_idx))
+            .map(|slot| crate::app::HeldResources::of(&slot.deck));
+        if let Some(held) = held {
+            let survivors: Vec<crate::app::HeldResources> = self
+                .mixer
+                .channels()
+                .iter()
+                .enumerate()
+                .flat_map(|(c, ch)| {
+                    ch.decks
+                        .iter()
+                        .enumerate()
+                        .map(move |(d, slot)| (c, d, slot))
+                })
+                .filter(|(c, d, _)| !(*c == channel_idx && *d == deck_idx))
+                .map(|(_, _, slot)| crate::app::HeldResources::of(&slot.deck))
+                .collect();
+            let still_held = crate::app::HeldResources::union(&survivors);
+            self.release_held_resources(held.minus(&still_held));
         }
         let ch = self
             .mixer
@@ -440,6 +537,10 @@ impl MixerCommands for VardaApp {
             .collect();
         ch.remove_deck(deck_idx);
         log::info!("Removed deck {deck_uuid} from channel {channel_idx}");
+        // Deleted for good: no bus keeps it (see `BusBank::forget`), and no
+        // rundown step.
+        self.production_buses.forget(deck_uuid);
+        self.rundown_forget_source(deck_uuid);
         self.mixer
             .modulation_mut()
             .remove_assignments_with_prefix(&format!("deck_{deck_uuid}:"));
@@ -451,24 +552,46 @@ impl MixerCommands for VardaApp {
         // A lane is where this deck sits in show time, so it leaves with the
         // deck. See /spec/arrangement.md § A lane is a deck.
         self.drop_lane(deck_uuid);
+        // So does a camera's sound, added with it.
+        self.audio_mix.remove_inputs_of_deck(deck_uuid);
         Ok(())
     }
 
-    fn move_deck(&mut self, deck_uuid: &str, dst_channel_uuid: &str) -> Result<()> {
+    fn move_deck(
+        &mut self,
+        deck_uuid: &str,
+        dst_channel_uuid: &str,
+        before_deck_uuid: Option<&str>,
+    ) -> Result<()> {
         let (src_ch, src_deck) = self.resolve_deck(deck_uuid)?;
         let dst_ch = self.resolve_channel(dst_channel_uuid)?;
-        if src_ch == dst_ch {
+        if let Some(before) = before_deck_uuid {
+            let in_dst = self.mixer.channels()[dst_ch]
+                .decks
+                .iter()
+                .any(|s| s.deck.uuid() == before);
+            if !in_dst {
+                return Err(super::resolve::UnknownEntity {
+                    kind: "deck",
+                    uuid: before.to_string(),
+                }
+                .into());
+            }
+            if before == deck_uuid {
+                return Ok(());
+            }
+        } else if src_ch == dst_ch && src_deck + 1 == self.mixer.channels()[src_ch].decks.len() {
+            // Already at the end.
             return Ok(());
         }
         let channels = self.mixer.channels_mut();
-        // Two mutable borrows into different vec elements require raw indexing
-        // (split_at_mut or index — Rust's borrow checker doesn't allow two
-        //  channel_mut() calls in the same scope)
         let Some(slot) = channels[src_ch].remove_deck_slot(src_deck) else {
             anyhow::bail!("deck '{deck_uuid}' vanished during move");
         };
-        channels[dst_ch].add_deck_slot(slot);
-        log::info!("Moved deck {deck_uuid} from ch{src_ch} to ch{dst_ch}");
+        // The anchor's position is read after the removal, which shifts it
+        // when the deck moves within its own channel.
+        let at = channels[dst_ch].insert_deck_slot_before(slot, before_deck_uuid);
+        log::info!("Moved deck {deck_uuid} from ch{src_ch} to ch{dst_ch} position {at}");
         Ok(())
     }
 
@@ -575,7 +698,25 @@ impl MixerCommands for VardaApp {
             .iter()
             .map(|effect| effect.uuid().to_string())
             .collect();
-        for uuid in decks {
+        // Layers elsewhere showing it (another input as a layer) go with it:
+        // left, one had nothing to show but kept its border, drawn where the
+        // picture was. The same undo brings them back.
+        let showing: Vec<String> = self
+            .mixer
+            .channels()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != channel_idx)
+            .flat_map(|(_, ch)| &ch.decks)
+            .filter(|slot| {
+                matches!(
+                    slot.deck.tap.as_ref().map(|t| &t.source),
+                    Some(crate::deck::TapSource::Channel(uuid)) if uuid == channel_uuid
+                )
+            })
+            .map(|slot| slot.deck.uuid().to_string())
+            .collect();
+        for uuid in decks.into_iter().chain(showing) {
             if let Err(e) = self.remove_deck(&uuid) {
                 log::warn!("Removing deck {uuid} with its channel: {e}");
             }
@@ -592,6 +733,10 @@ impl MixerCommands for VardaApp {
             .remove_assignments_with_prefix(&format!("ch_{channel_uuid}:"));
 
         if self.mixer.remove_channel(channel_idx) {
+            // Deleted for good: no bus keeps it (see `BusBank::forget`); its
+            // decks went through `remove_deck`, which let go of each.
+            self.production_buses.forget(channel_uuid);
+            self.rundown_forget_source(channel_uuid);
             // Selection fixup is handled by the UI consumer (UIRunner)
             Ok(())
         } else {
@@ -601,6 +746,19 @@ impl MixerCommands for VardaApp {
 
     fn add_effect(&mut self, target: EffectTarget, shader_name: &str) -> Result<String> {
         let chain = self.resolve_effect_target(&target)?;
+        if let EffectChain::Deck {
+            channel_idx,
+            deck_idx,
+        } = chain
+        {
+            if shader_name == crate::engine::value::mask::LAYER_MASK_EFFECT
+                && self.layer_mask_carrier(channel_idx, deck_idx).is_some()
+            {
+                anyhow::bail!(
+                    "A layer has one mask of its own: set it with PUT /api/decks/{{uuid}}/mask"
+                );
+            }
+        }
         let filters = self.registry.filters();
         let shader = filters
             .iter()
@@ -760,6 +918,19 @@ impl MixerCommands for VardaApp {
         }
         let effect = effects.remove(from_idx);
         effects.insert(to_idx, effect);
+        if let EffectChain::Deck {
+            channel_idx,
+            deck_idx,
+        } = chain
+        {
+            if let Some(slot) = self
+                .mixer
+                .channel_mut(channel_idx)
+                .and_then(|c| c.decks.get_mut(deck_idx))
+            {
+                slot.deck.settle_layer_mask();
+            }
+        }
         Ok(())
     }
 
@@ -1197,12 +1368,18 @@ impl OutputCommands for VardaApp {
     fn close_output(&mut self, output_uuid: &str) -> Result<()> {
         let idx = self.resolve_output(output_uuid)?;
         let name = self.output.outputs[idx].name().to_string();
-        // Stop active subprocess before removing to release ports/resources
+        // Stop active subprocess before removing to release ports/resources,
+        // and its sound subscription, which the capture would go on feeding.
+        let mut passthrough = None;
         if let crate::renderer::context::UnifiedOutput::Headless(h) = &mut self.output.outputs[idx]
         {
             if let Some(mut sub) = h.subprocess.take() {
                 sub.stop();
             }
+            passthrough = h.audio_pcm.take();
+        }
+        if let Some(pass) = passthrough {
+            pass.release(&mut self.audio_manager);
         }
         let removed = self.output.outputs.remove(idx);
         if let crate::renderer::context::UnifiedOutput::Window(w) = removed {
@@ -1214,13 +1391,8 @@ impl OutputCommands for VardaApp {
 
     fn set_output_display(&mut self, output_uuid: &str, monitor_name: &str) -> Result<()> {
         let idx = self.resolve_output(output_uuid)?;
-        let Some((mi, (_, handle))) = self
-            .output
-            .cached_monitors
-            .iter()
-            .enumerate()
-            .find(|(_, (name, _))| name == monitor_name)
-            .map(|(mi, (n, h))| (mi, (n.clone(), h.clone())))
+        let Some((mi, handle)) = super::monitors::find(&self.output.cached_monitors, monitor_name)
+            .map(|(mi, h)| (mi, h.clone()))
         else {
             anyhow::bail!("No monitor named '{monitor_name}'");
         };
@@ -1264,10 +1436,14 @@ impl OutputQueries for VardaApp {
                             }
                         })
                         .collect();
-                    let (target, is_on_display, is_active, calibration_mode, audio_passthrough, delivery) =
+                    let (target, target_label, is_on_display, is_active, calibration_mode, audio_passthrough, delivery) =
                         match o {
+                            // The configured target, so a client that writes it back
+                            // keeps a waiting output waiting; `is_on_display` says
+                            // whether it has actually got there.
                             UnifiedOutput::Window(w) => (
-                                w.target.clone(),
+                                w.configured_target(),
+                                w.target_label(),
                                 matches!(w.target, OutputTarget::Display { .. }),
                                 false,
                                 w.calibration_mode,
@@ -1277,11 +1453,7 @@ impl OutputQueries for VardaApp {
                             UnifiedOutput::Headless(h) => {
                                 let audio =
                                     h.audio_pcm.as_ref().map(|p| AudioPassthroughSnapshot {
-                                        device: h
-                                            .target
-                                            .audio_device()
-                                            .unwrap_or_default()
-                                            .to_string(),
+                                        device: p.label.clone(),
                                         frames_written: h
                                             .subprocess
                                             .as_deref()
@@ -1300,9 +1472,10 @@ impl OutputQueries for VardaApp {
                                 });
                                 (
                                     h.target.clone(),
+                                    h.target.to_string(),
                                     false,
                                     h.active,
-                                    crate::renderer::context::CalibrationMode::Off,
+                                    h.calibration_mode,
                                     audio,
                                     delivery,
                                 )
@@ -1311,7 +1484,7 @@ impl OutputQueries for VardaApp {
                     OutputWindowSnapshot {
                         uuid: o.uuid().to_string(),
                         name: o.name().to_string(),
-                        target_label: format!("{target}"),
+                        target_label,
                         target,
                         is_on_display,
                         is_active,
@@ -1321,6 +1494,8 @@ impl OutputQueries for VardaApp {
                         resolved_presentation: o.resolved_presentation().clone(),
                         audio_passthrough,
                         delivery,
+                        source: o.source().cloned(),
+                        led: o.led().cloned(),
                     }
                 })
                 .collect(),
@@ -1345,21 +1520,38 @@ impl OutputQueries for VardaApp {
                     hole_contours: s.hole_contours.clone(),
                 })
                 .collect(),
-            monitors: self
-                .output
-                .cached_monitors
-                .iter()
-                .enumerate()
-                .map(|(i, (name, handle))| {
-                    let size = handle.size();
-                    MonitorSnapshot {
-                        name: name.clone(),
-                        index: i,
-                        width: size.width,
-                        height: size.height,
-                    }
-                })
-                .collect(),
+            monitors: {
+                let keys: Vec<String> =
+                    self.output.cached_monitors.iter().map(|(n, _)| n.clone()).collect();
+                let sizes: Vec<(u32, u32)> = (0..keys.len())
+                    .map(|i| {
+                        let size = self.output.monitor_sizes.get(i).copied().unwrap_or_default();
+                        (size.width, size.height)
+                    })
+                    .collect();
+                let facts = &self.output.screen_facts;
+                let labels =
+                    super::screens::labels(&keys, facts, &self.output.screen_names, &sizes);
+                keys.into_iter()
+                    .zip(labels)
+                    .enumerate()
+                    .map(|(i, (name, label))| {
+                        let fact = facts.get(i);
+                        MonitorSnapshot {
+                            name,
+                            index: i,
+                            width: sizes[i].0,
+                            height: sizes[i].1,
+                            label,
+                            model: fact.and_then(|f| f.model.clone()),
+                            given_name: fact
+                                .and_then(|f| self.output.screen_names.get(&f.identity))
+                                .map(str::to_string),
+                            refresh_hz: fact.and_then(|f| f.refresh_hz),
+                        }
+                    })
+                    .collect()
+            },
         }
     }
 }
@@ -1526,7 +1718,7 @@ impl DetectCommands for VardaApp {
         let was_inactive = !self.camera_manager.is_active(camera_id);
         if was_inactive {
             self.camera_manager
-                .open_camera(camera_id, &self.context.device)
+                .open_camera(camera_id, &self.context.device, None)
                 .map_err(|e| {
                     crate::surface::import::ImportError::ImageLoad(format!(
                         "Failed to open camera {camera_id}: {e}"
@@ -1841,7 +2033,7 @@ mod tests {
         let deck = app
             .add_solid_color_deck(&ch0, [1.0, 0.0, 0.0, 1.0])
             .unwrap();
-        let result = app.move_deck(&deck, &ch0);
+        let result = app.move_deck(&deck, &ch0, None);
         assert!(result.is_ok());
         // Deck should still be in channel 0
         let snap = app.mixer_snapshot();
@@ -1854,7 +2046,7 @@ mod tests {
             return;
         };
         let ch0 = channel_uuid(&app, 0);
-        assert!(app.move_deck("nosuchdk", &ch0).is_err());
+        assert!(app.move_deck("nosuchdk", &ch0, None).is_err());
     }
 
     #[test]
@@ -1866,7 +2058,7 @@ mod tests {
         let deck = app
             .add_solid_color_deck(&ch0, [1.0, 0.0, 0.0, 1.0])
             .unwrap();
-        assert!(app.move_deck(&deck, "nosuchch").is_err());
+        assert!(app.move_deck(&deck, "nosuchch", None).is_err());
         assert_eq!(app.mixer_snapshot().channels[0].decks.len(), 1);
     }
 
@@ -1884,11 +2076,69 @@ mod tests {
         assert_eq!(snap.channels[0].decks.len(), 1);
         assert_eq!(snap.channels[1].decks.len(), 0);
 
-        let result = app.move_deck(&deck, &ch1);
+        let result = app.move_deck(&deck, &ch1, None);
         assert!(result.is_ok());
         let snap = app.mixer_snapshot();
         assert_eq!(snap.channels[0].decks.len(), 0);
         assert_eq!(snap.channels[1].decks.len(), 1);
+    }
+
+    /// Deck UUIDs of a channel, in stack order.
+    fn order(app: &VardaApp, ch: usize) -> Vec<String> {
+        app.mixer_snapshot().channels[ch]
+            .decks
+            .iter()
+            .map(|d| d.uuid.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_deck_moves_between_two_decks_of_another_channel() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let (ch0, ch1) = (channel_uuid(&app, 0), channel_uuid(&app, 1));
+        let moving = app.add_solid_color_deck(&ch0, [1.0; 4]).unwrap();
+        let a = app.add_solid_color_deck(&ch1, [1.0; 4]).unwrap();
+        let b = app.add_solid_color_deck(&ch1, [1.0; 4]).unwrap();
+        app.move_deck(&moving, &ch1, Some(&b)).unwrap();
+        assert_eq!(order(&app, 1), [a, moving, b]);
+        assert!(order(&app, 0).is_empty());
+    }
+
+    #[test]
+    fn a_deck_moves_up_and_down_within_its_channel() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let ch0 = channel_uuid(&app, 0);
+        let a = app.add_solid_color_deck(&ch0, [1.0; 4]).unwrap();
+        let b = app.add_solid_color_deck(&ch0, [1.0; 4]).unwrap();
+        let c = app.add_solid_color_deck(&ch0, [1.0; 4]).unwrap();
+        // Down: before c, which shifts up once a leaves.
+        app.move_deck(&a, &ch0, Some(&c)).unwrap();
+        assert_eq!(order(&app, 0), [b.clone(), a.clone(), c.clone()]);
+        // Up: to the top.
+        app.move_deck(&c, &ch0, Some(&b)).unwrap();
+        assert_eq!(order(&app, 0), [c.clone(), b.clone(), a.clone()]);
+        // To the end.
+        app.move_deck(&c, &ch0, None).unwrap();
+        assert_eq!(order(&app, 0), [b, a, c]);
+    }
+
+    #[test]
+    fn moving_before_a_deck_that_is_not_there_changes_nothing() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let (ch0, ch1) = (channel_uuid(&app, 0), channel_uuid(&app, 1));
+        let moving = app.add_solid_color_deck(&ch0, [1.0; 4]).unwrap();
+        let elsewhere = app.add_solid_color_deck(&ch0, [1.0; 4]).unwrap();
+        assert!(
+            app.move_deck(&moving, &ch1, Some(&elsewhere)).is_err(),
+            "the anchor must be in the destination channel"
+        );
+        assert_eq!(order(&app, 0), [moving, elsewhere]);
     }
 
     #[test]

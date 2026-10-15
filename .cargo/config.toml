@@ -8,8 +8,19 @@
 # appending, so prefer `LIBRARY_PATH` if you need to add a path on top.
 # Building with `--no-default-features` skips libfreenect entirely.
 
+#
+# FFmpeg: Homebrew's `ffmpeg-full` (keg-only, beside the plain `ffmpeg`) is the
+# one built with SRT. Where it is installed it is found first — its headers
+# through pkg-config, its libraries ahead of /opt/homebrew/lib, which holds the
+# plain `ffmpeg`'s of the same names — so the bindings and the libraries they
+# link are the same FFmpeg. Where it is not (and on Linux) both paths are
+# simply absent and the usual FFmpeg is used.
+
+[env]
+PKG_CONFIG_PATH = { value = "/opt/homebrew/opt/ffmpeg-full/lib/pkgconfig", force = false }
+
 [target.aarch64-apple-darwin]
-rustflags = ["-L", "native=/opt/homebrew/lib"]
+rustflags = ["-L", "native=/opt/homebrew/opt/ffmpeg-full/lib", "-L", "native=/opt/homebrew/lib"]
 
 [target.x86_64-apple-darwin]
 rustflags = ["-L", "native=/usr/local/lib"]

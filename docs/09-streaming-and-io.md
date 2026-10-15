@@ -3,7 +3,7 @@
 ## 10-bit SDR Delivery
 
 Set **SDR precision** to **10-bit SDR** on an output to request a high-precision codec or transport.
-Varda probes the installed GPU, FFmpeg encoders, NDI runtime, and endpoint contract before starting.
+Nida probes the installed GPU, FFmpeg encoders, NDI runtime, and endpoint contract before starting.
 If the complete path is unavailable, it keeps the request, delivers 8-bit SDR, and reports why.
 
 | Destination | 10-bit path | Explicit fallback |
@@ -15,7 +15,7 @@ If the complete path is unavailable, it keeps the request, delivers 8-bit SDR, a
 | RTMP / RTMPS | HEVC Main10 or AV1 with an Enhanced endpoint contract | Legacy RTMP uses H.264 8-bit |
 | Syphon | No interoperable 10-bit path | BGRA8 |
 
-Ten-bit delivery is still SDR. It preserves more code values after Varda's existing tonemap and LUT;
+Ten-bit delivery is still SDR. It preserves more code values after Nida's existing tonemap and LUT;
 it does not enable HDR metadata or extended brightness.
 
 ## NDI
@@ -26,18 +26,23 @@ Each output can send video over NDI to other applications and machines on the ne
 
 1. In the output panel, click **"+ Stream"**
 2. Select **NDI** from the protocol dropdown
-3. Enter a sender name (e.g., "Varda Main")
+3. Enter a sender name (e.g., "Nida Main")
 4. The NDI stream is discoverable by any NDI-compatible application on the LAN
 
 With a loaded NDI 6 runtime, a 10-bit request sends P216 with Rec.709 limited-range conversion.
 Older runtimes use UYVY and show a fallback reason. Receiver software should request its best or
-highest-quality color mode to avoid converting P216 back to 8-bit.
+highest-quality color mode to avoid converting P216 back to 8-bit. 8-bit UYVY is sent at video
+levels (16–235) in Rec.709, or Rec.601 below 720 lines, as NDI receivers read it.
+
+An NDI output carries an audio-mixer bus with its picture — Master when it is made. Change it
+under **Audio** in the output's settings, even while it runs, or choose **None (silent)**.
 
 ### Receiving
 
-1. In the Library panel, open the **📡 NDI Sources** section
-2. Click **Rescan** to discover NDI sources on the network
-3. **Drag** a source into a channel and it becomes a live deck source
+**Add Input → NDI** lists the sources on the network as they announce themselves, and adds
+one as a new input ([Adding Inputs](23-adding-inputs.md)). Or, in the Library panel, open the
+**📡 NDI Sources** section and **drag** a source into a channel. Its sound comes with it, as a
+strip in the [Audio Mixer](16-audio-mixer.md).
 
 NDI uses dynamic SDK loading (`libloading`). If the SDK is not installed, NDI features are gracefully unavailable.
 
@@ -45,19 +50,24 @@ NDI uses dynamic SDK loading (`libloading`). If the SDK is not installed, NDI fe
 
 ## SRT (Secure Reliable Transport)
 
+SRT needs an FFmpeg built with it. On a Mac that is Homebrew's `ffmpeg-full`
+(`brew install ffmpeg-full`); the plain `ffmpeg` has none, and SRT inputs and
+outputs then fail with *Protocol not found*. Nida links `ffmpeg-full` when it
+is installed, and runs its `ffmpeg` for REC and STREAM.
+
 ### Output (Streaming)
 
-SRT output uses **listener mode**. Varda acts as an SRT server that clients connect to.
+SRT output uses **listener mode**. Nida acts as an SRT server that clients connect to.
 
 1. Click **"+ Stream"** → select **SRT**
 2. Enter a URL (default: `srt://0.0.0.0:9001?mode=listener`)
-3. Start the output — Varda begins listening for SRT clients
+3. Start the output — Nida begins listening for SRT clients
 
 When a client disconnects, the SRT listener automatically restarts so new clients can connect. Frame delivery is non-blocking.
 
 ### Input (Receiving)
 
-SRT input uses **caller mode**. Varda connects to a remote SRT listener.
+SRT input uses **caller mode**. Nida connects to a remote SRT listener.
 
 1. In the Library, open the **📺 SRT Sources** section
 2. Add a URL (e.g., `srt://192.168.1.50:9001`)
@@ -78,7 +88,7 @@ SRT input supports receiver deduplication such that the same URL used by multipl
 3. For HLS, optionally enable **Low Latency** (LL-HLS) for 2–5 second end-to-end latency
 4. Start the output
 
-Varda writes segments and manifests to `.varda/streams/<name>/` and serves them via the built-in HTTP server:
+Nida writes segments and manifests to `.varda/streams/<name>/` and serves them via the built-in HTTP server:
 
 ```
 http://<your-ip>:8080/streams/<name>/playlist.m3u8   (HLS)
@@ -138,7 +148,9 @@ Each recording starts and stops independently, and ffmpeg writes directly to the
 
 ## Audio Passthrough
 
-Every ffmpeg-backed output (Recording, SRT, HLS, DASH, RTMP) can mux audio from a capture device alongside the video. This is the **same physical device** that drives Varda's modulation engine. One device feeds analysis, the live monitor, and every output at once, all off one hardware clock so audio and visuals stay in sync.
+> **Mixed sound instead.** An output can carry a bus of the [Audio Mixer](16-audio-mixer.md) — clip soundtracks and inputs at their fader levels — rather than one raw device. New outputs carry **Bus: Master** by default; passthrough below is the direct, unmixed alternative.
+
+Every ffmpeg-backed output (Recording, SRT, HLS, DASH, RTMP) can mux audio from a capture device alongside the video. This is the **same physical device** that drives Nida's modulation engine. One device feeds analysis, the live monitor, and every output at once, all off one hardware clock so audio and visuals stay in sync.
 
 ### Selecting a device
 
@@ -175,7 +187,7 @@ Push video directly to Twitch, YouTube, Kick, or any RTMP/RTMPS ingest endpoint.
 4. Choose **Enhanced** only when the endpoint explicitly accepts Enhanced RTMP signaling
 5. Start the output
 
-Varda uses FLV muxing with auto-scaled CBR bitrate and 2-second keyframe intervals. Frame delivery is non-blocking.
+Nida uses FLV muxing with auto-scaled CBR bitrate and 2-second keyframe intervals. Frame delivery is non-blocking.
 
 Legacy RTMP always resolves to H.264 8-bit. A 10-bit HEVC or AV1 request requires the persisted
 Enhanced endpoint contract and compatible FFmpeg muxer support.
@@ -195,7 +207,7 @@ RTMP input supports two modes:
 **Listen mode** — accept pushes from OBS, vMix, or other RTMP senders:
 
 1. In the Library, add an RTMP source and select **Listen** mode
-2. Varda generates a listen URL (starting at port 1935, incrementing for additional listeners)
+2. Nida generates a listen URL (starting at port 1935, incrementing for additional listeners)
 3. Configure OBS or other software to push to the generated URL
 4. **Drag** the source into a channel
 
@@ -240,7 +252,7 @@ HTML is rasterized on the **CPU** (Servo's software renderer) and uploaded to a 
 
 ## Syphon (macOS)
 
-Syphon enables inter-application GPU texture sharing on macOS. Varda works both ways: as a Syphon **client** (receiving other apps' frames as live sources) and as a Syphon **server** (publishing a Varda output for other apps to consume).
+Syphon enables inter-application GPU texture sharing on macOS. Nida works both ways: as a Syphon **client** (receiving other apps' frames as live sources) and as a Syphon **server** (publishing a Nida output for other apps to consume).
 
 **Receive (client):**
 
@@ -251,12 +263,12 @@ Syphon enables inter-application GPU texture sharing on macOS. Varda works both 
 
 1. In the output panel, click **+ Stream**
 2. Select **Syphon** from the protocol dropdown
-3. Enter a server name (e.g., "Varda Main")
+3. Enter a server name (e.g., "Nida Main")
 4. Start the output — other Syphon apps then see it in their source list
 
 ### Installing Syphon.framework
 
-Syphon support needs **nothing special at build time** — `Syphon.framework` is *not* linked, it is loaded at runtime via `dlopen`. A normal macOS build (`cargo build` / `cargo run`) works whether or not Syphon is installed; if it is missing, Syphon features simply stay disabled and the rest of Varda runs normally.
+Syphon support needs **nothing special at build time** — `Syphon.framework` is *not* linked, it is loaded at runtime via `dlopen`. A normal macOS build (`cargo build` / `cargo run`) works whether or not Syphon is installed; if it is missing, Syphon features simply stay disabled and the rest of Nida runs normally.
 
 To *use* Syphon, install the framework system-wide at:
 
@@ -271,30 +283,30 @@ This is the standard, verified location. It is also where other Syphon apps on t
    ```sh
    sudo cp -R /path/to/Syphon.framework /Library/Frameworks/
    ```
-3. Launch Varda. On startup the log shows `Syphon.framework found` when it loaded successfully, or `Syphon.framework not found — Syphon features disabled` otherwise.
+3. Launch Nida. On startup the log shows `Syphon.framework found` when it loaded successfully, or `Syphon.framework not found — Syphon features disabled` otherwise.
 
-> Varda also checks `~/Library/Frameworks/Syphon.framework` (per-user, no admin) as a fallback. The system-wide `/Library/Frameworks/` path above is the recommended and verified one.
+> Nida also checks `~/Library/Frameworks/Syphon.framework` (per-user, no admin) as a fallback. The system-wide `/Library/Frameworks/` path above is the recommended and verified one.
 
 Pass `--no-syphon` to disable Syphon explicitly even when the framework is installed.
 
-> **Note:** Varda is both a Syphon client (receive) and a Syphon server (publish a `SyphonServer` output).
+> **Note:** Nida is both a Syphon client (receive) and a Syphon server (publish a `SyphonServer` output).
 
 ---
 
 ## Screen & Window Capture
 
-Capture an OS display or a single application window as a live deck source. Anything on screen can become a layer: a browser, a game, a DAW, a slide deck, another VJ app, or Varda itself. Unlike Syphon, the source application needs no support for it and no plugin.
+Capture an OS display or a single application window as a live deck source. Anything on screen can become a layer: a browser, a game, a DAW, a slide deck, another VJ app, or Nida itself. Unlike Syphon, the source application needs no support for it and no plugin.
 
 ### Platform support
 
 | Platform | How it works | What to know |
 |---|---|---|
-| **macOS** 12.3+ | [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) | Needs the Screen Recording permission, see below. Varda excludes its own windows from a display capture, and the display is scaled down before it leaves the system, so a 4K screen costs no more than a 1080p one |
-| **Windows** 10 (1903+) | [Windows.Graphics.Capture](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture) | No permission prompt. Windows draws a yellow capture border around the captured surface on some builds, which Varda suppresses where the OS allows it |
+| **macOS** 12.3+ | [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) | Needs the Screen Recording permission, see below. Nida excludes its own windows from a display capture, and the display is scaled down before it leaves the system, so a 4K screen costs no more than a 1080p one |
+| **Windows** 10 (1903+) | [Windows.Graphics.Capture](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture) | No permission prompt. Windows draws a yellow capture border around the captured surface on some builds, which Nida suppresses where the OS allows it |
 | **Linux, Wayland** | XDG Desktop Portal plus PipeWire | Your compositor owns the picker. See the note below |
-| **Linux, X11** | `GetImage` polling | Works everywhere, but Varda cannot exclude itself from a display capture, and the cursor is never included |
+| **Linux, X11** | `GetImage` polling | Works everywhere, but Nida cannot exclude itself from a display capture, and the cursor is never included |
 
-Varda picks the Linux backend at startup based on the session you are logged into, so one build serves both. A session running under XWayland uses the portal, not X11, because X11 can only see other XWayland clients there.
+Nida picks the Linux backend at startup based on the session you are logged into, so one build serves both. A session running under XWayland uses the portal, not X11, because X11 can only see other XWayland clients there.
 
 **On Wayland the Library shows a single entry, "Pick a window or display…", instead of a list.** Drag it onto a channel and your desktop's own share dialog opens so you can choose what to capture. On Wayland the compositor decides what an application may see. Each new capture opens the dialog again, including when you load a scene that contains one.
 
@@ -304,9 +316,9 @@ Varda picks the Linux backend at startup based on the session you are logged int
 2. Targets are grouped under **Displays** and **Windows**. Hovering a row shows its pixel size
 3. **Drag** a target onto a channel to create a live capture deck
 
-The list is only refreshed when you press Rescan. Window lists churn constantly as you switch apps, so Varda never polls them in the background.
+The list is only refreshed when you press Rescan. Window lists churn constantly as you switch apps, so Nida never polls them in the background.
 
-Varda's own windows are labeled `(Varda)` and tinted, so capturing yourself is an informed choice rather than an accidental mirror.
+Nida's own windows are labeled `(Nida)` and tinted, so capturing yourself is an informed choice rather than an accidental mirror.
 
 ### Permissions (macOS)
 
@@ -315,7 +327,7 @@ Screen capture is gated by the system Screen Recording privacy control. The Libr
 - **Not yet determined.** A **Grant Screen Recording access** button appears. Clicking it asks macOS to prompt you.
 - **Denied.** The panel points you at **System Settings → Privacy & Security → Screen Recording**.
 
-In both cases **you must restart Varda after granting**. macOS does not apply a new grant to an already running process, so a user who approves the prompt and sees nothing change would otherwise conclude the feature is broken. Varda never requests the permission at startup, and never requests it at all when capture is disabled.
+In both cases **you must restart Nida after granting**. macOS does not apply a new grant to an already running process, so a user who approves the prompt and sees nothing change would otherwise conclude the feature is broken. Nida never requests the permission at startup, and never requests it at all when capture is disabled.
 
 Windows and Linux have no equivalent gate, so the Library shows no permission banner there. On Wayland the portal dialog is the gate, and it appears when you drag a capture onto a channel rather than ahead of time.
 
@@ -328,19 +340,25 @@ Select a capture deck to get its controls in the deck detail panel (bottom bar):
 | **Rate** | `deck/<deck_uuid>/capture/rate` | 1 to 120 fps. Defaults to 30 |
 | **Crop** X / Y / W / H | `deck/<deck_uuid>/capture/crop_x` (`_y`, `_w`, `_h`) | Normalized 0 to 1 within the target, with a **Reset** button |
 | **Cursor** | `deck/<deck_uuid>/capture/cursor` | Include the mouse pointer. Fixed when the capture opens on Wayland, and not available on X11 |
-| **Exclude Varda** | `deck/<deck_uuid>/capture/exclude_varda` | Omit Varda's own windows. Offered for display targets only, since for a window target it would do nothing. macOS only, see below |
+| **Exclude Nida** | `deck/<deck_uuid>/capture/exclude_varda` | Omit Nida's own windows. Offered for display targets only, since for a window target it would do nothing. macOS only, see below |
 
 Every one of these is a real parameter path, so all of them are MIDI-learnable, OSC-addressable, and macro-drivable. They are not modulation targets: a parameter path makes a value writable on demand, while a modulation target is re-evaluated every frame, which each parameter has to opt into. Shader inputs, opacity, macro values, and [video playback](05-modulation.md#video-playback) do; the capture parameters do not, yet. A macro bridges the gap in the meantime: assign the modulator to a macro, and point the macro at the capture path. See [Parameter Paths](06-control-surfaces.md#parameter-paths).
 
-### Capturing Varda itself
+### Capturing Nida itself
 
-Pointing a capture at one of Varda's own windows is supported, and is the straightforward way to record Varda for content. Be aware of what it implies: Varda's UI window contains deck and channel previews, so a capture of that window contains a preview of itself, nested. That is a genuine video feedback loop, and it is often the effect you want.
+Pointing a capture at one of Nida's own windows is supported, and is the straightforward way to record Nida for content. Be aware of what it implies: Nida's UI window contains deck and channel previews, so a capture of that window contains a preview of itself, nested. That is a genuine video feedback loop, and it is often the effect you want.
 
 If you want a clean recording of the program without the interface nested inside it, you have better options than capturing the UI window. Use a [Program Tap](#program-tap) to read the program directly, capture a windowed [output](07-outputs.md) rather than the main window, or use a [recording output](#recording).
 
-For a full-display capture, **Exclude Varda** is on by default so that pointing a deck at your main monitor does not produce an infinite mirror.
+For a full-display capture, **Exclude Nida** is on by default so that pointing a deck at your main monitor does not produce an infinite mirror.
 
-**On Linux under X11 this cannot be honoured.** X11 offers no way to leave one application out of a screen capture, so a display capture always includes Varda. The mirror stays stable rather than running away, because the capture rate sits below the render rate, but if you want a clean desktop capture on X11 you need to move Varda to another monitor or capture individual windows instead. Wayland does not have this problem, because you pick the target in your compositor's dialog.
+**On Linux under X11 this cannot be honoured.** X11 offers no way to leave one application out of a screen capture, so a display capture always includes Nida. The mirror stays stable rather than running away, because the capture rate sits below the render rate, but if you want a clean desktop capture on X11 you need to move Nida to another monitor or capture individual windows instead. Wayland does not have this problem, because you pick the target in your compositor's dialog.
+
+### Smooth motion and cost
+
+A captured screen refreshes on its own clock, never exactly in step with the show's. Each show frame shows the newest captured frame macOS took a steady time before it — by the time macOS stamped each one, not by when it happened to arrive — so motion on the captured screen (a video, a scrolling page) moves one frame per show frame when the rates match, and only a real difference of rate shows, as one frame repeated or skipped now and then. Frames that always come in time are shown as soon as they come; only frames that sometimes come late are shown a frame later (`pacing.inputs[].behind_ms` in `GET /api/state/performance`). On a Mac the frames go straight from the surface macOS captured into to the GPU, never through memory.
+
+Capturing a screen still costs macOS itself: measured on a MacBook Pro, a 1080p display captured at 60 fps took the window server from about 53% to 72% of a core, and with a busy show the screens then miss a refresh now and then (about one in two seconds) — each a single small jump on the outputs. 30 fps costs about half as much. Leaving Nida's windows out of the capture (**Exclude Nida**) made no measurable difference.
 
 ### Persistence
 
@@ -377,7 +395,7 @@ curl -X POST http://localhost:8080/api/channels/<ch_uuid>/decks/screen \
 
 ## Program Tap
 
-A **tap** re-enters Varda's own output as a deck source. The deck reads the program out of GPU memory. This is how you build video feedback, picture-in-picture of the program, and effect chains that process the whole mix.
+A **tap** re-enters Nida's own output as a deck source. The deck reads the program out of GPU memory. This is how you build video feedback, picture-in-picture of the program, and effect chains that process the whole mix.
 
 There are two tap points:
 
@@ -386,9 +404,13 @@ There are two tap points:
 | **Master Program** | The full mix, **before** tonemap and LUT |
 | **Channel** | One channel's composite, after its own effect chain |
 
-### One frame behind
+### This frame, or the one before
 
-A tap always shows the **previous** frame, never the current one. It means a tap can never read a texture that is still being written, and it means the delay does not depend on where the tapping deck sits in the mixer. Move the deck to another channel, reorder the channels, add more taps, and the latency stays at exactly one frame.
+A **channel** tap shows the channel's picture of **this** frame: the channel it shows is rendered before the channel the tap sits in, whatever their order in the mixer. The picture is drawn once and shown in both places, with no delay between them — the way to put an input into another input as a layer (see [Another input as a layer](21-input-settings.md#another-input-as-a-layer)).
+
+Round a loop no order can do that: a channel tapping itself, or two channels tapping each other. There one of them goes first and its tap shows the **previous** frame, kept in a second target that is swapped with the live one each frame, so a tap never reads a texture still being written and the loop settles instead of feeding itself. The **master** is composited after every channel, so a master tap always shows the previous frame.
+
+A tap reads the picture as it is, soft edges and see-through parts included. A tap of a channel starts **transparent**, showing what is under it wherever that channel is clear; untick **Transparent** — on the layer's **Source** tab in [Input settings](21-input-settings.md), or under **🔁 Tap** in the deck panel — to flatten it over black. A duplicate or paste keeps the setting.
 
 Master taps read before tonemapping on purpose. A feedback loop that read the tonemapped output and fed it back into the linear pipeline would apply the transfer curve again on every trip around the loop, and the image would crush toward the roll-off within a second or two.
 
@@ -401,7 +423,7 @@ The list is built from the live channel list rather than a device scan, so there
 
 ### Feedback
 
-Tapping the master from a deck that is itself part of the master is a deliberate feedback loop, and the one frame of delay is what keeps it stable rather than deadlocked. Two things are worth knowing before you turn one up:
+Tapping the master from a deck that is itself part of the master — or a channel from a deck in that same channel — is a deliberate feedback loop, and the one frame of delay is what keeps it stable rather than deadlocked. Two things are worth knowing before you turn one up:
 
 - **Gain above unity grows without bound.** A tap deck at opacity above 1.0 on an additive blend multiplies its own output every frame. The tonemap rolls the result off, it does not clamp it, so the image will bloom to white and stay there.
 - **Add a transform to see anything interesting.** A tap composited exactly over its own source just reproduces the image. Scale, rotate, offset, or run it through an effect chain, and you get the tunnels and trails that make the technique worth using.
@@ -434,7 +456,12 @@ All stream **input** protocols (SRT, HLS, DASH, and RTMP) share the same resilie
 
 - **Deduplication** — the same URL used by multiple decks shares one underlying connection, so adding a stream to several channels costs a single receive.
 - **Stall detection** — if no frames arrive for a timeout window, the receiver reconnects. The window is **5 s** for the live protocols (SRT, RTMP) and **15 s** for segment protocols (HLS, DASH), which buffer in larger chunks.
+- **Dead connections** — a sender that goes quiet without hanging up (a dead network, a crashed encoder behind an open socket) counts as a stall: the read is abandoned after the same window and the stream connected again, rather than the input freezing.
 - **Auto-reconnect** — on failure or stall, the receiver retries with **exponential backoff** (500 ms up to 10 s) until the source returns.
+- **Independent** — a stream waiting for its sender (a listener nobody has called yet) holds up no other: a second remote presenter connects while the first is still awaited.
+- **Paced** — frames show at the times they carry, not as they arrive: HLS, which arrives a segment at a time, and RTMP or SRT, which arrive in network bursts, play smoothly, with a tenth of a second held in hand.
+- **Its own size** — the picture keeps the stream's size and shape (up to 3840×2160), rather than being stretched to 1920×1080.
+- **Sound** — a stream's sound becomes a strip in the Audio Mixer named after the input, Audio Auto on, as an NDI source's does.
 
 ---
 

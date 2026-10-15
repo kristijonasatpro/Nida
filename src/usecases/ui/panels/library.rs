@@ -28,7 +28,11 @@ fn tap_row(ui: &mut egui::Ui, label: &str, payload: crate::scene::TapSourceConfi
 /// macOS grants do not apply to the running process, so the copy says so — a
 /// user who grants access and sees nothing change would otherwise conclude the
 /// feature is broken. See spec/screen-capture.md § Permissions.
-fn render_capture_permission(ui: &mut egui::Ui, actions: &mut UIActions, permission: &str) {
+pub(super) fn render_capture_permission(
+    ui: &mut egui::Ui,
+    actions: &mut UIActions,
+    permission: &str,
+) {
     match permission {
         "granted" | "not_required" => {}
         "denied" => {
@@ -39,8 +43,8 @@ fn render_capture_permission(ui: &mut egui::Ui, actions: &mut UIActions, permiss
             );
             ui.label(
                 egui::RichText::new(
-                    "Enable Varda under System Settings → Privacy & Security → \
-                     Screen Recording, then restart Varda.",
+                    "Enable Nida under System Settings → Privacy & Security → \
+                     Screen Recording, then restart Nida.",
                 )
                 .small()
                 .weak(),
@@ -58,7 +62,7 @@ fn render_capture_permission(ui: &mut egui::Ui, actions: &mut UIActions, permiss
                     .push(EngineCommand::RequestScreenCapturePermission);
             }
             ui.label(
-                egui::RichText::new("Varda must be restarted after granting.")
+                egui::RichText::new("Nida must be restarted after granting.")
                     .small()
                     .weak(),
             );
@@ -76,7 +80,7 @@ fn capture_target_row(
     let text = if target.is_varda {
         // Marking our own windows is what turns an accidental feedback loop
         // into a deliberate one.
-        format!("  🖥 {} (Varda)", target.label)
+        format!("  🖥 {} (Nida)", target.label)
     } else {
         format!("  🖥 {}", target.label)
     };
@@ -113,7 +117,7 @@ fn stream_row(
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             remove = ui
-                .small_button("✕")
+                .small_button("×")
                 .on_hover_text("Remove from library")
                 .clicked();
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -131,20 +135,7 @@ fn stream_row(
 }
 
 pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
-    ui.horizontal(|ui| {
-        ui.heading("📚 Library");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .small_button("◀")
-                .on_hover_text("Close library (L)")
-                .clicked()
-            {
-                actions.session.toggle_library_panel = true;
-            }
-        });
-    });
-    ui.separator();
-
+    // The panel's tab names it; L or the tab's × closes it.
     egui::ScrollArea::vertical()
         .scroll_source(egui::scroll_area::ScrollSource {
             scroll_bar: true,
@@ -176,7 +167,10 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                         // Fallback: double-click adds to first channel
                         if resp.double_clicked() {
                             if let Some(ch) = data.channels.first() {
-                                actions.session.shader_to_add = Some((ch.uuid.clone(), *gen_idx));
+                                actions.session.shader_to_add = Some((
+                                    crate::usecases::ui::DeckPlace::end_of(ch.uuid.clone()),
+                                    *gen_idx,
+                                ));
                             }
                         }
                         resp.on_hover_text(
@@ -280,7 +274,7 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
 
             // === DEPTH SENSORS ===
             let depth_header =
-                egui::RichText::new(format!("🛰 Depth Sensors ({})", data.depth_sensors.len()))
+                egui::RichText::new(format!("📡 Depth Sensors ({})", data.depth_sensors.len()))
                     .strong();
             egui::CollapsingHeader::new(depth_header)
                 .id_salt("lib_depth_sensors")
@@ -299,7 +293,7 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                     for (name, sensor_id) in &data.depth_sensors {
                         let item_id = egui::Id::new(("lib_depth", *sensor_id));
                         ui.dnd_drag_source(item_id, LibraryDrag::DepthSensor(*sensor_id), |ui| {
-                            ui.label(egui::RichText::new(format!("  🛰 {name}")).size(12.0));
+                            ui.label(egui::RichText::new(format!("  📡 {name}")).size(12.0));
                         });
                         if ui.ctx().is_being_dragged(item_id) {
                             ui.ctx().memory_mut(|mem| {
@@ -394,7 +388,7 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                 .default_open(false)
                 .show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new("Varda's own output, one frame behind.")
+                        egui::RichText::new("Nida's own output, one frame behind.")
                             .small()
                             .weak(),
                     );
@@ -519,7 +513,7 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                                             });
                                     });
                                     ui.horizontal(|ui| {
-                                        if ui.small_button("✓ Add").clicked() && !url.is_empty() {
+                                        if ui.small_button("✔ Add").clicked() && !url.is_empty() {
                                             let mode = if mode_idx == 0 {
                                                 crate::stream::SrtMode::Listener
                                             } else {
@@ -534,7 +528,7 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                                             );
                                             ui.data_mut(|d| d.insert_temp(adding_id, false));
                                         }
-                                        if ui.small_button("✕ Cancel").clicked() {
+                                        if ui.small_button("× Cancel").clicked() {
                                             ui.data_mut(|d| d.insert_temp(adding_id, false));
                                         }
                                     });
@@ -613,7 +607,7 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                                         ui.text_edit_singleline(&mut url);
                                     });
                                     ui.horizontal(|ui| {
-                                        if ui.small_button("✓ Add").clicked() && !url.is_empty() {
+                                        if ui.small_button("✔ Add").clicked() && !url.is_empty() {
                                             actions.commands.push(
                                                 EngineCommand::AddHlsLibraryEntry {
                                                     url: url.clone(),
@@ -621,7 +615,7 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                                             );
                                             ui.data_mut(|d| d.insert_temp(adding_id, false));
                                         }
-                                        if ui.small_button("✕ Cancel").clicked() {
+                                        if ui.small_button("× Cancel").clicked() {
                                             ui.data_mut(|d| d.insert_temp(adding_id, false));
                                         }
                                     });
@@ -691,7 +685,7 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                                         ui.text_edit_singleline(&mut url);
                                     });
                                     ui.horizontal(|ui| {
-                                        if ui.small_button("✓ Add").clicked() && !url.is_empty() {
+                                        if ui.small_button("✔ Add").clicked() && !url.is_empty() {
                                             actions.commands.push(
                                                 EngineCommand::AddDashLibraryEntry {
                                                     url: url.clone(),
@@ -699,7 +693,7 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                                             );
                                             ui.data_mut(|d| d.insert_temp(adding_id, false));
                                         }
-                                        if ui.small_button("✕ Cancel").clicked() {
+                                        if ui.small_button("× Cancel").clicked() {
                                             ui.data_mut(|d| d.insert_temp(adding_id, false));
                                         }
                                     });
@@ -829,7 +823,7 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                                         );
                                     }
                                     ui.horizontal(|ui| {
-                                        if ui.small_button("✓ Add").clicked() && !url.is_empty() {
+                                        if ui.small_button("✔ Add").clicked() && !url.is_empty() {
                                             actions.commands.push(
                                                 EngineCommand::AddRtmpLibraryEntry {
                                                     url: url.clone(),
@@ -838,7 +832,7 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                                             );
                                             ui.data_mut(|d| d.insert_temp(adding_id, false));
                                         }
-                                        if ui.small_button("✕ Cancel").clicked() {
+                                        if ui.small_button("× Cancel").clicked() {
                                             ui.data_mut(|d| d.insert_temp(adding_id, false));
                                         }
                                     });
@@ -912,13 +906,13 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                                 ui.text_edit_singleline(&mut url);
                             });
                             ui.horizontal(|ui| {
-                                if ui.small_button("✓ Add").clicked() && !url.is_empty() {
+                                if ui.small_button("✔ Add").clicked() && !url.is_empty() {
                                     actions.commands.push(EngineCommand::AddHtmlLibraryEntry {
                                         url: url.clone(),
                                     });
                                     ui.data_mut(|d| d.insert_temp(adding_id, false));
                                 }
-                                if ui.small_button("✕ Cancel").clicked() {
+                                if ui.small_button("× Cancel").clicked() {
                                     ui.data_mut(|d| d.insert_temp(adding_id, false));
                                 }
                             });

@@ -115,6 +115,17 @@ pub(super) fn render_effect_drop_zone(ui: &mut egui::Ui, chain_key: &str, positi
         egui::vec2(8.0, ui.available_height().max(40.0)),
         egui::Sense::hover(),
     );
+    register_effect_drop_zone(ui, &dz, chain_key, position);
+}
+
+/// A drop zone between two rows of a vertical effect list — the horizontal
+/// counterpart of [`render_effect_drop_zone`], same reordering underneath.
+pub(super) fn render_effect_drop_zone_row(ui: &mut egui::Ui, chain_key: &str, position: usize) {
+    let dz = ui.allocate_response(egui::vec2(ui.available_width(), 4.0), egui::Sense::hover());
+    register_effect_drop_zone(ui, &dz, chain_key, position);
+}
+
+fn register_effect_drop_zone(ui: &egui::Ui, dz: &egui::Response, chain_key: &str, position: usize) {
     let has_drag = egui::DragAndDrop::has_payload_of_type::<EffectDrag>(ui.ctx());
     // Store rect for deferred handler to find
     let key = egui::Id::new("eff_dz_rect").with((chain_key.to_string(), position));

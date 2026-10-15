@@ -229,6 +229,15 @@ impl SyphonManager {
         let available = Self::check_framework();
         if available {
             log::info!("Syphon.framework found");
+            // The directory hears of servers coming and going on the run loop
+            // of the thread that first asks for it: ask on the main thread,
+            // whose run loop always runs — the engine thread has none.
+            if crate::renderer::context::on_main_thread() {
+                // SAFETY: a class method without arguments, returning the
+                // shared directory.
+                let _: Retained<SyphonServerDirectory> =
+                    unsafe { msg_send![SyphonServerDirectory::class(), sharedDirectory] };
+            }
         } else {
             log::info!("Syphon.framework not found — Syphon features disabled");
         }

@@ -171,7 +171,7 @@ pub async fn syphon(State(state): State<SharedState>) -> impl IntoResponse {
     }
 }
 
-/// Render loop counters: measured FPS, total frames rendered, and the configured target FPS.
+/// Render loop counters: measured FPS, total frames rendered, the configured target FPS, and `pacing` — what starts frames (a screen's refresh or the timer), the spread of frame intervals over the last five seconds with frames started late, and each output window's presents, pace-skipped and unavailable frames.
 #[utoipa::path(get, path = "/api/state/performance",
     responses((status = 200, body = projection::PerformanceResponse), (status = 503, description = "Engine not yet initialized")),
     tag = "State")]
@@ -181,6 +181,7 @@ pub async fn performance(State(state): State<SharedState>) -> impl IntoResponse 
             fps: s.fps,
             frame_count: s.frame_count,
             target_fps: s.target_fps,
+            pacing: s.pacing.clone(),
         })
         .into_response(),
         Err((status, msg)) => (status, msg).into_response(),

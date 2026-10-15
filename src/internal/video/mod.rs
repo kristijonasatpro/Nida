@@ -7,7 +7,11 @@
 
 pub mod chase;
 pub mod hap;
+pub mod hdr;
+pub(crate) mod hwdecode;
 pub mod modulation;
+pub mod sound_only;
+pub mod yuv;
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -18,7 +22,7 @@ extern crate ffmpeg_next as ffmpeg;
 
 use ffmpeg::format::{input, Pixel};
 use ffmpeg::media::Type;
-use ffmpeg::software::scaling::{context::Context as Scaler, flag::Flags};
+use ffmpeg::software::scaling::context::Context as Scaler;
 use ffmpeg::util::frame::video::Video;
 
 /// Loop mode for video playback. Definition lives in `engine::value::video`
@@ -29,6 +33,7 @@ pub use chase::{ChaseInbox, VideoChaseBroadcast};
 pub use modulation::{
     PlaybackModulation, PlaybackModulationInbox, PositionTarget as ModulatedPosition,
 };
+pub use sound_only::{is_sound_only, SoundOnlyPlayer, SOUND_PICTURE_SIZE};
 
 /// Result of advancing playback state.
 pub struct AdvanceResult {
@@ -105,6 +110,11 @@ pub struct PlaybackState {
     /// therefore costs nothing after it has been reached, which is what keeps a
     /// slow LFO on the playhead from seeking on every frame.
     applied_position_offset: f64,
+    /// A paused clip owes the screen one frame: the first one when it opens
+    /// paused, the one it was moved to after a seek. Without it a clip that
+    /// opens paused shows nothing until it is played. Set by whoever opens it
+    /// paused or seeks it.
+    pub show_frame: bool,
 }
 
 impl PlaybackState {
@@ -130,6 +140,7 @@ impl PlaybackState {
             chasing: false,
             modulation: modulation::PlaybackModulation::default(),
             applied_position_offset: 0.0,
+            show_frame: false,
         }
     }
 
@@ -166,8 +177,16 @@ impl PlaybackState {
         if !self.playing {
             self.last_advance = std::time::Instant::now();
             self.chasing = false;
+            if std::mem::take(&mut self.show_frame) {
+                return AdvanceResult {
+                    needs_seek: false,
+                    frames_to_decode: 1,
+                };
+            }
             return self.paused_modulation_step();
         }
+        // Playing shows frames anyway.
+        self.show_frame = false;
 
         if let Some(transport) = self.chase_transport.take() {
             if self.transport_sync.mode.is_chasing(transport.running) {
@@ -461,13 +480,18 @@ impl HapTextureFormat {
         }
     }
 
-    /// Corresponding wgpu texture format.
+    /// Corresponding wgpu texture format. Colour is gamma-encoded, as in any
+    /// clip, so its texture decodes it to the linear light Nida mixes in —
+    /// read as linear, mid-grey comes out light grey. Hap Q's scaled `YCoCg`
+    /// is no colour until converted (the shader decodes it after), and an
+    /// alpha plane is no colour at all.
     pub fn wgpu_format(self) -> wgpu::TextureFormat {
         match self {
-            Self::Bc1 => wgpu::TextureFormat::Bc1RgbaUnorm,
-            Self::Bc3 | Self::Bc3YCoCg => wgpu::TextureFormat::Bc3RgbaUnorm,
+            Self::Bc1 => wgpu::TextureFormat::Bc1RgbaUnormSrgb,
+            Self::Bc3 => wgpu::TextureFormat::Bc3RgbaUnormSrgb,
+            Self::Bc3YCoCg => wgpu::TextureFormat::Bc3RgbaUnorm,
             Self::Bc4 => wgpu::TextureFormat::Bc4RUnorm,
-            Self::Bc7 => wgpu::TextureFormat::Bc7RgbaUnorm,
+            Self::Bc7 => wgpu::TextureFormat::Bc7RgbaUnormSrgb,
         }
     }
 
@@ -555,6 +579,17 @@ pub struct PlaybackSnapshot {
     /// Whether the ping-pong RAM cache was truncated (hit the memory cap).
     /// Always false for HAP sources (they reverse via seek, no cache).
     pub pingpong_cache_truncated: bool,
+    /// Whether decoding is suspended (see [`PlaybackState::suspended`]): the
+    /// playhead is frozen even though `playing` says otherwise.
+    pub suspended: bool,
+    /// The last frame came off the Mac's media engine rather than a software
+    /// decode.
+    pub hardware_decode: bool,
+    /// When this snapshot was taken. The decode thread publishes once per
+    /// frame, so a reader between frames extrapolates `position` from here —
+    /// how the clip's soundtrack stays in step with a playhead that only moves
+    /// in frame-sized hops.
+    pub taken_at: std::time::Instant,
 }
 
 impl PlaybackSnapshot {
@@ -585,7 +620,22 @@ impl PlaybackSnapshot {
             reached_end: ps.reached_end,
             frame_rate: ps.frame_rate,
             pingpong_cache_truncated: false,
+            hardware_decode: false,
+            suspended: ps.suspended,
+            taken_at: std::time::Instant::now(),
         }
+    }
+
+    /// Where the playhead is now, extrapolated from this snapshot at the rate
+    /// it was running: between the decode thread's once-a-frame updates the
+    /// stored position lags by up to a frame.
+    pub fn position_now(&self) -> f64 {
+        if !self.playing || self.suspended {
+            return self.position;
+        }
+        let since = self.taken_at.elapsed().as_secs_f64().min(0.25);
+        let dir = if self.reverse { -1.0 } else { 1.0 };
+        self.position + since * self.effective_speed.abs() * dir
     }
 }
 
@@ -599,6 +649,63 @@ impl PlaybackSnapshot {
 pub struct DecodeInboxes {
     pub chase: ChaseInbox,
     pub modulation: modulation::PlaybackModulationInbox,
+}
+
+/// What a decode thread drives: a playhead that hands out RGBA frames — a
+/// video file, or a sound file's stand-in picture.
+pub trait FramePlayer: Send {
+    fn playback(&mut self) -> &mut PlaybackState;
+    fn playback_state(&self) -> &PlaybackState;
+    /// The next frame due, if one is.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decoding fails.
+    fn next_frame(&mut self) -> Result<Option<&[u8]>>;
+    /// Move the playhead, as the performer asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be sought.
+    fn seek_and_reset(&mut self, time_secs: f64) -> Result<()>;
+    fn width(&self) -> u32;
+    fn height(&self) -> u32;
+    fn frame_rate(&self) -> f64 {
+        self.playback_state().frame_rate
+    }
+    fn pingpong_cache_truncated(&self) -> bool {
+        false
+    }
+    fn hardware_decode(&self) -> bool {
+        false
+    }
+}
+
+impl FramePlayer for VideoPlayer {
+    fn playback(&mut self) -> &mut PlaybackState {
+        &mut self.playback
+    }
+    fn playback_state(&self) -> &PlaybackState {
+        &self.playback
+    }
+    fn next_frame(&mut self) -> Result<Option<&[u8]>> {
+        VideoPlayer::next_frame(self)
+    }
+    fn seek_and_reset(&mut self, time_secs: f64) -> Result<()> {
+        VideoPlayer::seek_and_reset(self, time_secs)
+    }
+    fn width(&self) -> u32 {
+        self.width
+    }
+    fn height(&self) -> u32 {
+        self.height
+    }
+    fn pingpong_cache_truncated(&self) -> bool {
+        VideoPlayer::pingpong_cache_truncated(self)
+    }
+    fn hardware_decode(&self) -> bool {
+        VideoPlayer::hardware_decode(self)
+    }
 }
 
 /// Main-thread handle to a background video decode thread.
@@ -626,7 +733,8 @@ pub struct VideoDecodeHandle {
     thread: Option<std::thread::JoinHandle<()>>,
     pub width: u32,
     pub height: u32,
-    /// Whether this is a dual-plane HAP source (for render pass alpha detection).
+    /// Whether this is a dual-plane HAP source (for render pass alpha
+    /// detection): set as its first frame with an alpha plane is uploaded.
     pub is_dual_plane: bool,
 }
 
@@ -637,10 +745,24 @@ impl VideoDecodeHandle {
     ///
     /// Panics if the OS refuses to spawn the decode thread.
     pub fn spawn_video(player: VideoPlayer) -> Self {
+        Self::spawn_player(player, "video-decode")
+    }
+
+    /// Spawn the playhead of a sound file: it keeps time for the soundtrack
+    /// and shows a transparent picture.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS refuses to spawn the thread.
+    pub fn spawn_sound_only(player: SoundOnlyPlayer) -> Self {
+        Self::spawn_player(player, "sound-playhead")
+    }
+
+    fn spawn_player<P: FramePlayer + 'static>(player: P, name: &str) -> Self {
         let width = player.width();
         let height = player.height();
         let fps = player.frame_rate();
-        let initial_snapshot = PlaybackSnapshot::from_state(&player.playback);
+        let initial_snapshot = PlaybackSnapshot::from_state(player.playback_state());
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let frame_data: Arc<Mutex<Option<DecodedFrame>>> = Arc::new(Mutex::new(None));
@@ -659,7 +781,7 @@ impl VideoDecodeHandle {
         let ch = inboxes.clone();
 
         let thread = std::thread::Builder::new()
-            .name("video-decode".into())
+            .name(name.into())
             .spawn(move || {
                 video_decode_thread(player, &cmd_rx, &fd, &ss, &sf, &fp, fps, &ofps, &ch);
             })
@@ -824,9 +946,19 @@ impl VideoDecodeHandle {
                 reached_end: false,
                 frame_rate: 30.0,
                 pingpong_cache_truncated: false,
+                hardware_decode: false,
+                suspended: false,
+                taken_at: std::time::Instant::now(),
             },
             |s| s.clone(),
         )
+    }
+
+    /// The cell the decode thread publishes its snapshot into, for a reader on
+    /// another thread (the clip's soundtrack) that needs it without going
+    /// through the render thread.
+    pub fn snapshot_cell(&self) -> Arc<Mutex<PlaybackSnapshot>> {
+        self.snapshot.clone()
     }
 }
 
@@ -846,7 +978,14 @@ fn apply_command(ps: &mut PlaybackState, cmd: &VideoCommand) {
     match cmd {
         VideoCommand::Play => ps.playing = true,
         VideoCommand::Pause => ps.playing = false,
-        VideoCommand::SetSuspended(s) => ps.suspended = *s,
+        VideoCommand::SetSuspended(s) => {
+            // Back from suspension, the playhead moves on from now: the time
+            // it was frozen is not time it plays (it jumped a tenth of a second).
+            if ps.suspended && !*s {
+                ps.last_advance = std::time::Instant::now();
+            }
+            ps.suspended = *s;
+        }
         // Seek is handled specially by the thread loop (calls seek_and_reset / seek)
         VideoCommand::Seek(_) | VideoCommand::Stop => {}
         VideoCommand::SetSpeed(s) => ps.speed = *s,
@@ -946,8 +1085,8 @@ fn wait_for_next_frame(
 // Decode-thread plumbing: each arg is a distinct channel to the render thread,
 // with no shared invariant that a struct would express.
 #[allow(clippy::too_many_arguments)]
-fn video_decode_thread(
-    mut player: VideoPlayer,
+fn video_decode_thread<P: FramePlayer>(
+    mut player: P,
     cmd_rx: &mpsc::Receiver<VideoCommand>,
     frame_data: &Mutex<Option<DecodedFrame>>,
     snapshot: &Mutex<PlaybackSnapshot>,
@@ -971,7 +1110,7 @@ fn video_decode_thread(
             if let VideoCommand::Seek(t) = &cmd {
                 had_seek = Some(*t);
             }
-            apply_command(&mut player.playback, &cmd);
+            apply_command(player.playback(), &cmd);
         }
 
         // Process seek if any
@@ -984,15 +1123,15 @@ fn video_decode_thread(
         // Waking from suspension restarts the frame schedule, so the first
         // frames after a resume are not paced against a deadline set while the
         // thread was idling.
-        if was_suspended && !player.playback.suspended {
+        if was_suspended && !player.playback().suspended {
             next_frame_at = std::time::Instant::now();
         }
-        let woke = was_suspended && !player.playback.suspended;
-        was_suspended = player.playback.suspended;
+        let woke = was_suspended && !player.playback().suspended;
+        was_suspended = player.playback().suspended;
         player
-            .playback
+            .playback()
             .set_chase_transport(inboxes.chase.take(woke));
-        player.playback.set_modulation(inboxes.modulation.take());
+        player.playback().set_modulation(inboxes.modulation.take());
 
         // Decode next frame
         match player.next_frame() {
@@ -1027,13 +1166,14 @@ fn video_decode_thread(
 
         // Publish snapshot
         if let Ok(mut ss) = snapshot.lock() {
-            let mut snap = PlaybackSnapshot::from_state(&player.playback);
+            let mut snap = PlaybackSnapshot::from_state(player.playback());
             snap.pingpong_cache_truncated = player.pingpong_cache_truncated();
+            snap.hardware_decode = player.hardware_decode();
             *ss = snap;
         }
 
         // Sleep until the next frame falls due, or wake early on a command.
-        interval = wake_interval(player.playback.suspended, fps, output_fps);
+        interval = wake_interval(player.playback().suspended, fps, output_fps);
         match cmd_rx.recv_timeout(wait_for_next_frame(&mut next_frame_at, interval)) {
             Ok(cmd) => {
                 if let VideoCommand::Stop = &cmd {
@@ -1044,7 +1184,7 @@ fn video_decode_thread(
                         log::warn!("Video seek error: {e}");
                     }
                 } else {
-                    apply_command(&mut player.playback, &cmd);
+                    apply_command(player.playback(), &cmd);
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1090,6 +1230,7 @@ fn hap_decode_thread(
             if let Err(e) = player.seek(t) {
                 log::warn!("HAP seek error: {e}");
             }
+            player.playback.show_frame = true;
         }
 
         // Waking from suspension restarts the frame schedule, so the first
@@ -1155,6 +1296,7 @@ fn hap_decode_thread(
                     if let Err(e) = player.seek(*t) {
                         log::warn!("HAP seek error: {e}");
                     }
+                    player.playback.show_frame = true;
                 } else {
                     apply_command(&mut player.playback, &cmd);
                 }
@@ -1219,7 +1361,146 @@ pub fn detect_hap_codec<P: AsRef<Path>>(path: P) -> Result<Option<HapTextureForm
 /// At 1080p (~2.5 MB/frame) this holds ~800 frames (~13s at 60fps).
 const MAX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
-/// A video player that decodes frames from a video file using ffmpeg (CPU decode).
+/// A picture's size with its pixels' shape applied: anamorphic video (HDV's
+/// 1440×1080, DV's 720×576) stored narrow, its pixels wide, shown at the
+/// width its pixels make. Square pixels, or none said, leave it as it is.
+pub(crate) fn display_size((width, height): (u32, u32), aspect: ffmpeg::Rational) -> (u32, u32) {
+    let (num, den) = (aspect.numerator(), aspect.denominator());
+    if num <= 0 || den <= 0 || num == den {
+        return (width, height);
+    }
+    let wide = (f64::from(width) * f64::from(num) / f64::from(den)).round();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let wide = (wide as u32).clamp(1, 8192) & !1;
+    (wide.max(2), height)
+}
+
+/// The clockwise quarter turns a stream's display matrix asks for, as
+/// ffmpeg's own player turns it; 0 without one.
+fn quarter_turns_of(stream: &ffmpeg::format::stream::Stream) -> u8 {
+    let Some(matrix) = stream
+        .side_data()
+        .find(|d| d.kind() == ffmpeg::codec::packet::side_data::Type::DisplayMatrix)
+    else {
+        return 0;
+    };
+    let data = matrix.data();
+    if data.len() < 36 {
+        return 0;
+    }
+    // The matrix says how far the picture turns counter-clockwise.
+    let counter = unsafe { ffmpeg::ffi::av_display_rotation_get(data.as_ptr().cast()) };
+    quarter_turns(counter)
+}
+
+/// Clockwise quarter turns for a picture that must turn `counter` degrees
+/// counter-clockwise: -90 is one, 90 is three.
+fn quarter_turns(counter: f64) -> u8 {
+    if !counter.is_finite() {
+        return 0;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let turns = ((-counter / 90.0).round() as i64).rem_euclid(4) as u8;
+    turns
+}
+
+/// An interlaced frame's two fields blended (each row a quarter of the one
+/// above, half itself, a quarter of the one below): the comb its fields'
+/// two moments make on anything moving, gone, for a little sharpness.
+fn blend_fields(frame: &mut [u8], row: usize) {
+    let rows = frame.len() / row.max(1);
+    if rows < 3 {
+        return;
+    }
+    let mut above = frame[..row].to_vec();
+    let mut this = vec![0; row];
+    for y in 1..rows - 1 {
+        this.copy_from_slice(&frame[y * row..(y + 1) * row]);
+        let (head, below) = frame.split_at_mut((y + 1) * row);
+        let out = &mut head[y * row..];
+        for (i, o) in out.iter_mut().enumerate() {
+            let sum = u16::from(above[i]) + 2 * u16::from(this[i]) + u16::from(below[i]);
+            #[allow(clippy::cast_possible_truncation)]
+            let blended = ((sum + 2) / 4) as u8;
+            *o = blended;
+        }
+        std::mem::swap(&mut above, &mut this);
+    }
+}
+
+/// `src` (RGBA rows `stride` apart, `size` pixels) turned clockwise by
+/// `turns` quarters into `dst`, packed.
+fn turn_into(src: &[u8], stride: usize, (w, h): (u32, u32), turns: u8, dst: &mut [u8]) {
+    let (w, h) = (w as usize, h as usize);
+    let pixel = |x: usize, y: usize| {
+        let at = y * stride + x * 4;
+        [src[at], src[at + 1], src[at + 2], src[at + 3]]
+    };
+    match turns {
+        0 => {
+            for y in 0..h {
+                dst[y * w * 4..(y + 1) * w * 4]
+                    .copy_from_slice(&src[y * stride..y * stride + w * 4]);
+            }
+        }
+        2 => {
+            for y in 0..h {
+                for x in 0..w {
+                    let at = ((h - 1 - y) * w + (w - 1 - x)) * 4;
+                    dst[at..at + 4].copy_from_slice(&pixel(x, y));
+                }
+            }
+        }
+        // A quarter turn: what was a column is a row, in tiles that stay
+        // in the cache.
+        _ => {
+            const TILE: usize = 16;
+            for ty in (0..h).step_by(TILE) {
+                for tx in (0..w).step_by(TILE) {
+                    for y in ty..(ty + TILE).min(h) {
+                        for x in tx..(tx + TILE).min(w) {
+                            // Clockwise: (x, y) goes to (h-1-y, x); counter: (y, w-1-x).
+                            let (dx, dy) = if turns == 1 {
+                                (h - 1 - y, x)
+                            } else {
+                                (y, w - 1 - x)
+                            };
+                            let at = (dy * h + dx) * 4;
+                            dst[at..at + 4].copy_from_slice(&pixel(x, y));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A video stream's frame rate: its own — or, where that is no rate at all
+/// (a file whose rate varies can claim 90000), its average; 30 failing both.
+pub(crate) fn frame_rate_of(stream: &ffmpeg::format::stream::Stream) -> f64 {
+    let rate = |r: ffmpeg::Rational| {
+        (r.numerator() > 0 && r.denominator() > 0)
+            .then(|| f64::from(r.numerator()) / f64::from(r.denominator()))
+    };
+    rate(stream.rate())
+        .filter(|fps| *fps <= 240.0)
+        .or_else(|| rate(stream.avg_frame_rate()))
+        .unwrap_or(30.0)
+}
+
+/// When a file starts, in seconds: what its clip time 0 is. Broadcast files
+/// (.ts, .mts) run on from the recorder's clock, and start well after 0.
+pub(crate) fn clip_start(ictx: &ffmpeg::format::context::Input) -> f64 {
+    let start = unsafe { (*ictx.as_ptr()).start_time };
+    if start == ffmpeg::ffi::AV_NOPTS_VALUE {
+        0.0
+    } else {
+        start as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE)
+    }
+}
+
+/// A video player that decodes frames from a video file using ffmpeg — on
+/// the Mac's media engine where it can (see [`hwdecode`]), else on the CPU.
 ///
 /// # Safety: Send
 /// The ffmpeg types (`Input`, `Video` decoder, `Scaler`) contain raw pointers to C-allocated
@@ -1227,13 +1508,44 @@ const MAX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// shared mutable state across instances. Transferring a `VideoPlayer` between threads is
 /// safe because Rust's ownership system guarantees exclusive access (no concurrent use).
 /// The player is always used from a single thread at a time.
+// Independent flags (cache state, decode path), not one state machine.
+#[allow(clippy::struct_excessive_bools)]
 pub struct VideoPlayer {
     ictx: ffmpeg::format::context::Input,
     decoder: ffmpeg::decoder::Video,
-    scaler: Scaler,
+    /// YUV → RGBA, made for the format decoded frames arrive in (the
+    /// stream's own in software, NV12 or P010 from the media engine) and
+    /// the format out: 8 bits a channel, or 16 for an HDR frame.
+    scaler: Option<((Pixel, Pixel), Scaler)>,
+    /// An HDR clip's tone map, made with its first HDR frame.
+    tone: Option<hdr::ToneMap>,
+    /// The last frame converted was HDR, in 16 bits, to tone-map.
+    hdr_frame: bool,
+    /// The last frame converted was interlaced: its two fields, from two
+    /// moments, combed together.
+    interlaced_frame: bool,
+    /// An HDR frame tone-mapped, before it is turned upright.
+    sdr: Vec<u8>,
+    /// Which YUV matrix and range `scaler` is set up for.
+    yuv: yuv::YuvSetup,
+    /// Still decoding on the media engine (or trying to). Cleared for good
+    /// when the engine fails on this clip.
+    hardware: bool,
+    /// The last frame shown came off the media engine.
+    on_engine: bool,
+    /// A media-engine frame copied to memory for conversion.
+    engine_frame: Video,
     video_stream_index: usize,
+    /// The picture as shown: its pixels' shape applied, and turned upright.
     width: u32,
     height: u32,
+    /// As decoded.
+    coded: (u32, u32),
+    /// Its pixels' shape applied (1440×1080 HDV is 1920×1080), not yet turned.
+    scaled: (u32, u32),
+    /// Clockwise quarter turns that stand it upright: a phone held upright
+    /// records on its side and says so.
+    quarter_turns: u8,
     /// Shared playback state (loop mode, speed, in/out points, position).
     pub playback: PlaybackState,
     /// Current frame data (RGBA).
@@ -1254,7 +1566,26 @@ pub struct VideoPlayer {
     /// Bytes per frame for cache budget calculation.
     frame_byte_size: usize,
     /// Reused decoder output frame (avoids a per-frame ffmpeg frame allocation).
+    /// Holds the frame being shown.
     decoded: Video,
+    /// The next frame, decoded but not yet due; its clip time in
+    /// `lookahead_at`.
+    lookahead: Video,
+    lookahead_at: Option<f64>,
+    /// The clip time of the last frame decoded, for a frame without one.
+    last_at: f64,
+    /// The decoder has been told the file ended (it then hands over the
+    /// frames it held back, and says when it has none left).
+    eof_sent: bool,
+    /// The time last sought, and how far before it the file was last
+    /// seeked to, until a frame due at it comes out: a file that seeks past
+    /// the time asked (broadcast files may) is seeked again from further back.
+    sought: Option<(f64, f64)>,
+    /// Seconds per tick of the video stream's timestamps.
+    time_base: f64,
+    /// When the file starts, in seconds: clip time 0. Non-zero in broadcast
+    /// files (.ts, .mts), whose clocks run on from the recorder's.
+    start: f64,
     /// Reused scaler output frame (RGBA), avoids a per-frame allocation.
     rgb_frame: Video,
 }
@@ -1271,6 +1602,15 @@ impl VideoPlayer {
     /// opened, if it contains no video stream, or if a decoder or scaler cannot
     /// be created for it.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::open(path, hwdecode::wanted())
+    }
+
+    /// [`Self::new`], choosing whether to try the media engine.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub fn open<P: AsRef<Path>>(path: P, hardware: bool) -> Result<Self> {
         ffmpeg::init().context("Failed to initialize FFmpeg")?;
         let ictx = input(&path).context("Failed to open video file")?;
         let video_stream = ictx
@@ -1278,27 +1618,31 @@ impl VideoPlayer {
             .best(Type::Video)
             .context("No video stream found")?;
         let video_stream_index = video_stream.index();
-        let context_decoder =
-            ffmpeg::codec::context::Context::from_parameters(video_stream.parameters())?;
-        let decoder = context_decoder.decoder().video()?;
-        let width = decoder.width();
-        let height = decoder.height();
-        let rate = video_stream.rate();
-        let fps = f64::from(rate.0) / f64::from(rate.1);
+        let (decoder, hardware) = match hwdecode::open(video_stream.parameters(), hardware) {
+            Ok(decoder) => (decoder, hardware),
+            Err(e) if hardware => {
+                log::warn!("Hardware decoder would not open ({e}); decoding in software");
+                (hwdecode::open(video_stream.parameters(), false)?, false)
+            }
+            Err(e) => return Err(e),
+        };
+        let coded = (decoder.width(), decoder.height());
+        let scaled = display_size(coded, decoder.aspect_ratio());
+        let quarter_turns = quarter_turns_of(&video_stream);
+        let (width, height) = if quarter_turns % 2 == 1 {
+            (scaled.1, scaled.0)
+        } else {
+            scaled
+        };
+        let fps = frame_rate_of(&video_stream);
+        let tb = video_stream.time_base();
+        let time_base = f64::from(tb.numerator()) / f64::from(tb.denominator().max(1));
+        let start = clip_start(&ictx);
         let duration = if ictx.duration() > 0 {
             ictx.duration() as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE)
         } else {
             0.0
         };
-        let scaler = Scaler::get(
-            decoder.format(),
-            width,
-            height,
-            Pixel::RGBA,
-            width,
-            height,
-            Flags::BILINEAR,
-        )?;
         let frame_byte_size = (width * height * 4) as usize;
         let frame_data = vec![0u8; frame_byte_size];
         let max_cached_frames = MAX_CACHE_BYTES / frame_byte_size.max(1);
@@ -1308,10 +1652,21 @@ impl VideoPlayer {
         Ok(Self {
             ictx,
             decoder,
-            scaler,
+            scaler: None,
+            tone: None,
+            hdr_frame: false,
+            interlaced_frame: false,
+            sdr: Vec::new(),
+            yuv: yuv::YuvSetup::default(),
+            hardware,
+            on_engine: false,
+            engine_frame: Video::empty(),
             video_stream_index,
             width,
             height,
+            coded,
+            scaled,
+            quarter_turns,
             playback: PlaybackState::new(duration, fps),
             frame_data,
             frame_cache: Vec::new(),
@@ -1321,6 +1676,13 @@ impl VideoPlayer {
             cache_overflow_warned: false,
             frame_byte_size,
             decoded: Video::empty(),
+            lookahead: Video::empty(),
+            lookahead_at: None,
+            last_at: 0.0,
+            eof_sent: false,
+            sought: None,
+            time_base,
+            start,
             rgb_frame: Video::empty(),
         })
     }
@@ -1350,7 +1712,14 @@ impl VideoPlayer {
         // No frames to decode this tick — hold current frame.
         // Return None so the caller skips the GPU texture upload;
         // the texture already contains the current frame from the last upload.
-        if result.frames_to_decode == 0 && !result.needs_seek {
+        // A playing clip whose next frame has fallen due shows it, though:
+        // one whose rate varies has frames closer together than its rate.
+        let next_due = self.playback.playing
+            && !self.playback.reverse
+            && self
+                .lookahead_at
+                .map_or(!self.eof_sent, |at| at <= self.due());
+        if result.frames_to_decode == 0 && !result.needs_seek && !next_due {
             return Ok(None);
         }
 
@@ -1403,106 +1772,320 @@ impl VideoPlayer {
             self.seek(self.playback.position)?;
         }
 
-        // Forward playback — decode frames_to_decode frames (skip intermediate ones)
-        let target_frames = result.frames_to_decode.max(1);
-        let mut decoded_count = 0u32;
+        // Forward playback: the latest frame due at the playhead, by the
+        // frames' own timestamps — a seek lands on its frame, not the
+        // keyframe before it, and a clip whose rate varies keeps time.
+        let due = self.due();
+        let mut current = false;
+        let mut converted = false;
         loop {
-            if self.decoder.receive_frame(&mut self.decoded).is_ok() {
-                decoded_count += 1;
-                // Only convert the last frame we need (skip intermediate for speed > 1)
-                if decoded_count >= target_frames {
-                    self.scaler.run(&self.decoded, &mut self.rgb_frame)?;
-                    let data = self.rgb_frame.data(0);
-                    let stride = self.rgb_frame.stride(0);
-                    for y in 0..self.height as usize {
-                        let src_offset = y * stride;
-                        let dst_offset = y * (self.width as usize * 4);
-                        let row_bytes = self.width as usize * 4;
-                        self.frame_data[dst_offset..dst_offset + row_bytes]
-                            .copy_from_slice(&data[src_offset..src_offset + row_bytes]);
+            let at = match self.lookahead_at {
+                Some(at) => at,
+                None => match self.decode_ahead()? {
+                    Some(at) => {
+                        self.lookahead_at = Some(at);
+                        at
                     }
-                    // Cache frame for potential reverse playback
-                    if self.caching_enabled && self.playback.loop_mode == LoopMode::PingPong {
-                        if self.frame_cache.len() * self.frame_byte_size < MAX_CACHE_BYTES {
-                            self.frame_cache.push(self.frame_data.clone());
+                    None => break,
+                },
+            };
+            if at > due {
+                // The first frame after a seek, and already past the time
+                // sought: the file seeked too far. From further back — as
+                // far as its start, or 8 s — or else this frame, the nearest
+                // there is.
+                match self.sought {
+                    Some((target, back)) if !current && back < target && back < 8.0 => {
+                        let back = if back == 0.0 { 1.0 } else { back * 2.0 };
+                        if back < target {
+                            self.seek_file(target - back)?;
                         } else {
-                            self.caching_enabled = false;
-                            self.cache_overflowed = true;
-                            if !self.cache_overflow_warned {
-                                self.cache_overflow_warned = true;
-                                log::warn!("Ping-pong frame cache full ({} frames, {} MB) — reverse will cover partial clip",
-                                    self.frame_cache.len(),
-                                    self.frame_cache.len() * self.frame_byte_size / (1024 * 1024));
-                            }
+                            // Back to the start: by its first byte, which
+                            // a file seeking by time can miss (a broadcast
+                            // file lands on its second keyframe).
+                            self.seek_to_first_byte()?;
                         }
+                        self.sought = Some((target, back));
+                        continue;
                     }
-                    return Ok(Some(&self.frame_data));
+                    Some(_) if !current => {}
+                    _ => break,
                 }
-                // Intermediate frame at speed > 1: still cache for ping-pong
-                if self.caching_enabled && self.playback.loop_mode == LoopMode::PingPong {
-                    // Lightweight: decode into scaler for cache but skip if over budget
-                    self.scaler.run(&self.decoded, &mut self.rgb_frame)?;
-                    let data = self.rgb_frame.data(0);
-                    let stride = self.rgb_frame.stride(0);
-                    let mut cache_buf = vec![0u8; self.frame_byte_size];
-                    for y in 0..self.height as usize {
-                        let src_offset = y * stride;
-                        let dst_offset = y * (self.width as usize * 4);
-                        let row_bytes = self.width as usize * 4;
-                        cache_buf[dst_offset..dst_offset + row_bytes]
-                            .copy_from_slice(&data[src_offset..src_offset + row_bytes]);
-                    }
-                    if self.frame_cache.len() * self.frame_byte_size < MAX_CACHE_BYTES {
-                        self.frame_cache.push(cache_buf);
-                    }
-                }
-                continue;
             }
-            if let Some((stream, packet)) = self.ictx.packets().next() {
-                if stream.index() == self.video_stream_index {
-                    self.decoder.send_packet(&packet)?;
-                }
-            } else {
-                // End of stream
-                if self.playback.chasing {
-                    return Ok(Some(&self.frame_data));
-                }
-                match self.playback.loop_mode {
-                    LoopMode::Loop => {
-                        self.playback.position = self.playback.in_point;
-                        self.seek(self.playback.position)?;
-                    }
-                    LoopMode::PingPong => {
-                        self.playback.reverse = true;
-                        if !self.frame_cache.is_empty() {
-                            self.cache_read_idx = self.frame_cache.len() - 1;
-                            return self.next_frame();
-                        }
-                        // No cache: hold current frame at boundary.
-                        // advance_frame will walk position backward until in_point,
-                        // then flip back to forward on the next pass.
-                        self.playback.position =
-                            self.playback.effective_out() - (1.0 / self.playback.frame_rate);
-                        return Ok(Some(&self.frame_data));
-                    }
-                    LoopMode::OneShot => {
-                        self.playback.playing = false;
-                        return Ok(None);
-                    }
-                    LoopMode::HoldLast => {
-                        return Ok(Some(&self.frame_data));
+            // Due: the frame to show, unless a later one is due too.
+            std::mem::swap(&mut self.decoded, &mut self.lookahead);
+            self.lookahead_at = None;
+            self.sought = None;
+            current = true;
+            converted = false;
+            // Every frame passed, kept for ping-pong's way back.
+            if self.caching_enabled && self.playback.loop_mode == LoopMode::PingPong {
+                self.convert_current()?;
+                converted = true;
+                if self.frame_cache.len() * self.frame_byte_size < MAX_CACHE_BYTES {
+                    self.frame_cache.push(self.frame_data.clone());
+                } else {
+                    self.caching_enabled = false;
+                    self.cache_overflowed = true;
+                    if !self.cache_overflow_warned {
+                        self.cache_overflow_warned = true;
+                        log::warn!("Ping-pong frame cache full ({} frames, {} MB) — reverse will cover partial clip",
+                            self.frame_cache.len(),
+                            self.frame_cache.len() * self.frame_byte_size / (1024 * 1024));
                     }
                 }
             }
         }
+        if current {
+            if !converted {
+                self.convert_current()?;
+            }
+            return Ok(Some(&self.frame_data));
+        }
+        if self.lookahead_at.is_some() {
+            // The next frame is not due yet.
+            return Ok(None);
+        }
+        // No frames left. The last holds until the playhead reaches the
+        // out-point, where `advance_frame` loops, stops or turns it — unless
+        // the file does not say how long it is.
+        if self.playback.chasing || self.playback.duration > 0.0 {
+            return Ok(None);
+        }
+        match self.playback.loop_mode {
+            LoopMode::Loop => {
+                self.playback.position = self.playback.in_point;
+                self.seek(self.playback.position)?;
+                Ok(None)
+            }
+            LoopMode::PingPong => {
+                self.playback.reverse = true;
+                if !self.frame_cache.is_empty() {
+                    self.cache_read_idx = self.frame_cache.len() - 1;
+                }
+                Ok(None)
+            }
+            LoopMode::OneShot => {
+                self.playback.playing = false;
+                Ok(None)
+            }
+            LoopMode::HoldLast => Ok(None),
+        }
+    }
+
+    /// The latest clip time a frame can have and be shown now: the playhead,
+    /// and half a frame, so each frame shows from nearer its time than not.
+    fn due(&self) -> f64 {
+        self.playback.position + 0.5 / self.playback.frame_rate
+    }
+
+    /// Decode the next frame into `lookahead`: its clip time, or `None` once
+    /// the file has no more — the decoder drained of the frames it held back
+    /// (the last few, in a file with B-frames), or the file unreadable.
+    fn decode_ahead(&mut self) -> Result<Option<f64>> {
+        loop {
+            match self.decoder.receive_frame(&mut self.lookahead) {
+                Ok(()) => {
+                    let at = self
+                        .lookahead
+                        .timestamp()
+                        .or_else(|| self.lookahead.pts())
+                        .map_or(self.last_at + 1.0 / self.playback.frame_rate, |t| {
+                            t as f64 * self.time_base - self.start
+                        });
+                    self.last_at = at;
+                    return Ok(Some(at));
+                }
+                Err(ffmpeg::Error::Eof) => return Ok(None),
+                Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::util::error::EAGAIN => {}
+                // A media engine that gives up on a clip says so here: decode
+                // the rest in software.
+                Err(e) if self.hardware => {
+                    self.fall_back_to_software(&e.to_string())?;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+            if self.eof_sent {
+                return Ok(None);
+            }
+            // The packet iterator ends at the end of the file and at an error
+            // reading it (skipping a corrupt packet): either way, no more.
+            if let Some((stream, packet)) = self.ictx.packets().next() {
+                if stream.index() == self.video_stream_index {
+                    if let Err(e) = self.decoder.send_packet(&packet) {
+                        if self.hardware {
+                            self.fall_back_to_software(&e.to_string())?;
+                            continue;
+                        }
+                        // A corrupt packet costs its frame, not the clip.
+                        log::debug!("Video packet refused: {e}");
+                    }
+                }
+            } else {
+                let _ = self.decoder.send_eof();
+                self.eof_sent = true;
+            }
+        }
+    }
+
+    /// Convert the frame being shown to RGBA in `frame_data`.
+    fn convert_current(&mut self) -> Result<()> {
+        if let Err(e) = self.convert_decoded() {
+            if !self.hardware {
+                return Err(e);
+            }
+            // Its frame is lost with the engine; the next one comes in software.
+            self.fall_back_to_software(&e.to_string())?;
+            return Ok(());
+        }
+        let data = self.rgb_frame.data(0);
+        let stride = self.rgb_frame.stride(0);
+        if let Some(tone) = self.tone.as_ref().filter(|_| self.hdr_frame) {
+            tone.apply(data, stride, self.scaled, &mut self.sdr);
+            let packed = self.scaled.0 as usize * 4;
+            turn_into(
+                &self.sdr,
+                packed,
+                self.scaled,
+                self.quarter_turns,
+                &mut self.frame_data,
+            );
+        } else {
+            turn_into(
+                data,
+                stride,
+                self.scaled,
+                self.quarter_turns,
+                &mut self.frame_data,
+            );
+        }
+        // Rows stay rows turned half round; a quarter turn of interlaced
+        // video is nothing anyone records.
+        if self.interlaced_frame && self.quarter_turns.is_multiple_of(2) {
+            blend_fields(&mut self.frame_data, self.width as usize * 4);
+        }
+        Ok(())
+    }
+
+    /// Convert the decoded frame to RGBA in `rgb_frame`, copying it off the
+    /// media engine first if it is there, and making the scaler for its
+    /// format the first time that format arrives.
+    fn convert_decoded(&mut self) -> Result<()> {
+        self.on_engine = hwdecode::on_engine(&self.decoded);
+        if self.on_engine {
+            hwdecode::to_memory(&self.decoded, &mut self.engine_frame)?;
+        }
+        let source = if self.on_engine {
+            &self.engine_frame
+        } else {
+            &self.decoded
+        };
+        let format = source.format();
+        // An HDR frame converts to 16 bits a channel, in its transfer still,
+        // for the tone map; any other to 8.
+        let transfer = hdr::Transfer::of(source);
+        self.hdr_frame = transfer.is_some();
+        self.interlaced_frame = source.is_interlaced();
+        if let Some(transfer) = transfer {
+            if self.tone.as_ref().is_none_or(|t| t.transfer() != transfer) {
+                log::info!("HDR clip ({transfer:?}): tone-mapped to SDR");
+                self.tone = Some(hdr::ToneMap::new(transfer));
+            }
+        }
+        let out = if self.hdr_frame {
+            Pixel::RGBA64LE
+        } else {
+            Pixel::RGBA
+        };
+        if self
+            .scaler
+            .as_ref()
+            .is_none_or(|(built, _)| *built != (format, out))
+        {
+            let scaler = Scaler::get(
+                format,
+                self.coded.0,
+                self.coded.1,
+                out,
+                self.scaled.0,
+                self.scaled.1,
+                yuv::rgba_flags(),
+            )?;
+            self.scaler = Some(((format, out), scaler));
+            self.yuv.reset();
+        }
+        let (_, scaler) = self.scaler.as_mut().expect("made above");
+        self.yuv.apply(scaler, source);
+        scaler.run(source, &mut self.rgb_frame)?;
+        Ok(())
+    }
+
+    /// The media engine failed on this clip: reopen it in software where the
+    /// playhead is, and stay there.
+    fn fall_back_to_software(&mut self, why: &str) -> Result<()> {
+        log::warn!("Hardware decoding failed ({why}); decoding this clip in software");
+        self.hardware = false;
+        self.on_engine = false;
+        let parameters = self
+            .ictx
+            .stream(self.video_stream_index)
+            .context("The video stream is gone")?
+            .parameters();
+        self.decoder = hwdecode::open(parameters, false)?;
+        self.seek(self.playback.position)
+    }
+
+    /// Whether the last frame shown was decoded on the media engine.
+    pub fn hardware_decode(&self) -> bool {
+        self.on_engine
     }
 
     /// Seek to a specific time in seconds (internal — does not clear cache).
+    /// The file seeks to the keyframe at or before it; the frames from there
+    /// to it are decoded, not shown (see `next_frame`).
     fn seek(&mut self, time_secs: f64) -> Result<()> {
-        let timestamp = (time_secs * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
+        self.seek_file(time_secs)?;
+        self.sought = Some((time_secs, 0.0));
+        self.playback.position = time_secs;
+        // The playhead moves on from the time sought, not from the last
+        // tick before it: the frame there shows, not the one after.
+        self.playback.last_advance = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// Seek the file to its very start, by bytes.
+    fn seek_to_first_byte(&mut self) -> Result<()> {
+        let done = unsafe {
+            ffmpeg::ffi::avformat_seek_file(
+                self.ictx.as_mut_ptr(),
+                -1,
+                i64::MIN,
+                0,
+                0,
+                ffmpeg::ffi::AVSEEK_FLAG_BYTE,
+            )
+        };
+        if done < 0 {
+            // A file that cannot seek by bytes seeks by time.
+            return self.seek_file(0.0);
+        }
+        self.decoder.flush();
+        self.lookahead_at = None;
+        self.eof_sent = false;
+        self.last_at = 0.0;
+        Ok(())
+    }
+
+    /// Seek the file to the keyframe at or before clip time `time_secs`.
+    fn seek_file(&mut self, time_secs: f64) -> Result<()> {
+        let timestamp =
+            ((time_secs.max(0.0) + self.start) * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
         self.ictx.seek(timestamp, ..timestamp)?;
         self.decoder.flush();
-        self.playback.position = time_secs;
+        self.lookahead_at = None;
+        self.eof_sent = false;
+        self.last_at = time_secs;
         Ok(())
     }
 
@@ -1518,6 +2101,7 @@ impl VideoPlayer {
         self.caching_enabled = true;
         self.cache_overflowed = false;
         self.playback.reverse = false;
+        self.playback.show_frame = true;
         self.seek(time_secs)
     }
 
@@ -1719,6 +2303,478 @@ mod tests {
         );
     }
 
+    /// A 2-second 640×360 test clip made with the ffmpeg tool; `None` without
+    /// it (or without the encoder).
+    fn clip(dir: &Path, name: &str, codec: &[&str]) -> Option<std::path::PathBuf> {
+        let path = dir.join(name);
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "testsrc2=size=640x360:rate=25", "-t", "2"])
+            .args(codec)
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&path)
+            .status()
+            .is_ok_and(|s| s.success());
+        made.then_some(path)
+    }
+
+    /// Move the playhead on by one frame's time, as that much time passing.
+    fn step(player: &mut VideoPlayer) -> Option<Vec<u8>> {
+        let frame = std::time::Duration::from_secs_f64(1.0 / player.playback.frame_rate);
+        player.playback.last_advance = std::time::Instant::now().checked_sub(frame).unwrap();
+        player.next_frame().expect("decode").map(<[u8]>::to_vec)
+    }
+
+    /// Decode `n` ticks' worth of frames; every frame that came out, RGBA.
+    fn decode(player: &mut VideoPlayer, n: usize) -> Vec<Vec<u8>> {
+        let frames: Vec<Vec<u8>> = (0..n).filter_map(|_| step(player)).collect();
+        assert!(frames.len() > n / 2, "frames came out: {}", frames.len());
+        frames
+    }
+
+    /// A clip of `seconds` from the ffmpeg tool's moving test picture, every
+    /// frame different, coded all but losslessly (lossless drops B-frames,
+    /// and the decoder holding frames back for them is part of the test); a
+    /// keyframe every 2 s. `extra` goes before the output. `None` without the
+    /// tool.
+    fn test_clip(
+        dir: &Path,
+        name: &str,
+        seconds: u32,
+        extra: &[&str],
+    ) -> Option<std::path::PathBuf> {
+        let path = dir.join(name);
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "testsrc2=size=320x180:rate=25"])
+            .args(["-t", &seconds.to_string()])
+            .args(extra)
+            .args([
+                "-c:v", "libx264", "-preset", "veryfast", "-qp", "4", "-bf", "2", "-g", "50",
+            ])
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&path)
+            .status()
+            .is_ok_and(|s| s.success());
+        made.then_some(path)
+    }
+
+    /// Which frame of `reference` a picture is.
+    fn which(reference: &[Vec<u8>], frame: &[u8]) -> usize {
+        reference
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i, mean_difference(r, frame)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _)| i)
+            .unwrap()
+    }
+
+    /// Every frame of a clip in order: played at one frame a tick, each
+    /// frame comes out once, the last ones — held back by the decoder for
+    /// B-frames — among them.
+    fn every_frame(path: &Path) -> Vec<Vec<u8>> {
+        let mut player = VideoPlayer::open(path, false).unwrap();
+        player.playback.loop_mode = LoopMode::HoldLast;
+        // The first, at once: it is due from the start.
+        let mut frames: Vec<Vec<u8>> = player
+            .next_frame()
+            .unwrap()
+            .map(<[u8]>::to_vec)
+            .into_iter()
+            .collect();
+        for _ in 0..1000 {
+            if let Some(frame) = step(&mut player) {
+                frames.push(frame);
+            }
+            if player.playback.position >= player.playback.duration {
+                break;
+            }
+        }
+        frames
+    }
+
+    /// ffmpeg's own first frame of a clip, turned upright and its pixels
+    /// shaped as its player shows it: RGBA, and its size.
+    fn as_ffmpeg_shows(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
+        let png = path.with_extension("png");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(path)
+            .args(["-frames:v", "1", "-vf", "scale=iw*sar:ih,setsar=1"])
+            .arg(&png)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            return None;
+        }
+        let image = image::open(&png).ok()?.to_rgba8();
+        let (w, h) = image.dimensions();
+        Some((image.into_raw(), w, h))
+    }
+
+    /// A clip `extra` makes of a short test clip — `None` without ffmpeg.
+    fn remade(
+        dir: &Path,
+        name: &str,
+        input: &[&str],
+        output: &[&str],
+    ) -> Option<std::path::PathBuf> {
+        let plain = test_clip(dir, "plain.mp4", 1, &["-vf", "scale=144:96,setsar=1"])?;
+        let path = dir.join(name);
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(input)
+            .arg("-i")
+            .arg(&plain)
+            .args(output)
+            .arg(&path)
+            .status()
+            .is_ok_and(|s| s.success());
+        made.then_some(path)
+    }
+
+    fn first_frame(path: &Path) -> (Vec<u8>, u32, u32) {
+        let mut player = VideoPlayer::open(path, false).unwrap();
+        let frame = player.next_frame().unwrap().expect("a frame").to_vec();
+        (frame, player.width(), player.height())
+    }
+
+    /// A phone held upright records its picture on its side and says so: it
+    /// is shown upright, as ffmpeg's player shows it — either way round.
+    #[test]
+    fn a_clip_recorded_on_its_side_is_shown_upright() {
+        let dir = tempfile::tempdir().unwrap();
+        for turn in ["90", "-90", "180"] {
+            let name = format!("turned{turn}.mp4");
+            let Some(path) = remade(
+                dir.path(),
+                &name,
+                &["-display_rotation", turn],
+                &["-c", "copy"],
+            ) else {
+                return;
+            };
+            let (want, w, h) = as_ffmpeg_shows(&path).expect("ffmpeg's picture");
+            let (got, gw, gh) = first_frame(&path);
+            assert_eq!((gw, gh), (w, h), "turned {turn}: its shape");
+            let off = mean_difference(&want, &got);
+            assert!(
+                off < 12.0,
+                "turned {turn}: the picture as ffmpeg's (off by {off})"
+            );
+        }
+    }
+
+    /// Anamorphic video — stored narrow, its pixels wide — is shown at the
+    /// width its pixels make, not squeezed.
+    #[test]
+    fn an_anamorphic_clip_is_shown_at_its_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = remade(
+            dir.path(),
+            "wide.mp4",
+            &[],
+            &[
+                "-vf",
+                "setsar=4/3",
+                "-c:v",
+                "libx264",
+                "-qp",
+                "4",
+                "-pix_fmt",
+                "yuv420p",
+            ],
+        ) else {
+            return;
+        };
+        let (want, w, h) = as_ffmpeg_shows(&path).expect("ffmpeg's picture");
+        let (got, gw, gh) = first_frame(&path);
+        assert_eq!((w, h), (192, 96), "ffmpeg widens it");
+        assert_eq!((gw, gh), (192, 96));
+        let off = mean_difference(&want, &got);
+        assert!(off < 12.0, "the picture as ffmpeg's (off by {off})");
+    }
+
+    /// An HDR clip — tagged PQ or HLG, BT.2020 — is tone-mapped: its
+    /// reference white comes out near white, where read as SDR it came out
+    /// a dim mid-grey. An SDR clip of the same numbers is left as it is.
+    #[test]
+    fn an_hdr_clip_is_tone_mapped_not_dim() {
+        let dir = tempfile::tempdir().unwrap();
+        // Flat grey at PQ's and HLG's reference white.
+        for (name, grey, tags) in [
+            (
+                "pq.mp4",
+                "0x949494",
+                "color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc",
+            ),
+            (
+                "hlg.mp4",
+                "0xBFBFBF",
+                "color_trc=arib-std-b67:color_primaries=bt2020:colorspace=bt2020nc",
+            ),
+            (
+                "sdr.mp4",
+                "0x949494",
+                "color_trc=bt709:color_primaries=bt709:colorspace=bt709",
+            ),
+        ] {
+            let path = dir.path().join(name);
+            let made = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi"])
+                .args(["-i", &format!("color=c={grey}:s=64x64:r=25"), "-t", "0.2"])
+                .args(["-vf", &format!("format=yuv420p10le,setparams={tags}")])
+                .args(["-c:v", "libx264"])
+                .arg(&path)
+                .status()
+                .is_ok_and(|s| s.success());
+            if !made {
+                return;
+            }
+            let (frame, ..) = first_frame(&path);
+            let red = frame[(32 * 64 + 32) * 4];
+            if name == "sdr.mp4" {
+                assert!((140..=156).contains(&red), "SDR as it was: {red}");
+            } else {
+                assert!(
+                    (225..=250).contains(&red),
+                    "{name}: near white, not dim: {red}"
+                );
+            }
+        }
+    }
+
+    /// A clip suspended while nothing shows it (see deck residency) picks up
+    /// where it was when it shows again, not a tenth of a second on.
+    #[test]
+    fn a_clip_resumes_where_it_was_suspended() {
+        let mut ps = free_running_clip();
+        ps.position = 2.0;
+        apply_command(&mut ps, &VideoCommand::SetSuspended(true));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        apply_command(&mut ps, &VideoCommand::SetSuspended(false));
+        ps.advance_frame();
+        assert!(ps.position - 2.0 < 0.02, "moved {}", ps.position - 2.0);
+    }
+
+    /// Interlaced video — here each field a different moment, one white,
+    /// one black — shows no comb: rows alternate no more.
+    #[test]
+    fn an_interlaced_clip_shows_no_comb() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fields.mp4");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "color=c=gray:s=64x64:r=50", "-t", "0.4"])
+            .args([
+                "-vf",
+                "geq=lum='if(mod(N,2),235,16)':cb=128:cr=128,interlace=scan=tff",
+            ])
+            .args([
+                "-c:v",
+                "libx264",
+                "-flags",
+                "+ilme+ildct",
+                "-x264opts",
+                "tff=1",
+            ])
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&path)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            return;
+        }
+        let (frame, w, _) = first_frame(&path);
+        let row = |y: usize| frame[(y * w as usize + 32) * 4];
+        let comb = (10..50).map(|y| row(y).abs_diff(row(y + 1))).max().unwrap();
+        assert!(comb < 40, "rows alternate by {comb}");
+    }
+
+    #[test]
+    fn quarter_turns_follow_the_display_matrix() {
+        assert_eq!(quarter_turns(0.0), 0);
+        assert_eq!(quarter_turns(-90.0), 1);
+        assert_eq!(quarter_turns(90.0), 3);
+        assert_eq!(quarter_turns(180.0), 2);
+        assert_eq!(quarter_turns(-180.0), 2);
+        assert_eq!(quarter_turns(89.9), 3);
+        assert_eq!(quarter_turns(f64::NAN), 0);
+    }
+
+    #[test]
+    fn every_frame_of_a_clip_is_shown_to_the_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = test_clip(dir.path(), "three.mp4", 3, &[]) else {
+            return;
+        };
+        let frames = every_frame(&path);
+        assert_eq!(frames.len(), 75, "3 s at 25 fps");
+        for (i, frame) in frames.iter().enumerate() {
+            assert_eq!(which(&frames, frame), i, "frame {i} once, in order");
+        }
+    }
+
+    /// A seek between keyframes shows the frame at the time sought — not the
+    /// keyframe before it, 1.5 s early, while the sound starts on time.
+    #[test]
+    fn a_seek_lands_on_its_frame_not_the_keyframe_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = test_clip(dir.path(), "three.mp4", 3, &[]) else {
+            return;
+        };
+        let frames = every_frame(&path);
+        let mut player = VideoPlayer::open(&path, false).unwrap();
+        player.playback.playing = false;
+        player.seek_and_reset(1.49).unwrap();
+        let shown = player
+            .next_frame()
+            .unwrap()
+            .expect("the frame sought")
+            .to_vec();
+        assert_eq!(which(&frames, &shown), 37, "1.48 s is frame 37");
+        // Playing on from there, frame by frame.
+        player.playback.playing = true;
+        let next = step(&mut player).expect("the next frame");
+        assert_eq!(which(&frames, &next), 38);
+    }
+
+    /// A clip whose frames come further apart after its first second (half
+    /// the rate: phones and screen recordings vary so) plays in time: 2 s in,
+    /// it shows the frame from 2 s, not the 50th.
+    #[test]
+    fn a_clip_whose_rate_varies_keeps_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(steady) = test_clip(dir.path(), "steady.mp4", 3, &[]) else {
+            return;
+        };
+        let spacing = "setpts='if(lt(N,25),N,25+(N-25)*2)/25/TB'";
+        let Some(varying) = test_clip(
+            dir.path(),
+            "varying.mp4",
+            3,
+            &["-vf", spacing, "-fps_mode", "vfr"],
+        ) else {
+            return;
+        };
+        let frames = every_frame(&steady);
+        let mut player = VideoPlayer::open(&varying, false).unwrap();
+        let mut shown = None;
+        while player.playback.position < 1.99 {
+            shown = step(&mut player).or(shown);
+        }
+        // 1 s of 25 frames, then 1 s of 12.5.
+        let at = which(&frames, &shown.expect("frames"));
+        assert!((36..=37).contains(&at), "frame {at}");
+    }
+
+    /// A broadcast file's clock starts where the recorder's was — here 10 s
+    /// — and its first frame is still clip time 0: a seek to 1 s shows the
+    /// frame from 1 s.
+    #[test]
+    fn a_broadcast_file_counts_from_its_own_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(steady) = test_clip(dir.path(), "steady.mp4", 3, &[]) else {
+            return;
+        };
+        let Some(ts) = test_clip(dir.path(), "late.ts", 3, &["-output_ts_offset", "10"]) else {
+            return;
+        };
+        let frames = every_frame(&steady);
+        let mut player = VideoPlayer::open(&ts, false).unwrap();
+        assert!(
+            (player.start - 10.0).abs() < 1.5,
+            "starts at {}",
+            player.start
+        );
+        player.playback.playing = false;
+        player.seek_and_reset(1.01).unwrap();
+        let shown = player.next_frame().unwrap().expect("a frame").to_vec();
+        assert_eq!(which(&frames, &shown), 25);
+    }
+
+    /// Every frame of `got` is, pixel for pixel, one of `reference`. Wall-
+    /// clock pacing may skip a frame here or there (a hardware session takes
+    /// a moment to start), so which frames is not compared — what they show is.
+    fn all_found(reference: &[Vec<u8>], got: &[Vec<u8>], label: &str) {
+        for (i, frame) in got.iter().enumerate() {
+            let best = reference
+                .iter()
+                .map(|r| mean_difference(r, frame))
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                best < 0.5,
+                "{label}: frame {i} matches no software frame (best {best})"
+            );
+        }
+    }
+
+    fn mean_difference(a: &[u8], b: &[u8]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let total: u64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| u64::from(x.abs_diff(*y)))
+            .sum();
+        #[allow(clippy::cast_precision_loss)]
+        let mean = total as f64 / a.len() as f64;
+        mean
+    }
+
+    const CODECS: [(&str, &[&str]); 3] = [
+        ("h264.mp4", &["-c:v", "libx264", "-preset", "veryfast"]),
+        (
+            "hevc.mp4",
+            &["-c:v", "libx265", "-preset", "veryfast", "-tag:v", "hvc1"],
+        ),
+        ("av1.mp4", &["-c:v", "libsvtav1", "-preset", "12"]),
+    ];
+
+    #[test]
+    fn the_media_engine_decodes_the_same_picture_and_does_the_work() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, codec) in CODECS {
+            let Some(path) = clip(dir.path(), name, codec) else {
+                eprintln!("skipping {name}: no ffmpeg or encoder");
+                continue;
+            };
+            let mut software = VideoPlayer::open(&path, false).unwrap();
+            let mut hardware = VideoPlayer::open(&path, true).unwrap();
+            let reference = decode(&mut software, 40);
+            let got = decode(&mut hardware, 12);
+            all_found(&reference, &got, name);
+            assert!(
+                !software.hardware_decode(),
+                "{name}: software stays in software"
+            );
+            if cfg!(target_os = "macos") && name != "av1.mp4" {
+                assert!(
+                    hardware.hardware_decode(),
+                    "{name}: every Apple-silicon Mac decodes this on the media engine"
+                );
+            }
+            eprintln!("{name}: media engine = {}", hardware.hardware_decode());
+        }
+    }
+
+    #[test]
+    fn a_clip_the_engine_cannot_decode_plays_in_software() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = clip(dir.path(), "av1.mp4", CODECS[2].1) else {
+            return;
+        };
+        let reference = decode(&mut VideoPlayer::open(&path, false).unwrap(), 40);
+        // ffmpeg's native AV1 decoder with no engine behind it: an M1 or M2.
+        hwdecode::PRETEND_NO_ENGINE.set(true);
+        let mut player = VideoPlayer::open(&path, true).unwrap();
+        let got = decode(&mut player, 12);
+        hwdecode::PRETEND_NO_ENGINE.set(false);
+        assert!(!player.hardware, "it gave up on the engine");
+        assert!(!player.hardware_decode());
+        all_found(&reference, &got, "av1 in software after the engine gave up");
+    }
+
     #[test]
     fn frame_pool_reuses_and_bounds_buffers() {
         let pool: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1873,6 +2929,28 @@ mod tests {
         assert!(!result.needs_seek);
         assert_eq!(result.frames_to_decode, 0);
         assert_eq!(ps.position, 0.0);
+    }
+
+    #[test]
+    fn a_paused_clip_decodes_the_one_frame_it_owes_and_no_more() {
+        let mut ps = PlaybackState::new(10.0, 30.0);
+        ps.playing = false;
+        ps.show_frame = true;
+        let owed = ps.advance_frame();
+        assert_eq!(
+            owed.frames_to_decode, 1,
+            "the frame it opened or was moved to"
+        );
+        assert!(!owed.needs_seek);
+        assert_eq!(ps.position, 0.0, "without moving the playhead");
+        assert_eq!(ps.advance_frame().frames_to_decode, 0, "then it holds");
+
+        // Playing shows frames anyway: nothing is owed once it pauses.
+        ps.show_frame = true;
+        ps.playing = true;
+        ps.advance_frame();
+        ps.playing = false;
+        assert_eq!(ps.advance_frame().frames_to_decode, 0);
     }
 
     #[test]

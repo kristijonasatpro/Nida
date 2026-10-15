@@ -23,10 +23,16 @@ use varda::usecases::ui::{UIActions, UIData};
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 struct AccActions {
+    // Last "take to bus": the input staged on a bus's Preview, then the take.
+    bus_preview: Option<(String, varda::bus::BusInputRef)>,
+    bus_cut: Option<String>,
+    bus_auto: Option<String>,
     // Simple booleans
     add_channel: bool,
     toggle_library_panel: bool,
     toggle_right_panel: bool,
+    /// The panel arrangement the last pass sent.
+    screen_layout: Option<varda::usecases::ui::screen_layout::ScreenLayout>,
     select_master: bool,
     save_requested: bool,
     toggle_stage_editor: bool,
@@ -80,6 +86,7 @@ struct AccActions {
     set_lane_collapsed: Option<(String, bool)>,
     set_envelope_breakpoints: Option<(String, Vec<varda::modulation::Breakpoint>)>,
     reorder_deck: Option<(String, usize, usize)>,
+    move_deck: Option<(String, String, Option<String>)>,
     toggle_effect: Option<String>,
     copy: Option<varda::engine::ClipboardSource>,
     paste: Option<varda::engine::PasteTarget>,
@@ -97,6 +104,9 @@ impl AccActions {
         // Booleans — OR-accumulate
         self.toggle_library_panel |= a.session.toggle_library_panel;
         self.toggle_right_panel |= a.session.toggle_right_panel;
+        if a.session.screen_layout.is_some() {
+            self.screen_layout.clone_from(&a.session.screen_layout);
+        }
         self.select_master |= a.session.select_master;
         self.save_requested |= a.session.save_requested;
         self.toggle_stage_editor |= a.session.toggle_stage_editor;
@@ -196,6 +206,22 @@ impl AccActions {
                 EngineCommand::ToggleEffect { effect_uuid } => {
                     self.toggle_effect = Some(effect_uuid.clone());
                 }
+                EngineCommand::SetBusPreview { uuid, input } => {
+                    self.bus_preview = Some((uuid.clone(), input.clone()));
+                }
+                EngineCommand::MoveDeck {
+                    deck_uuid,
+                    dst_channel_uuid,
+                    before_deck_uuid,
+                } => {
+                    self.move_deck = Some((
+                        deck_uuid.clone(),
+                        dst_channel_uuid.clone(),
+                        before_deck_uuid.clone(),
+                    ));
+                }
+                EngineCommand::BusCut { uuid } => self.bus_cut = Some(uuid.clone()),
+                EngineCommand::BusAuto { uuid, .. } => self.bus_auto = Some(uuid.clone()),
                 EngineCommand::Copy { source, .. } => self.copy = Some(source.clone()),
                 EngineCommand::Paste { target } => self.paste = Some(target.clone()),
                 _ => {}
@@ -214,6 +240,14 @@ impl AccActions {
     }
 }
 
+/// Bring the Setup panel (tonemap, modulation, MIDI, stage layout, outputs)
+/// to the front of its tab group.
+fn show_setup(harness: &mut Harness<'static, AccActions>) {
+    harness.get_by_label("Setup").click();
+    harness.run();
+    *harness.state_mut() = AccActions::default();
+}
+
 /// Helper: build a harness around `render_ui` with the given fixture data.
 /// Uses 1280x720 to match a realistic window size for our panel layout.
 /// State accumulates across multiple egui passes within a single `run()`.
@@ -228,13 +262,27 @@ fn make_harness(data: UIData) -> Harness<'static, AccActions> {
 /// other, and the default quarter-second step puts every simulated click far
 /// outside that window.
 fn make_harness_stepping(data: UIData, step_dt: f32) -> Harness<'static, AccActions> {
-    let data = Rc::new(data);
+    make_sized_harness(data, egui::vec2(1280.0, 720.0), step_dt)
+}
+
+/// [`make_harness`] at any window size. The panel arrangement each pass sends
+/// is fed back into the next, as the runner does, so a tab brought to the
+/// front stays there.
+fn make_sized_harness(
+    data: UIData,
+    size: egui::Vec2,
+    step_dt: f32,
+) -> Harness<'static, AccActions> {
+    let data = Rc::new(std::cell::RefCell::new(data));
     let mut harness = Harness::builder()
-        .with_size(egui::vec2(1280.0, 720.0))
+        .with_size(size)
         .with_step_dt(step_dt)
         .build_ui_state(
             move |ui, acc: &mut AccActions| {
-                let actions = render_ui(ui, &data);
+                let actions = render_ui(ui, &data.borrow());
+                if let Some(screen) = &actions.session.screen_layout {
+                    data.borrow_mut().screen = screen.clone();
+                }
                 acc.merge(&actions);
             },
             AccActions::default(),
@@ -428,7 +476,7 @@ where
 fn url_row(ui: &mut egui::Ui, url: &str) {
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let _ = ui.small_button("✕");
+            let _ = ui.small_button("×");
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.dnd_drag_source(egui::Id::new("probe_dnd"), 0u32, |ui| {
                     ui.label(egui::RichText::new("●"));
@@ -450,7 +498,7 @@ fn naive_url_row_inflates_panel() {
     let naive = probe_panel_width(|ui| {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(format!("📡 {LONG_URL}")).size(12.0));
-            let _ = ui.small_button("✕");
+            let _ = ui.small_button("×");
         });
     });
     assert!(
@@ -515,43 +563,46 @@ fn click_snap_b_sets_crossfader_action() {
 
 // ── Toggle Library Panel ────────────────────────────────────────────
 
+/// The Library panel closes from the Layout menu's panel list…
 #[test]
-fn click_close_library_sets_toggle() {
-    let mut data = UIData::test_fixture();
-    data.library_panel_open = true;
-    let mut harness = make_harness(data);
-
-    harness.get_by_label("◀").click();
+fn the_layout_menu_closes_the_library() {
+    let mut harness = make_harness(UIData::test_fixture());
+    harness.get_by_label("Layout: Classic").click();
     harness.run();
-
-    assert!(
-        harness.state().toggle_library_panel,
-        "toggle_library_panel should be true"
-    );
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::CheckBox, "Library")
+        .click();
+    harness.run();
+    let screen = harness.state().screen_layout.clone().unwrap();
+    assert!(!screen.has(varda::usecases::ui::screen_layout::Pane::Library));
 }
 
+/// …and opens again from it.
 #[test]
-fn click_open_library_sets_toggle() {
+fn the_layout_menu_opens_a_closed_library() {
     let mut data = UIData::test_fixture();
-    data.library_panel_open = false;
-    let mut harness = make_harness(data);
-
-    harness.get_by_label("▶").click();
-    harness.run();
-
-    assert!(
-        harness.state().toggle_library_panel,
-        "toggle_library_panel should be true"
+    varda::usecases::ui::screen_layout::remove_pane(
+        &mut data.screen.dock,
+        varda::usecases::ui::screen_layout::Pane::Library,
     );
+    let mut harness = make_harness(data);
+    harness.get_by_label("Layout: Classic *").click();
+    harness.run();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::CheckBox, "Library")
+        .click();
+    harness.run();
+    let screen = harness.state().screen_layout.clone().unwrap();
+    assert!(screen.has(varda::usecases::ui::screen_layout::Pane::Library));
 }
 
 // ── Select Master ───────────────────────────────────────────────────
 
 #[test]
-fn click_main_output_heading_selects_master() {
+fn click_main_output_selects_master() {
     let mut harness = make_harness(UIData::test_fixture());
 
-    harness.get_by_label("🎬 Main Output").click();
+    harness.get_by_label("Main output").click();
     harness.run();
 
     assert!(
@@ -689,21 +740,11 @@ fn click_auto_transition_4s() {
 
 #[test]
 fn click_new_output_creates_output_action() {
-    // Taller window so the right panel's ScrollArea exposes the Output section
-    let data = Rc::new(UIData::test_fixture());
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(1280.0, 1200.0))
-        .build_ui_state(
-            move |ui, acc: &mut AccActions| {
-                let actions = render_ui(ui, &data);
-                acc.merge(&actions);
-            },
-            AccActions::default(),
-        );
-    harness.run();
-    *harness.state_mut() = AccActions::default();
+    // Taller window so the Setup panel exposes the Output section
+    let mut harness = make_sized_harness(UIData::test_fixture(), egui::vec2(1280.0, 1400.0), 0.25);
 
     // Expand the "📺 Outputs" collapsing header first
+    show_setup(&mut harness);
     harness.get_by_label("📺 Outputs").click();
     harness.run();
     *harness.state_mut() = AccActions::default();
@@ -723,10 +764,13 @@ fn click_new_output_creates_output_action() {
 fn click_add_lfo() {
     let mut harness = make_harness(UIData::test_fixture());
 
+    show_setup(&mut harness);
     harness.get_by_label("〰 Modulation").click();
     harness.run();
     *harness.state_mut() = AccActions::default();
 
+    harness.get_by_label("➕ LFO").scroll_to_me();
+    harness.run();
     harness.get_by_label("➕ LFO").click();
     harness.run();
 
@@ -740,10 +784,13 @@ fn click_add_lfo() {
 fn click_add_audio_mod() {
     let mut harness = make_harness(UIData::test_fixture());
 
+    show_setup(&mut harness);
     harness.get_by_label("〰 Modulation").click();
     harness.run();
     *harness.state_mut() = AccActions::default();
 
+    harness.get_by_label("➕ Audio").scroll_to_me();
+    harness.run();
     harness.get_by_label("➕ Audio").click();
     harness.run();
 
@@ -757,10 +804,13 @@ fn click_add_audio_mod() {
 fn click_add_adsr() {
     let mut harness = make_harness(UIData::test_fixture());
 
+    show_setup(&mut harness);
     harness.get_by_label("〰 Modulation").click();
     harness.run();
     *harness.state_mut() = AccActions::default();
 
+    harness.get_by_label("➕ ADSR").scroll_to_me();
+    harness.run();
     harness.get_by_label("➕ ADSR").click();
     harness.run();
 
@@ -774,10 +824,13 @@ fn click_add_adsr() {
 fn click_add_step_seq() {
     let mut harness = make_harness(UIData::test_fixture());
 
+    show_setup(&mut harness);
     harness.get_by_label("〰 Modulation").click();
     harness.run();
     *harness.state_mut() = AccActions::default();
 
+    harness.get_by_label("➕ StepSeq").scroll_to_me();
+    harness.run();
     harness.get_by_label("➕ StepSeq").click();
     harness.run();
 
@@ -796,10 +849,15 @@ fn click_open_stage_editor() {
     let mut harness = make_harness(data);
 
     // Expand "🗺 Stage Layout" collapsing header
+    show_setup(&mut harness);
     harness.get_by_label("🗺 Stage Layout").click();
     harness.run();
     *harness.state_mut() = AccActions::default();
 
+    // The right panel scrolls; the Switcher and Audio Mixer above push the
+    // button below a 720-pixel window.
+    harness.get_by_label("✏ Open Editor").scroll_to_me();
+    harness.run();
     harness.get_by_label("✏ Open Editor").click();
     harness.run();
 
@@ -856,7 +914,7 @@ fn arrangement_mode_offers_the_way_back() {
     data.arrangement_mode_open = true;
     let mut harness = make_harness(data);
 
-    harness.get_by_label("🎛 Perform").click();
+    harness.get_by_label("▶ Perform").click();
     harness.run();
 
     assert!(harness.state().toggle_arrangement_mode);
@@ -1957,6 +2015,7 @@ fn click_midi_rescan() {
     let mut harness = make_harness(UIData::test_fixture());
 
     // Expand "🎹 MIDI" collapsing header
+    show_setup(&mut harness);
     harness.get_by_label("🎹 MIDI").click();
     harness.run();
     *harness.state_mut() = AccActions::default();
@@ -2003,6 +2062,7 @@ fn click_remove_channel_with_three_channels() {
         blend_mode: BlendMode::Normal,
         decks: vec![],
         effects: vec![],
+        overlay: false,
     });
     data.channel_count = 3;
     let mut harness = make_harness(data);
@@ -2110,35 +2170,6 @@ fn click_channel_b_heading_selects_channel_b() {
         harness.state().select_channel,
         Some(1),
         "Expected select_channel = Some(1)"
-    );
-}
-
-// ── Library: Open Library from right panel (when closed) ────────────
-
-#[test]
-fn click_open_library_from_right_panel() {
-    let mut data = UIData::test_fixture();
-    data.library_panel_open = false;
-    // Use tall harness to ensure the button is visible in the right panel
-    let data = Rc::new(data);
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(1280.0, 1200.0))
-        .build_ui_state(
-            move |ui, acc: &mut AccActions| {
-                let actions = render_ui(ui, &data);
-                acc.merge(&actions);
-            },
-            AccActions::default(),
-        );
-    harness.run();
-    *harness.state_mut() = AccActions::default();
-
-    harness.get_by_label("📚 Open Library (L)").click();
-    harness.run();
-
-    assert!(
-        harness.state().toggle_library_panel,
-        "toggle_library_panel should be true"
     );
 }
 
@@ -2329,21 +2360,11 @@ fn collapsing_midi_clear_all_mappings() {
         device_name: "Test Device".to_string(),
         param_path: "crossfader".to_string(),
     }];
-    // Use tall harness — MIDI section is at the bottom of the right panel
-    let data = Rc::new(data);
-    let mut harness = Harness::builder()
-        .with_size(egui::vec2(1280.0, 1200.0))
-        .build_ui_state(
-            move |ui, acc: &mut AccActions| {
-                let actions = render_ui(ui, &data);
-                acc.merge(&actions);
-            },
-            AccActions::default(),
-        );
-    harness.run();
-    *harness.state_mut() = AccActions::default();
+    // A tall window, so the Setup panel shows the MIDI section in full
+    let mut harness = make_sized_harness(data, egui::vec2(1280.0, 1400.0), 0.25);
 
     // Expand "🎹 MIDI" collapsing header in right panel
+    show_setup(&mut harness);
     harness.get_by_label("🎹 MIDI").click();
     harness.run();
     *harness.state_mut() = AccActions::default();
@@ -2365,8 +2386,8 @@ fn collapsing_midi_clear_all_mappings() {
 
 // ── Clipboard menus ─────────────────────────────────────────────────
 
-/// The card is a container full of parameter widgets, so the surface carrying
-/// its menu has to sense clicks without swallowing theirs.
+/// An effect's row in the chain list carries its menu on the name; the enable
+/// checkbox beside it must still take its own clicks.
 #[test]
 fn an_effect_card_offers_copy_without_stealing_clicks_from_its_contents() {
     let mut harness = make_harness(UIData::test_fixture());
@@ -2382,12 +2403,14 @@ fn an_effect_card_offers_copy_without_stealing_clicks_from_its_contents() {
     harness.run();
     *harness.state_mut() = AccActions::default();
 
-    // The enable checkbox sits in the card's header row. Clicking it worked
-    // before the card sensed clicks at all; the regression would be the card
-    // taking the click instead.
+    // The enable checkbox sits in the same row as the name; the regression
+    // would be the row's menu surface taking the click instead.
     let toggle = harness
         .query_all_by_role(egui::accesskit::Role::CheckBox)
-        .find(|node| card.contains(node.rect().center()))
+        .find(|node| {
+            let c = node.rect().center();
+            c.y >= card.top() && c.y <= card.bottom() && c.x < card.left()
+        })
         .expect("the effect's enable checkbox");
     toggle.click();
     harness.run();
@@ -2488,4 +2511,151 @@ fn an_empty_channel_takes_a_pasted_deck_in_its_body() {
         Some(varda::engine::PasteTarget::IntoChannel(channel_uuid)),
         "a deck pasted in a channel's body lands in that channel"
     );
+}
+
+/// Right-clicking an input sends it straight to a screen: "Cut to TV" stages
+/// the deck on the TV bus and takes it, without going through the switcher.
+#[test]
+fn right_clicking_a_deck_cuts_it_to_a_bus() {
+    let mut harness = make_harness(UIData::test_fixture());
+    harness
+        .get_by_label("test_generator_a deck card")
+        .click_secondary();
+    harness.run();
+    harness.get_by_label("Cut to TV").click();
+    harness.run();
+    let acc = harness.state();
+    assert_eq!(
+        acc.bus_preview,
+        Some((
+            "bus00001".to_string(),
+            varda::bus::BusInputRef::Deck("a0000001".to_string())
+        ))
+    );
+    assert_eq!(acc.bus_cut.as_deref(), Some("bus00001"));
+    assert_eq!(acc.bus_auto, None);
+}
+
+/// The master mix goes to a bus the same way, from the Main Output preview.
+#[test]
+fn right_clicking_the_main_output_cuts_master_to_a_bus() {
+    let mut harness = make_harness(UIData::test_fixture());
+    harness.get_by_label("Main output").click_secondary();
+    harness.run();
+    harness.get_by_label("Cut to TV").click();
+    harness.run();
+    let acc = harness.state();
+    assert_eq!(
+        acc.bus_preview,
+        Some(("bus00001".to_string(), varda::bus::BusInputRef::Master))
+    );
+    assert_eq!(acc.bus_cut.as_deref(), Some("bus00001"));
+}
+
+/// The same from a channel's header, with a fade.
+#[test]
+fn right_clicking_a_channel_fades_it_to_a_bus() {
+    let mut harness = make_harness(UIData::test_fixture());
+    harness.get_by_label("▌ Ch B").click_secondary();
+    harness.run();
+    harness.get_by_label("Fade to TV").click();
+    harness.run();
+    let acc = harness.state();
+    assert_eq!(
+        acc.bus_preview,
+        Some((
+            "bus00001".to_string(),
+            varda::bus::BusInputRef::Channel("cb000001".to_string())
+        ))
+    );
+    assert_eq!(acc.bus_auto.as_deref(), Some("bus00001"));
+}
+
+/// A deck card dragged into another channel lands where it is dropped:
+/// between the two cards there, not at the end.
+#[test]
+fn a_deck_dragged_to_another_channel_lands_between_its_decks() {
+    let mut harness = make_harness(UIData::test_fixture());
+    let moving = harness.get_by_label("test_generator_a deck card").rect();
+    // Ch B holds test_generator_c then test_generator_d.
+    let second = harness.get_by_label("test_generator_d deck card").rect();
+    drag(
+        &mut harness,
+        moving.center(),
+        egui::pos2(second.center().x, second.top() + 6.0),
+    );
+    assert_eq!(
+        harness.state().move_deck,
+        Some((
+            "a0000001".to_string(),
+            "cb000001".to_string(),
+            Some("b0000002".to_string())
+        ))
+    );
+}
+
+/// Within a channel, the same drop moves a card up or down; dropped just
+/// under itself it stays put and makes no undo step.
+#[test]
+fn a_deck_dragged_within_its_channel_moves_or_stays() {
+    let mut harness = make_harness(UIData::test_fixture());
+    let first = harness.get_by_label("test_generator_a deck card").rect();
+    let second = harness.get_by_label("test_generator_b deck card").rect();
+    drag(
+        &mut harness,
+        second.center(),
+        egui::pos2(first.center().x, first.top() + 6.0),
+    );
+    assert_eq!(
+        harness.state().move_deck,
+        Some((
+            "a0000002".to_string(),
+            "ca000001".to_string(),
+            Some("a0000001".to_string())
+        )),
+        "the second card moves above the first"
+    );
+
+    let mut harness = make_harness(UIData::test_fixture());
+    let first = harness.get_by_label("test_generator_a deck card").rect();
+    drag(
+        &mut harness,
+        first.center(),
+        egui::pos2(first.center().x, first.bottom() - 6.0),
+    );
+    assert_eq!(
+        harness.state().move_deck,
+        None,
+        "the lower half of itself is where it already is"
+    );
+}
+
+/// Double-clicking a deck card opens its channel's input settings with that
+/// layer picked.
+#[test]
+fn double_clicking_a_deck_card_opens_its_layer_in_input_settings() {
+    let mut harness = make_harness_stepping(UIData::test_fixture(), 1.0 / 60.0);
+    let card = harness.get_by_label("test_generator_a deck card").rect();
+    double_click(&mut harness, card.center());
+    harness.get_by_label("Ch A — Input Settings");
+    harness.get_by_label_contains("Layer 1 — test_generator_a");
+    harness.get_by_label("Adjust preview");
+    assert_eq!(
+        harness.state().select_deck,
+        Some((0, 0)),
+        "the deck is selected too"
+    );
+}
+
+/// A deck card's right-click menu copies and pastes crop, border and
+/// transform together, for any layer of any channel.
+#[test]
+fn a_deck_cards_menu_offers_copy_and_paste_position() {
+    let mut harness = make_harness(UIData::test_fixture());
+    harness
+        .get_by_label("test_generator_a deck card")
+        .click_secondary();
+    harness.run();
+    harness.get_by_label("Copy position");
+    harness.get_by_label("Paste position");
 }

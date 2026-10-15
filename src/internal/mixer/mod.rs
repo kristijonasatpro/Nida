@@ -1,7 +1,13 @@
 //! Mixer - Top-level compositor that owns channels, crossfader, master effects, and modulation
 
+mod main_transition;
+mod program;
 mod render;
 mod transition;
+
+pub use program::{
+    MainFade, MainProgram, MainSnapshot, MainSource, MainTransition, MixMode, DEFAULT_FADE_SECS,
+};
 
 pub use transition::{
     AutoCrossfade, BeatSyncCrossfade, CrossfadeEasing, SequencerState, StepKind, TransitionEffect,
@@ -120,6 +126,26 @@ pub struct FrameInputs<'a> {
 }
 
 /// Mixer - Top-level compositor
+/// How a frame will be shown, for what moves by whole frames.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameTiming {
+    /// When the screen's refresh that called for this frame came, when a
+    /// refresh starts frames: moved on by that, not by when the frame
+    /// happened to start.
+    pub refresh_at: Option<std::time::Instant>,
+    /// A screen's refresh starts each frame, so each is shown once in turn:
+    /// moved on a frame per frame (see `VardaApp::frames_follow_a_screen`).
+    pub held: bool,
+}
+
+/// How often a channel shown only as a tile in the control window is drawn:
+/// plenty for a thumbnail — a clock turns over once a second — at a third of
+/// the cost of every frame at 60.
+pub const TILE_FPS: u32 = 20;
+
+// The flags are unrelated render switches (visible parts, tiles, tap
+// state…), not one state enum.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Mixer {
     /// Channels (default 2: A and B)
     channels: Vec<Channel>,
@@ -129,6 +155,12 @@ pub struct Mixer {
 
     /// Crossfader position (0.0 = Ch 0, 1.0 = Ch 1)
     crossfader: f32,
+
+    /// How the master is made: layered channels, or Main with overlays.
+    mix_mode: MixMode,
+
+    /// What is on Main, used in [`MixMode::Program`].
+    main: MainProgram,
 
     /// Active auto-crossfade (if any)
     auto_crossfade: Option<AutoCrossfade>,
@@ -166,6 +198,18 @@ pub struct Mixer {
     composite_texture: wgpu::Texture,
     composite_view: wgpu::TextureView,
 
+    /// A 1x1 cleared texture, sampled when a feed resolves to nothing.
+    ///
+    /// A production bus can legitimately be black — nothing taken yet, or a
+    /// route the load refused to trust. Returning "no view" for that would make
+    /// the destination skip its blit and keep showing the *previous* frame,
+    /// which is the one thing a black bus must not do. One pixel is enough: it
+    /// is sampled across the whole target.
+    black_view: wgpu::TextureView,
+    /// Whether `black_view` has been cleared: nothing else writes it, so once
+    /// is enough (see `clear_black_source`).
+    black_cleared: std::sync::atomic::AtomicBool,
+
     /// Ping-pong texture for master effect chain
     effect_ping_texture: wgpu::Texture,
     effect_ping_view: wgpu::TextureView,
@@ -197,8 +241,15 @@ pub struct Mixer {
 
     /// Simple blit pipeline for first-channel copy
     blit_pipeline: BlitPipeline,
+    /// Blend-unit pipelines for Add and Screen channels (see
+    /// [`crate::renderer::blit::ADD_BLENDING`]).
+    add_pipeline: BlitPipeline,
+    screen_pipeline: BlitPipeline,
+    /// The new picture added over the old in Main's dissolve, colour and
+    /// coverage weighted alike (see [`crate::renderer::blit::SUM_BLENDING`]).
+    sum_pipeline: BlitPipeline,
 
-    /// Tonemap pipeline (bypass/ACES) applied after master effects
+    /// Tonemap pipeline (bypass or a curve) applied after master effects
     tonemap_pipeline: TonemapPipeline,
 
     /// Current tonemap mode
@@ -212,6 +263,9 @@ pub struct Mixer {
 
     /// Active transition effect (replaces opacity-based crossfade when set)
     active_transition: Option<TransitionEffect>,
+    /// Main's transitions other than a fade: their shaders, pipelines and
+    /// textures (see `main_transition`).
+    main_transitions: main_transition::MainTransitions,
 
     /// Transition sequences (channel-to-channel automation). Multiple named sequences supported.
     transition_sequences: Vec<TransitionSequence>,
@@ -223,6 +277,27 @@ pub struct Mixer {
     /// Used when surfaces source from Channel(idx) — the raw channel composite
     /// can't be tonemapped in-place since it feeds into the mixer composite.
     tonemapped_channel_cache: std::collections::HashMap<usize, (wgpu::Texture, wgpu::TextureView)>,
+
+    /// Decks shown on their own outside Main — alone on a bus, or being
+    /// edited — by UUID, set by the app each frame. They render even when a
+    /// deck covering their channel hides them there.
+    pub decks_shown_alone: Vec<String>,
+    /// How this frame will be shown, for what moves by whole frames (a
+    /// playlist's transition). Set each frame before [`Mixer::render`].
+    pub frame_timing: FrameTiming,
+    /// The control window shows every channel's picture as a tile: a channel
+    /// off air and not otherwise needed is drawn a few times a second for it
+    /// (see [`TILE_FPS`]) instead of not at all, which froze its tile until
+    /// it was selected. Set by the app.
+    pub tile_previews: bool,
+    /// Draw each deck only where the opaque decks over it leave it showing
+    /// (see [`crate::renderer::region`]). On by default; off draws every
+    /// deck whole, as before, for comparing the two.
+    pub draw_visible_parts: bool,
+    /// The order channels render in this frame, set by `prepare_taps`: a
+    /// channel shown in another renders before it, so the other shows this
+    /// frame's picture. Channel order everywhere else is unchanged.
+    render_order: Vec<usize>,
 
     /// GPU performance profiling: when > 0, insert device.poll(Wait) between
     /// GPU work stages to measure actual GPU drain time per category.
@@ -266,6 +341,11 @@ impl Mixer {
         let composite_texture = context.create_compositing_texture(width, height);
         let composite_view = composite_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // 1x1 and never resized: it is sampled across whatever target uses it.
+        let black_view = context
+            .create_compositing_texture(1, 1)
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
         let effect_ping_texture = context.create_compositing_texture(width, height);
         let effect_ping_view =
             effect_ping_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -283,6 +363,21 @@ impl Mixer {
             context.compositing_format,
             wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
         )?;
+        let add_pipeline = BlitPipeline::with_blend(
+            &context.device,
+            context.compositing_format,
+            crate::renderer::blit::ADD_BLENDING,
+        )?;
+        let screen_pipeline = BlitPipeline::with_blend(
+            &context.device,
+            context.compositing_format,
+            crate::renderer::blit::SCREEN_BLENDING,
+        )?;
+        let sum_pipeline = BlitPipeline::with_blend(
+            &context.device,
+            context.compositing_format,
+            crate::renderer::blit::SUM_BLENDING,
+        )?;
         let tonemap_pipeline = TonemapPipeline::new(&context.device, context.compositing_format)?;
         let lut_pipeline = LutPipeline::new(&context.device, context.compositing_format)?;
 
@@ -295,6 +390,8 @@ impl Mixer {
             channels: vec![channel_0, channel_1],
             next_channel_index: 2, // Ch 0, Ch 1 already used
             crossfader: 0.0,
+            mix_mode: MixMode::Layered,
+            main: MainProgram::default(),
             auto_crossfade: None,
             beat_sync_crossfade: None,
             modulation: ModulationEngine::new(),
@@ -306,6 +403,8 @@ impl Mixer {
             last_render_time: now,
             composite_texture,
             composite_view,
+            black_view,
+            black_cleared: std::sync::atomic::AtomicBool::new(false),
             effect_ping_texture,
             effect_ping_view,
             master_tap: None,
@@ -315,15 +414,24 @@ impl Mixer {
             gpu_utilization: 0.0,
             composite_pipeline,
             blit_pipeline,
+            add_pipeline,
+            screen_pipeline,
+            sum_pipeline,
             tonemap_pipeline,
             tonemap_mode: TonemapMode::default(),
             lut_pipeline,
             active_lut: None,
             active_transition: None,
+            main_transitions: main_transition::MainTransitions::new(context)?,
             transition_sequences: Vec::new(),
             sub_mix_cache: std::collections::HashMap::new(),
             tonemapped_channel_cache: std::collections::HashMap::new(),
             perf_profile_frames: 0,
+            decks_shown_alone: Vec::new(),
+            frame_timing: FrameTiming::default(),
+            tile_previews: false,
+            draw_visible_parts: true,
+            render_order: Vec::new(),
             query_set: if context.timestamp_supported {
                 Some(context.device.create_query_set(&wgpu::QuerySetDescriptor {
                     label: Some("GPU Timing QuerySet"),
@@ -386,6 +494,7 @@ impl Mixer {
         self.effect_ping_view = self
             .effect_ping_texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        self.main_transitions.resized();
 
         // Tap targets are dropped rather than resized; `sync_tap_targets`
         // reallocates them at the new size on the next frame.
@@ -397,41 +506,78 @@ impl Mixer {
         self.tonemapped_channel_cache.clear();
     }
 
-    /// Resolve every tap deck for this frame.
+    /// Resolve every tap deck for this frame, and the order channels render
+    /// in.
     ///
-    /// Allocates the targets that are actually read, exchanges each one with
-    /// the live composite so reads and writes never collide, and binds the
-    /// resulting views onto the tapping decks. Must run before any deck
-    /// renders — that ordering is what makes a tap uniformly one frame old
-    /// instead of depending on where the tapping deck sits.
+    /// A deck showing another channel reads that channel's picture of this
+    /// frame: the channel is rendered before the one the deck sits in. Where
+    /// channels show each other round a loop — a channel showing itself, or
+    /// two showing each other, a deliberate feedback — one of them has to go
+    /// first, and a deck there reads the picture of the frame before, kept in
+    /// a second target swapped with the live one, so a read never meets a
+    /// write and the loop settles rather than feeding itself within a frame.
+    /// The master is composited after every channel, so a master tap is
+    /// always the frame before. Must run before any deck renders.
     /// See spec/program-tap.md.
     pub fn prepare_taps(&mut self, context: &GpuContext) {
+        let index: std::collections::HashMap<String, usize> = self
+            .channels
+            .iter()
+            .enumerate()
+            .map(|(i, ch)| (ch.uuid().to_string(), i))
+            .collect();
         let mut master_tapped = false;
-        let mut tapped_channels = std::collections::HashSet::new();
-        for channel in &self.channels {
+        // The channels each channel's decks show.
+        let mut shows: Vec<Vec<usize>> = vec![Vec::new(); self.channels.len()];
+        for (at, channel) in self.channels.iter().enumerate() {
             for slot in &channel.decks {
                 match slot.deck.tap.as_ref().map(|t| &t.source) {
                     Some(crate::deck::TapSource::MasterProgram) => master_tapped = true,
                     Some(crate::deck::TapSource::Channel(uuid)) => {
-                        tapped_channels.insert(uuid.clone());
+                        if let Some(&shown) = index.get(uuid) {
+                            shows[at].push(shown);
+                        }
                     }
                     None => {}
                 }
             }
         }
+        let order = render_order(&shows);
+        let mut position = vec![0; order.len()];
+        for (place, &ch) in order.iter().enumerate() {
+            position[ch] = place;
+        }
+        // Shown by a channel that renders first, or by itself: the frame
+        // before.
+        let mut late = std::collections::HashSet::new();
+        for (at, shown) in shows.iter().enumerate() {
+            for &ch in shown {
+                if position[ch] >= position[at] {
+                    late.insert(ch);
+                }
+            }
+        }
 
-        self.sync_tap_targets(context, master_tapped, &tapped_channels);
+        self.sync_tap_targets(context, master_tapped, &late);
         for channel in &mut self.channels {
             channel.swap_tap();
+        }
+        for (at, channel) in self.channels.iter_mut().enumerate() {
+            channel.tapped = shows.iter().any(|shown| shown.contains(&at));
         }
 
         // Cloned up front because binding borrows the channels mutably and so
         // cannot also read the channel that is being tapped.
         let master_view = self.master_tap.as_ref().map(|(_, v)| v.clone());
-        let channel_views: std::collections::HashMap<String, wgpu::TextureView> = self
+        let live: Vec<wgpu::TextureView> = self
             .channels
             .iter()
-            .filter_map(|ch| Some((ch.uuid().to_string(), ch.tap_view()?.clone())))
+            .map(|ch| ch.composite_view.clone())
+            .collect();
+        let before: Vec<Option<wgpu::TextureView>> = self
+            .channels
+            .iter()
+            .map(|ch| ch.tap_view().cloned())
             .collect();
         let labels: Vec<(String, String)> = self
             .channels
@@ -439,7 +585,7 @@ impl Mixer {
             .map(|ch| (ch.uuid().to_string(), ch.name.clone()))
             .collect();
 
-        for channel in &mut self.channels {
+        for (at, channel) in self.channels.iter_mut().enumerate() {
             for slot in &mut channel.decks {
                 let Some(tap) = slot.deck.tap.as_ref() else {
                     continue;
@@ -449,7 +595,14 @@ impl Mixer {
                         (master_view.clone(), "Master Program".to_string())
                     }
                     crate::deck::TapSource::Channel(uuid) => {
-                        (channel_views.get(uuid).cloned(), tap.source.label(&labels))
+                        let view = index.get(uuid).and_then(|&ch| {
+                            if position[ch] < position[at] {
+                                Some(live[ch].clone())
+                            } else {
+                                before[ch].clone()
+                            }
+                        });
+                        (view, tap.source.label(&labels))
                     }
                 };
                 slot.deck.external_source_view = view;
@@ -461,15 +614,28 @@ impl Mixer {
                 }
             }
         }
+        self.render_order = order;
     }
 
-    /// Allocate tap targets for exactly the sources some deck is tapping, and
-    /// release the rest. A scene with no taps therefore allocates nothing.
+    /// The order channels render in: `render_order` when it covers them all,
+    /// else as they stand.
+    pub(crate) fn channel_render_order(&self) -> Vec<usize> {
+        if self.render_order.len() == self.channels.len() {
+            self.render_order.clone()
+        } else {
+            (0..self.channels.len()).collect()
+        }
+    }
+
+    /// Allocate tap targets for exactly the pictures some deck reads a frame
+    /// late — the master's, and those of the channels in `late` — and
+    /// release the rest. A scene with no taps, or whose taps all read this
+    /// frame's picture, therefore allocates nothing.
     fn sync_tap_targets(
         &mut self,
         context: &GpuContext,
         master_tapped: bool,
-        tapped_channels: &std::collections::HashSet<String>,
+        late: &std::collections::HashSet<usize>,
     ) {
         let width = self.composite_texture.width();
         let height = self.composite_texture.height();
@@ -484,8 +650,8 @@ impl Mixer {
             self.master_tap = None;
         }
 
-        for channel in &mut self.channels {
-            if tapped_channels.contains(channel.uuid()) {
+        for (at, channel) in self.channels.iter_mut().enumerate() {
+            if late.contains(&at) {
                 channel.ensure_tap(context, width, height);
             } else {
                 channel.clear_tap();
@@ -500,6 +666,43 @@ impl Mixer {
     }
 
     /// Clear the sub-mix texture cache (e.g. after resolution change).
+    /// A view that always reads black. See the `black_view` field docs.
+    pub fn black_view(&self) -> &wgpu::TextureView {
+        &self.black_view
+    }
+
+    /// Whether the black source has been cleared (see `clear_black_source`).
+    pub(crate) fn black_source_cleared(&self) -> bool {
+        self.black_cleared
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Clear the black source, so it reads black rather than undefined (or
+    /// wgpu's transparent zero) — once is enough: nothing else writes it.
+    /// Cleared every frame, it was a pass of its own each frame, and a pass
+    /// costs the GPU ~0.15 ms however little it draws (measured,
+    /// `renderer::gpu_time`).
+    pub(crate) fn clear_black_source(&self, encoder: &mut wgpu::CommandEncoder) {
+        self.black_cleared
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Clear black source"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.black_view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+    }
+
     pub fn clear_sub_mix_cache(&mut self) {
         self.sub_mix_cache.clear();
     }
@@ -623,6 +826,124 @@ impl Mixer {
     /// Current crossfader position (0.0 = Ch 0, 1.0 = Ch 1).
     pub fn crossfader(&self) -> f32 {
         self.crossfader
+    }
+
+    /// How the master is made.
+    pub fn mix_mode(&self) -> MixMode {
+        self.mix_mode
+    }
+
+    pub fn set_mix_mode(&mut self, mode: MixMode) {
+        self.mix_mode = mode;
+    }
+
+    /// What is on Main, and its overlays.
+    pub fn main(&self) -> &MainProgram {
+        &self.main
+    }
+
+    pub fn main_mut(&mut self) -> &mut MainProgram {
+        &mut self.main
+    }
+
+    /// Whether a Main source names a channel or deck in this scene.
+    pub fn main_source_exists(&self, source: &MainSource) -> bool {
+        match source {
+            MainSource::Black => true,
+            MainSource::Channel(uuid) => self.find_channel_by_uuid(uuid).is_some(),
+            MainSource::Deck(uuid) => self.find_deck_by_uuid(uuid).is_some(),
+        }
+    }
+
+    /// In [`MixMode::Program`], how much of each channel reaches the master:
+    /// 1 for the one on Main (or holding the deck on Main, or either side of
+    /// a fade), an overlay's level times its fader, 0 for the rest. Decides
+    /// which channels render at all.
+    fn program_weights(&self) -> Vec<f32> {
+        let on_air = |ch: &Channel| {
+            let holds = |source: &MainSource| match source {
+                MainSource::Black => false,
+                MainSource::Channel(uuid) => ch.uuid() == uuid,
+                MainSource::Deck(uuid) => ch.decks.iter().any(|d| d.deck.uuid() == uuid),
+            };
+            holds(&self.main.program) || self.main.fade.as_ref().is_some_and(|f| holds(&f.from))
+        };
+        self.channels
+            .iter()
+            .enumerate()
+            .map(|(i, ch)| {
+                if on_air(ch) {
+                    1.0
+                } else if ch.overlay {
+                    self.main.overlay_level(ch.uuid()) * self.channel_opacity(i)
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
+    /// The transition shader Main's chosen transition needs and has not
+    /// got — for the app, which holds the shader library, to give it — and
+    /// its name in the library.
+    pub fn main_transition_shader_wanted(&self) -> Option<(MainTransition, &'static str)> {
+        // The take running first, then the one chosen for the next.
+        let running = self.main.fade.as_ref().map(|f| f.transition);
+        running
+            .into_iter()
+            .chain(std::iter::once(self.main.transition))
+            .find_map(|transition| {
+                let name = transition.shader_name()?;
+                (!self.main_transitions.shaders.contains_key(&transition)
+                    && !self.main_transitions.refused.contains(&transition))
+                .then_some((transition, name))
+            })
+    }
+
+    /// Give Main's `transition` its shader, compiled; one missing from the
+    /// library, or that will not compile, is not asked for again — the
+    /// transition is then a fade.
+    ///
+    /// # Errors
+    ///
+    /// When the shader is missing or will not compile.
+    pub fn set_main_transition_shader(
+        &mut self,
+        context: &GpuContext,
+        transition: MainTransition,
+        shader: Option<crate::isf::ISFShader>,
+    ) -> anyhow::Result<()> {
+        let compiled = shader
+            .ok_or_else(|| anyhow::anyhow!("not in the shader library"))
+            .and_then(|shader| TransitionEffect::compile(context, shader));
+        match compiled {
+            Ok(effect) => {
+                self.main_transitions.shaders.insert(transition, effect);
+                Ok(())
+            }
+            Err(e) => {
+                self.main_transitions.refused.insert(transition);
+                Err(e)
+            }
+        }
+    }
+
+    /// How strongly each channel shows in the master now: Main's on-air,
+    /// fading and overlay channels in Main mode; each at its fader, the
+    /// crossfader between two, in the layered mix.
+    pub fn channel_weights(&self) -> Vec<f32> {
+        if self.mix_mode == MixMode::Program {
+            return self.program_weights();
+        }
+        if self.channels.len() == 2 {
+            return vec![
+                (1.0 - self.crossfader) * self.channel_opacity(0),
+                self.crossfader * self.channel_opacity(1),
+            ];
+        }
+        (0..self.channels.len())
+            .map(|i| self.channel_opacity(i))
+            .collect()
     }
 
     /// Read-only access to the auto-crossfade state.
@@ -1004,9 +1325,58 @@ fn channel_name(index: usize) -> String {
     format!("Ch {index}")
 }
 
+/// The order to render channels in, given the channels each one's decks
+/// show: every channel after the ones it shows, otherwise as they stand.
+/// Round a loop no order can do that, so the loop's first channel found goes
+/// first, and its decks read the others a frame late.
+fn render_order(shows: &[Vec<usize>]) -> Vec<usize> {
+    let count = shows.len();
+    let mut placed = vec![false; count];
+    let mut order = Vec::with_capacity(count);
+    while order.len() < count {
+        let ready = (0..count)
+            .find(|&ch| !placed[ch] && shows[ch].iter().all(|&shown| placed[shown] || shown == ch));
+        let next = ready.unwrap_or_else(|| {
+            // Every channel left shows one left: follow them from the first
+            // until one comes round again, which is on a loop.
+            let mut seen = vec![false; count];
+            let mut ch = (0..count).find(|&ch| !placed[ch]).unwrap_or(0);
+            while !seen[ch] {
+                seen[ch] = true;
+                ch = shows[ch]
+                    .iter()
+                    .copied()
+                    .filter(|&shown| !placed[shown])
+                    .min()
+                    .unwrap_or(ch);
+            }
+            ch
+        });
+        placed[next] = true;
+        order.push(next);
+    }
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channels_render_after_the_ones_they_show() {
+        assert_eq!(render_order(&[vec![], vec![]]), vec![0, 1], "as they stand");
+        assert_eq!(render_order(&[vec![1], vec![]]), vec![1, 0]);
+        assert_eq!(render_order(&[vec![2], vec![0], vec![]]), vec![2, 0, 1]);
+        assert_eq!(
+            render_order(&[vec![0], vec![]]),
+            vec![0, 1],
+            "showing itself"
+        );
+        // Round a loop the first channel found on it goes first...
+        assert_eq!(render_order(&[vec![1], vec![0], vec![0]]), vec![0, 1, 2]);
+        // ...not one merely showing a channel on it.
+        assert_eq!(render_order(&[vec![1], vec![2], vec![1]]), vec![1, 0, 2]);
+    }
 
     // ── CrossfadeEasing tests ────────────────────────────────────────
 
@@ -1311,6 +1681,31 @@ mod tests {
             mixer.channel(1).unwrap().active_deck_count,
             1,
             "cued off-air channel must be force-rendered"
+        );
+    }
+
+    /// With the control window showing every channel as a tile, an off-air
+    /// channel is still drawn — a few times a second — so its tile does not
+    /// freeze (a clock stood still until its channel was selected).
+    #[test]
+    fn an_off_air_channel_is_drawn_now_and_then_for_its_tile() {
+        let gpu = headless_gpu();
+        let mut mixer = Mixer::new(&gpu, 64, 64).unwrap();
+        add_solid_deck_to(&mut mixer, &gpu, 1, [1.0, 0.0, 0.0, 1.0]);
+        let every = 60 / TILE_FPS;
+        for _ in 0..every * 4 {
+            render_once(&mut mixer, &gpu, &[]);
+        }
+        assert_eq!(mixer.channel(1).unwrap().frames_drawn(), 0, "culled without tiles");
+
+        mixer.tile_previews = true;
+        for _ in 0..every * 4 {
+            render_once(&mut mixer, &gpu, &[]);
+        }
+        assert_eq!(
+            mixer.channel(1).unwrap().frames_drawn(),
+            4,
+            "drawn every {every} frames for its tile, not every frame nor never"
         );
     }
 

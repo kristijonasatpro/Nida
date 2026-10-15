@@ -67,6 +67,12 @@ pub fn headless_config() -> crate::app::AppConfig {
         "--no-osc",
         "--no-ndi",
         "--no-syphon",
+        // The suite constructs an app hundreds of times. Camera enumeration
+        // raises the OS permission dialog on construction, and an unanswered
+        // one does not stop the next, so without this a full run stacks
+        // hundreds of prompts — which on macOS can also stop unrelated
+        // permission requests from being presented at all.
+        "--no-camera",
         "--workspace",
         &temp_workspace(),
     ])

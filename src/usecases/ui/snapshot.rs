@@ -59,6 +59,9 @@ pub(crate) fn build_ui_data(
                         out_point: vp.out_point,
                         frame_rate: vp.frame_rate,
                         transport_sync: vp.transport_sync,
+                        hardware_decode: vp.hardware_decode,
+                        auto: vp.auto,
+                        sound_only: vp.sound_only,
                     });
                     let auto_transition = d.auto_transition.as_ref().map(|at| AutoTransitionUI {
                         enabled: at.enabled,
@@ -119,6 +122,11 @@ pub(crate) fn build_ui_data(
                         depth_prepro,
                         screen_capture,
                         tap,
+                        playlist: d.playlist.clone(),
+                        timer: d.timer.clone(),
+                        camera_colour: d.camera_colour,
+                        camera_profile: d.camera_profile.clone(),
+                        camera_lowest_latency: d.camera_lowest_latency,
                         is_html_interactive: d.is_html_interactive,
                         opacity: d.opacity,
                         effective_opacity: d.effective_opacity,
@@ -127,11 +135,14 @@ pub(crate) fn build_ui_data(
                         mute: d.mute,
                         transparent: d.transparent,
                         scaling_mode: d.scaling_mode,
+                        source_size: d.source_size,
+                        solid_color: d.solid_color,
                         generator,
                         effects,
                         video_playback,
                         auto_transition,
                         render_fps: d.render_fps,
+                        render_scale: d.render_scale,
                         effective_render_fps: d.effective_render_fps,
                         render_cost_us: d.render_cost_us,
                         gpu_render_cost_us: d.gpu_render_cost_us,
@@ -147,6 +158,7 @@ pub(crate) fn build_ui_data(
                 blend_mode: ch.blend_mode,
                 decks,
                 effects,
+                overlay: ch.overlay,
             }
         })
         .collect();
@@ -316,8 +328,8 @@ pub(crate) fn build_ui_data(
                         })
                         .collect();
                     (
-                        w.target.clone(),
-                        format!("{}", w.target),
+                        w.configured_target(),
+                        w.target_label(),
                         true,
                         true,
                         std::time::Duration::ZERO,
@@ -347,7 +359,7 @@ pub(crate) fn build_ui_data(
                         h.active,
                         o.active_duration(),
                         sa,
-                        crate::renderer::context::CalibrationMode::Off,
+                        h.calibration_mode,
                         (h.width, h.height),
                     )
                 }
@@ -357,7 +369,7 @@ pub(crate) fn build_ui_data(
             let audio_passthrough = match o {
                 crate::renderer::context::UnifiedOutput::Headless(h) => {
                     h.audio_pcm.as_ref().map(|p| AudioPassthroughUI {
-                        device: h.target.audio_device().unwrap_or_default().to_string(),
+                        device: p.label.clone(),
                         frames_written: h
                             .subprocess
                             .as_deref()
@@ -404,6 +416,12 @@ pub(crate) fn build_ui_data(
                 delivery,
                 preview_width,
                 preview_height,
+                source: o.source().cloned(),
+                audio_bus: match o {
+                    crate::renderer::context::UnifiedOutput::Headless(h) => h.audio_bus.clone(),
+                    crate::renderer::context::UnifiedOutput::Window(_) => None,
+                },
+                led: o.led().cloned(),
             }
         })
         .collect();
@@ -438,6 +456,10 @@ pub(crate) fn build_ui_data(
             index: m.index,
             width: m.width,
             height: m.height,
+            is_control: app.control_screen() == Some(m.name.as_str()),
+            label: m.label.clone(),
+            model: m.model.clone(),
+            given_name: m.given_name.clone(),
         })
         .collect();
 
@@ -530,15 +552,25 @@ pub(crate) fn build_ui_data(
         .visible()
         .iter()
         .map(|n| NotificationUI {
+            id: n.id,
             level: n.level,
             message: n.message.clone(),
             progress: n.progress(),
         })
         .collect();
 
+    let effect_masks = engine
+        .mixer
+        .channels
+        .iter()
+        .flat_map(|ch| ch.decks.iter().flat_map(|d| &d.effects).chain(&ch.effects))
+        .chain(&engine.mixer.master_effects)
+        .filter_map(|e| Some((e.uuid.clone(), e.mask.clone()?)))
+        .collect();
     UIData {
         generators: engine.registry.generators,
         filters: engine.registry.filters,
+        effect_masks,
         shader_count: engine.registry.shader_count,
         channels,
         master_effect_info,
@@ -607,17 +639,43 @@ pub(crate) fn build_ui_data(
         camera_detect_contours: vec![], // populated by UIRunner
         library_panel_open: layout.library_panel_open,
         right_panel_open: layout.right_panel_open,
+        screen: layout.screen.clone(),
+        saved_layouts: std::sync::Arc::default(), // populated by UIRunner
+        show_name: app.show_name(),
+        show_folder: app.show_folder().to_path_buf(),
+        recent_shows: std::sync::Arc::default(), // populated by UIRunner
+        window_choices: crate::usecases::ui::window_choices::WindowChoices::default(), // populated by UIRunner
+        show_switch_refused: app.show_switch_refused().map(str::to_string),
+        collapsed_channels: layout.collapsed_channels.clone(),
         stage_editor_grid_size: layout.stage_editor_grid_size,
         stage_editor_snap: layout.stage_editor_snap,
         available_monitors,
+        audio_mix: engine.audio_mix.clone(),
+        stream_settings: app.stream_settings().clone(),
+        stream_status: engine.stream.status.clone(),
+        record: engine.record.clone(),
+        main: engine.mixer.main.clone(),
+        buses: engine
+            .buses
+            .iter()
+            .map(|bus| crate::usecases::ui::BusUI {
+                screen: app.bus_screen(&bus.uuid),
+                bus: bus.clone(),
+            })
+            .collect(),
+        rundown: engine.rundown.clone(),
         midi_devices,
         midi_mappings,
         cameras: engine.cameras.devices,
+        camera_modes: engine.cameras.modes,
+        camera_access_denied: engine.cameras.access_denied,
+        camera_video_effects: engine.cameras.video_effects.clone(),
         depth_sensors: engine.depth_sensors.devices,
         capture_targets: engine.screen_capture.targets,
         screen_capture_permission: engine.screen_capture.permission,
         screen_capture_available: engine.screen_capture.available,
         ndi_sources: engine.ndi_sources.clone(),
+        decklink_devices: engine.decklink_devices.clone(),
         ndi_available: engine.ndi_available,
         syphon_sources: engine.syphon_sources.clone(),
         syphon_available: engine.syphon_available,
@@ -692,22 +750,15 @@ pub(crate) fn build_ui_data(
                 .channels
                 .iter()
                 .map(|ch| {
-                    // Average the per-deck wall-clock FPS across active decks
-                    let active_decks: Vec<f32> = ch
-                        .decks
-                        .iter()
-                        .filter(|s| !s.mute && s.opacity > 0.0)
-                        .map(|s| s.fps)
-                        .filter(|&fps| fps > 0.0)
-                        .collect();
-                    let avg_fps = if active_decks.is_empty() {
-                        0.0
-                    } else {
-                        active_decks.iter().sum::<f32>() / active_decks.len() as f32
-                    };
+                    let fps = channel_fps(
+                        ch.decks
+                            .iter()
+                            .filter(|s| !s.mute && s.opacity > 0.0)
+                            .map(|s| (s.fps, s.still)),
+                    );
                     crate::usecases::ui::ChannelRenderStats {
                         name: ch.name.clone(),
-                        avg_deck_fps: avg_fps,
+                        fps,
                         active_deck_count: ch.active_deck_count,
                         render_time_ms: ch.render_time_ms,
                     }
@@ -725,7 +776,12 @@ pub(crate) fn build_ui_data(
         gpu_driver: app.gpu_context().adapter.get_info().driver,
         gpu_driver_info: app.gpu_context().adapter.get_info().driver_info,
         gpu_device_type: format!("{:?}", app.gpu_context().adapter.get_info().device_type),
-        gpu_utilization: app.mixer_ref().gpu_utilization(),
+        gpu_utilization: app
+            .frame_stats
+            .system_monitor
+            .gpu_busy()
+            .unwrap_or_else(|| app.mixer_ref().gpu_utilization()),
+        gpu_utilization_measured: app.frame_stats.system_monitor.gpu_busy().is_some(),
         cpu_usage: app.frame_stats.system_monitor.cpu_usage(),
         ram_used: app.frame_stats.system_monitor.ram_used(),
         ram_total: app.frame_stats.system_monitor.ram_total(),
@@ -745,8 +801,11 @@ pub(crate) fn build_ui_data(
         timecode: engine.timecode,
         render_width: app.render_width(),
         render_height: app.render_height(),
+        render_auto: app.render_auto(),
         max_render_dimension: app.max_render_dimension(),
         target_fps: app.target_fps(),
+        frames_in_flight: app.frames_in_flight(),
+        control_screen_rate: app.control_screen_rate(),
         // Populated by UIRunner after build (history/pending loads live on runner, not app)
         can_undo: false,
         can_redo: false,
@@ -769,6 +828,20 @@ pub(crate) fn build_ui_data(
 }
 
 // ── Snapshot → UI type helpers ──────────────────────────────────────
+
+/// A channel's frame rate as its motion shows it: the slowest of its visible
+/// layers that moves, from each layer's `(fps, still)`. A still image is drawn
+/// again only when its settings change, so its rate (0.16 for an idle PNG)
+/// says nothing about motion and is left out — averaged in, it turned four
+/// layers at 61 into a yellow "48". 0 when nothing moves.
+fn channel_fps(layers: impl IntoIterator<Item = (f32, bool)>) -> f32 {
+    layers
+        .into_iter()
+        .filter(|&(fps, still)| !still && fps > 0.0)
+        .map(|(fps, _)| fps)
+        .reduce(f32::min)
+        .unwrap_or(0.0)
+}
 
 fn params_snapshot_to_ui(snap: &ShaderParamsSnapshot) -> ShaderParamsUI {
     ShaderParamsUI {
@@ -818,4 +891,19 @@ fn list_available_luts(workspace: &crate::persistence::Workspace) -> Vec<String>
         .collect();
     files.sort();
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::channel_fps;
+
+    #[test]
+    fn a_channel_runs_at_its_slowest_moving_layer_and_a_still_does_not_count() {
+        // The PiP scene: a still background and four moving taps.
+        let pip = [(0.16, true), (61.0, false), (61.1, false), (61.0, false), (61.2, false)];
+        assert!((channel_fps(pip) - 61.0).abs() < 1e-4, "not dragged to 48 by the still");
+        assert!((channel_fps([(61.0, false), (30.0, false)]) - 30.0).abs() < 1e-4, "the slowest");
+        assert!(channel_fps([(0.16, true)]).abs() < f32::EPSILON, "nothing moving");
+        assert!(channel_fps([]).abs() < f32::EPSILON, "no layers");
+    }
 }

@@ -100,6 +100,7 @@ mod tests {
 
     fn make_scene(crossfader: f32) -> SceneConfig {
         SceneConfig {
+            main: None,
             version: 2,
             channels: vec![],
             crossfader,
@@ -110,6 +111,9 @@ mod tests {
             transition_sequences: vec![],
             render_width: None,
             render_height: None,
+            render_resolution_auto: false,
+            frames_in_flight: None,
+            free_control_screen: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,

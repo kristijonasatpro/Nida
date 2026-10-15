@@ -1,0 +1,20 @@
+# Shaders the DMG leaves out: adaptations of other people's work whose
+# licence is non-commercial (dull_skull: CC BY-NC 4.0) or not stated, which
+# on Shadertoy means CC BY-NC-SA 3.0 (mandelbrot_deco says only "Ported"). What the DMG holds is free to use for
+# any purpose, a conference's paid work too. These stay in the source, under
+# their own terms. One file name per line (build-macos.sh).
+apollonian_glow.fs
+aurora_borealis.fs
+bicycle_day.fs
+biomine.fs
+clouds.fs
+digital_brain.fs
+dull_skull.fs
+eyes.fs
+eyes_depth.fs
+mandelbrot_deco.fs
+plasma_globe.fs
+steel_lattice.fs
+taste_of_noise.fs
+truchet_tube.fs
+warped_grid.fs

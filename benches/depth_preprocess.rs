@@ -110,7 +110,7 @@ fn bench_passes(c: &mut Criterion) {
                     pipeline.update_uniform(&gpu.queue, &params, 1.0 / 30.0);
                     let mut cmds = Vec::new();
                     pipeline.run(&gpu.device, &src, None, &mut cmds);
-                    gpu.queue.submit(cmds);
+                    gpu.submit(cmds);
                     drain(&gpu);
                 });
             },
@@ -139,7 +139,7 @@ fn bench_decks(c: &mut Criterion) {
                     pipeline.update_uniform(&gpu.queue, &params, 1.0 / 30.0);
                     pipeline.run(&gpu.device, &src, None, &mut cmds);
                 }
-                gpu.queue.submit(cmds);
+                gpu.submit(cmds);
                 drain(&gpu);
             });
         });

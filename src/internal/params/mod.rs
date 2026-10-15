@@ -79,7 +79,7 @@ impl ParamValue {
 }
 
 /// Convert a single sRGB component to linear light.
-fn srgb_to_linear(c: f32) -> f32 {
+pub(crate) fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.04045 {
         c / 12.92
     } else {
@@ -242,6 +242,18 @@ impl ShaderParams {
         if let Some(ParamValue::Float(v)) = self.values.get_mut(name) {
             *v = value;
             self.dirty = true;
+        }
+    }
+
+    /// A number for the value, as a controller's light shows it: a switch
+    /// is 0 or 1, a choice its index.
+    pub fn get_scalar(&self, name: &str) -> Option<f32> {
+        match self.values.get(name)? {
+            ParamValue::Float(v) => Some(*v),
+            ParamValue::Bool(v) => Some(if *v { 1.0 } else { 0.0 }),
+            #[allow(clippy::cast_precision_loss)]
+            ParamValue::Long(v) => Some(*v as f32),
+            _ => None,
         }
     }
 
@@ -412,8 +424,42 @@ impl ShaderParams {
     /// Generic set method for any parameter value
     pub fn set(&mut self, name: &str, value: ParamValue) {
         if self.values.contains_key(name) {
+            let value = self.as_declared(name, value);
             self.values.insert(name.to_string(), value);
             self.dirty = true;
+        }
+    }
+
+    /// `value` as the parameter `name` is declared: a number written to a
+    /// switch — from MIDI, OSC or the API's numeric routes — is on above
+    /// half way. Kept a number, the shader would read any non-zero bits as
+    /// on while Nida's own sums read it as neither.
+    ///
+    /// A number written to an integer parameter is kept an integer, the
+    /// nearest one. JSON has one kind of number, so a saved show's or the
+    /// API's whole number arrives as `Float` (tried first); kept so, the
+    /// shader's `int` would read the float's bits and match no choice.
+    fn as_declared(&self, name: &str, value: ParamValue) -> ParamValue {
+        let declared = self.definitions.get(name).map(|d| d.input_type.as_str());
+        match (declared, value) {
+            (Some("bool"), ParamValue::Float(v)) => ParamValue::Bool(v > 0.5),
+            (Some("bool"), ParamValue::Long(v)) => ParamValue::Bool(v != 0),
+            // Saturating; NaN is 0.
+            #[allow(clippy::cast_possible_truncation)]
+            (Some("long"), ParamValue::Float(v)) => ParamValue::Long(v.round() as i32),
+            (_, other) => other,
+        }
+    }
+
+    /// Reset the parameters named to their ISF defaults; names it does not
+    /// have are passed over.
+    pub fn reset_named_to_defaults(&mut self, names: &[String]) {
+        for name in names {
+            if let Some(definition) = self.definitions.get(name) {
+                self.values
+                    .insert(name.clone(), ParamValue::from_isf_input(definition));
+                self.dirty = true;
+            }
         }
     }
 
@@ -762,6 +808,47 @@ mod tests {
         assert!((params.get_float("brightness").unwrap() - 0.5).abs() < 1e-5);
         params.set_float("brightness", 0.8);
         assert!((params.get_float("brightness").unwrap() - 0.8).abs() < 1e-5);
+    }
+
+    /// A number written to a switch — MIDI, OSC, the API's numeric routes —
+    /// is kept as a switch, on above half way; a number to a number stays
+    /// one.
+    #[test]
+    fn a_number_written_to_a_switch_is_kept_as_a_switch() {
+        let inputs = vec![
+            make_bool_input("circle", false),
+            make_float_input("radius", 0.0, 0.0, 540.0),
+        ];
+        let mut params = ShaderParams::from_inputs(&inputs);
+        for (written, kept) in [
+            (ParamValue::Float(1.0), true),
+            (ParamValue::Float(0.3), false),
+            (ParamValue::Float(0.7), true),
+            (ParamValue::Long(2), true),
+            (ParamValue::Long(0), false),
+        ] {
+            params.set("circle", written);
+            assert_eq!(params.get_bool("circle"), Some(kept), "{written:?}");
+        }
+        params.set("radius", ParamValue::Float(0.7));
+        assert!(matches!(params.values.get("radius"), Some(ParamValue::Float(v)) if (*v - 0.7).abs() < 1e-6));
+    }
+
+    /// A whole number for an integer parameter is kept an integer. JSON has
+    /// one kind of number, so a saved show's `"mode": 2` — or the API's —
+    /// comes back `Float(2.0)` (`ParamValue` tries Float first); kept so, the
+    /// shader's `int mode` would read the float's bits and match no mode.
+    #[test]
+    fn a_whole_number_for_an_integer_param_is_kept_an_integer() {
+        let mut params = ShaderParams::from_inputs(&[make_long_input("mode", 0)]);
+        let saved = serde_json::to_string(&ParamValue::Long(2)).unwrap();
+        let back: ParamValue = serde_json::from_str(&saved).unwrap();
+        assert!(matches!(back, ParamValue::Float(_)), "untagged: {back:?}");
+        params.set("mode", back);
+        assert_eq!(params.get_long("mode"), Some(2));
+        let mut bytes = Vec::new();
+        params.values["mode"].write_bytes(&mut bytes);
+        assert_eq!(bytes, 2i32.to_le_bytes(), "the shader reads the integer");
     }
 
     #[test]

@@ -612,23 +612,23 @@ fn read_param_value(mixer: &Mixer, path: &str) -> f32 {
         }
         ["deck", uuid, "trigger"] => deck_slot_by_uuid(mixer, uuid).map_or(-1.0, |d| d.opacity),
         ["deck", uuid, "param", name] => deck_slot_by_uuid(mixer, uuid)
-            .and_then(|d| d.deck.generator_params.get_float(name))
+            .and_then(|d| d.deck.generator_params.get_scalar(name))
             .unwrap_or(-1.0),
         ["deck", uuid, "effect", fx_uuid, "param", name] => deck_slot_by_uuid(mixer, uuid)
             .and_then(|d| d.deck.effects.iter().find(|e| e.uuid() == *fx_uuid))
-            .and_then(|e| e.params.get_float(name))
+            .and_then(|e| e.params.get_scalar(name))
             .unwrap_or(-1.0),
         ["ch", ch_uuid, "effect", fx_uuid, "param", name] => mixer
             .find_channel_by_uuid(ch_uuid)
             .and_then(|ch| mixer.channel(ch))
             .and_then(|c| c.effects.iter().find(|e| e.uuid() == *fx_uuid))
-            .and_then(|e| e.params.get_float(name))
+            .and_then(|e| e.params.get_scalar(name))
             .unwrap_or(-1.0),
         ["master", "effect", fx_uuid, "param", name] => mixer
             .master_effects()
             .iter()
             .find(|e| e.uuid() == *fx_uuid)
-            .and_then(|e| e.params.get_float(name))
+            .and_then(|e| e.params.get_scalar(name))
             .unwrap_or(-1.0),
         _ => -1.0,
     }
@@ -778,6 +778,29 @@ mod tests {
         // Unknown UUIDs yield the "not found" sentinel, not a wrong entity.
         assert_eq!(read_param_value(&mixer, "deck/deadbeef/opacity"), -1.0);
         assert_eq!(read_param_value(&mixer, "ch/deadbeef/opacity"), -1.0);
+    }
+
+    /// A switch an effect has — Crop's Border, say — lights as off or on:
+    /// read as 0 or 1, never as "not found".
+    #[test]
+    fn a_switch_lights_as_off_or_on() {
+        use crate::renderer::GpuContext;
+        let gpu = GpuContext::new_headless().expect("headless GPU required for tests");
+        let mut mixer = Mixer::new(&gpu, 64, 64).unwrap();
+        let mut deck = crate::deck::Deck::new_solid_color(&gpu, [1.0, 0.0, 0.0, 1.0], 64, 64).unwrap();
+        let shader = crate::isf::ISFShader::from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/crop.fs"),
+        )
+        .unwrap();
+        deck.add_effect(crate::deck::Effect::new(&gpu, shader).unwrap());
+        let (deck_uuid, fx) = (deck.uuid().to_string(), deck.effects[0].uuid().to_string());
+        mixer.channel_mut(0).unwrap().add_deck(deck);
+        let path = format!("deck/{deck_uuid}/effect/{fx}/param/border_mode");
+        assert_eq!(read_param_value(&mixer, &path), 0.0);
+        mixer.channel_mut(0).unwrap().decks[0].deck.effects[0]
+            .params
+            .set("border_mode", crate::params::ParamValue::Float(1.0));
+        assert_eq!(read_param_value(&mixer, &path), 1.0);
     }
 
     #[test]

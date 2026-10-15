@@ -235,7 +235,7 @@ fn bench_raw_copy_cost(c: &mut Criterion) {
                         src_1080.size(),
                     );
                 }
-                ctx.queue.submit(Some(encoder.finish()));
+                ctx.submit(Some(encoder.finish()));
                 poll(&ctx);
             });
         },
@@ -258,7 +258,7 @@ fn bench_raw_copy_cost(c: &mut Criterion) {
                         src.size(),
                     );
                 }
-                ctx.queue.submit(Some(encoder.finish()));
+                ctx.submit(Some(encoder.finish()));
                 poll(&ctx);
             });
         });

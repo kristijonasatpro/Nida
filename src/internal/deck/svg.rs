@@ -17,17 +17,62 @@ use std::sync::{Arc, OnceLock};
 ///
 /// `usvg` turns `<text>` into paths at parse time, so this is only paid by the
 /// first SVG loaded and never again — including on re-rasterization, which
-/// works from the already-resolved tree.
-fn system_fonts() -> Arc<usvg::fontdb::Database> {
+/// works from the already-resolved tree. Timers draw their numbers with it
+/// too (see [`super::timer`]).
+pub(crate) fn system_fonts() -> Arc<usvg::fontdb::Database> {
     static FONTS: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
     FONTS
         .get_or_init(|| {
             let mut db = usvg::fontdb::Database::new();
             db.load_system_fonts();
+            // "sans-serif" is Arial unless told otherwise, which a Linux
+            // desktop seldom has: the first of these there is instead.
+            let has = |family: &str| {
+                db.faces()
+                    .any(|f| f.families.iter().any(|(name, _)| name == family))
+            };
+            if !has("Arial") {
+                let fallback = ["Helvetica Neue", "Helvetica", "DejaVu Sans", "Noto Sans"]
+                    .into_iter()
+                    .find(|family| has(family));
+                if let Some(family) = fallback {
+                    db.set_sans_serif_family(family);
+                }
+            }
             log::debug!("Loaded {} system font faces for SVG text", db.len());
             Arc::new(db)
         })
         .clone()
+}
+
+/// The font families installed, by name, once they have been read — which
+/// is started, on a thread, by the first ask: `None` until then.
+pub fn font_families() -> Option<Arc<Vec<String>>> {
+    static FAMILIES: OnceLock<Arc<Vec<String>>> = OnceLock::new();
+    static ASKED: std::sync::Once = std::sync::Once::new();
+    if let Some(families) = FAMILIES.get() {
+        return Some(families.clone());
+    }
+    ASKED.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("font-list".into())
+            .spawn(|| {
+                let db = system_fonts();
+                let mut names: Vec<String> = db
+                    .faces()
+                    .filter_map(|f| f.families.first().map(|(name, _)| name.clone()))
+                    // Hidden system faces (".SF NS") are not for choosing.
+                    .filter(|name| !name.starts_with('.'))
+                    .collect();
+                names.sort_by_key(|n| n.to_lowercase());
+                names.dedup();
+                let _ = FAMILIES.set(Arc::new(names));
+            });
+        if let Err(e) = spawned {
+            log::warn!("Font list not read: {e}");
+        }
+    });
+    None
 }
 
 /// Whether a path should be treated as vector art rather than handed to the

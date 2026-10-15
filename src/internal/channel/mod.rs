@@ -6,6 +6,7 @@ use crate::isf::ISFShader;
 use crate::mixer::GpuTimingFrame;
 use crate::modulation::ModulationEngine;
 use crate::params::ShaderParams;
+use crate::renderer::region::{self, Pixels};
 use crate::renderer::{
     BlitPipeline, CompositeBlitPipeline, GpuContext, ISFUniforms, TransitionPipeline,
 };
@@ -63,6 +64,27 @@ impl BlendMode {
             BlendMode::Darken => 12,
             BlendMode::Lighten => 13,
             BlendMode::LinearBurn => 14,
+        }
+    }
+
+    /// Full name, where there is room to spell it out.
+    pub fn label(&self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Add => "Add",
+            BlendMode::Subtract => "Subtract",
+            BlendMode::Multiply => "Multiply",
+            BlendMode::Screen => "Screen",
+            BlendMode::Overlay => "Overlay",
+            BlendMode::SoftLight => "Soft light",
+            BlendMode::HardLight => "Hard light",
+            BlendMode::ColorDodge => "Colour dodge",
+            BlendMode::ColorBurn => "Colour burn",
+            BlendMode::Difference => "Difference",
+            BlendMode::Exclusion => "Exclusion",
+            BlendMode::Darken => "Darken",
+            BlendMode::Lighten => "Lighten",
+            BlendMode::LinearBurn => "Linear burn",
         }
     }
 
@@ -402,6 +424,9 @@ impl DeckSlot {
 }
 
 /// Channel - Groups multiple decks into a composited layer
+// Switches set by the mixer each frame (overlay, visible parts, every
+// deck, tapped): each its own question, not a state.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Channel {
     /// Stable UUID for this channel (8-char hex, persists across saves)
     uuid: String,
@@ -421,6 +446,11 @@ pub struct Channel {
     /// Channel blend mode for mixing into final output
     pub blend_mode: BlendMode,
 
+    /// In Main mode (`crate::mixer::MixMode::Program`), an overlay: switched
+    /// on and off over whatever is on Main, like vMix's overlay channels,
+    /// instead of being taken to Main itself.
+    pub overlay: bool,
+
     /// Composite output texture (all decks blended together)
     pub composite_texture: wgpu::Texture,
     pub composite_view: wgpu::TextureView,
@@ -429,9 +459,10 @@ pub struct Channel {
     pub effect_ping_texture: wgpu::Texture,
     pub effect_ping_view: wgpu::TextureView,
 
-    /// Previous frame's composite, kept only while some deck taps this channel.
-    /// Swapped with `composite_texture` at the top of each frame, so reading it
-    /// costs no copy and always yields frame N-1 regardless of channel order.
+    /// Previous frame's composite, kept only while a deck taps this channel
+    /// round a loop (see `Mixer::prepare_taps`) — any other tap reads this
+    /// frame's composite, rendered first. Swapped with `composite_texture` at
+    /// the top of each frame, so reading it costs no copy.
     /// See spec/program-tap.md.
     tap_prev: Option<(wgpu::Texture, wgpu::TextureView)>,
 
@@ -443,11 +474,46 @@ pub struct Channel {
 
     /// Simple blit pipeline for first-deck copy (Normal mode, no blend needed)
     blit_pipeline: BlitPipeline,
+    /// Blend-unit pipelines for Add and Screen decks (see
+    /// [`crate::renderer::blit::ADD_BLENDING`]).
+    add_pipeline: BlitPipeline,
+    screen_pipeline: BlitPipeline,
 
     /// Smoothed render time for this channel in milliseconds (EMA over recent frames)
     pub render_time_ms: f32,
     /// Number of active (rendered) decks in the last frame
     pub active_deck_count: u32,
+    /// Frame time gone by since this channel was last drawn, while it is
+    /// drawn only now and then (a tile, see `Mixer::tile_previews`): handed
+    /// to its next draw, so what runs on time keeps real time.
+    pub dt_owed: f32,
+    /// Decks blended into the composite last frame — fewer than the active
+    /// ones when a deck covering the frame hides those below it.
+    pub composited_deck_count: usize,
+    /// Decks shown on their own somewhere — alone on Main or a bus, or being
+    /// edited — by UUID, set by the mixer each frame. A deck hidden under one
+    /// that covers the frame still renders when it is one of these.
+    pub shown_alone: Vec<String>,
+    /// Draw each deck only where the decks over it leave it showing; set by
+    /// the mixer each frame (see `Mixer::draw_visible_parts`).
+    pub draw_visible_parts: bool,
+    /// Draw every deck, and all of each — none left out as hidden under
+    /// another, none only in parts — set by the mixer each frame for a
+    /// channel in a merge, whose layers move and uncover one another.
+    pub draw_every_deck: bool,
+    /// Some deck, here or in another channel, shows this channel's picture
+    /// (a tap); set by the mixer each frame. It must render then, whatever
+    /// its own level on the mix.
+    pub tapped: bool,
+}
+
+/// How a deck takes part in its channel's picture this frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CompositeRole {
+    /// Drawn in its place in the stack.
+    Steady,
+    /// Transitioning with a shader, at this progress: drawn over the rest.
+    Transitioning(f64),
 }
 
 impl Channel {
@@ -481,6 +547,16 @@ impl Channel {
             context.compositing_format,
             wgpu::BlendState::ALPHA_BLENDING,
         )?;
+        let add_pipeline = BlitPipeline::with_blend(
+            &context.device,
+            context.compositing_format,
+            crate::renderer::blit::ADD_BLENDING,
+        )?;
+        let screen_pipeline = BlitPipeline::with_blend(
+            &context.device,
+            context.compositing_format,
+            crate::renderer::blit::SCREEN_BLENDING,
+        )?;
 
         Ok(Self {
             uuid: crate::deck::generate_short_uuid(),
@@ -489,6 +565,7 @@ impl Channel {
             effects: Vec::new(),
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
+            overlay: false,
             composite_texture,
             composite_view,
             effect_ping_texture,
@@ -497,12 +574,21 @@ impl Channel {
             frame_count: 0,
             composite_pipeline,
             blit_pipeline,
+            add_pipeline,
+            screen_pipeline,
             render_time_ms: 0.0,
             active_deck_count: 0,
+            dt_owed: 0.0,
+            composited_deck_count: 0,
+            shown_alone: Vec::new(),
+            draw_visible_parts: true,
+            draw_every_deck: false,
+            tapped: false,
         })
     }
 
-    /// Previous frame's composite, or `None` when nothing taps this channel.
+    /// Previous frame's composite, or `None` when nothing taps this channel
+    /// round a loop.
     pub fn tap_view(&self) -> Option<&wgpu::TextureView> {
         self.tap_prev.as_ref().map(|(_, v)| v)
     }
@@ -524,8 +610,8 @@ impl Channel {
     }
 
     /// Exchange the composite and tap targets. Called once per frame before
-    /// any deck renders, which is what makes the tap uniformly one frame old
-    /// no matter where the tapping deck sits in the channel order.
+    /// any deck renders, so a tap round a loop reads last frame's composite
+    /// while this frame's is written.
     pub(crate) fn swap_tap(&mut self) {
         if let Some((mut tex, mut view)) = self.tap_prev.take() {
             std::mem::swap(&mut self.composite_texture, &mut tex);
@@ -566,7 +652,27 @@ impl Channel {
         idx
     }
 
+    /// Put a deck slot just before the deck `before` (by UUID), or at the end
+    /// when that is `None` or not in this channel. Returns where it went.
+    pub fn insert_deck_slot_before(&mut self, slot: DeckSlot, before: Option<&str>) -> usize {
+        let at = before
+            .and_then(|b| self.decks.iter().position(|s| s.deck.uuid() == b))
+            .unwrap_or(self.decks.len());
+        self.decks.insert(at, slot);
+        at
+    }
+
+    /// Add a deck just before the deck `before` (by UUID), or at the end.
+    pub fn insert_deck_before(&mut self, deck: Deck, before: Option<&str>) -> usize {
+        self.insert_deck_slot_before(DeckSlot::new(deck), before)
+    }
+
     /// Get number of decks
+    /// Frames this channel has been drawn.
+    pub fn frames_drawn(&self) -> u32 {
+        self.frame_count
+    }
+
     pub fn deck_count(&self) -> usize {
         self.decks.len()
     }
@@ -576,12 +682,21 @@ impl Channel {
     /// stay in sync and don't show stale/black frames when faded back in.
     /// `target_fps` is the rate the renderer presents at (0 = uncapped); decode
     /// threads use it to avoid producing frames that can never be shown.
+    /// `refresh_at` is when the refresh that called for this frame came,
+    /// when a screen's refresh starts frames; `held`, whether each frame is
+    /// held on screen a frame's time.
     ///
     /// The one exception is a deck the arrangement has put to sleep, which is
     /// far enough from its next region that nothing can bring it up in time to
     /// matter. It holds its last frame and resumes from there.
     /// See /spec/deck-residency.md.
-    pub fn tick_video_frames(&mut self, encoder: &mut wgpu::CommandEncoder, target_fps: u32) {
+    pub fn tick_video_frames(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_fps: u32,
+        refresh_at: Option<std::time::Instant>,
+        held: bool,
+    ) {
         for slot in &mut self.decks {
             slot.deck
                 .set_video_suspended(!slot.source_demand.wants_frames());
@@ -589,6 +704,8 @@ impl Channel {
                 continue;
             }
             slot.deck.set_video_output_fps(target_fps);
+            slot.deck.set_frame_refresh_at(refresh_at);
+            slot.deck.set_frame_held(held);
             if let Err(e) = slot.deck.update_video_frame(encoder) {
                 log::warn!("Video frame update failed: {e}");
             }
@@ -602,6 +719,117 @@ impl Channel {
         }
     }
 
+    /// How a deck is composited this frame: `None` when it is not (muted,
+    /// soloed away, invisible, or an auto-transition deck waiting or done).
+    fn composite_role(&self, idx: usize, any_solo: bool) -> Option<CompositeRole> {
+        let slot = &self.decks[idx];
+        let phase = slot.transition_phase();
+        if slot.mute || (any_solo && !slot.solo) || slot.opacity <= 0.0 {
+            return None;
+        }
+        // Another input as a layer, that input gone: nothing to show, and no
+        // border or effect drawn round the nothing.
+        if slot.deck.shows_a_lost_input() {
+            return None;
+        }
+        // Inactive and Done auto-transition decks don't composite.
+        // Inactive = waiting for turn. Done = already played, no longer needed
+        // (the next deck in sequence gets re-activated to Playing when needed).
+        let has_at = slot.auto_transition.as_ref().is_some_and(|at| at.enabled);
+        if has_at && (phase == DeckTransitionPhase::Inactive || phase == DeckTransitionPhase::Done)
+        {
+            return None;
+        }
+        Some(match phase {
+            DeckTransitionPhase::Transitioning { progress } => {
+                CompositeRole::Transitioning(progress)
+            }
+            // Done decks composite normally (full opacity) — they serve
+            // as the visible background that transitioning decks reveal.
+            _ => CompositeRole::Steady,
+        })
+    }
+
+    /// The decks nothing of which can show: those under the topmost deck
+    /// that covers the whole frame (opaque, Normal, at full opacity), by
+    /// index. Transitioning decks are drawn over everything, so they are
+    /// never hidden, and neither is a deck shown on its own somewhere.
+    fn hidden_decks(
+        &self,
+        deck_indices: &[usize],
+        any_solo: bool,
+        modulation: &ModulationEngine,
+    ) -> std::collections::HashSet<usize> {
+        let steady: Vec<usize> = deck_indices
+            .iter()
+            .copied()
+            .filter(|&idx| self.composite_role(idx, any_solo) == Some(CompositeRole::Steady))
+            .collect();
+        let Some(top) = steady.iter().rposition(|&idx| {
+            let slot = &self.decks[idx];
+            slot.opacity >= 1.0
+                && slot.blend_mode == BlendMode::Normal
+                && slot.deck.covers_frame(modulation)
+        }) else {
+            return std::collections::HashSet::new();
+        };
+        steady[..top]
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                let uuid = self.decks[idx].deck.uuid();
+                !self.shown_alone.iter().any(|s| s == uuid)
+            })
+            .collect()
+    }
+
+    /// What shows of each steady deck once the opaque decks over it are
+    /// drawn, as rectangles of composite pixels that do not overlap, for the
+    /// decks partly or wholly covered; a deck not listed is drawn whole —
+    /// as is one shown on its own somewhere, or one whose showing part
+    /// would take too many rectangles to be worth it. Only steady decks
+    /// over it cover a deck: a transitioning one is drawn over everything
+    /// and lets it show through.
+    fn visible_parts(
+        &self,
+        deck_indices: &[usize],
+        any_solo: bool,
+        modulation: &ModulationEngine,
+    ) -> std::collections::HashMap<usize, Vec<Pixels>> {
+        let (width, height) = (
+            self.composite_texture.width(),
+            self.composite_texture.height(),
+        );
+        let all = Pixels::all(width, height);
+        let mut covers: Vec<Pixels> = Vec::new();
+        let mut parts = std::collections::HashMap::new();
+        for &idx in deck_indices.iter().rev() {
+            if self.composite_role(idx, any_solo) != Some(CompositeRole::Steady) {
+                continue;
+            }
+            let slot = &self.decks[idx];
+            if !covers.is_empty() && !self.shown_alone.iter().any(|s| s == slot.deck.uuid()) {
+                let shows = covers
+                    .iter()
+                    .fold(vec![all], |left, cover| region::subtract(&left, cover));
+                if shows.len() <= region::MAX_PARTS {
+                    parts.insert(idx, shows);
+                }
+            }
+            if slot.opacity >= 1.0 && slot.blend_mode == BlendMode::Normal {
+                let cover = if slot.deck.covers_frame(modulation) {
+                    Some(all)
+                } else {
+                    slot.deck
+                        .opaque_area(modulation)
+                        .and_then(|area| area.inner_pixels(width, height, 0))
+                };
+                covers.extend(cover);
+            }
+        }
+        parts
+    }
+
     /// Render all decks in this channel and composite them, then apply channel effects
     /// `channel_idx` is used for modulation key addressing (e.g., "`ch0_deck0:paramname`")
     /// `dt` is the frame delta in seconds (for auto-transition tick).
@@ -609,6 +837,8 @@ impl Channel {
     /// `total_active_decks` is the total active deck count across all channels (from last frame).
     /// `gpu_load_ratio` scales CPU-measured render costs to estimate true GPU execution time.
     /// A ratio of 1.0 means CPU and GPU costs match; >1.0 means GPU-bound (GPU takes longer).
+    /// `frame_over_budget`: whether last frame's decks together ran over a
+    /// frame's time — the only case a deck on `Auto` is drawn less often.
     ///
     /// # Errors
     ///
@@ -628,6 +858,7 @@ impl Channel {
         target_fps: u32,
         total_active_decks: u32,
         gpu_load_ratio: f32,
+        frame_over_budget: bool,
         prefix_cmds: &mut Vec<wgpu::CommandBuffer>,
         mut timing: Option<&mut GpuTimingFrame>,
         query_set: Option<&wgpu::QuerySet>,
@@ -637,6 +868,8 @@ impl Channel {
             blend_mode: BlendMode,
             opacity: f32,
             transition_progress: Option<f64>, // Some = transitioning with shader
+            /// The parts of the composite it shows in, when not all of it.
+            within: Option<Vec<Pixels>>,
         }
 
         let render_start = std::time::Instant::now();
@@ -668,6 +901,28 @@ impl Channel {
             frame_budget_us
         };
 
+        // Decks hidden under one that covers the frame are not rendered at
+        // all: nothing of them shows, and a generator hidden under a
+        // full-screen picture costs a whole frame at 4K. They pick up again
+        // the frame the cover goes.
+        let hidden = if self.draw_every_deck {
+            std::collections::HashSet::default()
+        } else {
+            self.hidden_decks(&deck_indices, any_solo, modulation)
+        };
+        // Of the rest, those partly covered are drawn only where they show:
+        // a background with a camera over most of it costs the strips round
+        // the camera. Nothing shows of one covered by several at once.
+        let parts = if self.draw_visible_parts && !self.draw_every_deck {
+            self.visible_parts(&deck_indices, any_solo, modulation)
+        } else {
+            std::collections::HashMap::new()
+        };
+        let (composite_width, composite_height) = (
+            self.composite_texture.width(),
+            self.composite_texture.height(),
+        );
+
         // Render each deck to its texture (skip muted, non-solo'd, zero-opacity)
         // Done decks still render — they serve as visible background for transitioning decks above.
         // Adaptive skipping: expensive decks render less frequently, reusing stale textures.
@@ -676,7 +931,21 @@ impl Channel {
         let mut active_count: u32 = 0;
         let mut per_deck_timings: Vec<(String, u128, bool)> = Vec::new(); // (name, us, skipped)
         for (deck_idx, slot) in self.decks.iter_mut().enumerate() {
-            if !slot.mute && (!any_solo || slot.solo) && slot.opacity > 0.0 {
+            let shows = parts.get(&deck_idx);
+            if hidden.contains(&deck_idx) || shows.is_some_and(Vec::is_empty) {
+                continue;
+            }
+            slot.deck.set_visible(shows.map(|rects| {
+                rects
+                    .iter()
+                    .map(|r| r.area(composite_width, composite_height))
+                    .collect()
+            }));
+            // A deck shown on its own somewhere — alone on Main — is drawn
+            // whatever its place here: muted, left out by a solo, faded out.
+            // Whether it is composited here is the composite's own question.
+            let alone = self.shown_alone.iter().any(|s| s == slot.deck.uuid());
+            if alone || (!slot.mute && (!any_solo || slot.solo) && slot.opacity > 0.0) {
                 active_count += 1;
                 slot.skip_counter += 1;
 
@@ -687,26 +956,18 @@ impl Channel {
                         let skip_interval = (target_fps / fps).max(1);
                         slot.skip_counter % skip_interval == 0
                     }
-                    DeckRenderFps::Auto => {
-                        // Auto: skip if estimated cost exceeds budget share.
-                        // Always use CPU-measured cost × gpu_load_ratio for skip decisions.
-                        // GPU timestamps only measure shader execution, missing pipeline
-                        // setup, compositing, and submission overhead that scales with
-                        // deck count. The systemic estimate (cpu × ratio) captures the
-                        // true per-deck impact on frame timing.
-                        let estimated_cost = slot.render_cost_us * gpu_load_ratio;
-                        if estimated_cost > 0.0
-                            && per_deck_budget_us < f32::MAX
-                            && estimated_cost > per_deck_budget_us
-                        {
-                            let skip_interval = (estimated_cost / per_deck_budget_us).ceil() as u32;
-                            slot.skip_counter % skip_interval.max(1) == 0
-                        } else {
-                            true // under budget or no data yet
-                        }
-                    }
+                    DeckRenderFps::Auto => auto_draws(
+                        slot.render_cost_us * gpu_load_ratio,
+                        per_deck_budget_us,
+                        frame_over_budget,
+                        slot.skip_counter,
+                    ),
                     DeckRenderFps::Fixed(_) => true, // Fixed(0) or uncapped target = always render
                 };
+                // A frame showing a part the last render left undrawn cannot
+                // reuse it; nor can a merge, which moves the deck about.
+                let should_render =
+                    should_render || slot.deck.shows_undrawn_part() || self.draw_every_deck;
 
                 if should_render {
                     // Set the fixed time step so the shader TIME uniform advances
@@ -774,32 +1035,21 @@ impl Channel {
         let deck_composite_info: Vec<DeckCompositeInfo> = deck_indices
             .iter()
             .filter_map(|&idx| {
-                let slot = &self.decks[idx];
-                let phase = slot.transition_phase();
-                if slot.mute || (any_solo && !slot.solo) || slot.opacity <= 0.0 {
-                    return None;
-                }
-                // Inactive and Done auto-transition decks don't composite.
-                // Inactive = waiting for turn. Done = already played, no longer needed
-                // (the next deck in sequence gets re-activated to Playing when needed).
-                let has_at = slot.auto_transition.as_ref().is_some_and(|at| at.enabled);
-                if has_at
-                    && (phase == DeckTransitionPhase::Inactive
-                        || phase == DeckTransitionPhase::Done)
-                {
-                    return None;
-                }
-                let transition_progress = match phase {
-                    DeckTransitionPhase::Transitioning { progress } => Some(progress),
-                    // Done decks composite normally (full opacity) — they serve
-                    // as the visible background that transitioning decks reveal.
-                    _ => None,
+                let transition_progress = match self.composite_role(idx, any_solo)? {
+                    CompositeRole::Steady => None,
+                    CompositeRole::Transitioning(progress) => Some(progress),
                 };
+                let slot = &self.decks[idx];
+                let within = parts.get(&idx).cloned();
+                if within.as_ref().is_some_and(Vec::is_empty) {
+                    return None;
+                }
                 Some(DeckCompositeInfo {
                     deck_idx: idx,
                     blend_mode: slot.blend_mode,
                     opacity: slot.opacity,
                     transition_progress,
+                    within,
                 })
             })
             .collect();
@@ -816,8 +1066,20 @@ impl Channel {
                 non_transitioning.push(info);
             }
         }
+        // Nothing under the topmost deck that covers the frame can show, so
+        // it is not composited. A stack of full-screen slides is a normal
+        // show; at 4K each hidden one cost a full-frame copy and blend. The
+        // result is identical: the covering deck's blit clears what was below.
+        if let Some(top) = non_transitioning.iter().rposition(|info| {
+            info.opacity >= 1.0
+                && info.blend_mode == BlendMode::Normal
+                && self.decks[info.deck_idx].deck.covers_frame(modulation)
+        }) {
+            non_transitioning.drain(..top);
+        }
         let ordered: Vec<&DeckCompositeInfo> =
             non_transitioning.into_iter().chain(transitioning).collect();
+        self.composited_deck_count = ordered.len();
 
         // Composite all decks to the composite texture.
         // Per-draw params are written into a persistent ring buffer (one slot per
@@ -831,6 +1093,10 @@ impl Channel {
         // One params slot per compositing deck. Sized up front, not per draw:
         // growing mid-loop would strand bind groups on the previous buffer.
         self.blit_pipeline
+            .ensure_ring_slots(&context.device, ordered.len());
+        self.add_pipeline
+            .ensure_ring_slots(&context.device, ordered.len());
+        self.screen_pipeline
             .ensure_ring_slots(&context.device, ordered.len());
         self.composite_pipeline
             .ensure_ring_slots(&context.device, ordered.len());
@@ -1041,10 +1307,47 @@ impl Channel {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    self.blit_pipeline
-                        .render_at_slot(&mut render_pass, &bind_group);
+                    // Where it does not show, a deck over it covers the
+                    // clear.
+                    self.blit_pipeline.render_at_slot_within(
+                        &mut render_pass,
+                        &bind_group,
+                        info.within.as_deref(),
+                    );
                 }
                 composite_cmds.push(encoder.finish());
+            } else if let Some(pipeline) = match info.blend_mode {
+                BlendMode::Normal => Some(&self.blit_pipeline),
+                BlendMode::Add => Some(&self.add_pipeline),
+                BlendMode::Screen => Some(&self.screen_pipeline),
+                _ => None,
+            } {
+                // Normal, Add and Screen are what the GPU's blend unit computes
+                // itself, exactly as the composite shader does (see the blend
+                // states), so the deck is drawn straight onto the composite —
+                // no full-frame snapshot copy and re-read, ~130 MB at 4K.
+                if info.blend_mode == BlendMode::Normal {
+                    // ALPHA_BLENDING weights the straight colour by alpha itself.
+                    pipeline.write_params_slot(
+                        &context.queue,
+                        i,
+                        info.opacity,
+                        [1.0, 1.0],
+                        [0.0, 0.0],
+                        false,
+                    );
+                } else {
+                    pipeline.write_params_slot_premultiplying(&context.queue, i, info.opacity);
+                }
+                bind_group_count += 1;
+                composite_cmds.push(pipeline.blend_onto_within(
+                    &context.device,
+                    &slot.deck.texture_view,
+                    &self.composite_view,
+                    i,
+                    "Channel Composite (blend unit)",
+                    info.within.as_deref(),
+                ));
             } else {
                 // Subsequent decks: snapshot composite → ping, blend src + ping → composite
                 let t_copy = std::time::Instant::now();
@@ -1087,13 +1390,19 @@ impl Channel {
                             label: Some("Channel Composite Encoder"),
                         });
                 {
+                    // Drawn only where it shows, the rest is left as it was.
+                    let load = if info.within.is_some() {
+                        wgpu::LoadOp::Load
+                    } else {
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                    };
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("Channel Composite Pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: &self.composite_view,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                load,
                                 store: wgpu::StoreOp::Store,
                             },
                             depth_slice: None,
@@ -1103,8 +1412,11 @@ impl Channel {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    self.composite_pipeline
-                        .render_at_slot(&mut render_pass, &bind_group);
+                    self.composite_pipeline.render_at_slot_within(
+                        &mut render_pass,
+                        &bind_group,
+                        info.within.as_deref(),
+                    );
                 }
                 composite_cmds.push(copy_encoder.finish());
                 composite_cmds.push(encoder.finish());
@@ -1496,6 +1808,46 @@ impl Channel {
             }
         }
     }
+}
+
+/// Whether a deck on [`DeckRenderFps::Auto`] is drawn this frame, its
+/// estimated cost `estimated_us` (CPU-measured × the GPU load ratio) against
+/// its share of a frame's time.
+///
+/// Drawn every frame unless last frame's decks together ran over a frame's
+/// time (`frame_over_budget`); only then is one over its share drawn every
+/// Nth frame, repeating its last picture between. Splitting a frame's time
+/// evenly between the decks and skipping any over its share whatever the
+/// total (as Varda did) had a show of a dozen decks — picture-in-pictures,
+/// taps, playlists — drawing most of them every other frame, a moving picture stuttering on
+/// Preview, while the frame itself kept well within its time.
+fn auto_draws(
+    estimated_us: f32,
+    per_deck_budget_us: f32,
+    frame_over_budget: bool,
+    skip_counter: u32,
+) -> bool {
+    if !frame_over_budget
+        || estimated_us <= 0.0
+        || per_deck_budget_us >= f32::MAX
+        || estimated_us <= per_deck_budget_us
+    {
+        return true;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let skip_interval = (estimated_us / per_deck_budget_us).ceil() as u32;
+    skip_counter.is_multiple_of(skip_interval.max(1))
+}
+
+/// Whether decks costing `estimated_us` each (CPU-measured × the GPU load
+/// ratio) together run over a frame's time at `target_fps`.
+pub(crate) fn decks_over_budget(estimated_us: impl IntoIterator<Item = f32>, target_fps: u32) -> bool {
+    if target_fps == 0 {
+        return false;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let frame_us = 1_000_000.0 / target_fps as f32;
+    estimated_us.into_iter().sum::<f32>() > frame_us
 }
 
 #[cfg(test)]

@@ -167,26 +167,57 @@ impl VardaApp {
         CommandResult::Ok
     }
 
-    /// Save a deck's current config as a named deck preset (writes to disk).
+    /// Save a deck's current config as a named deck preset: kept at once,
+    /// its file written in the background (see `persistence::writer`).
     pub(crate) fn cmd_save_deck_preset(&mut self, deck_uuid: &str, name: &str) -> CommandResult {
-        let (channel_idx, deck_idx) = match self.resolve_deck(deck_uuid) {
-            Ok(loc) => loc,
-            Err(e) => return e.into(),
-        };
+        match self.deck_preset_file(deck_uuid, name) {
+            Ok(save) => {
+                self.save_preset(save, None);
+                CommandResult::Ok
+            }
+            Err(refused) => refused,
+        }
+    }
+
+    /// Save a channel's current config as a named channel preset: kept at
+    /// once, its file written in the background.
+    pub(crate) fn cmd_save_channel_preset(
+        &mut self,
+        channel_uuid: &str,
+        name: &str,
+    ) -> CommandResult {
+        match self.channel_preset_file(channel_uuid, name) {
+            Ok(save) => {
+                self.save_preset(save, None);
+                CommandResult::Ok
+            }
+            Err(refused) => refused,
+        }
+    }
+
+    /// A deck's current config as a named deck preset: the preset kept in
+    /// the library and the deck named after it at once, and the file to
+    /// write — or why there is none.
+    pub(crate) fn deck_preset_file(
+        &mut self,
+        deck_uuid: &str,
+        name: &str,
+    ) -> Result<PresetSave, CommandResult> {
+        let (channel_idx, deck_idx) = self.resolve_deck(deck_uuid).map_err(CommandResult::from)?;
         let mixer = &mut self.mixer;
         let scene =
             crate::persistence::snapshot_scene(mixer, None, self.render_width, self.render_height);
         let Some(ch_config) = scene.channels.get(channel_idx) else {
-            return CommandResult::Err {
+            return Err(CommandResult::Err {
                 code: ErrorCode::NotFound,
                 message: format!("Channel {channel_idx} not found"),
-            };
+            });
         };
         let Some(deck_config) = ch_config.decks.get(deck_idx) else {
-            return CommandResult::Err {
+            return Err(CommandResult::Err {
                 code: ErrorCode::NotFound,
                 message: format!("Deck {deck_idx} not found in channel {channel_idx}"),
-            };
+            });
         };
         let mut preset_config = deck_config.clone();
         preset_config.name = name.to_string();
@@ -204,75 +235,132 @@ impl VardaApp {
         let prefix = format!("deck_{deck_uuid}");
         preset_config.modulation =
             extract_modulation_recipes(mixer.modulation(), Some(&prefix), &effect_uuids);
-        match crate::persistence::presets::PresetLibrary::save_deck_preset(
+        let (path, json) = crate::persistence::presets::PresetLibrary::deck_preset_file(
             &self.session.workspace,
             name,
             &preset_config,
-        ) {
-            Ok(()) => {
-                // Update the deck's display name to match the saved preset name.
-                if let Some(ch) = mixer.channel_mut(channel_idx) {
-                    if let Some(slot) = ch.decks.get_mut(deck_idx) {
-                        slot.deck.set_source_name(name.to_string());
-                    }
-                }
-                self.session.preset_library.refresh(&self.session.workspace);
-                self.session
-                    .notifications
-                    .info(format!("💾 Saved deck preset '{name}'"));
-                CommandResult::Ok
+        )
+        .map_err(|e| self.preset_refused(&e))?;
+        // The deck's display name matches the preset it was saved as.
+        let mut renamed = None;
+        if let Some(ch) = self.mixer.channel_mut(channel_idx) {
+            if let Some(slot) = ch.decks.get_mut(deck_idx) {
+                let before = slot.deck.source_name().to_string();
+                slot.deck.set_source_name(name.to_string());
+                renamed = Some((deck_uuid.to_string(), before, name.to_string()));
             }
-            Err(e) => {
-                log::error!("Failed to save deck preset: {e}");
-                self.session
-                    .notifications
-                    .error(format!("Failed to save preset: {e}"));
-                CommandResult::Err {
-                    code: ErrorCode::InternalError,
-                    message: e.to_string(),
+        }
+        let kept = self.session.preset_library.keep_deck(&path, &json);
+        Ok(PresetSave {
+            file: preset_file(format!("deck preset '{name}'"), path, json, name, "deck"),
+            on_way: PresetOnWay { kept, renamed },
+        })
+    }
+
+    /// A channel's current config as a named channel preset: kept in the
+    /// library at once, and the file to write — or why there is none.
+    pub(crate) fn channel_preset_file(
+        &mut self,
+        channel_uuid: &str,
+        name: &str,
+    ) -> Result<PresetSave, CommandResult> {
+        let channel_idx = self
+            .resolve_channel(channel_uuid)
+            .map_err(CommandResult::from)?;
+        let Some(preset_ch_config) = self.channel_config(channel_idx) else {
+            return Err(CommandResult::Err {
+                code: ErrorCode::NotFound,
+                message: format!("Channel {channel_idx} not found"),
+            });
+        };
+        let (path, json) = crate::persistence::presets::PresetLibrary::channel_preset_file(
+            &self.session.workspace,
+            name,
+            &preset_ch_config,
+        )
+        .map_err(|e| self.preset_refused(&e))?;
+        let kept = self.session.preset_library.keep_channel(&path, &json);
+        Ok(PresetSave {
+            file: preset_file(
+                format!("channel preset '{name}'"),
+                path,
+                json,
+                name,
+                "channel",
+            ),
+            on_way: PresetOnWay {
+                kept,
+                renamed: None,
+            },
+        })
+    }
+
+    /// Write a preset's file after the saves before it; `reply` is
+    /// answered once it has landed, and the operator told then. The writer
+    /// reads the presets folder again as it lands — off the engine — for
+    /// the library to settle on (see `preset_landed`).
+    pub(crate) fn save_preset(&mut self, mut save: PresetSave, reply: Option<crate::app::Reply>) {
+        save.file.then = reply.map(crate::app::workspace::answer_when_landed);
+        let id = self.show_writer.submit_file(save.file);
+        self.presets_on_way.push((id, save.on_way));
+    }
+
+    /// A preset's file has landed: the library settles on the presets as
+    /// the disk has them, read again off the engine — those still on their
+    /// way kept as saved — so a file that did not land is gone from it, as
+    /// it will be after a restart. A deck named after a preset that did not
+    /// land gets back its name.
+    pub(crate) fn preset_landed(&mut self, landed: &mut crate::persistence::writer::Landed) {
+        let Some(at) = self
+            .presets_on_way
+            .iter()
+            .position(|(id, _)| *id == landed.id)
+        else {
+            return;
+        };
+        let (_, preset) = self.presets_on_way.remove(at);
+        if let Some(scanned) = landed.presets.take() {
+            let on_way = self
+                .presets_on_way
+                .iter()
+                .filter_map(|(_, p)| p.kept.as_ref());
+            self.session.preset_library.settle(scanned, on_way);
+        }
+        if landed.errors.is_empty() {
+            return;
+        }
+        if let Some((deck_uuid, before, given)) = preset.renamed {
+            // A later save from the same deck still on its way settles it
+            // instead, handed the name to put back — if it was named from
+            // this one; renamed between them, the later save knows it.
+            let later = self
+                .presets_on_way
+                .iter_mut()
+                .find_map(|(_, p)| p.renamed.as_mut().filter(|(uuid, ..)| *uuid == deck_uuid));
+            if let Some(later) = later {
+                if later.1 == given {
+                    later.1 = before;
+                }
+            } else if let Ok((ch, at)) = self.resolve_deck(&deck_uuid) {
+                if let Some(slot) = self.mixer.channel_mut(ch).and_then(|c| c.decks.get_mut(at)) {
+                    // Unless renamed since.
+                    if slot.deck.source_name() == given {
+                        slot.deck.set_source_name(before);
+                    }
                 }
             }
         }
     }
 
-    /// Save a channel's current config as a named channel preset (writes to disk).
-    pub(crate) fn cmd_save_channel_preset(
-        &mut self,
-        channel_uuid: &str,
-        name: &str,
-    ) -> CommandResult {
-        let channel_idx = match self.resolve_channel(channel_uuid) {
-            Ok(idx) => idx,
-            Err(e) => return e.into(),
-        };
-        let Some(preset_ch_config) = self.channel_config(channel_idx) else {
-            return CommandResult::Err {
-                code: ErrorCode::NotFound,
-                message: format!("Channel {channel_idx} not found"),
-            };
-        };
-        match crate::persistence::presets::PresetLibrary::save_channel_preset(
-            &self.session.workspace,
-            name,
-            &preset_ch_config,
-        ) {
-            Ok(()) => {
-                self.session.preset_library.refresh(&self.session.workspace);
-                self.session
-                    .notifications
-                    .info(format!("💾 Saved channel preset '{name}'"));
-                CommandResult::Ok
-            }
-            Err(e) => {
-                log::error!("Failed to save channel preset: {e}");
-                self.session
-                    .notifications
-                    .error(format!("Failed to save preset: {e}"));
-                CommandResult::Err {
-                    code: ErrorCode::InternalError,
-                    message: e.to_string(),
-                }
-            }
+    /// A preset that cannot be made: said, and the answer for a command.
+    fn preset_refused(&mut self, e: &anyhow::Error) -> CommandResult {
+        log::error!("Failed to save preset: {e}");
+        self.session
+            .notifications
+            .error(format!("Failed to save preset: {e}"));
+        CommandResult::Err {
+            code: ErrorCode::InternalError,
+            message: e.to_string(),
         }
     }
 
@@ -354,18 +442,15 @@ impl VardaApp {
         )?;
         // Apply the preset's display name (overrides the generator/source name).
         if !config.name.is_empty() {
-            deck.set_source_name(config.name.clone());
+            deck.set_source_name(crate::persistence::label_now(&config.name));
         }
         let dk_idx = {
             let ch = mixer
                 .channel_mut(ch_idx)
                 .ok_or_else(|| anyhow::anyhow!("Channel {ch_idx} not found"))?;
-            let mut slot = crate::channel::DeckSlot::new(deck);
-            slot.opacity = config.opacity;
-            slot.blend_mode = config.blend_mode.into();
-            slot.mute = config.mute;
-            slot.solo = config.solo;
-            slot.z_index = config.z_index;
+            // Its transparency, pace, size and auto-transition with the rest:
+            // a duplicated tap came back flattening without them.
+            let slot = crate::persistence::slot_from_config(deck, config, context, registry);
             ch.add_deck_slot(slot);
             // Appended, then moved into place, so the slot goes through the one
             // insertion path the channel maintains.
@@ -390,6 +475,40 @@ impl VardaApp {
             apply_modulation_recipes(&config.modulation, &new_prefix, mixer.modulation_mut());
         }
         Ok(deck_uuid)
+    }
+}
+
+/// A preset saved: its file to write, and what to put back should it not
+/// land.
+pub(crate) struct PresetSave {
+    file: crate::persistence::writer::FileSave,
+    on_way: PresetOnWay,
+}
+
+/// A preset whose file is on its way: it as kept in the library, and the
+/// deck renamed after it — its UUID, its name before and the one given.
+pub(crate) struct PresetOnWay {
+    kept: Option<crate::persistence::presets::KeptPreset>,
+    renamed: Option<(String, String, String)>,
+}
+
+/// A preset's file, to be written in the background: said once it has
+/// landed, as a save said once it had been written.
+fn preset_file(
+    label: String,
+    path: std::path::PathBuf,
+    content: String,
+    name: &str,
+    kind: &str,
+) -> crate::persistence::writer::FileSave {
+    crate::persistence::writer::FileSave {
+        label,
+        path,
+        content,
+        said: Some(format!("💾 Saved {kind} preset '{name}'")),
+        failed: Some("Failed to save preset".into()),
+        presets: true,
+        then: None,
     }
 }
 

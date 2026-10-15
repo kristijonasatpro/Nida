@@ -2,7 +2,7 @@
 use anyhow::Result;
 use wgpu::util::DeviceExt;
 
-/// Uniform buffer for HAP convert shader — 32 bytes (8 x f32).
+/// Uniform buffer for HAP convert shader — 48 bytes (12 x f32).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct HapConvertParams {
@@ -12,6 +12,10 @@ struct HapConvertParams {
     _pad: f32,
     uv_scale: [f32; 2],
     uv_offset: [f32; 2],
+    /// The part of the texture the picture fills: all of it, unless its size
+    /// is not a whole number of 4×4 blocks and the texture was made larger.
+    extent: [f32; 2],
+    _pad2: [f32; 2],
 }
 
 pub struct HapConvertPipeline {
@@ -86,6 +90,8 @@ impl HapConvertPipeline {
                 _pad: 0.0,
                 uv_scale: [1.0, 1.0],
                 uv_offset: [0.0, 0.0],
+                extent: [1.0, 1.0],
+                _pad2: [0.0; 2],
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -168,11 +174,15 @@ impl HapConvertPipeline {
                 _pad: 0.0,
                 uv_scale: [1.0, 1.0],
                 uv_offset: [0.0, 0.0],
+                extent: [1.0, 1.0],
+                _pad2: [0.0; 2],
             }]),
         );
     }
 
-    /// Update conversion parameters with UV transform for scaling modes.
+    /// Update conversion parameters with UV transform for scaling modes, the
+    /// picture filling `extent` of its texture.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_params_with_uv(
         &self,
         queue: &wgpu::Queue,
@@ -181,6 +191,7 @@ impl HapConvertPipeline {
         has_alpha_plane: bool,
         uv_scale: [f32; 2],
         uv_offset: [f32; 2],
+        extent: [f32; 2],
     ) {
         queue.write_buffer(
             &self.params_buffer,
@@ -192,6 +203,8 @@ impl HapConvertPipeline {
                 _pad: 0.0,
                 uv_scale,
                 uv_offset,
+                extent,
+                _pad2: [0.0; 2],
             }]),
         );
     }
@@ -234,8 +247,19 @@ impl HapConvertPipeline {
         render_pass: &mut wgpu::RenderPass<'a>,
         bind_group: &'a wgpu::BindGroup,
     ) {
+        self.draw_within(render_pass, bind_group, None);
+    }
+
+    /// [`Self::draw`] only through the scissor rectangles `within`, or
+    /// everywhere for `None`.
+    pub fn draw_within<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        bind_group: &'a wgpu::BindGroup,
+        within: Option<&[super::region::Pixels]>,
+    ) {
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, bind_group, &[]);
-        render_pass.draw(0..3, 0..1);
+        super::region::draw_within(render_pass, within);
     }
 }

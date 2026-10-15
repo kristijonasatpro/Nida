@@ -15,6 +15,8 @@
 pub mod backend;
 pub mod platform;
 pub mod resample;
+#[cfg(target_os = "macos")]
+pub mod surface;
 
 use backend::{
     CaptureConfig, CaptureError, CaptureFrame, CapturePixelFormat, CaptureTargetInfo,
@@ -23,6 +25,23 @@ use backend::{
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+use crate::frame_picker::FramePicker;
+use crate::renderer::context::GpuContext;
+
+/// Frames of a capture kept waiting for the show at most: each holds a
+/// surface the capture needs back (see `platform::macos`).
+const PICKER_FRAMES: usize = 4;
+
+/// When a frame was captured, host seconds: as macOS says, or as it came.
+fn frame_time(frame: &CaptureFrame) -> f64 {
+    #[cfg(target_os = "macos")]
+    if let Some(at) = frame.captured_at {
+        return at;
+    }
+    let _ = frame;
+    crate::host_clock::host_seconds()
+}
 
 /// Opaque handle to an open capture session.
 pub type CaptureId = u32;
@@ -46,8 +65,10 @@ struct ActiveCapture {
     format: CapturePixelFormat,
     /// How many decks are using this capture.
     ref_count: u32,
-    /// Latest frame — capture thread swaps in, render thread takes.
-    frame_data: Arc<Mutex<Option<CaptureFrame>>>,
+    /// Frames come — the capture thread puts them in with when each was
+    /// captured, and the render thread picks the one for each show frame
+    /// (see `crate::frame_picker`).
+    frame_data: Arc<Mutex<FramePicker<CaptureFrame>>>,
     /// Live config, re-read by the capture thread each tick.
     config: Arc<Mutex<CaptureConfig>>,
     stop_flag: Arc<AtomicBool>,
@@ -292,7 +313,12 @@ impl ScreenCaptureManager {
         let (texture, texture_view) =
             Self::create_texture(device, id, &target.label, width, height, format);
 
-        let frame_data: Arc<Mutex<Option<CaptureFrame>>> = Arc::new(Mutex::new(first));
+        let mut picker = FramePicker::keeping(PICKER_FRAMES);
+        if let Some(first) = first {
+            let let_go = picker.push(frame_time(&first), first);
+            drop(let_go);
+        }
+        let frame_data = Arc::new(Mutex::new(picker));
         let config = Arc::new(Mutex::new(config));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicBool::new(false));
@@ -497,38 +523,71 @@ impl ScreenCaptureManager {
     /// Upload frames only for captures whose IDs are in the set. Captures not
     /// in the set skip the GPU upload entirely, so an invisible capture deck
     /// costs nothing.
+    ///
+    /// `show_at` is when the show frame being drawn is due on screen, host
+    /// seconds: each capture's frame for it is picked by that.
     pub fn update_selective(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        context: &GpuContext,
         needed: &HashSet<CaptureId>,
+        show_at: f64,
     ) {
         for (id, active) in &mut self.active {
             if needed.contains(id) {
-                Self::upload_frame(*id, active, device, queue);
+                Self::upload_frame(*id, active, context, show_at);
             }
         }
     }
 
-    /// Upload frames for every active capture.
-    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    /// Each capture's label and how long before its show frame's time the
+    /// frame shown last was captured, seconds.
+    pub fn picture_delays(&self) -> Vec<(String, f64)> {
+        self.active
+            .values()
+            .filter_map(|active| {
+                let latency = active.frame_data.try_lock().ok()?.latency()?;
+                Some((active.label.clone(), latency))
+            })
+            .collect()
+    }
+
+    /// Upload frames for every active capture, for the show frame due at
+    /// `show_at`.
+    pub fn update(&mut self, context: &GpuContext, show_at: f64) {
         for (id, active) in &mut self.active {
-            Self::upload_frame(*id, active, device, queue);
+            Self::upload_frame(*id, active, context, show_at);
         }
     }
 
-    fn upload_frame(
-        id: CaptureId,
-        active: &mut ActiveCapture,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) {
-        let Some(frame) = active
-            .frame_data
-            .try_lock()
-            .ok()
-            .and_then(|mut slot| slot.take())
-        else {
+    fn upload_frame(id: CaptureId, active: &mut ActiveCapture, context: &GpuContext, show_at: f64) {
+        use crate::renderer::present_trace::{Step, TRACE};
+        let device = &context.device;
+        // Waits only while a frame is put in — moments: a show frame that
+        // went without, the picker busy as a frame came, showed the one
+        // before twice and skipped one the next (see the camera's `take`).
+        let picked = active.frame_data.lock().ok().map(|mut picker| {
+            let (frame, what) = picker.pick(show_at);
+            let step = TRACE.recording().then(|| Step::Picked {
+                input: format!("capture {id}"),
+                show_at,
+                captured: frame.as_ref().and(picker.shown()),
+                skipped: match what {
+                    crate::frame_picker::Picked::Skipped(n) => n,
+                    _ => 0,
+                },
+                repeated: what == crate::frame_picker::Picked::Repeated,
+                delay: picker.delay(),
+                waiting: picker.waiting(),
+            });
+            (frame, step)
+        });
+        let Some((frame, step)) = picked else {
+            return;
+        };
+        if let Some(step) = step {
+            TRACE.note("", 0, step);
+        }
+        let Some(frame) = frame else {
             return;
         };
 
@@ -548,12 +607,21 @@ impl ScreenCaptureManager {
             active.format = frame.format;
         }
 
+        // In the GPU surface it was captured into: copied there, on the GPU.
+        #[cfg(target_os = "macos")]
+        if let Some(surface) = frame.surface {
+            if let Err(e) = surface::copy_into(context, surface, &active.texture) {
+                log::warn!("Screen capture {id}: frame not copied: {e}");
+            }
+            return;
+        }
+
         let expected = (active.width as usize) * (active.height as usize) * 4;
         if frame.data.len() < expected {
             return;
         }
 
-        queue.write_texture(
+        context.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &active.texture,
                 mip_level: 0,
@@ -614,7 +682,7 @@ fn poll_interval(frame_interval: std::time::Duration, self_paced: bool) -> std::
 fn capture_loop(
     session: &mut dyn ScreenCaptureBackend,
     id: CaptureId,
-    frame_data: &Mutex<Option<CaptureFrame>>,
+    frame_data: &Mutex<FramePicker<CaptureFrame>>,
     config: &Mutex<CaptureConfig>,
     stop: &AtomicBool,
     connected: &AtomicBool,
@@ -641,11 +709,20 @@ fn capture_loop(
             }
         }
 
-        if let Some(frame) = session.next_frame() {
+        // Every frame come, each with when it was captured: the render
+        // thread picks the one for each show frame. A self-paced backend may
+        // have several waiting; a polled one makes one a call.
+        while let Some(frame) = session.next_frame() {
             connected.store(true, Ordering::SeqCst);
-            // Latest-wins: overwrite whatever the render thread has not taken.
-            if let Ok(mut slot) = frame_data.lock() {
-                *slot = Some(frame);
+            // Frames let go give their surfaces back to the capture here,
+            // the picker no longer held: the show's frame waits for it.
+            let let_go = frame_data
+                .lock()
+                .map(|mut picker| picker.push(frame_time(&frame), frame))
+                .unwrap_or_default();
+            drop(let_go);
+            if !self_paced {
+                break;
             }
         }
 
@@ -843,7 +920,7 @@ mod tests {
 
         let mut needed = std::collections::HashSet::new();
         needed.insert(id);
-        mgr.update_selective(&gpu.device, &gpu.queue, &needed);
+        mgr.update_selective(&gpu, &needed, crate::host_clock::host_seconds());
         assert_eq!(mgr.resolution(id), Some((160, 120)));
         mgr.release(id);
     }
@@ -897,7 +974,11 @@ mod tests {
             .expect("mock open");
 
         // Empty set: no upload, and crucially no panic on the absent entry.
-        mgr.update_selective(&gpu.device, &gpu.queue, &std::collections::HashSet::new());
+        mgr.update_selective(
+            &gpu,
+            &std::collections::HashSet::new(),
+            crate::host_clock::host_seconds(),
+        );
         assert!(mgr.is_active(id));
         mgr.release(id);
     }

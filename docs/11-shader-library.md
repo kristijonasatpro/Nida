@@ -1,6 +1,6 @@
 # Shader Library
 
-Varda ships with a catalog of ISF shaders, ready to drag from the **Library** panel into any deck (generators), onto a deck/channel/master (filters), or into a transition slot. All of them live in the `shaders/` directory and can be opened, edited, and hot-reloaded. See [ISF Shader Authoring](12-isf-authoring.md).
+Nida ships with a catalog of ISF shaders, ready to drag from the **Library** panel into any deck (generators), onto a deck/channel/master (filters), or into a transition slot. All of them live in the `shaders/` directory and can be opened, edited, and hot-reloaded. See [ISF Shader Authoring](12-isf-authoring.md).
 
 Shaders are classified automatically by type:
 
@@ -132,7 +132,7 @@ Shaders are classified automatically by type:
 | `tile.fs` | Repeat/tile the image in a grid |
 | `tilt_shift.fs` | Fake miniature/selective focus blur |
 | `tint.fs` | Color tint overlay |
-| `transform.fs` | 2D translate, rotate, scale |
+| `transform.fs` | Move, scale and rotate about the picture's own centre; proportional scale unless "Separate X / Y scale" is on |
 | `tunnel.fs` | Infinite zoom tunnel distortion |
 | `twist.fs` | Rotational twist/twirl from center |
 | `vhs_crt.fs` | Retro video distortion with tracking errors |

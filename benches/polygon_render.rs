@@ -143,7 +143,7 @@ fn bench_render(c: &mut Criterion) {
                     });
                     pipeline.draw(&mut rp, &prepared, &vertex_pool);
                 }
-                ctx.queue.submit(std::iter::once(encoder.finish()));
+                ctx.submit(std::iter::once(encoder.finish()));
                 poll(&ctx);
             });
         });
@@ -222,7 +222,7 @@ fn bench_render_pipelined(c: &mut Criterion) {
                         });
                         pipeline.draw(&mut rp, &prepared, &vertex_pool);
                     }
-                    ctx.queue.submit(std::iter::once(encoder.finish()));
+                    ctx.submit(std::iter::once(encoder.finish()));
                 }
                 poll(&ctx);
             });

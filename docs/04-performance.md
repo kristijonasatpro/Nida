@@ -23,6 +23,29 @@ The **speed** slider in the deck detail panel runs from **0.1× to 4.0×** (belo
 
 The **position slider** in the Playback section shows the current time on the left and the clip duration on the right. **Click or drag** it to scrub. Seeking is also MIDI/OSC/keyboard-mappable via `deck/<uuid>/video/seek`: the normalized 0.0–1.0 value maps to the clip's full duration, so the same mapping works for clips of any length (handy for scrubbing from a fader or an LFO).
 
+A seek lands on the frame at the time asked, not the keyframe before it
+(which in a typical H.264 file can be seconds earlier while the sound starts
+on time): the frames between are decoded, not shown. Each frame shows at the
+time it carries, so a clip whose frame rate varies — phone, Zoom or screen
+recordings — plays in time, and every frame to the last is shown.
+
+### What a Clip Says About Itself
+
+A clip is shown the way its file says it should be:
+
+- **Turned upright** — a phone held upright records on its side and says so;
+  the clip plays standing up, as the phone showed it.
+- **At its pixels' shape** — anamorphic video (HDV's 1440×1080, DV) is shown
+  at the width its pixels make, not squeezed.
+- **HDR** — HDR10 and HLG clips (an iPhone records HLG by default) are
+  tone-mapped to Nida's picture: reference white comes out white, highlights
+  roll off below it, BT.2020 colours come to BT.709. Read as ordinary video
+  they came out dim and flat.
+- **Interlaced** — a frame flagged interlaced has its two fields blended, so
+  movement shows no comb.
+- **Broadcast files** (.ts, .mts), whose clocks start where the recorder's
+  was, count from their own start: picture and sound line up.
+
 ### In/Out Points
 
 Define a sub-range of the clip to play:
@@ -39,6 +62,21 @@ Play, speed, seek, and loop mode are also **modulation targets**, so an LFO can 
 
 A modulated playhead moves a **paused** clip too: pause stops the clip advancing on its own, it does not stop a modulator scrubbing it. That is the case where the effect reads most clearly, since the swing is centred on wherever you parked the playhead. It does mean a paused clip with a playhead assignment is decoding rather than idle, so the same seek costs apply as when it is playing.
 
+### Hardware Decoding (Mac media engine)
+
+On a Mac, H.264, HEVC and ProRes clips decode on the chip's media engine
+instead of the CPU — at 4K about a fifteenth of the CPU a software decode
+takes, which leaves room for several clips at once beside the renderer. AV1
+decodes there too on M3 and newer chips (an M1 or M2 plays AV1 in software).
+Incoming streams — SRT, HLS, DASH and RTMP sources — decode there too. The
+picture is identical either way.
+
+The info line under a clip's playback controls says **hardware decode** or
+**software decode**. Anything the engine will not take decodes in software as
+before, and a clip the engine fails on part-way through carries on in software
+by itself. To decode everything in software, for troubleshooting, start Nida
+with `VARDA_SOFTWARE_DECODE=1`.
+
 ### HAP Hardware Codecs
 
 HAP clips decode straight to GPU-native compressed textures (no CPU color conversion), making them the most efficient option for high-resolution playback and reliable reverse/scrubbing. All HAP variants are supported on playback:
@@ -50,9 +88,14 @@ HAP clips decode straight to GPU-native compressed textures (no CPU color conver
 | **HAP Q** | YCoCg (BC3) — higher quality |
 | **HAP Q Alpha** | Dual-plane: YCoCg color + BC4 alpha |
 
+Colour comes out as in any other clip (mid-grey is mid-grey), HAP Q is
+opaque, and HAP Q Alpha and HAP Alpha keep their transparency. A picture
+whose size is not a multiple of 4 plays too, and a damaged frame is skipped
+rather than stopping the clip.
+
 ### Ping-Pong & Reverse Cache
 
-During forward playback, Ping-Pong mode caches decoded frames so it can replay them in reverse. The cache is capped at **2 GB** (roughly 13 s of 1080p at 60 fps). If a clip's forward pass exceeds that, the reverse leg is truncated to what fits, and Varda shows a **one-time** notice:
+During forward playback, Ping-Pong mode caches decoded frames so it can replay them in reverse. The cache is capped at **2 GB** (roughly 13 s of 1080p at 60 fps). If a clip's forward pass exceeds that, the reverse leg is truncated to what fits, and Nida shows a **one-time** notice:
 
 > Deck '<name>': reverse playback truncated (cache full). Transcode to HAP for full-length reverse.
 
@@ -147,7 +190,7 @@ A Fade step targets a pair of channels rather than one deck, so sequences cannot
 
 ## Undo / Redo
 
-Varda maintains a 50-level undo history on a single unified timeline covering both your mixer/scene edits and your stage-editor / warp edits. One Cmd+Z reverts the most recent action you took, whichever it was.
+Nida maintains a 50-level undo history on a single unified timeline covering both your mixer/scene edits and your stage-editor / warp edits. One Cmd+Z reverts the most recent action you took, whichever it was.
 
 | Action | Shortcut |
 |--------|----------|
@@ -175,6 +218,7 @@ A continuous drag (dragging a vertex, a warp point, a bezier handle, or the gizm
 
 - **Crossfader position** — continuous live control (too many snapshots)
 - **Video playback** — temporal state (position, play/pause)
+- **Playlist playback** — playing, stopping, and showing an item (its list and settings are undoable)
 - **MIDI mappings** — device configuration, not show state
 - **Output windows** — creating, removing, moving, or resizing a projector output window is a physical-hardware action; undo won't tear down or recreate an output feed mid-set. (Assigning surfaces *onto* an existing output is undoable.)
 
@@ -196,7 +240,7 @@ A deck preset captures everything about a single deck:
 - Auto-transition configuration
 - Modulation recipes (sources + assignments, using relative parameter keys)
 
-**Save**: select a deck → click **"Save Preset"** in the deck detail panel. Name it.
+**Save**: select a deck → click **"Save Preset"** in the deck detail panel. Name it. It is there to load at once; its file is written on a thread of its own, so the outputs carry on — **💾 Saved deck preset** says when it is on disk.
 
 **Load**: drag a deck preset from the **Library** panel into a channel. A new deck is created with all settings restored. Modulation sources are deduplicated so if an identical source already exists, it's reused.
 

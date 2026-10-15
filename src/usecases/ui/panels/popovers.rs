@@ -143,15 +143,8 @@ pub(super) fn render_fps_popover(ui: &mut egui::Ui, data: &UIData) {
     ui.label(egui::RichText::new("⏱ Render Pipeline").strong());
     ui.separator();
 
-    let fps_color = |fps: f32| {
-        if fps > 55.0 {
-            egui::Color32::from_rgb(100, 220, 100)
-        } else if fps > 30.0 {
-            egui::Color32::from_rgb(220, 200, 60)
-        } else {
-            egui::Color32::from_rgb(220, 60, 60)
-        }
-    };
+    // Against the target, as the top bar's figure is.
+    let fps_color = |fps: f32| super::monitoring::fps_color(fps, data.target_fps);
 
     ui.horizontal(|ui| {
         ui.label("Avg pipeline FPS:");
@@ -171,17 +164,19 @@ pub(super) fn render_fps_popover(ui: &mut egui::Ui, data: &UIData) {
             .striped(true)
             .show(ui, |ui| {
                 ui.label(egui::RichText::new("Channel").strong().small());
-                ui.label(egui::RichText::new("Avg FPS").strong().small());
+                ui.label(egui::RichText::new("FPS").strong().small())
+                    .on_hover_text("The slowest moving layer. Still images are left out: they are drawn again only when they change.");
                 ui.label(egui::RichText::new("Decks").strong().small());
-                ui.label(egui::RichText::new("Time").strong().small());
+                ui.label(egui::RichText::new("CPU").strong().small())
+                    .on_hover_text("Time the CPU spent preparing the channel's drawing each frame — not the GPU's own time, nor the delay to the screen.");
                 ui.end_row();
 
                 for stat in &data.channel_render_stats {
                     ui.label(&stat.name);
-                    if stat.avg_deck_fps > 0.0 {
+                    if stat.fps > 0.0 {
                         ui.label(
-                            egui::RichText::new(format!("{:.0}", stat.avg_deck_fps))
-                                .color(fps_color(stat.avg_deck_fps))
+                            egui::RichText::new(format!("{:.0}", stat.fps))
+                                .color(fps_color(stat.fps))
                                 .monospace(),
                         );
                     } else {
@@ -208,7 +203,7 @@ pub(super) fn render_fps_popover(ui: &mut egui::Ui, data: &UIData) {
         ui.add_space(4.0);
         ui.separator();
         ui.label(format!(
-            "{total_active} active decks · {total_ms:.1}ms total render"
+            "{total_active} active decks · {total_ms:.1} ms CPU a frame"
         ));
     }
 }
@@ -639,7 +634,7 @@ pub(super) fn render_clock_popover(ui: &mut egui::Ui, data: &UIData, actions: &m
     for src in &data.clock_detected_midi {
         let is_selected = data.clock_preference_force_device_id == Some(src.device_id);
         let bpm_str = src.bpm.map_or("--".to_string(), |b| format!("{b:.0}"));
-        let label = format!("🟣 {}  {} BPM", src.device_name, bpm_str);
+        let label = format!("{}  {} BPM", src.device_name, bpm_str);
         if ui.radio(is_selected, label).clicked() && !is_selected {
             actions.commands.push(EngineCommand::SetClockPreference {
                 preference: crate::clock::ClockPreference::ForceMidi {
@@ -668,7 +663,7 @@ pub(super) fn render_clock_popover(ui: &mut egui::Ui, data: &UIData, actions: &m
     let audio_bpm_str = data
         .clock_audio_bpm
         .map_or("--".to_string(), |b| format!("{b:.0}"));
-    let label = format!("🟢 Audio only  {audio_bpm_str} BPM");
+    let label = format!("Audio only  {audio_bpm_str} BPM");
     if ui.radio(is_audio, label).clicked() && !is_audio {
         actions.commands.push(EngineCommand::SetClockPreference {
             preference: crate::clock::ClockPreference::ForceAudio,
@@ -679,7 +674,7 @@ pub(super) fn render_clock_popover(ui: &mut egui::Ui, data: &UIData, actions: &m
     let is_manual = data.clock_preference == "ForceManual";
     let mut manual_bpm = data.clock_manual_bpm.unwrap_or(120.0);
     ui.horizontal(|ui| {
-        if ui.radio(is_manual, "🟠 Manual").clicked() && !is_manual {
+        if ui.radio(is_manual, "Manual").clicked() && !is_manual {
             actions.commands.push(EngineCommand::SetClockPreference {
                 preference: crate::clock::ClockPreference::ForceManual { bpm: manual_bpm },
             });
@@ -736,6 +731,22 @@ pub(super) fn render_resolution_popover(ui: &mut egui::Ui, data: &UIData, action
     let current_w = data.render_width;
     let current_h = data.render_height;
 
+    if ui
+        .radio(data.render_auto, "Auto — match the output screens")
+        .on_hover_text(
+            "Follow the largest screen an output is on: a 4K TV gets a 4K picture, \
+             Full HD screens a Full HD one. The screen's own mode is set in the \
+             system display settings.",
+        )
+        .clicked()
+        && !data.render_auto
+    {
+        actions
+            .commands
+            .push(EngineCommand::SetRenderResolutionAuto { enabled: true });
+    }
+    ui.separator();
+
     // Landscape presets, then the shapes short-form video actually ships in.
     // 1080×1920 is the single 9:16 master every vertical platform takes —
     // Reels, TikTok, Shorts, Stories and Facebook Reels all specify exactly
@@ -759,7 +770,8 @@ pub(super) fn render_resolution_popover(ui: &mut egui::Ui, data: &UIData, action
         for &(label, w, h) in presets {
             let is_current = current_w == w && current_h == h;
             let text = format!("{label} ({w}×{h})");
-            if ui.radio(is_current, text).clicked() && !is_current {
+            let picked = !data.render_auto && is_current;
+            if ui.radio(picked, text).clicked() && !picked {
                 actions.commands.push(EngineCommand::SetRenderResolution {
                     width: w,
                     height: h,
@@ -834,14 +846,13 @@ pub(super) fn render_target_fps_popover(ui: &mut egui::Ui, data: &UIData, action
 
     let current = data.target_fps;
 
-    let presets: &[(&str, u32)] = &[
-        ("30 FPS", 30),
-        ("60 FPS", 60),
-        ("120 FPS", 120),
-        ("Uncapped", 0),
-    ];
+    // The rates are `TARGET_FPS_CHOICES` (see there), then Uncapped.
+    let presets = crate::engine::value::render::TARGET_FPS_CHOICES
+        .iter()
+        .map(|&fps| (format!("{fps} FPS"), fps))
+        .chain(std::iter::once(("Uncapped".to_string(), 0)));
 
-    for &(label, fps) in presets {
+    for (label, fps) in presets {
         let is_current = current == fps;
         if ui.radio(is_current, label).clicked() && !is_current {
             actions.commands.push(EngineCommand::SetTargetFps { fps });
@@ -858,11 +869,123 @@ pub(super) fn render_target_fps_popover(ui: &mut egui::Ui, data: &UIData, action
         .weak()
         .small(),
     );
+
+    render_latency(ui, data, actions);
+    #[cfg(target_os = "macos")]
+    render_control_screen_rate(ui, data, actions);
+}
+
+/// Whether Nida sets the control window's screen to the show's rate while it
+/// runs (see `crate::screen_rate`).
+#[cfg(target_os = "macos")]
+fn render_control_screen_rate(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
+    ui.separator();
+    let mut on = data.control_screen_rate;
+    let changed = ui
+        .checkbox(&mut on, "Keep this screen at the show's rate")
+        .on_hover_text(
+            "Sets the screen this window is on to the show's rate (60 Hz for a 60 fps show) \
+             while Nida runs; macOS puts it back when Nida quits. At 120 Hz macOS missed \
+             frames on every screen while a screen was captured. Output screens are never \
+             changed.",
+        )
+        .changed();
+    if changed {
+        actions
+            .commands
+            .push(EngineCommand::SetControlScreenRate { on });
+    }
+}
+
+/// Latency, as vMix offers it: how many frames the GPU may still be drawing
+/// when the next starts. Low waits for each; Normal and High let the next be
+/// prepared meanwhile — a frame or two later on screen, but a busy GPU (4K
+/// on a laptop) no longer holds each frame up.
+fn render_latency(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
+    ui.separator();
+    ui.label(egui::RichText::new("⏱ Latency").strong());
+    #[allow(clippy::cast_precision_loss)]
+    let frame_ms = 1000.0 / data.target_fps.max(1) as f32;
+    let choices: &[(&str, u32, &str)] = &[
+        ("Low", 1, "Each frame finished before the next starts"),
+        ("Normal", 2, "The next frame prepared while the GPU draws this one"),
+        ("High", 3, "Two frames prepared ahead"),
+    ];
+    for &(name, frames, what) in choices {
+        let label = if frames == 1 {
+            name.to_string()
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            let later = (frames - 1) as f32 * frame_ms;
+            format!("{name} (+{later:.0} ms)")
+        };
+        let is_current = data.frames_in_flight == frames;
+        if ui.radio(is_current, label).on_hover_text(what).clicked() && !is_current {
+            actions
+                .commands
+                .push(EngineCommand::SetFramesInFlight { frames });
+        }
+    }
+    ui.label(
+        egui::RichText::new(
+            "Pictures stutter with the GPU busy (4K on a laptop)? \
+             Normal, or a lower resolution.",
+        )
+        .weak()
+        .small(),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The European broadcast rates must be offered: a show mixed into a
+    /// 50 Hz ATEM at 60 judders.
+    #[test]
+    fn the_frame_rate_menu_offers_broadcast_rates() {
+        use egui_kittest::kittest::Queryable;
+        for (label, fps) in [("25 FPS", 25), ("50 FPS", 50)] {
+            let data = UIData::test_fixture();
+            let mut actions = UIActions::new();
+            {
+                let mut harness = egui_kittest::Harness::new_ui(|ui| {
+                    render_target_fps_popover(ui, &data, &mut actions);
+                });
+                harness.get_by_label(label).click();
+                harness.run();
+            }
+            assert!(
+                actions
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, EngineCommand::SetTargetFps { fps: f } if *f == fps)),
+                "{label} must set {fps}"
+            );
+        }
+    }
+    /// Latency as vMix offers it: Normal lets the next frame be prepared
+    /// while the GPU draws, saying what it costs.
+    #[test]
+    fn the_latency_menu_sets_frames_in_flight() {
+        use egui_kittest::kittest::Queryable;
+        let data = UIData::test_fixture();
+        let mut actions = UIActions::new();
+        {
+            let mut harness = egui_kittest::Harness::new_ui(|ui| {
+                render_target_fps_popover(ui, &data, &mut actions);
+            });
+            harness.get_by_label("Normal (+17 ms)").click();
+            harness.run();
+        }
+        assert!(
+            actions
+                .commands
+                .iter()
+                .any(|c| matches!(c, EngineCommand::SetFramesInFlight { frames: 2 })),
+            "Normal sets two frames in flight"
+        );
+    }
     use crate::transport::TransportSource;
 
     /// Emphasis follows engine state, not UI mode: the tempo readout is only

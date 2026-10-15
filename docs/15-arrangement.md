@@ -8,14 +8,14 @@ Click **▤ Arrange** in the top bar to switch, and **🎛 Perform** to switch b
 
 ## What Changes and What Doesn't
 
-Only the **central mixing area** is replaced. The library on the left, the detail bar along the bottom, and the right panel all stay exactly where they were:
+Only the **channel view** is replaced — the Channels panel, or in the Broadcast and VJ layouts the Inputs or Layers panel. The library, the Properties panel and the rest all stay exactly where they were:
 
 - Selecting a lane selects its deck, so the bottom bar edits generator parameters, effect chains, and playback for the deck you clicked in the timeline.
 - Dragging a generator from the library onto a **group row** creates a deck in that channel, and therefore a lane, the same way dropping onto a channel column does.
 - Dragging an **effect** onto a lane, group, Master row, or any automation under them appends to that owner's effect chain and selects the owner (same surfaces as Performance mode; see [Library → Drag-and-Drop](03-library-panel.md#drag-and-drop)).
 - Modulators, tonemapping, surfaces, and outputs stay reachable, so you can build an LFO while looking at the timeline.
 
-If you want a wider timeline, collapse the library with **L** and the right panel with **«**.
+If you want a wider timeline, close the library with **L**, or drag the timeline's tab out to its own space (see [Screen Layouts](20-layouts.md)).
 
 ## Anatomy
 
@@ -134,7 +134,7 @@ The edges are forgiving: a press a few pixels outside a region still grabs its e
 
 **Snap** rounds every edit to a whole frame at the show's timecode rate, and is on by default. Turn it off for continuous positions.
 
-Snapping applies to the *gesture*, never to what is stored: positions are continuous everywhere in Varda, so changing the show's frame rate re-labels the ruler without moving a single region. See [Frame rates](06-control-surfaces.md#frame-rates-and-drop-frame).
+Snapping applies to the *gesture*, never to what is stored: positions are continuous everywhere in Nida, so changing the show's frame rate re-labels the ruler without moving a single region. See [Frame rates](06-control-surfaces.md#frame-rates-and-drop-frame).
 
 ## Selecting a Slice
 
@@ -205,7 +205,7 @@ The crossfader cannot be automated yet: it is mappable and macro-drivable, but i
 
 The deck's own opacity curve is not offered as an editable row, because it is authored by dragging regions and hand edits to it would be overwritten by the next region edit.
 
-Curves do not appear as cards in the right panel's modulation list. A show can have hundreds of them and that list is built for a handful of live modulators.
+Curves do not appear as cards in the Setup panel's modulation list. A show can have hundreds of them and that list is built for a handful of live modulators.
 
 ### Reusing a shape
 
@@ -281,7 +281,7 @@ Old scenes default to Auto. They play as they used to until you hit Play on the 
 
 "Run this loop until the schedule starts" is a normal installation requirement, and a pre-show state that is simply black looks exactly like a broken rig on a dark stage. Pick one deliberately.
 
-If the arrangement ever drives everything to zero, Varda tells you once rather than leaving you to wonder whether the output died.
+If the arrangement ever drives everything to zero, Nida tells you once rather than leaving you to wonder whether the output died.
 
 ## What Regions Cannot Do
 
@@ -292,11 +292,11 @@ A lane is a deck, and a deck holds one source. Loading a different video into a 
 - Every timeline drag is **one** undo entry. Cmd+Z returns the region or breakpoint to where it was before you started dragging.
 - The arrangement is saved in `scene.json` with everything else, because every lane is a deck in that scene and every curve is a modulation source in it. There is no separate arrangement file to keep in sync.
 - This is **scene version 7**. Older scenes open unchanged, but a scene containing an arrangement will not open on a build older than this one.
-- Decks stay in memory for the whole show, so a long arrangement holds all of them at once. The monitoring cluster at the bottom of the right panel shows the deck count and an estimate of the colour-target memory they hold. See [Performance Monitoring](10-resolution-and-monitoring.md#performance-monitoring).
+- Decks stay in memory for the whole show, so a long arrangement holds all of them at once. The monitoring cluster in the top bar shows the deck count and an estimate of the colour-target memory they hold. See [Performance Monitoring](10-resolution-and-monitoring.md#performance-monitoring).
 
 ## Sleeping Clips
 
-A video whose next region is minutes away has nothing to show, so Varda **stops decoding it** and wakes it a second before it is needed. Sixty video decks in a two-hour show would otherwise run sixty decoders all evening to serve clips nobody is looking at.
+A video whose next region is minutes away has nothing to show, so Nida **stops decoding it** and wakes it a second before it is needed. Sixty video decks in a two-hour show would otherwise run sixty decoders all evening to serve clips nobody is looking at.
 
 This changes one thing you can see, and it is worth knowing: **a sleeping clip freezes rather than playing on silently.** When its region arrives it resumes from where it paused, instead of being wherever wall-clock time carried it. That is the behaviour an arrangement wants (the same show position looks the same on the second run), but it will surprise you once if you are used to a clip free-running behind a closed fader. Its transport still reads as playing, because sleep is not pause and re-arming will not restart a clip you paused by hand.
 

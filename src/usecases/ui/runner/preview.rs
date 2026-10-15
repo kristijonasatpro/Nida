@@ -27,6 +27,37 @@ impl PreviewSlot {
     }
 }
 
+/// One preview, encoded: the source sampled at each target pixel's centre,
+/// linear light to sRGB — what the blit did for each, a fragment at a time.
+const ENCODE_SHADER: &str = r"
+@group(0) @binding(0) var texture_sampler: sampler;
+@group(0) @binding(1) var source_texture: texture_2d<f32>;
+@group(0) @binding(2) var preview: texture_storage_2d<rgba8unorm, write>;
+
+// Linear to sRGB (IEC 61966-2-1), as the blit shader's `gamma_from_linear_rgb`.
+fn gamma_from_linear_rgb(rgb: vec3<f32>) -> vec3<f32> {
+    let c = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lower = c * 12.92;
+    let higher = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(higher, lower, c < vec3<f32>(0.0031308));
+}
+
+@compute @workgroup_size(8, 8)
+fn encode_preview(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(preview);
+    if (id.x >= size.x || id.y >= size.y) {
+        return;
+    }
+    let uv = (vec2<f32>(id.xy) + vec2<f32>(0.5)) / vec2<f32>(size);
+    let color = textureSampleLevel(source_texture, texture_sampler, uv, 0.0);
+    textureStore(
+        preview,
+        vec2<i32>(id.xy),
+        vec4<f32>(gamma_from_linear_rgb(color.rgb), clamp(color.a, 0.0, 1.0)),
+    );
+}
+";
+
 /// Gamma-encodes linear engine textures so egui previews match the real output.
 ///
 /// egui assumes every texture handed to it is already gamma-encoded ("We expect
@@ -48,21 +79,107 @@ impl PreviewSlot {
 /// Targets are cached per key and recreated only when the source size changes.
 /// They are capped to `MAX_DIM` on the long edge — previews are thumbnails, so
 /// this also makes egui sample far less than the full render resolution.
+///
+/// All of a frame's previews are encoded in one compute pass, a dispatch
+/// each, not a render pass each: wgpu gives every pass a command buffer of
+/// its own, and a pass costs the GPU ~0.15 ms however little it draws —
+/// measured on a laptop, a dozen previews a frame at ~0.2 ms each, all
+/// but the floor (`renderer::gpu_time`).
 pub(super) struct PreviewEncoder {
-    pipeline: crate::renderer::BlitPipeline,
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
     targets: std::collections::HashMap<String, (wgpu::Texture, wgpu::TextureView)>,
+    /// What each channel preview was last encoded from: the channel, and
+    /// how many times it had been drawn (see `changed`).
+    encoded: std::collections::HashMap<String, (String, u32)>,
 }
 
 impl PreviewEncoder {
     /// Long-edge cap for preview targets.
     const MAX_DIM: u32 = 960;
 
-    fn new(device: &wgpu::Device) -> anyhow::Result<Self> {
-        Ok(Self {
-            // Non-sRGB target on purpose — see the type-level comment.
-            pipeline: crate::renderer::BlitPipeline::new(device, wgpu::TextureFormat::Rgba8Unorm)?,
+    fn new(device: &wgpu::Device) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Preview Encode"),
+            source: wgpu::ShaderSource::Wgsl(ENCODE_SHADER.into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Preview Encode"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        // Non-sRGB target on purpose — see the type-level comment.
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Preview Encode"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Preview Encode"),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some("encode_preview"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        // As the blit samples: linear, clamped to the edge.
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Preview Encode"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        Self {
+            pipeline,
+            layout,
+            sampler,
             targets: std::collections::HashMap::new(),
-        })
+            encoded: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Whether the preview `key`, now `stamp` — its source and how many
+    /// times that has been drawn — needs encoding: not already encoded at
+    /// that. A channel off air is drawn a third of the frames (for its tile),
+    /// so its preview is encoded as often, not every frame of the control
+    /// window. Counted as encoded from here.
+    fn changed(&mut self, key: &str, stamp: (String, u32)) -> bool {
+        if self.encoded.get(key) == Some(&stamp) {
+            return false;
+        }
+        self.encoded.insert(key.to_owned(), stamp);
+        true
     }
 
     /// Scale `(w, h)` down so the long edge is at most `MAX_DIM`, preserving aspect.
@@ -78,6 +195,43 @@ impl PreviewEncoder {
         )
     }
 
+    /// Widths a preview target is made at, for a picture drawn smaller than
+    /// the full preview: a tile is a fraction of the width of the Program
+    /// picture, and the encode samples every target pixel — so each target
+    /// is made the size it is drawn at, a step up.
+    const WIDTHS: [u32; 5] = [160, 240, 320, 480, 640];
+
+    /// The size to make a preview target: `full` (the source capped at
+    /// `MAX_DIM`), or the smallest of `WIDTHS` (keeping `full`'s shape) that
+    /// covers `drawn` — the largest it was drawn at, in pixels, if it was.
+    /// Grown at once; shrunk only once drawn two-thirds of `current` or
+    /// less, so a window being resized does not remake it every frame. Not
+    /// drawn, it stays as it is.
+    fn target_size(
+        full: (u32, u32),
+        drawn: Option<[u32; 2]>,
+        current: Option<[u32; 2]>,
+    ) -> [u32; 2] {
+        let full = [full.0, full.1];
+        let Some([drawn_w, drawn_h]) = drawn else {
+            return current.unwrap_or(full);
+        };
+        let shaped = |width: u32| {
+            let height =
+                (u64::from(width) * u64::from(full[1])).div_ceil(u64::from(full[0].max(1)));
+            [width, u32::try_from(height).unwrap_or(u32::MAX).max(1)]
+        };
+        let wanted = Self::WIDTHS
+            .iter()
+            .map(|&width| shaped(width))
+            .find(|&[w, h]| w < full[0] && w >= drawn_w && h >= drawn_h)
+            .unwrap_or(full);
+        match current {
+            Some(now) if wanted[0] < now[0] && wanted[0] * 3 > now[0] * 2 => now,
+            _ => wanted,
+        }
+    }
+
     /// Create or resize the target for `key`. Returns true when the target was
     /// (re)created, meaning the caller must re-register it with egui — a
     /// `TextureId` is bound to a specific texture, so a resize invalidates it.
@@ -87,8 +241,10 @@ impl PreviewEncoder {
         key: &str,
         src_w: u32,
         src_h: u32,
+        drawn: Option<[u32; 2]>,
     ) -> bool {
-        let (w, h) = Self::preview_size(src_w, src_h);
+        let current = self.targets.get(key).map(|(t, _)| [t.width(), t.height()]);
+        let [w, h] = Self::target_size(Self::preview_size(src_w, src_h), drawn, current);
         let stale = self
             .targets
             .get(key)
@@ -105,12 +261,15 @@ impl PreviewEncoder {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             self.targets.insert(key.to_string(), (texture, view));
+            // A new target holds nothing yet.
+            self.encoded.remove(key);
         }
         stale
     }
@@ -138,35 +297,49 @@ impl PreviewEncoder {
         if sources.is_empty() {
             return;
         }
-        self.pipeline.set_srgb_encode(&context.queue, true);
         let mut encoder = context
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Preview Encode"),
             });
-        for (slot, src, ..) in sources {
-            let key = slot.key();
-            let Some(target_view) = self.target_view(&key) else {
-                continue;
-            };
-            let bind_group = self.pipeline.create_bind_group(&context.device, src);
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Preview Encode Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
                 timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
             });
-            self.pipeline.render(&mut pass, &bind_group);
+            pass.set_pipeline(&self.pipeline);
+            for (slot, src, ..) in sources {
+                let key = slot.key();
+                let Some((target, target_view)) = self.targets.get(&key) else {
+                    continue;
+                };
+                let bind_group = context
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Preview Encode"),
+                        layout: &self.layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(src),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(target_view),
+                            },
+                        ],
+                    });
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(
+                    target.width().div_ceil(8),
+                    target.height().div_ceil(8),
+                    1,
+                );
+            }
         }
         context.submit(std::iter::once(encoder.finish()));
     }
@@ -174,6 +347,7 @@ impl PreviewEncoder {
     /// Drop cached targets whose key is no longer live (removed decks/outputs).
     fn retain_keys(&mut self, live: &std::collections::HashSet<String>) {
         self.targets.retain(|k, _| live.contains(k));
+        self.encoded.retain(|k, _| live.contains(k));
     }
 }
 
@@ -216,10 +390,11 @@ impl UIRunner {
     /// source is a render-resolution composite, deck, or sub-mix.
     fn output_preview_source<'a>(
         output: &'a crate::renderer::context::UnifiedOutput,
-        mixer: &'a crate::mixer::Mixer,
+        varda: &'a crate::app::VardaApp,
     ) -> (&'a wgpu::TextureView, u32, u32) {
         use crate::renderer::context::UnifiedOutput;
-        let view = Self::output_preview_view(output, mixer);
+        let mixer = varda.mixer_ref();
+        let view = Self::output_preview_view(output, varda);
         let (w, h) = match output {
             UnifiedOutput::Window(w) => (w.preview_texture.width(), w.preview_texture.height()),
             UnifiedOutput::Headless(_) => {
@@ -235,13 +410,19 @@ impl UIRunner {
     /// Headless outputs resolve their source.
     pub(super) fn output_preview_view<'a>(
         output: &'a crate::renderer::context::UnifiedOutput,
-        mixer: &'a crate::mixer::Mixer,
+        varda: &'a crate::app::VardaApp,
     ) -> &'a wgpu::TextureView {
         use crate::renderer::context::{OutputSource, UnifiedOutput};
+        let mixer = varda.mixer_ref();
         match output {
             UnifiedOutput::Window(w) => &w.preview_texture_view,
             UnifiedOutput::Headless(h) => match &h.source {
                 OutputSource::Master => mixer.composite_view(),
+                // What the bus has on air, resolved every frame; black for a
+                // bus with nothing on air or one that no longer exists.
+                OutputSource::BusProgram(uuid) => varda
+                    .bus_program_view(uuid)
+                    .unwrap_or_else(|| mixer.black_view()),
                 OutputSource::Channel(idx) => mixer
                     .channels()
                     .get(*idx)
@@ -302,7 +483,7 @@ impl UIRunner {
             ct.height(),
         ));
         for (out_idx, output) in varda.outputs_ref().iter().enumerate() {
-            let (view, w, h) = Self::output_preview_source(output, mixer);
+            let (view, w, h) = Self::output_preview_source(output, varda);
             out.push((PreviewSlot::Output(out_idx), view, w, h));
         }
         out
@@ -318,13 +499,7 @@ impl UIRunner {
         let context = varda.gpu_context();
 
         if self.preview_encoder.is_none() {
-            match PreviewEncoder::new(&context.device) {
-                Ok(e) => self.preview_encoder = Some(e),
-                Err(e) => {
-                    log::error!("Failed to create preview encoder: {e}");
-                    return;
-                }
-            }
+            self.preview_encoder = Some(PreviewEncoder::new(&context.device));
         }
         let Some(egui_renderer) = self.egui_renderer.as_mut() else {
             return;
@@ -340,7 +515,14 @@ impl UIRunner {
         for (slot, _src, w, h) in &sources {
             let key = slot.key();
             live.insert(key.clone());
-            let recreated = encoder.ensure_target(context, &key, *w, *h);
+            let texture = match slot {
+                PreviewSlot::Deck(uuid) => self.deck_preview_textures.get(uuid).copied(),
+                PreviewSlot::Channel(idx) => self.channel_preview_textures.get(idx).copied(),
+                PreviewSlot::Main => self.main_output_texture,
+                PreviewSlot::Output(idx) => self.output_preview_textures.get(idx).copied(),
+            };
+            let drawn = texture.and_then(|id| self.drawn_px.get(&id).copied());
+            let recreated = encoder.ensure_target(context, &key, *w, *h, drawn);
             let known = match slot {
                 PreviewSlot::Deck(uuid) => self.deck_preview_textures.contains_key(uuid),
                 PreviewSlot::Channel(idx) => self.channel_preview_textures.contains_key(idx),
@@ -413,17 +595,43 @@ impl UIRunner {
         encoder.retain_keys(&live);
     }
 
-    /// Gamma-encode every preview for this frame.
+    /// Gamma-encode the previews this frame's UI draws (`textures_drawn`) —
+    /// a channel's only when it has been drawn since (see
+    /// `PreviewEncoder::changed`).
+    ///
+    /// Every preview of every deck, channel, output and the main picture used
+    /// to be encoded every frame of the control window, shown or not: on the
+    /// laptop that was the GPU's biggest cost by far, ~1.4 s of pass time a
+    /// second, ten times the control window's own drawing.
     ///
     /// Must run after the mixer render *and* after output windows have drawn, but
     /// before egui paints. See the frame sequence in `render_frame`.
     pub(super) fn encode_previews(&mut self) {
         let Some(varda) = &self.varda else { return };
-        let Some(encoder) = &self.preview_encoder else {
+        let Some(encoder) = &mut self.preview_encoder else {
             return;
         };
         let context = varda.gpu_context();
-        encoder.encode_all(context, &Self::preview_sources(varda));
+        let channels = varda.mixer_ref().channels();
+        let sources: Vec<_> = Self::preview_sources(varda)
+            .into_iter()
+            .filter(|(slot, ..)| {
+                let texture = match slot {
+                    PreviewSlot::Deck(uuid) => self.deck_preview_textures.get(uuid).copied(),
+                    PreviewSlot::Channel(idx) => self.channel_preview_textures.get(idx).copied(),
+                    PreviewSlot::Main => self.main_output_texture,
+                    PreviewSlot::Output(idx) => self.output_preview_textures.get(idx).copied(),
+                };
+                texture.is_some_and(|id| self.textures_drawn.contains(&id))
+            })
+            .filter(|(slot, ..)| match slot {
+                PreviewSlot::Channel(idx) => channels.get(*idx).is_none_or(|ch| {
+                    encoder.changed(&slot.key(), (ch.uuid().to_string(), ch.frames_drawn()))
+                }),
+                _ => true,
+            })
+            .collect();
+        encoder.encode_all(context, &sources);
     }
 
     /// Per-frame egui texture sync. Previews are gamma-encoded into dedicated
@@ -437,6 +645,244 @@ impl UIRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Registrations ───────────────────────────────────────────────
+
+    /// Previews are registered with egui only here, pointing at their
+    /// gamma-encoded copies. The frame loop once re-pointed them at the
+    /// engine's linear textures after a resolution change and after an undo
+    /// that added or removed decks — and every preview showed dark and
+    /// over-contrasty until a restart. It must not register previews at all.
+    #[test]
+    fn the_frame_loop_leaves_preview_registrations_to_the_preview_sync() {
+        let runner = include_str!("mod.rs");
+        for call in [
+            "update_egui_texture_from_wgpu_texture",
+            "register_native_texture",
+        ] {
+            assert!(
+                !runner.contains(call),
+                "runner/mod.rs calls {call}: previews must stay on their encoded copies"
+            );
+        }
+    }
+
+    // ── Encoding ────────────────────────────────────────────────────
+
+    /// Read an `Rgba8Unorm` texture back, row by row.
+    fn read_rgba8(gpu: &crate::renderer::GpuContext, texture: &wgpu::Texture) -> Vec<u8> {
+        let (w, h) = (texture.width(), texture.height());
+        let row = (w * 4).div_ceil(256) * 256;
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Preview readback"),
+            size: u64::from(row * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            texture.size(),
+        );
+        gpu.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().expect("mapped").expect("mapped");
+        let data = buffer.slice(..).get_mapped_range().expect("mapped range");
+        (0..h as usize)
+            .flat_map(|y| data[y * row as usize..y * row as usize + w as usize * 4].to_vec())
+            .collect()
+    }
+
+    /// `source` (w × h) encoded by the compute pass, and blitted as before,
+    /// both into a preview target's size: the two read back.
+    fn encoded_and_blitted(
+        gpu: &crate::renderer::GpuContext,
+        source: &wgpu::Texture,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let (w, h) = (source.width(), source.height());
+        let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = PreviewEncoder::new(&gpu.device);
+        encoder.ensure_target(gpu, "ch:0", w, h, None);
+        encoder.encode_all(gpu, &[(PreviewSlot::Channel(0), &source_view, w, h)]);
+        let target = &encoder.targets["ch:0"].0;
+        let computed = read_rgba8(gpu, target);
+
+        let blit = crate::renderer::BlitPipeline::new(&gpu.device, wgpu::TextureFormat::Rgba8Unorm)
+            .expect("a blit pipeline");
+        blit.set_srgb_encode(&gpu.queue, true);
+        let blitted = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Blitted preview"),
+            size: target.size(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let blitted_view = blitted.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = blit.create_bind_group(&gpu.device, &source_view);
+        let mut commands = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = commands.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Blitted preview"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &blitted_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            blit.render(&mut pass, &bind_group);
+        }
+        gpu.submit([commands.finish()]);
+        (computed, read_rgba8(gpu, &blitted))
+    }
+
+    /// A linear-light gradient (w × h) with alpha, red past 1.0 and blue
+    /// below 0.
+    fn gradient(gpu: &crate::renderer::GpuContext, w: u32, h: u32) -> wgpu::Texture {
+        let source = gpu.create_compositing_texture(w, h);
+        let mut texels: Vec<u16> = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let (u, v) = (x as f32 / (w - 1) as f32, y as f32 / (h - 1) as f32);
+                for c in [1.5 * u, v, 0.4 * v - 0.1, 0.25 + 0.75 * u] {
+                    texels.push(half::f16::from_f32(c).to_bits());
+                }
+            }
+        }
+        gpu.queue.write_texture(
+            source.as_image_copy(),
+            bytemuck::cast_slice(&texels),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 8),
+                rows_per_image: Some(h),
+            },
+            source.size(),
+        );
+        source
+    }
+
+    /// The previews look as they did when each was blitted on its own: the
+    /// compute pass gives the blit's pixels — the source sampled at each
+    /// pixel's centre, linear light to sRGB, out-of-range light clamped —
+    /// at full size and scaled down to a preview's (1920 × 1080 to 960 × 540).
+    #[test]
+    fn a_preview_encoded_in_the_compute_pass_matches_the_blit() {
+        let Ok(gpu) = crate::renderer::context::GpuContext::new_headless() else {
+            return;
+        };
+        for (w, h) in [(128, 72), (1920, 1080)] {
+            let source = gradient(&gpu, w, h);
+            let (computed, expected) = encoded_and_blitted(&gpu, &source);
+            assert!(
+                gpu.errors.fault_count() == 0,
+                "{:?}",
+                gpu.errors.take_faults()
+            );
+            let worst = computed
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .expect("pixels");
+            assert!(
+                worst <= 1,
+                "{w}×{h}: differs from the blit by up to {worst}"
+            );
+            assert!(computed.contains(&255), "light past 1.0 clamps to white");
+        }
+    }
+
+    // ── Sizing ──────────────────────────────────────────────────────
+
+    /// A preview target is made the size it is drawn at, a step up, never
+    /// above the full preview or its source; it grows at once, shrinks only
+    /// once drawn two-thirds the size or less, and stays as it is while not
+    /// drawn.
+    #[test]
+    fn a_preview_is_made_the_size_it_is_drawn_at() {
+        let full = (960, 540);
+        let size = |drawn, current| PreviewEncoder::target_size(full, drawn, current);
+        assert_eq!(size(None, None), [960, 540], "not drawn yet: full");
+        assert_eq!(size(Some([300, 169]), None), [320, 180], "a tile");
+        assert_eq!(
+            size(Some([1400, 788]), Some([320, 180])),
+            [960, 540],
+            "the Program picture: full, at once"
+        );
+        assert_eq!(
+            size(Some([600, 338]), Some([960, 540])),
+            [640, 360],
+            "drawn two-thirds the size: made smaller"
+        );
+        assert_eq!(
+            size(Some([450, 253]), Some([640, 360])),
+            [640, 360],
+            "a little smaller: kept"
+        );
+        assert_eq!(
+            size(None, Some([320, 180])),
+            [320, 180],
+            "not drawn: as it is"
+        );
+        assert_eq!(
+            PreviewEncoder::target_size((200, 112), Some([300, 169]), None),
+            [200, 112],
+            "never bigger than its source"
+        );
+    }
+
+    // ── Encoding only what changed ──────────────────────────────────
+
+    /// A channel's preview is encoded when the channel has been drawn since,
+    /// or another channel now stands in its place, or its target is new —
+    /// not again for the same picture.
+    #[test]
+    fn a_channel_preview_is_encoded_only_when_its_picture_changed() {
+        let Ok(gpu) = crate::renderer::context::GpuContext::new_headless() else {
+            return;
+        };
+        let mut encoder = PreviewEncoder::new(&gpu.device);
+        let stamp = |channel: &str, drawn: u32| (channel.to_owned(), drawn);
+        assert!(encoder.changed("ch:0", stamp("a", 1)));
+        assert!(!encoder.changed("ch:0", stamp("a", 1)), "the same picture");
+        assert!(encoder.changed("ch:0", stamp("a", 2)), "drawn since");
+        assert!(
+            encoder.changed("ch:0", stamp("b", 2)),
+            "another channel in its place"
+        );
+        assert!(encoder.ensure_target(&gpu, "ch:0", 64, 36, None));
+        assert!(
+            encoder.changed("ch:0", stamp("b", 2)),
+            "a new target holds nothing yet"
+        );
+    }
 
     // ── PreviewSlot keys ────────────────────────────────────────────
 

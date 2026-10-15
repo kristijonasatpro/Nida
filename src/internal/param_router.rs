@@ -688,8 +688,14 @@ fn apply_mod_param(
 }
 
 /// Apply a normalized 0.0–1.0 value to a float param, scaling to the param's min/max range.
+/// An integer param is a set of choices, picked by bucket (see [`choice_of`]).
 fn apply_float_param_scaled(params: &mut crate::ShaderParams, name: &str, normalized: f32) {
     if let Some(def) = params.definitions.get(name) {
+        if def.input_type == "long" {
+            let choice = choice_of(def, normalized);
+            params.set(name, ParamValue::Long(choice));
+            return;
+        }
         let min = def.min.unwrap_or(0.0);
         let max = def.max.unwrap_or(1.0);
         let scaled = min + normalized * (max - min);
@@ -697,6 +703,32 @@ fn apply_float_param_scaled(params: &mut crate::ShaderParams, name: &str, normal
     } else {
         params.set(name, ParamValue::Float(normalized));
     }
+}
+
+/// The choice of an integer param a fader at `normalized` picks: its
+/// `VALUES` split evenly by bucket, as a deck's variants are; without them,
+/// every whole number from `MIN` to `MAX` (0 and 1 when undeclared).
+fn choice_of(def: &crate::isf::ISFInput, normalized: f32) -> i32 {
+    let listed: Vec<i32> = def
+        .values
+        .iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_i64)
+        .filter_map(|v| i32::try_from(v).ok())
+        .collect();
+    if !listed.is_empty() {
+        return listed[bucket_index(normalized, listed.len())];
+    }
+    // Saturating; NaN is 0.
+    #[allow(clippy::cast_possible_truncation)]
+    let (min, max) = (
+        def.min.unwrap_or(0.0).round() as i32,
+        def.max.unwrap_or(1.0).round() as i32,
+    );
+    let (low, high) = (min.min(max), min.max(max));
+    let count = usize::try_from(i64::from(high) - i64::from(low) + 1).unwrap_or(1);
+    let index = i64::try_from(bucket_index(normalized, count)).unwrap_or(0);
+    i32::try_from(i64::from(low) + index).unwrap_or(high)
 }
 
 /// Clamp a value to 0.0–1.0, treating non-finite input as `1.0` (used for
@@ -1017,6 +1049,40 @@ mod tests {
             "ch/c0000001",
         ] {
             assert_eq!(modulation_key_for_path(path), None, "{path}");
+        }
+    }
+
+    /// A fader on an integer param picks its choices by bucket — every one
+    /// reachable — and writes an integer, never a float the shader's `int`
+    /// would read as garbage.
+    #[test]
+    fn a_fader_on_an_integer_param_picks_its_choices() {
+        let modes = crate::isf::ISFInput {
+            name: "mode".into(),
+            input_type: "long".into(),
+            default: Some(serde_json::json!(0)),
+            min: None,
+            max: None,
+            label: None,
+            values: Some((0..5).map(|v| serde_json::json!(v)).collect()),
+            labels: None,
+            identity: None,
+        };
+        let ranged = crate::isf::ISFInput {
+            name: "count".into(),
+            values: None,
+            min: Some(2.0),
+            max: Some(4.0),
+            ..modes.clone()
+        };
+        let mut params = crate::ShaderParams::from_inputs(&[modes, ranged]);
+        for (fader, mode) in [(0.0, 0), (0.19, 0), (0.2, 1), (0.5, 2), (0.79, 3), (1.0, 4)] {
+            apply_float_param_scaled(&mut params, "mode", fader);
+            assert_eq!(params.get_long("mode"), Some(mode), "fader {fader}");
+        }
+        for (fader, count) in [(0.0, 2), (0.5, 3), (1.0, 4)] {
+            apply_float_param_scaled(&mut params, "count", fader);
+            assert_eq!(params.get_long("count"), Some(count), "fader {fader}");
         }
     }
 

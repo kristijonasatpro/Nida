@@ -20,17 +20,28 @@ fn fx_accent() -> egui::Color32 {
     egui::Color32::from_rgb(100, 200, 255)
 }
 
-pub(super) fn render_central_panel(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
+/// The stage editor or the arrangement, which take the place of the first
+/// channel view on screen while they are open.
+pub(super) fn render_modal_center(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
     if data.stage_editor_open {
         render_stage_editor(ui, data, actions);
         return;
     }
 
-    // Arrangement is a view of the same decks, so it replaces the central area
-    // and nothing else. The stage editor wins when both are open: it is a modal
-    // task, while arrangement is a way of looking at the scene.
+    // Arrangement is a view of the same decks, so it replaces the channels
+    // and nothing else. The stage editor wins when both are open: it is a
+    // modal task, while arrangement is a way of looking at the scene.
     if data.arrangement_mode_open {
         super::arrangement::render_arrangement(ui, data, actions);
+    }
+}
+
+/// The Channels panel: channel columns around the mixer, or in Main mode the
+/// wide columns taken to Main.
+pub(super) fn render_channel_desk(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
+    // Main mode: channels in a row, taken to Main one at a time — no mixer.
+    if super::main_desk::in_main_mode(data) {
+        super::main_desk::render_main_desk(ui, data, actions);
         return;
     }
 
@@ -202,6 +213,18 @@ fn render_center_stack(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions
         .max_height(height)
         .auto_shrink([false, true])
         .show(ui, |ui| {
+            if ui
+                .button("Main mode…")
+                .on_hover_text(
+                    "One channel on Main at a time — Space cuts, Enter fades — with overlay \
+                     channels on top, instead of this layered mixer",
+                )
+                .clicked()
+            {
+                actions.commands.push(EngineCommand::SetMixMode {
+                    mode: crate::mixer::MixMode::Program,
+                });
+            }
             render_mixer_box(ui, data, actions);
             // Sequence builder — same width as mixer
             if !data.sequences.is_empty() {
@@ -244,7 +267,7 @@ pub(super) fn render_mixer_box(ui: &mut egui::Ui, data: &UIData, actions: &mut U
         ))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("🎚 Mixer").strong().size(13.0));
+                ui.label(egui::RichText::new("Mixer").strong().size(13.0));
                 if ui
                     .small_button("➕ Ch")
                     .on_hover_text("Add a new channel")
@@ -557,6 +580,8 @@ pub(super) fn render_channel_column(
         let is_hovering = has_relevant_drag && ui.rect_contains_pointer(ui.max_rect());
         let fx_hovering = has_fx_drag && ui.rect_contains_pointer(ui.max_rect());
         let is_ch_selected = data.selected_channel == Some(ch_idx);
+        let desk = super::main_desk::in_main_mode(data);
+        let on_main = desk && super::main_desk::channel_on_main(data, ch);
 
         // Always show a bordered box — glow when a relevant drag is active, intensify on hover
         let frame = if is_hovering {
@@ -585,6 +610,11 @@ pub(super) fn render_channel_column(
             egui::Frame::default()
                 .fill(accent.linear_multiply(0.08))
                 .stroke(egui::Stroke::new(1.5_f32, accent.linear_multiply(0.5)))
+                .corner_radius(4.0)
+                .inner_margin(2.0)
+        } else if on_main {
+            egui::Frame::default()
+                .stroke(egui::Stroke::new(3.0_f32, super::main_desk::ON_MAIN_RED))
                 .corner_radius(4.0)
                 .inner_margin(2.0)
         } else if is_ch_selected {
@@ -620,14 +650,31 @@ pub(super) fn render_channel_column(
                                 egui::RichText::new(format!("▌ {}", ch.name))
                                     .strong()
                                     .color(accent)
-                                    .size(16.0),
+                                    .size(if desk { 18.0 } else { 16.0 }),
                             )
                             .sense(egui::Sense::click()),
                         );
                         if header_resp.clicked() {
                             actions.session.select_channel = Some(ch_idx);
                         }
+                        if header_resp.double_clicked() {
+                            super::channel_settings::open_channel(ui.ctx(), ch);
+                        }
                         header_resp.context_menu(|ui| channel_context_menu(ui, data, actions, ch));
+                        if let Some((deck, list)) = super::playlist::of_channel(ch) {
+                            let size = egui::vec2(26.0, 20.0);
+                            super::playlist::play_button(ui, &deck.uuid, list, size, actions);
+                            super::playlist::list_button(ui, &deck.uuid, size);
+                        }
+                        if let Some((deck, timer)) = super::timer::of_channel(ch) {
+                            let size = egui::vec2(26.0, 20.0);
+                            super::timer::start_button(ui, &deck.uuid, timer, size, actions);
+                            super::timer::settings_button(ui, &deck.uuid, size);
+                        }
+                        if desk {
+                            render_desk_tallies(ui, ch, on_main, data, actions);
+                            return;
+                        }
 
                         // Blend mode dropdown — right-aligned in header
                         let all_modes = BlendMode::all();
@@ -690,76 +737,20 @@ pub(super) fn render_channel_column(
                                 actions.session.select_channel = Some(ch_idx);
                             }
                         }
-                        let is_deck_drag_active =
-                            egui::DragAndDrop::has_payload_of_type::<DeckDrag>(ui.ctx());
-                        let drag_is_same_ch = egui::DragAndDrop::payload::<DeckDrag>(ui.ctx())
-                            .is_some_and(|p| ch.decks.iter().any(|d| d.uuid == p.deck_uuid));
-
-                        for (i, deck) in ch.decks.iter().enumerate() {
-                            // Drop zone BEFORE each deck (for reordering within channel)
-                            if is_deck_drag_active && drag_is_same_ch {
-                                let drop_zone = ui.allocate_response(
-                                    egui::vec2(ui.available_width(), 6.0),
-                                    egui::Sense::click(),
-                                );
-                                if drop_zone.contains_pointer() {
-                                    ui.painter().rect_filled(
-                                        drop_zone.rect,
-                                        2.0,
-                                        accent.linear_multiply(0.5),
-                                    );
-                                }
-                                if let Some(payload) = drop_zone.dnd_release_payload::<DeckDrag>() {
-                                    // The ordinal is read here, not at drag
-                                    // start, so a reorder mid-drag can't send
-                                    // the wrong deck.
-                                    let from_idx =
-                                        ch.decks.iter().position(|d| d.uuid == payload.deck_uuid);
-                                    if let Some(from_idx) = from_idx {
-                                        let to = if from_idx < i { i - 1 } else { i };
-                                        if to != from_idx {
-                                            actions.commands.push(EngineCommand::ReorderDeck {
-                                                channel_uuid: ch.uuid.clone(),
-                                                from_idx,
-                                                to_idx: to,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-
-                            render_deck_thumbnail(ui, ch_idx, deck, accent, data, actions);
+                        // Where each card was drawn, so a drop between two of
+                        // them lands between them (see `insertion`).
+                        let mut cards: super::insertion::Cards = Vec::with_capacity(ch.decks.len());
+                        for deck in &ch.decks {
+                            let card = ui
+                                .scope(|ui| {
+                                    render_deck_thumbnail(ui, ch_idx, deck, accent, data, actions);
+                                })
+                                .response
+                                .rect;
+                            cards.push((deck.uuid.clone(), card));
                             ui.add_space(2.0);
                         }
-
-                        // Drop zone AFTER last deck (for moving to end)
-                        if is_deck_drag_active && drag_is_same_ch && !ch.decks.is_empty() {
-                            let drop_zone = ui.allocate_response(
-                                egui::vec2(ui.available_width(), 6.0),
-                                egui::Sense::click(),
-                            );
-                            if drop_zone.contains_pointer() {
-                                ui.painter().rect_filled(
-                                    drop_zone.rect,
-                                    2.0,
-                                    accent.linear_multiply(0.5),
-                                );
-                            }
-                            if let Some(payload) = drop_zone.dnd_release_payload::<DeckDrag>() {
-                                let last = ch.decks.len() - 1;
-                                let from_idx =
-                                    ch.decks.iter().position(|d| d.uuid == payload.deck_uuid);
-                                if let Some(from_idx) = from_idx {
-                                    if from_idx != last {
-                                        actions.commands.push(EngineCommand::ReorderDeck {
-                                            channel_uuid: ch.uuid.clone(),
-                                            from_idx,
-                                            to_idx: last,
-                                        });
-                                    }
-                                }
-                            }
-                        }
+                        super::insertion::publish_cards(ui.ctx(), ch_idx, cards);
 
                         // Drop hint when dragging over a channel with existing decks
                         if is_hovering && !ch.decks.is_empty() {
@@ -788,14 +779,6 @@ pub(super) fn render_channel_column(
                             )
                         });
                         drop_resp.context_menu(|ui| channel_context_menu(ui, data, actions, ch));
-                        if let Some(payload) = drop_resp.dnd_release_payload::<DeckDrag>() {
-                            if !ch.decks.iter().any(|d| d.uuid == payload.deck_uuid) {
-                                actions.commands.push(EngineCommand::MoveDeck {
-                                    deck_uuid: payload.deck_uuid.clone(),
-                                    dst_channel_uuid: ch.uuid.clone(),
-                                });
-                            }
-                        }
 
                         // Channel FX chain (compact) — clickable to select channel
                         if !ch.effects.is_empty() {
@@ -834,22 +817,203 @@ pub(super) fn render_channel_column(
             mem.data
                 .insert_temp(egui::Id::new("ch_drop_rect").with(ch_idx), ch_rect);
         });
+        handle_deck_drop(ui, ch, ch_rect, accent, actions);
         // Effect drops resolve channel ownership from this surface (deck cards
         // publish their own rects and win by hit priority).
         publish_channel_surface_fx(ui.ctx(), &ch.uuid, ch_idx, ch_rect);
     });
 }
 
+/// A deck card or a Library generator dragged over a channel column: show
+/// where it would land, and on release put a card there — before the card the
+/// pointer is in the upper half of, from this channel or another.
+pub(super) fn handle_deck_drop(
+    ui: &mut egui::Ui,
+    ch: &ChannelUIInfo,
+    ch_rect: egui::Rect,
+    accent: egui::Color32,
+    actions: &mut UIActions,
+) {
+    let ctx = ui.ctx().clone();
+    let column = ui.interact(
+        ch_rect,
+        ui.id().with("deck_drop_column"),
+        egui::Sense::hover(),
+    );
+    let Some(pos) = ctx
+        .pointer_latest_pos()
+        .filter(|_| column.contains_pointer())
+    else {
+        return;
+    };
+    let deck_drag = egui::DragAndDrop::has_payload_of_type::<DeckDrag>(&ctx);
+    let generator_drag = egui::DragAndDrop::payload::<LibraryDrag>(&ctx)
+        .is_some_and(|p| matches!(&*p, LibraryDrag::Generator(_)));
+    if !deck_drag && !generator_drag {
+        return;
+    }
+    let insertion = super::insertion::insertion_at(&ctx, ch.ch_idx, pos.y);
+    super::insertion::paint(&ctx, &insertion, accent);
+    let Some(payload) = column.dnd_release_payload::<DeckDrag>() else {
+        return;
+    };
+    // Dropped back where it already is: nothing to do, and no undo step.
+    let at = ch.decks.iter().position(|d| d.uuid == payload.deck_uuid);
+    let unmoved = at.is_some_and(|i| match &insertion.before {
+        Some(before) => {
+            *before == payload.deck_uuid
+                || ch.decks.get(i + 1).is_some_and(|next| next.uuid == *before)
+        }
+        None => i + 1 == ch.decks.len(),
+    });
+    if !unmoved {
+        actions.commands.push(EngineCommand::MoveDeck {
+            deck_uuid: payload.deck_uuid.clone(),
+            dst_channel_uuid: ch.uuid.clone(),
+            before_deck_uuid: insertion.before,
+        });
+    }
+}
+
 /// Copy, duplicate, and paste for a channel, on every part of its column that
 /// is the channel rather than a deck inside it.
-fn channel_context_menu(
+pub(super) fn channel_context_menu(
     ui: &mut egui::Ui,
     data: &UIData,
     actions: &mut UIActions,
     ch: &ChannelUIInfo,
 ) {
+    if ui
+        .button("Settings…")
+        .on_hover_text("Layers, position, crop, colour, keys and effects (or double-click)")
+        .clicked()
+    {
+        actions.session.select_channel = Some(ch.ch_idx);
+        super::channel_settings::open_channel(ui.ctx(), ch);
+        ui.close();
+    }
+    if ui.button("Rename…").clicked() {
+        super::rename::open(ui.ctx(), ch);
+        ui.close();
+    }
+    let earlier = ch.ch_idx.checked_sub(1).and_then(|i| data.channels.get(i));
+    if ui
+        .add_enabled(earlier.is_some(), egui::Button::new("Move earlier"))
+        .on_hover_text(
+            "Swap with the channel before it — earlier channels are drawn under later ones",
+        )
+        .clicked()
+    {
+        if let Some(before) = earlier {
+            actions.commands.push(EngineCommand::MoveChannel {
+                channel_uuid: ch.uuid.clone(),
+                before_channel_uuid: Some(before.uuid.clone()),
+            });
+        }
+        ui.close();
+    }
+    let later = data.channels.get(ch.ch_idx + 1);
+    if ui
+        .add_enabled(later.is_some(), egui::Button::new("Move later"))
+        .on_hover_text("Swap with the channel after it")
+        .clicked()
+    {
+        if let Some(after) = later {
+            actions.commands.push(EngineCommand::MoveChannel {
+                channel_uuid: ch.uuid.clone(),
+                before_channel_uuid: data.channels.get(after.ch_idx + 1).map(|c| c.uuid.clone()),
+            });
+        }
+        ui.close();
+    }
+    ui.separator();
+    // Taking it to Main comes first in Main mode, then the screens: what a
+    // live right-click is for.
+    if super::main_desk::in_main_mode(data) {
+        super::main_desk::main_menu_items(
+            ui,
+            &crate::mixer::MainSource::Channel(ch.uuid.clone()),
+            ch.overlay.then_some(ch),
+            data,
+            actions,
+        );
+        ui.separator();
+    }
+    if !data.buses.is_empty() {
+        super::switcher::take_menu_items(
+            ui,
+            &crate::bus::BusInputRef::Channel(ch.uuid.clone()),
+            data,
+            actions,
+        );
+        ui.separator();
+    }
     let subject = clipboard_menu::Subject::channel(&ch.uuid, &ch.name);
     clipboard_menu::items(ui, data, actions, &subject);
+}
+
+/// A channel header's right side in Main mode: ON MAIN / NEXT tallies, and
+/// the overlay switch — the role, and for an overlay whether it is on.
+fn render_desk_tallies(
+    ui: &mut egui::Ui,
+    ch: &ChannelUIInfo,
+    on_main: bool,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
+    let next = super::main_desk::next_channel(data).is_some_and(|n| n.uuid == ch.uuid);
+    let badge = |ui: &mut egui::Ui, text: &str, color: egui::Color32| {
+        ui.label(
+            egui::RichText::new(format!(" {text} "))
+                .strong()
+                .color(egui::Color32::WHITE)
+                .background_color(color),
+        );
+    };
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let mut overlay = ch.overlay;
+        if ui
+            .checkbox(&mut overlay, "Overlay")
+            .on_hover_text(
+                "An overlay (logo, lower third) is switched on and off over whatever is on \
+                 Main, instead of being taken to Main",
+            )
+            .changed()
+        {
+            actions.commands.push(EngineCommand::SetChannelOverlay {
+                channel_uuid: ch.uuid.clone(),
+                overlay,
+            });
+        }
+        if ch.overlay {
+            let on = super::main_desk::overlay_on(data, ch);
+            let (text, fill) = if on {
+                ("ON", super::main_desk::ON_MAIN_RED)
+            } else {
+                ("OFF", egui::Color32::from_rgb(60, 60, 70))
+            };
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new(text)
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(fill)
+                    .min_size(egui::vec2(44.0, 22.0)),
+                )
+                .on_hover_text("Switch this overlay on or off over Main")
+                .clicked()
+            {
+                super::main_desk::take_channel(ch, data, actions, false);
+            }
+        } else if on_main {
+            badge(ui, "ON MAIN", super::main_desk::ON_MAIN_RED);
+        }
+        if next {
+            badge(ui, "NEXT", super::main_desk::NEXT_GREEN);
+        }
+    });
 }
 
 /// Render a drop zone in empty mixer side space that creates a new channel on drop.
@@ -881,6 +1045,7 @@ fn render_new_channel_drop_zone(
                 actions.commands.push(EngineCommand::MoveDeck {
                     deck_uuid,
                     dst_channel_uuid: ch.uuid.clone(),
+                    before_deck_uuid: None,
                 });
             }
             _ => log::warn!("Dropping deck move: the new channel was never created"),
@@ -979,11 +1144,19 @@ pub(super) fn render_deck_thumbnail(
     let is_selected = data.selected_deck == Some((ch_idx, idx));
     // Square budget, so a 16:9 project keeps the 100×56 card it has always had
     // while a portrait one grows downward to 56×100 instead of being squashed.
+    // Main mode's wide columns give the picture the column's width.
+    let main_mode = super::main_desk::in_main_mode(data);
+    let budget = if main_mode {
+        (ui.available_width() - 38.0).clamp(100.0, 320.0)
+    } else {
+        100.0
+    };
     let preview = super::utils::preview_size(
-        egui::vec2(100.0, 100.0),
+        egui::vec2(budget, budget),
         data.render_width,
         data.render_height,
     );
+    let on_main = main_mode && super::main_desk::deck_on_main(data, &deck.uuid);
     let preview_width = preview.x;
     let preview_height = preview.y;
     let slider_width = 18.0;
@@ -992,8 +1165,8 @@ pub(super) fn render_deck_thumbnail(
     ui.push_id(format!("deck_{ch_idx}_{idx}"), |ui| {
         // Use manual rect-based painting to avoid egui layout overlap issues.
         // Total card height = preview_height + name_row(16) + button_row(20) + spacing(8) + padding(8)
-        let name_row_h = 16.0;
-        let button_row_h = 20.0;
+        let name_row_h = if main_mode { 20.0 } else { 16.0 };
+        let button_row_h = if main_mode { 26.0 } else { 20.0 };
         let spacing = 4.0;
         let padding = 4.0;
         let total_h =
@@ -1008,12 +1181,16 @@ pub(super) fn render_deck_thumbnail(
         let fx_hover = effect_drag_active(ui.ctx()) && ui.rect_contains_pointer(card_rect);
         let border_color = if fx_hover {
             fx_accent()
+        } else if on_main {
+            super::main_desk::ON_MAIN_RED
         } else if is_selected {
             accent
         } else {
             accent.linear_multiply(0.3)
         };
-        let border_width = if fx_hover || is_selected {
+        let border_width = if on_main {
+            3.0_f32
+        } else if fx_hover || is_selected {
             2.0_f32
         } else {
             1.0_f32
@@ -1055,6 +1232,39 @@ pub(super) fn render_deck_thumbnail(
             )
         });
         card_resp.context_menu(|ui| {
+            if main_mode {
+                ui.label(egui::RichText::new("This input alone").small().weak());
+                super::main_desk::main_menu_items(
+                    ui,
+                    &crate::mixer::MainSource::Deck(deck.uuid.clone()),
+                    None,
+                    data,
+                    actions,
+                );
+                ui.separator();
+            }
+            if !data.buses.is_empty() {
+                super::switcher::take_menu_items(
+                    ui,
+                    &crate::bus::BusInputRef::Deck(deck.uuid.clone()),
+                    data,
+                    actions,
+                );
+                ui.separator();
+            }
+            if ui
+                .button("Adjust…")
+                .on_hover_text(
+                    "Crop, move and effects, previewing the result (or double-click the card)",
+                )
+                .clicked()
+            {
+                actions.session.select_deck = Some((ch_idx, idx));
+                super::deck_adjust::open(ui.ctx(), &deck.uuid);
+                ui.close();
+            }
+            super::deck_detail::framing_menu_items(ui, deck, actions);
+            ui.separator();
             let subject = clipboard_menu::Subject::deck(&deck.uuid, &deck.name);
             clipboard_menu::items(ui, data, actions, &subject);
             ui.separator();
@@ -1179,7 +1389,7 @@ pub(super) fn render_deck_thumbnail(
                         ("🔄", egui::Color32::from_rgb(200, 160, 40))
                     }
                     crate::channel::DeckTransitionPhase::Done => {
-                        ("✓", egui::Color32::from_rgb(100, 100, 100))
+                        ("✔", egui::Color32::from_rgb(100, 100, 100))
                     }
                 };
                 // Small badge in top-right of preview
@@ -1223,6 +1433,12 @@ pub(super) fn render_deck_thumbnail(
         // Click on card to select deck (only when not in learn mode — learn mode click selects trigger)
         if !data.midi_learn_active && !data.keyboard_learn_active && card_resp.clicked() {
             actions.session.select_deck = Some((ch_idx, idx));
+        }
+        // Double-click opens the adjuster, which previews the result rather
+        // than the deck alone.
+        if !data.midi_learn_active && !data.keyboard_learn_active && card_resp.double_clicked() {
+            actions.session.select_deck = Some((ch_idx, idx));
+            super::deck_adjust::open(ui.ctx(), &deck.uuid);
         }
 
         // Vertical opacity slider — use a child ui placed at the slider rect
@@ -1297,12 +1513,18 @@ pub(super) fn render_deck_thumbnail(
 
         // Row 2: Deck name
         let name_y = card_rect.min.y + padding + preview_height + spacing;
-        let display_name = super::utils::truncate_chars(&deck.name, 16);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let name_chars = if main_mode {
+            ((card_width / 8.0) as usize).max(16)
+        } else {
+            16
+        };
+        let display_name = super::utils::truncate_chars(&deck.name, name_chars);
         ui.painter().text(
             egui::pos2(card_rect.min.x + padding, name_y),
             egui::Align2::LEFT_TOP,
             &display_name,
-            egui::FontId::proportional(11.0),
+            egui::FontId::proportional(if main_mode { 14.0 } else { 11.0 }),
             accent,
         );
 
@@ -1314,9 +1536,17 @@ pub(super) fn render_deck_thumbnail(
         );
         let mut btn_ui = ui.new_child(egui::UiBuilder::new().max_rect(btn_rect));
         let any_learn = data.midi_learn_active || data.keyboard_learn_active;
+        // Main mode's wide cards get full-size buttons, easier to hit live.
+        let label = |text: &str| {
+            if main_mode {
+                egui::RichText::new(text).size(14.0)
+            } else {
+                egui::RichText::new(text).small()
+            }
+        };
         btn_ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            let mute_resp = ui.selectable_label(mute, egui::RichText::new("M").small());
+            ui.spacing_mut().item_spacing.x = if main_mode { 6.0 } else { 2.0 };
+            let mute_resp = ui.selectable_label(mute, label("M"));
             if any_learn {
                 let mute_path = format!("deck/{}/mute", deck.uuid);
                 if data.midi_learn_active {
@@ -1346,7 +1576,7 @@ pub(super) fn render_deck_thumbnail(
             } else if mute_resp.clicked() {
                 mute = !mute;
             }
-            let solo_resp = ui.selectable_label(solo, egui::RichText::new("S").small());
+            let solo_resp = ui.selectable_label(solo, label("S"));
             if any_learn {
                 let solo_path = format!("deck/{}/solo", deck.uuid);
                 if data.midi_learn_active {
@@ -1376,7 +1606,7 @@ pub(super) fn render_deck_thumbnail(
             } else if solo_resp.clicked() {
                 solo = !solo;
             }
-            if !any_learn && ui.small_button(egui::RichText::new("x").small()).clicked() {
+            if !any_learn && ui.small_button(label("x")).clicked() {
                 actions.commands.push(EngineCommand::RemoveDeck {
                     deck_uuid: deck.uuid.clone(),
                 });
@@ -1416,7 +1646,7 @@ mod tests {
         let data = UIData::test_fixture();
         let mut actions = UIActions::new();
         let _harness = egui_kittest::Harness::new_ui(|ui| {
-            render_central_panel(ui, &data, &mut actions);
+            render_channel_desk(ui, &data, &mut actions);
         });
     }
 
@@ -1426,7 +1656,7 @@ mod tests {
         data.stage_editor_open = true;
         let mut actions = UIActions::new();
         let _harness = egui_kittest::Harness::new_ui(|ui| {
-            render_central_panel(ui, &data, &mut actions);
+            render_modal_center(ui, &data, &mut actions);
         });
     }
 

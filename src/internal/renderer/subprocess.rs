@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -18,6 +18,198 @@ use crate::engine::value::render::{
     StreamingCodec,
 };
 use crate::renderer::{ReadbackFormat, ReadbackFrame};
+
+#[cfg(target_os = "macos")]
+mod native;
+
+/// No encoder in Nida off the Mac: the stream's encoder is always ffmpeg's.
+#[cfg(not(target_os = "macos"))]
+mod native {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{mpsc, Arc};
+    use std::time::Instant;
+
+    use super::{FrameCounters, NativeVideo};
+    use crate::streaming::{RatePlan, StreamOptions, VideoCodec};
+
+    pub(super) type Opened = std::convert::Infallible;
+
+    pub(super) fn open(
+        _: &StreamOptions,
+        _: (u32, u32),
+        _: u32,
+        _: bool,
+        _: &RatePlan,
+    ) -> Option<Opened> {
+        None
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn start(
+        opened: Opened,
+        _: std::process::ChildStdin,
+        _: mpsc::Receiver<(Instant, Vec<u8>)>,
+        _: (u32, VideoCodec, u32),
+        _: FrameCounters,
+        _: (Arc<AtomicBool>, Arc<AtomicBool>),
+        _: &str,
+        _: Option<Instant>,
+    ) -> (std::thread::JoinHandle<()>, NativeVideo) {
+        match opened {}
+    }
+}
+
+/// What a stream's encoder in Nida shares between its threads and the app
+/// that steers its rate. Made on a Mac only.
+#[derive(Clone)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct NativeShared {
+    /// The rate the app asks for now.
+    wanted_kbps: Arc<AtomicU32>,
+    /// The rate the engine last took.
+    applied_kbps: Arc<AtomicU32>,
+    audio_kbps: u32,
+    /// The stream's frame rate: a slot is this long.
+    fps: u32,
+    failed: Arc<AtomicBool>,
+    /// Frames the engine dropped.
+    dropped: Arc<AtomicU64>,
+    epoch: std::time::Instant,
+    /// Frames handed to the engine, and frames whose end the output thread
+    /// has taken: the difference is what the engine and the pipe still hold.
+    submitted: Arc<AtomicU64>,
+    finished: Arc<AtomicU64>,
+    /// When the engine last went from holding nothing to holding a frame,
+    /// and when a frame's end last came out, in ms from `epoch`.
+    busy_since_ms: Arc<AtomicU64>,
+    last_out_ms: Arc<AtomicU64>,
+    /// The media engine's padding is dropped as it comes out: the stream is
+    /// Variable (see `streaming::RateMode`). Switched while live.
+    strip_filler: Arc<AtomicBool>,
+}
+
+/// Frames held this long with none ending: the engine — or the pipe to
+/// ffmpeg — has stopped, and the stream's encoder is started again.
+const NATIVE_STUCK_MS: u64 = 3000;
+
+/// How long a stop waits for an encoder in Nida to end its session. Ending
+/// it waits for every frame the engine holds, which an engine that has
+/// stopped may never give back: past this the threads are left to end on
+/// their own, and the app goes on.
+const NATIVE_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Join `threads` on a thread of its own, waiting up to `wait`: whether they
+/// all ended in time. Those that did not are left to end on their own.
+fn join_within(threads: Vec<std::thread::JoinHandle<()>>, wait: std::time::Duration) -> bool {
+    let (done_tx, done_rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("stream-encoder-end".into())
+        .spawn(move || {
+            for thread in threads {
+                let _ = thread.join();
+            }
+            let _ = done_tx.send(());
+        });
+    spawned.is_ok() && done_rx.recv_timeout(wait).is_ok()
+}
+
+impl NativeShared {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn new(kbps: u32, audio_kbps: u32, fps: u32) -> Self {
+        Self {
+            wanted_kbps: Arc::new(AtomicU32::new(kbps)),
+            applied_kbps: Arc::new(AtomicU32::new(kbps)),
+            audio_kbps,
+            fps: fps.max(1),
+            failed: Arc::default(),
+            dropped: Arc::default(),
+            epoch: std::time::Instant::now(),
+            submitted: Arc::default(),
+            finished: Arc::default(),
+            busy_since_ms: Arc::default(),
+            last_out_ms: Arc::default(),
+            strip_filler: Arc::default(),
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn wanted_kbps(&self) -> u32 {
+        self.wanted_kbps.load(Ordering::Relaxed)
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn applied(&self, kbps: u32) {
+        self.applied_kbps.store(kbps, Ordering::Relaxed);
+    }
+
+    fn failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn fail(&self) {
+        self.failed.store(true, Ordering::Relaxed);
+    }
+
+    fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn note_dropped(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A frame about to go to the engine: counted before it goes, so its end
+    /// is never counted first.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn going_in(&self) {
+        let (submitted, finished) = (
+            self.submitted.load(Ordering::Relaxed),
+            self.finished.load(Ordering::Relaxed),
+        );
+        if submitted == finished {
+            self.busy_since_ms.store(self.now_ms(), Ordering::Relaxed);
+        }
+        self.submitted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A frame's end taken by the output thread.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn came_out(&self) {
+        self.last_out_ms.store(self.now_ms(), Ordering::Relaxed);
+        self.finished.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Failed, or holding frames for [`NATIVE_STUCK_MS`] with none ending —
+    /// counted from when it last had nothing, so a show idle for a while
+    /// and then drawing again is given the time.
+    fn stuck(&self) -> bool {
+        self.stuck_at(self.now_ms())
+    }
+
+    /// [`Self::stuck`] at `now_ms` from `epoch`.
+    fn stuck_at(&self, now_ms: u64) -> bool {
+        let holding = self.submitted.load(Ordering::Relaxed) > self.finished.load(Ordering::Relaxed);
+        let since = self
+            .last_out_ms
+            .load(Ordering::Relaxed)
+            .max(self.busy_since_ms.load(Ordering::Relaxed));
+        self.failed() || (holding && now_ms > since + NATIVE_STUCK_MS)
+    }
+}
+
+/// A stream's encoder in Nida, and the thread writing what it makes to
+/// ffmpeg. Made on a Mac only.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct NativeVideo {
+    shared: NativeShared,
+    output: Option<std::thread::JoinHandle<()>>,
+}
 
 /// Fully pinned video contract for one recording subprocess.
 ///
@@ -203,6 +395,7 @@ fn readback_label(format: ReadbackFormat) -> &'static str {
         ReadbackFormat::Rgba16Unorm => "RGBA16",
         ReadbackFormat::Uyvy => "UYVY",
         ReadbackFormat::P216 => "P216",
+        ReadbackFormat::Nv12 => "NV12",
     }
 }
 
@@ -357,6 +550,29 @@ impl StreamingCapabilities {
             std::sync::OnceLock::new();
         *CAPABILITIES.get_or_init(Self::detect)
     }
+
+    /// What `request` needs to know of the installed FFmpeg.
+    fn for_request(request: PresentationRequest) -> Self {
+        Self::needed_for(request, Self::installed)
+    }
+
+    /// What the installed FFmpeg can do, asked of `installed` only for ten
+    /// bits: asking runs ffmpeg, and eight bits — every Record and Stream —
+    /// need none of it and must not wait for it, as a REC or STREAM started
+    /// as Nida launched once did (codex, 2026-10-04).
+    fn needed_for(request: PresentationRequest, installed: impl FnOnce() -> Self) -> Self {
+        if request.depth == PresentationDepth::Sdr10 {
+            installed()
+        } else {
+            Self::default()
+        }
+    }
+}
+
+/// Find what the installed FFmpeg can stream in ten bits, ahead — on a
+/// thread of its own at launch: it runs ffmpeg several times.
+pub(crate) fn find_streaming_capabilities() {
+    let _ = StreamingCapabilities::installed();
 }
 
 fn probe_enhanced_flv(encoder: &str, profile: &str) -> bool {
@@ -512,7 +728,7 @@ impl StreamingPlan {
         target: &crate::engine::value::render::OutputTarget,
         request: PresentationRequest,
     ) -> Option<Self> {
-        let capabilities = StreamingCapabilities::installed();
+        let capabilities = StreamingCapabilities::for_request(request);
         match target {
             crate::engine::value::render::OutputTarget::SrtStream { codec, .. } => {
                 let codec = match codec {
@@ -544,6 +760,14 @@ impl StreamingPlan {
             } => Some(Self::resolve(
                 StreamingProtocol::Rtmp(*codec_contract),
                 codec.clone(),
+                request,
+                capabilities,
+            )),
+            // Eight-bit H.264, the same plan `spawn_stream` uses.
+            crate::engine::value::render::OutputTarget::Stream
+            | crate::engine::value::render::OutputTarget::Record => Some(Self::resolve(
+                StreamingProtocol::Rtmp(RtmpCodecContract::Legacy),
+                StreamingCodec::H264,
                 request,
                 capabilities,
             )),
@@ -696,7 +920,7 @@ fn write_stream_player(dir: &str, kind: &str, manifest_filename: &str, low_laten
     };
     let html = format!(
         r#"<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Varda — {title} stream</title>
+<html><head><meta charset="utf-8"><title>Nida — {title} stream</title>
 <style>*{{margin:0;padding:0;background:#000}}video{{width:100vw;height:100vh;object-fit:contain}}</style>
 <script src="{lib_url}"></script></head>
 <body><video id="v" autoplay muted controls></video>
@@ -715,8 +939,8 @@ fn write_stream_player(dir: &str, kind: &str, manifest_filename: &str, low_laten
 /// (e.g. SRT listener waiting for a client connection).
 pub struct FfmpegSubprocess {
     child: Child,
-    /// Channel sender for frame data → writer thread
-    frame_tx: Option<mpsc::SyncSender<Vec<u8>>>,
+    /// Channel sender for frames, with when each was drawn → writer thread
+    frame_tx: Option<mpsc::SyncSender<(std::time::Instant, Vec<u8>)>>,
     /// Writer thread handle
     writer_thread: Option<std::thread::JoinHandle<()>>,
     /// Frame tallies, shared with the writer thread.
@@ -743,6 +967,144 @@ pub struct FfmpegSubprocess {
     frame_contract: Option<FrameContract>,
     /// Resolved precision selected by the recording or streaming adapter.
     presentation: Option<ResolvedPresentation>,
+    /// ffmpeg's last lines of output, read for as long as it runs.
+    stderr_tail: StderrTail,
+    /// The stream's destinations, fed from this encoder's output. `None`
+    /// for everything but a stream.
+    fanout: Option<crate::streaming::Fanout>,
+    /// The stream's video encoded in Nida, its rate followed while live;
+    /// `None` where ffmpeg encodes it.
+    native: Option<NativeVideo>,
+    /// How the stream is encoded: its encoder and rate mode as they are,
+    /// and why where they differ from those set. `None` but for a stream.
+    rate_plan: Option<crate::streaming::RatePlan>,
+}
+
+/// ffmpeg's stderr, read by a thread for as long as the process runs, keeping
+/// the last lines for the log and for telling the operator what went wrong.
+///
+/// A pipe nobody reads holds 64 KB. When it is full, ffmpeg blocks on its next
+/// log line and stops reading frames: with the default half-second progress
+/// line that was five or six minutes into every recording and stream. Reading
+/// it continuously is what keeps a long take alive; `-nostats` keeps the tail
+/// for the lines that matter.
+#[derive(Clone, Default)]
+pub(crate) struct StderrTail {
+    lines: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+}
+
+/// Lines of ffmpeg output kept for the log and error messages.
+const STDERR_TAIL_LINES: usize = 40;
+
+impl StderrTail {
+    /// Take `child`'s stderr and start reading it. A child without a piped
+    /// stderr gets an empty tail.
+    pub(crate) fn attach(child: &mut Child) -> Self {
+        let tail = Self::default();
+        if let Some(stderr) = child.stderr.take() {
+            tail.read_from(stderr);
+        }
+        tail
+    }
+
+    /// Read `stream` to its end on a thread, line by line — a carriage return
+    /// ends a line too, as in ffmpeg's progress output.
+    pub(crate) fn read_from(&self, mut stream: impl std::io::Read + Send + 'static) {
+        let lines = self.lines.clone();
+        let spawned = std::thread::Builder::new()
+            .name("ffmpeg-stderr".into())
+            .spawn(move || {
+                let mut buf = [0u8; 4096];
+                let mut line = Vec::new();
+                let push = |line: &mut Vec<u8>| {
+                    let text = String::from_utf8_lossy(line).trim().to_string();
+                    line.clear();
+                    if text.is_empty() {
+                        return;
+                    }
+                    let mut lines = lines
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if lines.len() == STDERR_TAIL_LINES {
+                        lines.pop_front();
+                    }
+                    lines.push_back(text);
+                };
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            for &byte in &buf[..n] {
+                                if byte == b'\n' || byte == b'\r' {
+                                    push(&mut line);
+                                } else {
+                                    line.push(byte);
+                                }
+                            }
+                        }
+                    }
+                }
+                push(&mut line);
+            });
+        if let Err(error) = spawned {
+            log::warn!("Could not start the ffmpeg stderr reader: {error}");
+        }
+    }
+
+    /// The lines kept so far, oldest first.
+    pub(crate) fn lines(&self) -> Vec<String> {
+        self.lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// The most telling line for an operator: the last one that reads like an
+    /// error, else the last line.
+    pub(crate) fn last_error(&self) -> Option<String> {
+        let lines = self.lines();
+        lines
+            .iter()
+            .rev()
+            .find(|l| is_error_line(l))
+            .or(lines.last())
+            .cloned()
+    }
+
+    /// Log the kept lines — errors as errors, the rest at debug — and forget
+    /// them, so a second call logs nothing twice.
+    fn log(&self, label: &str) {
+        let lines: Vec<String> = self
+            .lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect();
+        for line in lines {
+            if is_error_line(&line) {
+                log::error!("ffmpeg [{label}]: {line}");
+            } else {
+                log::debug!("ffmpeg [{label}]: {line}");
+            }
+        }
+    }
+}
+
+fn is_error_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    [
+        "error",
+        "failed",
+        "invalid",
+        "fatal",
+        "refused",
+        "denied",
+        "unauthorized",
+    ]
+    .iter()
+    .any(|w| lower.contains(w))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -756,12 +1118,150 @@ struct FrameContract {
 /// to stay one frame ahead without accumulating unbounded latency.
 const FRAME_CHANNEL_CAPACITY: usize = 2;
 
-/// Ceiling on repeated frames emitted to cover one gap, in
-/// [`FfmpegSubprocess::start_writer_thread`]. Half a second at 60 fps: long
-/// enough to ride out any hitch worth correcting, short enough that a genuine
-/// freeze degrades into a shortened timeline rather than a burst of writes into
-/// a pipe that is already struggling.
-const MAX_PAD_FRAMES_PER_ARRIVAL: u64 = 30;
+/// Memory a stream's frame queue may take.
+const STREAM_QUEUE_BYTES: usize = 128 * 1024 * 1024;
+
+/// Frames the stream's encoder may fall behind before one is dropped: a
+/// fifth of a second, where a recording has two frames. The encoder is fast
+/// enough on average but pauses now and then; with two frames of slack each
+/// pause dropped one, and a platform's stream is seconds behind anyway, so
+/// 0.2 s more costs nothing. Capped in memory for large pictures.
+/// What NV12 made on the GPU is, said to FFmpeg before it reads it: BT.709
+/// at video levels. Left unsaid, FFmpeg takes it for the older BT.601 and
+/// converts it to the BT.709 the encoder is set to — reds and greens a few
+/// codes darker in every recording.
+fn nv12_input_colour(nv12: bool) -> &'static [&'static str] {
+    if nv12 {
+        &[
+            "-colorspace",
+            "bt709",
+            "-color_range",
+            "tv",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+        ]
+    } else {
+        &[]
+    }
+}
+
+fn stream_frame_capacity(width: u32, height: u32, fps: u32, nv12: bool) -> usize {
+    let pixels = width as usize * height as usize;
+    let frame_bytes = if nv12 { pixels * 3 / 2 } else { pixels * 4 }.max(1);
+    (fps as usize / 5)
+        .min(STREAM_QUEUE_BYTES / frame_bytes)
+        .max(FRAME_CHANNEL_CAPACITY)
+}
+
+/// The longest gap filled before a frame, seconds: the whole of any freeze
+/// short of this goes in before the frame after it, which keeps its own slot
+/// — filled in parts over the frames that followed, as it once was, that
+/// frame landed in the file up to a second and a half early. Past two
+/// minutes frozen the show was not being recorded anyway, and one frame must
+/// not become an hour of repeats.
+const MAX_GAP_SECS: f64 = 120.0;
+
+/// Where each frame goes in a raw video stream, which ffmpeg times by
+/// position alone: frame N plays at N/fps, whenever it was made.
+///
+/// A frame goes to the slot of the moment it was drawn, counted from `start`
+/// — when the sound's first sample was taken, so both tracks start together.
+/// One that gets here late, held up on the GPU or behind an encoder still
+/// starting, still goes to its own slot; slots no frame came for are filled
+/// with the frame before; one for a slot already written is left out.
+/// Placed by when frames arrived instead, the half second a first take
+/// waited for the encoder, and every hold-up after, went into the picture's
+/// timeline but not the sound's, and the two came apart.
+struct Timeline {
+    start: Option<std::time::Instant>,
+    /// When the frame written last was drawn: one drawn no later is left out.
+    last: Option<std::time::Instant>,
+    fps: f64,
+    /// Where the slots fall, in frames, now and as the first frame set them:
+    /// at the earliest frames, as a refresh's call can come late but never
+    /// early. They move to an earlier frame at once — never more than half a
+    /// frame from where the first frame set them, which keeps the tracks
+    /// within a frame of each other — and never later: frames that keep
+    /// coming later are a show slower than the take's rate, its frames
+    /// repeated now and then.
+    phase: Option<(f64, f64)>,
+    /// Frames written so far, repeats included.
+    written: u64,
+}
+
+/// How late, in frames, a frame may come after the next slot to write and
+/// still go there. Frames are timed by the refresh they were drawn for, as
+/// its call reached Nida: never early, a little late as a rule, more when
+/// macOS is busy. Put in whichever slot was nearest, one frame in a second
+/// landed a slot late, a frame repeated before it and the next left out (a
+/// laptop, 2026-10-03). Only a frame a whole slot late or more — a refresh
+/// the show drew no frame for — has slots filled before it.
+const SLOT_LATE: f64 = 1.0;
+
+/// How early, in frames, a frame may come before the next slot to write and
+/// still go there: one earlier is for a slot already written.
+const SLOT_EARLY: f64 = 0.5;
+
+
+/// What [`Timeline::place`] makes of a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placed {
+    /// Write it, after this many repeats of the frame before it.
+    After(u64),
+    /// Drawn before the take began, or for a slot already written.
+    LeftOut,
+}
+
+impl Timeline {
+    fn new(start: Option<std::time::Instant>, fps: f64) -> Self {
+        Self {
+            start,
+            last: None,
+            fps,
+            phase: None,
+            written: 0,
+        }
+    }
+
+    fn place(&mut self, made: std::time::Instant) -> Placed {
+        // Clear of rounding at whole frames, where steady frames fall.
+        const WHOLE: f64 = 1e-6;
+        let start = *self.start.get_or_insert(made);
+        if made < start || self.last.is_some_and(|last| made <= last) {
+            return Placed::LeftOut;
+        }
+        let since = (made - start).as_secs_f64() * self.fps;
+        let first = since - (since + WHOLE).floor();
+        let (mut phase, first) = self.phase.unwrap_or((first, first));
+        // How many slots past the next one to write the frame falls.
+        #[allow(clippy::cast_precision_loss)] // Frame counts stay far below 2^52.
+        let mut past = since - phase - self.written as f64;
+        if past < 0.0 {
+            // Earlier than the slots: they were set by a frame whose call
+            // came late. Moved back to this one, as far as they may go.
+            let moved = (phase + past).max(first - 0.5);
+            past += phase - moved;
+            phase = moved;
+        }
+        if past < -SLOT_EARLY {
+            self.phase.get_or_insert((first, first));
+            return Placed::LeftOut;
+        }
+        let repeats = if past + WHOLE >= SLOT_LATE {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Positive, bounded.
+            let (behind, most) = ((past + WHOLE).floor() as u64, (self.fps * MAX_GAP_SECS) as u64);
+            behind.min(most)
+        } else {
+            0
+        };
+        self.phase = Some((phase, first));
+        self.last = Some(made);
+        self.written += repeats + 1;
+        Placed::After(repeats)
+    }
+}
 
 /// What the writer thread has put down the pipe, split by where it came from.
 ///
@@ -775,6 +1275,11 @@ struct FrameCounters {
     /// Frames the render thread offered while the writer channel was full.
     /// Distinct from `padded`: a drop never entered the pipe.
     dropped: Arc<AtomicU64>,
+    /// Frames left out by the writer: drawn before the take began, or for a
+    /// slot already written — the show running faster than the encoder's rate.
+    left_out: Arc<AtomicU64>,
+    /// The time the dropped frames would have covered.
+    drop_clock: Arc<std::sync::Mutex<DropClock>>,
 }
 
 impl FrameCounters {
@@ -783,7 +1288,33 @@ impl FrameCounters {
             written: Arc::new(AtomicU64::new(0)),
             padded: Arc::new(AtomicU64::new(0)),
             dropped: Arc::new(AtomicU64::new(0)),
+            left_out: Arc::new(AtomicU64::new(0)),
+            drop_clock: Arc::default(),
         }
+    }
+}
+
+/// The time the frames an encoder could not take would have covered: each
+/// one counts the stretch since the frame offered before it — its own slot,
+/// at whatever pace the show runs then — so a frame rate changed while live
+/// does not recount what went before.
+#[derive(Debug, Default)]
+struct DropClock {
+    last_offer: Option<std::time::Instant>,
+    lost: std::time::Duration,
+}
+
+impl DropClock {
+    /// The most one dropped frame counts: a stall before it is the show's,
+    /// not the encoder's.
+    const MOST: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// A frame drawn at `made` was offered, and `dropped` or taken.
+    fn offer(&mut self, made: std::time::Instant, dropped: bool) {
+        if let (true, Some(before)) = (dropped, self.last_offer) {
+            self.lost += made.saturating_duration_since(before).min(Self::MOST);
+        }
+        self.last_offer = Some(made);
     }
 }
 
@@ -793,12 +1324,13 @@ impl FrameCounters {
 /// increments `dropped` so the operator can see backpressure. `Disconnected`
 /// returns false.
 fn try_enqueue_frame(
-    tx: &mpsc::SyncSender<Vec<u8>>,
+    tx: &mpsc::SyncSender<(std::time::Instant, Vec<u8>)>,
     dropped: &AtomicU64,
     label: &str,
+    made: std::time::Instant,
     rgba: &[u8],
 ) -> bool {
-    match tx.try_send(rgba.to_vec()) {
+    match tx.try_send((made, rgba.to_vec())) {
         Ok(()) => true,
         Err(mpsc::TrySendError::Full(_)) => {
             let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -843,6 +1375,10 @@ pub struct AudioInput {
     /// was full. The writer replaces them with silence so the sample count keeps
     /// matching elapsed time — see [`AudioPipe::start`].
     pub lost_samples: Arc<AtomicU64>,
+    /// When the first sample in `rx` was taken: the moment the subscription
+    /// began. The picture's timeline starts here too, so both tracks start
+    /// together (see [`Timeline`]).
+    pub started: std::time::Instant,
 }
 
 /// ffmpeg argument vectors + the live listener/receiver, computed before the
@@ -853,7 +1389,7 @@ struct PreparedAudio {
     out_args: Vec<String>,
     listener: TcpListener,
     rx: crossbeam_channel::Receiver<PcmChunk>,
-    lost_samples: Arc<AtomicU64>,
+    started: std::time::Instant,
 }
 
 /// Build the ffmpeg audio input/output args and bind the loopback TCP endpoint
@@ -862,6 +1398,29 @@ struct PreparedAudio {
 fn prepare_audio(
     audio: Option<AudioInput>,
     is_stream: bool,
+) -> anyhow::Result<Option<PreparedAudio>> {
+    prepare_audio_at(audio, is_stream, AUDIO_BITRATE)
+}
+
+/// [`prepare_audio`] at a given AAC bit rate, such as `"160k"`.
+fn prepare_audio_at(
+    audio: Option<AudioInput>,
+    is_stream: bool,
+    bitrate: &str,
+) -> anyhow::Result<Option<PreparedAudio>> {
+    prepare_audio_with(
+        audio,
+        is_stream,
+        vec!["-c:a".into(), "aac".into(), "-b:a".into(), bitrate.into()],
+    )
+}
+
+/// [`prepare_audio`] with the sound codec arguments given, such as
+/// `-c:a pcm_s16le` beside `ProRes`.
+fn prepare_audio_with(
+    audio: Option<AudioInput>,
+    is_stream: bool,
+    codec_args: Vec<String>,
 ) -> anyhow::Result<Option<PreparedAudio>> {
     let Some(audio) = audio else {
         return Ok(None);
@@ -894,16 +1453,13 @@ fn prepare_audio(
     ];
     // Output opts: AAC, stereo downmix (Decision: stereo for v1), async resample
     // to absorb A/V drift; force 48k on streams, leave native on recordings.
-    let mut out_args = vec![
-        "-c:a".into(),
-        "aac".into(),
-        "-b:a".into(),
-        AUDIO_BITRATE.into(),
+    let mut out_args = codec_args;
+    out_args.extend([
         "-ac".into(),
         "2".into(),
         "-af".into(),
         "aresample=async=1:first_pts=0".into(),
-    ];
+    ]);
     if is_stream {
         out_args.push("-ar".into());
         out_args.push(STREAM_SAMPLE_RATE.into());
@@ -918,7 +1474,7 @@ fn prepare_audio(
         out_args,
         listener,
         rx: audio.rx,
-        lost_samples: audio.lost_samples,
+        started: audio.started,
     }))
 }
 
@@ -943,12 +1499,7 @@ fn finalize_audio(
     label: String,
 ) -> anyhow::Result<Option<AudioPipe>> {
     match prepared {
-        Some(p) => Ok(Some(AudioPipe::start(
-            p.listener,
-            p.rx,
-            p.lost_samples,
-            label,
-        )?)),
+        Some(p) => Ok(Some(AudioPipe::start(p.listener, p.rx, label)?)),
         None => Ok(None),
     }
 }
@@ -973,17 +1524,16 @@ impl AudioPipe {
     /// Start the audio writer thread. It accepts ffmpeg's connection to the
     /// loopback listener, then drains `rx` into the stream as f32le bytes.
     ///
-    /// `lost_samples` counts PCM the capture callback had to discard because
-    /// this pipe was backed up. The writer replaces each lost sample with a
-    /// sample of silence before writing the next real chunk. That matters now
-    /// that timestamps come from the sample count: a gap left unfilled does not
-    /// read as a gap, it pulls every later sample earlier, so a single dropout
-    /// would desynchronise the rest of the recording. Filling it costs a brief
-    /// mute and keeps the timeline exact.
+    /// Each chunk says how many samples were lost just before it
+    /// (`PcmChunk::lost_before`): discarded because this pipe was backed up,
+    /// or never mixed. The writer puts that much silence in their place,
+    /// before the chunk. That matters as timestamps come from the sample
+    /// count: a gap left unfilled does not read as a gap, it pulls every later
+    /// sample earlier, so a single dropout would desynchronise the rest of the
+    /// recording. Filling it costs a brief mute and keeps the timeline exact.
     fn start(
         listener: TcpListener,
         rx: crossbeam_channel::Receiver<PcmChunk>,
-        lost_samples: Arc<AtomicU64>,
         label: String,
     ) -> anyhow::Result<Self> {
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -1026,10 +1576,23 @@ impl AudioPipe {
                 let silence = [0f32; SILENCE_BLOCK];
                 loop {
                     match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        // Stopping wins over a producer that never pauses. A
+                        // capture device goes quiet once it is released, but
+                        // an audio-mixer bus sends a block every 10 ms for as
+                        // long as it exists: checking only on a timeout meant
+                        // the writer never quit, ffmpeg never saw the end of
+                        // its audio input, and the recording was never
+                        // finished.
+                        Ok(_) if sd.load(Ordering::SeqCst) => {
+                            let _ = stream.flush();
+                            return;
+                        }
                         Ok(chunk) => {
-                            // Restore any time the capture callback had to throw
-                            // away, before the samples that follow it.
-                            let mut lost = lost_samples.swap(0, Ordering::Relaxed);
+                            // Restore the time lost just before this chunk —
+                            // thrown away on a full channel, or jumped over by
+                            // the mixer — there, before it: the chunks that came
+                            // earlier keep their places.
+                            let mut lost = chunk.lost_before;
                             if lost > 0 {
                                 spliced.fetch_add(lost, Ordering::Relaxed);
                                 log::warn!(
@@ -1109,90 +1672,61 @@ impl Drop for AudioPipe {
 }
 
 impl FfmpegSubprocess {
-    /// Start the background writer thread that drains the channel into ffmpeg stdin.
     /// Start the video writer thread.
     ///
     /// The raw video input is declared at a constant `fps`, so ffmpeg times each
     /// frame by its position in the stream: frame N is at N/fps regardless of
-    /// when it was produced. That makes a missing frame invisible in the video
-    /// but *silent* about time — the recorded timeline simply comes out shorter
-    /// than the session was. The audio track is built on the capture device's
-    /// sample clock and stays true to real time, so every skipped frame used to
-    /// pull the two apart a little more, and the drift accumulated for as long
-    /// as the recording ran.
-    ///
-    /// So when the renderer misses its slot, the writer repeats the previous
-    /// frame often enough to cover the gap. Repeating a frame is nearly free to
-    /// encode — it differs from its predecessor in nothing — and it keeps the
-    /// file constant-frame-rate, which is what editors want. See
-    /// /spec/av-sync.md.
+    /// when it was produced. The sound is timed by its sample count from
+    /// `start`, when its first sample was taken. So every frame goes where the
+    /// moment it was drawn falls after `start` (see [`Timeline`]): a slot no
+    /// frame came for repeats the frame before it — nearly free to encode, and
+    /// the file stays constant-frame-rate, which is what editors want — and a
+    /// frame for a slot already written is left out. Without `start` (no
+    /// sound), the first frame starts the take.
+    #[allow(clippy::too_many_arguments)] // Each is one shared piece of the encoder's state.
     fn start_writer_thread(
         mut stdin: std::process::ChildStdin,
-        rx: mpsc::Receiver<Vec<u8>>,
+        rx: mpsc::Receiver<(std::time::Instant, Vec<u8>)>,
         fps: u32,
         counters: FrameCounters,
         write_failed: Arc<AtomicBool>,
         shutting_down: Arc<AtomicBool>,
         label: String,
+        start: Option<std::time::Instant>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::Builder::new()
             .name(format!("ffmpeg-writer-{label}"))
             .spawn(move || {
-                let fps = f64::from(fps.max(1));
-                // Frames emitted so far, padding included. Counted separately
-                // from `frames_written` so the health stat still reports what
-                // the renderer actually produced.
-                let mut emitted: u64 = 0;
-                // Anchored on the *first* frame, not on this thread starting.
-                // ffmpeg takes a moment to come up and the caller may not have
-                // a frame ready the instant it does; timing from spawn would
-                // read that startup as a gap and open every recording with a
-                // frozen still.
-                let mut started: Option<std::time::Instant> = None;
-
-                for frame in rx {
-                    let pad = started.map_or_else(
-                        || {
-                            started = Some(std::time::Instant::now());
-                            0
-                        },
-                        |t| Self::pad_count(t.elapsed(), fps, emitted),
-                    );
-                    for _ in 0..pad {
-                        if let Err(e) = stdin.write_all(&frame) {
+                let mut timeline = Timeline::new(start, f64::from(fps.max(1)));
+                // The frame written last, repeated over slots no frame came
+                // for: what was on screen through them.
+                let mut last: Option<Vec<u8>> = None;
+                for (made, frame) in rx {
+                    let Placed::After(repeats) = timeline.place(made) else {
+                        counters.left_out.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    let fill = last.as_deref().unwrap_or(&frame);
+                    for _ in 0..repeats {
+                        if let Err(e) = stdin.write_all(fill) {
                             Self::report_write_error(&e, &shutting_down, &write_failed, &label);
                             return;
                         }
-                        emitted += 1;
                     }
-                    if pad > 0 {
-                        counters.padded.fetch_add(pad, Ordering::Relaxed);
+                    if repeats > 0 {
+                        counters.padded.fetch_add(repeats, Ordering::Relaxed);
                     }
-
                     if let Err(e) = stdin.write_all(&frame) {
                         Self::report_write_error(&e, &shutting_down, &write_failed, &label);
                         return;
                     }
-                    emitted += 1;
                     counters.written.fetch_add(1, Ordering::Relaxed);
+                    last = Some(frame);
                 }
                 // Channel closed — normal shutdown, flush stdin
                 let _ = stdin.flush();
             })
             .expect("failed to spawn ffmpeg writer thread")
-    }
-
-    /// How many repeated frames to emit before the frame that just arrived.
-    ///
-    /// `emitted` is everything written so far, padding included. If real time
-    /// has moved further than that, the difference is the renderer's shortfall
-    /// and repeating the previous frame covers it. Capped at
-    /// [`MAX_PAD_FRAMES_PER_ARRIVAL`]: past that the app was not really
-    /// recording anyway, and a burst of writes into a pipe that is already
-    /// behind would make things worse rather than better.
-    fn pad_count(elapsed: std::time::Duration, fps: f64, emitted: u64) -> u64 {
-        let due = (elapsed.as_secs_f64() * fps) as u64;
-        due.saturating_sub(emitted).min(MAX_PAD_FRAMES_PER_ARRIVAL)
     }
 
     fn report_write_error(
@@ -1302,7 +1836,7 @@ impl FfmpegSubprocess {
             None => (&empty, &empty),
         };
         let mut cmd = Command::new("ffmpeg");
-        cmd.arg("-y")
+        cmd.args(["-hide_banner", "-nostats", "-y"])
             .args(["-f", "rawvideo"])
             .args(["-pix_fmt", plan.input_pixel_format])
             .args(["-s", &format!("{width}x{height}")])
@@ -1330,6 +1864,7 @@ impl FfmpegSubprocess {
         );
 
         let stdin = child.stdin.take().expect("ffmpeg stdin not piped");
+        let stderr_tail = StderrTail::attach(&mut child);
         let counters = FrameCounters::new();
         let write_failed = Arc::new(AtomicBool::new(false));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -1342,11 +1877,16 @@ impl FfmpegSubprocess {
             write_failed.clone(),
             shutting_down.clone(),
             path.to_string(),
+            prepared.as_ref().map(|p| p.started),
         );
         let audio = finalize_audio(prepared, path.to_string())?;
 
         Ok(Self {
             child,
+            stderr_tail,
+            fanout: None,
+            rate_plan: None,
+            native: None,
             frame_tx: Some(tx),
             writer_thread: Some(writer_thread),
             counters,
@@ -1411,11 +1951,11 @@ impl FfmpegSubprocess {
             StreamingProtocol::Srt,
             configured_codec,
             request,
-            StreamingCapabilities::installed(),
+            StreamingCapabilities::for_request(request),
         );
 
         let mut cmd = Command::new("ffmpeg");
-        cmd.arg("-y")
+        cmd.args(["-hide_banner", "-nostats", "-y"])
             .args(["-f", "rawvideo"])
             .args(["-pix_fmt", plan.input_pixel_format])
             .args(["-s", &format!("{width}x{height}")])
@@ -1437,6 +1977,7 @@ impl FfmpegSubprocess {
         log::info!("SRT server started: {srt_url} ({width}x{height} @ {fps}fps)");
 
         let stdin = child.stdin.take().expect("ffmpeg stdin not piped");
+        let stderr_tail = StderrTail::attach(&mut child);
         let counters = FrameCounters::new();
         let write_failed = Arc::new(AtomicBool::new(false));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -1449,11 +1990,16 @@ impl FfmpegSubprocess {
             write_failed.clone(),
             shutting_down.clone(),
             url.to_string(),
+            prepared.as_ref().map(|p| p.started),
         );
         let audio = finalize_audio(prepared, url.to_string())?;
 
         Ok(Self {
             child,
+            stderr_tail,
+            fanout: None,
+            rate_plan: None,
+            native: None,
             frame_tx: Some(tx),
             writer_thread: Some(writer_thread),
             counters,
@@ -1515,11 +2061,11 @@ impl FfmpegSubprocess {
             StreamingProtocol::Hls,
             codec.clone(),
             request,
-            StreamingCapabilities::installed(),
+            StreamingCapabilities::for_request(request),
         );
 
         let mut cmd = Command::new("ffmpeg");
-        cmd.arg("-y")
+        cmd.args(["-hide_banner", "-nostats", "-y"])
             .args(["-f", "rawvideo"])
             .args(["-pix_fmt", plan.input_pixel_format])
             .args(["-s", &format!("{width}x{height}")])
@@ -1550,6 +2096,7 @@ impl FfmpegSubprocess {
         log::info!("{mode} output started: {playlist} ({width}x{height} @ {fps}fps)");
 
         let stdin = child.stdin.take().expect("ffmpeg stdin not piped");
+        let stderr_tail = StderrTail::attach(&mut child);
         let counters = FrameCounters::new();
         let write_failed = Arc::new(AtomicBool::new(false));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -1562,11 +2109,16 @@ impl FfmpegSubprocess {
             write_failed.clone(),
             shutting_down.clone(),
             name.to_string(),
+            prepared.as_ref().map(|p| p.started),
         );
         let audio = finalize_audio(prepared, name.to_string())?;
 
         Ok(Self {
             child,
+            stderr_tail,
+            fanout: None,
+            rate_plan: None,
+            native: None,
             frame_tx: Some(tx),
             writer_thread: Some(writer_thread),
             counters,
@@ -1620,14 +2172,14 @@ impl FfmpegSubprocess {
             StreamingProtocol::Rtmp(codec_contract),
             codec.clone(),
             request,
-            StreamingCapabilities::installed(),
+            StreamingCapabilities::for_request(request),
         );
 
         let (maxrate, bufsize) = compute_rtmp_bitrate(width, height, fps);
         let gop = fps * 2;
 
         let mut cmd = Command::new("ffmpeg");
-        cmd.arg("-y")
+        cmd.args(["-hide_banner", "-nostats", "-y"])
             .args(["-f", "rawvideo"])
             .args(["-pix_fmt", plan.input_pixel_format])
             .args(["-s", &format!("{width}x{height}")])
@@ -1653,6 +2205,7 @@ impl FfmpegSubprocess {
         log::info!("RTMP output started: {url} ({width}x{height} @ {fps}fps, {maxrate}kbps)");
 
         let stdin = child.stdin.take().expect("ffmpeg stdin not piped");
+        let stderr_tail = StderrTail::attach(&mut child);
         let counters = FrameCounters::new();
         let write_failed = Arc::new(AtomicBool::new(false));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -1666,11 +2219,16 @@ impl FfmpegSubprocess {
             write_failed.clone(),
             shutting_down.clone(),
             label.clone(),
+            prepared.as_ref().map(|p| p.started),
         );
         let audio = finalize_audio(prepared, label.clone())?;
 
         Ok(Self {
             child,
+            stderr_tail,
+            fanout: None,
+            rate_plan: None,
+            native: None,
             frame_tx: Some(tx),
             writer_thread: Some(writer_thread),
             counters,
@@ -1688,6 +2246,451 @@ impl FfmpegSubprocess {
             }),
             presentation: Some(plan.resolved),
         })
+    }
+
+    /// Spawn the stream's encoder: the picture and sound encoded once, as
+    /// MPEG-TS on ffmpeg's stdout, which a [`crate::streaming::Fanout`] sends
+    /// on to every destination in `settings`.
+    ///
+    /// The stream always carries sound — silence when no audio is given —
+    /// because some platforms refuse a stream without an audio track.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the audio endpoint cannot be prepared or ffmpeg
+    /// cannot be spawned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if ffmpeg's stdin or stdout was not piped, or the writer thread
+    /// cannot be spawned.
+    pub fn spawn_stream(
+        settings: &crate::streaming::StreamSettings,
+        request: PresentationRequest,
+        size: (u32, u32),
+        fps: u32,
+        audio: Option<AudioInput>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_stream_with(settings, request, size, fps, audio, false)
+    }
+
+    /// [`Self::spawn_stream`], fed NV12 frames made on the GPU when `nv12`
+    /// (see [`Self::feed_nv12`]) rather than RGBA for FFmpeg to convert.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::spawn_stream`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::spawn_stream`].
+    pub fn spawn_stream_with(
+        settings: &crate::streaming::StreamSettings,
+        request: PresentationRequest,
+        (width, height): (u32, u32),
+        fps: u32,
+        audio: Option<AudioInput>,
+        nv12: bool,
+    ) -> anyhow::Result<Self> {
+        let options = &settings.options;
+        let audio_rate = format!("{}k", options.audio_kbps);
+        let prepared = prepare_audio_at(audio, true, &audio_rate)?;
+        let (a_in, a_out): (Vec<String>, Vec<String>) = match &prepared {
+            Some(p) => (p.in_args.clone(), p.out_args.clone()),
+            None => (
+                [
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=channel_layout=stereo:sample_rate=48000",
+                ]
+                .map(str::to_string)
+                .to_vec(),
+                [
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    &audio_rate,
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                ]
+                .map(str::to_string)
+                .to_vec(),
+            ),
+        };
+        // Eight-bit H.264, as RTMP carries: the plan pins the pixel formats
+        // and colour signalling; the encoder itself is the stream's own.
+        let plan = StreamingPlan::resolve(
+            StreamingProtocol::Rtmp(RtmpCodecContract::Legacy),
+            StreamingCodec::H264,
+            request,
+            StreamingCapabilities::for_request(request),
+        );
+        let rate_plan = options.encoder.plan(options.codec, options.rate_mode);
+        if let Some(note) = &rate_plan.note {
+            log::warn!("Stream: {note}");
+        }
+        let encoder = rate_plan.encoder;
+        // Frames arrive at Varda's rate; ffmpeg drops or repeats them to the
+        // rate the stream is sent at, and keyframes count in those frames.
+        let out_fps = options.fps.unwrap_or(fps).max(1);
+        let gop = out_fps * options.keyframe_secs.max(1);
+        // Encoded in Nida where it can be, its rate followed while live.
+        let native = native::open(options, (width, height), out_fps, nv12, &rate_plan);
+
+        let input_format = if nv12 {
+            "nv12"
+        } else {
+            plan.input_pixel_format
+        };
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-hide_banner", "-nostats", "-y"]);
+        if native.is_some() {
+            // Nida's encoded frames, each with its time (see `streaming::flv`):
+            // read at once, not looked ahead into for seconds, and copied.
+            cmd.args(["-f", "flv", "-probesize", "32", "-analyzeduration", "0"])
+                .args(["-i", "pipe:0"])
+                .args(&a_in)
+                .args(["-c:v", "copy"]);
+        } else {
+            cmd.args(["-f", "rawvideo"])
+                .args(["-pix_fmt", input_format])
+                .args(nv12_input_colour(nv12))
+                .args(["-s", &format!("{width}x{height}")])
+                .args(["-r", &fps.to_string()])
+                .args(["-i", "-"])
+                .args(&a_in)
+                .args(["-r", &out_fps.to_string()])
+                .args(encoder.stream_video_args(options.codec, options.video_kbps, gop, &rate_plan))
+                .args([
+                    "-pix_fmt",
+                    encoder.pixel_format(options.codec, nv12),
+                    "-color_primaries",
+                    "bt709",
+                    "-color_trc",
+                    "bt709",
+                    "-colorspace",
+                    "bt709",
+                    "-color_range",
+                    "tv",
+                ]);
+        }
+        cmd.args(&a_out)
+            .args(["-f", "mpegts", "pipe:1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!("Failed to spawn ffmpeg for the stream: {e}. Is ffmpeg installed?")
+        })?;
+        let label = "stream".to_string();
+        log::info!(
+            "Stream encoder started: {width}x{height} @ {out_fps}fps (from {fps}), {} {} kbps {}, {}",
+            options.codec.label(),
+            options.video_kbps,
+            rate_plan.mode.label(),
+            if native.is_some() {
+                "the media engine, in Nida (the rate changes while live)"
+            } else {
+                encoder.label()
+            }
+        );
+
+        let stdin = child.stdin.take().expect("ffmpeg stdin not piped");
+        let stdout = child.stdout.take().expect("ffmpeg stdout not piped");
+        let stderr_tail = StderrTail::attach(&mut child);
+        let bytes_per_sec = u64::from(options.video_kbps + options.audio_kbps) * 1000 / 8;
+        let fanout = crate::streaming::Fanout::start(
+            stdout,
+            &settings.destinations,
+            bytes_per_sec,
+            options.keyframe_secs,
+            options.buffer_secs,
+        );
+        let counters = FrameCounters::new();
+        let write_failed = Arc::new(AtomicBool::new(false));
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(stream_frame_capacity(width, height, fps, nv12));
+        let started = prepared.as_ref().map(|p| p.started);
+        let (writer_thread, native) = match native {
+            Some(opened) => {
+                let (writer, native) = native::start(
+                    opened,
+                    stdin,
+                    rx,
+                    (out_fps, options.codec, options.audio_kbps),
+                    counters.clone(),
+                    (write_failed.clone(), shutting_down.clone()),
+                    &label,
+                    started,
+                );
+                // A lost piece is worth the time it held at the rate the
+                // engine took, whoever changed it.
+                fanout.reckon_at(native.shared.applied_kbps.clone(), native.shared.audio_kbps);
+                native
+                    .shared
+                    .strip_filler
+                    .store(rate_plan.mode == crate::streaming::RateMode::Variable, Ordering::Relaxed);
+                (writer, Some(native))
+            }
+            None => (
+                Self::start_writer_thread(
+                    stdin,
+                    rx,
+                    fps,
+                    counters.clone(),
+                    write_failed.clone(),
+                    shutting_down.clone(),
+                    label.clone(),
+                    started,
+                ),
+                None,
+            ),
+        };
+        let audio = finalize_audio(prepared, label.clone())?;
+
+        Ok(Self {
+            child,
+            stderr_tail,
+            fanout: Some(fanout),
+            native,
+            rate_plan: Some(rate_plan),
+            frame_tx: Some(tx),
+            writer_thread: Some(writer_thread),
+            counters,
+            write_failed,
+            shutting_down,
+            label,
+            start_time: std::time::Instant::now(),
+            stopped: false,
+            audio,
+            graceful_shutdown: false,
+            frame_contract: Some(FrameContract {
+                format: if nv12 {
+                    ReadbackFormat::Nv12
+                } else {
+                    plan.expected_readback
+                },
+                width,
+                height,
+            }),
+            presentation: Some(plan.resolved),
+        })
+    }
+
+    /// Spawn a recording's encoder: RGBA frames and the sound into `path`,
+    /// encoded as `options` say — on the media engine where it can.
+    /// Stopping finishes the file on a background thread (see [`Self::stop`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the folder cannot be made, the audio endpoint
+    /// cannot be prepared, or ffmpeg cannot be spawned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if ffmpeg's stdin was not piped, or the writer thread cannot be
+    /// spawned.
+    pub fn spawn_record(
+        options: &crate::record::RecordOptions,
+        size: (u32, u32),
+        fps: u32,
+        audio: Option<AudioInput>,
+        path: &std::path::Path,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_record_with(options, size, fps, audio, path, false)
+    }
+
+    /// [`Self::spawn_record`], fed NV12 frames made on the GPU when `nv12`
+    /// (see [`Self::feed_nv12`]) — for H.264 and HEVC; `ProRes` takes RGBA.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::spawn_record`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::spawn_record`].
+    pub fn spawn_record_with(
+        options: &crate::record::RecordOptions,
+        (width, height): (u32, u32),
+        fps: u32,
+        audio: Option<AudioInput>,
+        path: &std::path::Path,
+        nv12: bool,
+    ) -> anyhow::Result<Self> {
+        let nv12 = nv12 && options.takes_nv12();
+        if let Some(folder) = path.parent() {
+            std::fs::create_dir_all(folder).map_err(|e| {
+                anyhow::anyhow!("Cannot make the recording folder {}: {e}", folder.display())
+            })?;
+        }
+        let prepared = prepare_audio_with(audio, false, options.audio_codec_args())?;
+        let (a_in, a_out): (Vec<String>, Vec<String>) = if let Some(p) = &prepared {
+            (p.in_args.clone(), p.out_args.clone())
+        } else {
+            let mut out = options.audio_codec_args();
+            out.extend(
+                ["-ar", "48000", "-ac", "2", "-map", "0:v:0", "-map", "1:a:0"].map(str::to_string),
+            );
+            (
+                [
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=channel_layout=stereo:sample_rate=48000",
+                ]
+                .map(str::to_string)
+                .to_vec(),
+                out,
+            )
+        };
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-hide_banner", "-nostats", "-y"])
+            .args([
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                if nv12 { "nv12" } else { "rgba" },
+            ])
+            .args(nv12_input_colour(nv12))
+            .args(["-s", &format!("{width}x{height}")])
+            .args(["-r", &fps.to_string()])
+            .args(["-i", "-"])
+            .args(&a_in)
+            .args(options.output_args_for((width, height), fps, nv12))
+            .args(&a_out)
+            .arg(path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!("Failed to spawn ffmpeg for the recording: {e}. Is ffmpeg installed?")
+        })?;
+        let label = path.display().to_string();
+        log::info!(
+            "Recording started: {label} ({width}x{height} @ {}fps, {})",
+            options.fps.unwrap_or(fps),
+            options.codec.label()
+        );
+        let stdin = child.stdin.take().expect("ffmpeg stdin not piped");
+        let stderr_tail = StderrTail::attach(&mut child);
+        let counters = FrameCounters::new();
+        let write_failed = Arc::new(AtomicBool::new(false));
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(stream_frame_capacity(width, height, fps, nv12));
+        let writer_thread = Self::start_writer_thread(
+            stdin,
+            rx,
+            fps,
+            counters.clone(),
+            write_failed.clone(),
+            shutting_down.clone(),
+            label.clone(),
+            prepared.as_ref().map(|p| p.started),
+        );
+        let audio = finalize_audio(prepared, label.clone())?;
+        Ok(Self {
+            child,
+            stderr_tail,
+            fanout: None,
+            rate_plan: None,
+            native: None,
+            frame_tx: Some(tx),
+            writer_thread: Some(writer_thread),
+            counters,
+            write_failed,
+            shutting_down,
+            label,
+            start_time: std::time::Instant::now(),
+            stopped: false,
+            audio,
+            graceful_shutdown: true,
+            frame_contract: Some(FrameContract {
+                format: if nv12 {
+                    ReadbackFormat::Nv12
+                } else {
+                    ReadbackFormat::Rgba8
+                },
+                width,
+                height,
+            }),
+            presentation: None,
+        })
+    }
+
+    /// Kill ffmpeg abruptly, as a crash would — for tests of what survives.
+    #[doc(hidden)]
+    pub fn kill_process(&mut self) {
+        let _ = self.child.kill();
+    }
+
+    /// The stream's destinations, when this is the stream's encoder.
+    pub fn fanout(&self) -> Option<&crate::streaming::Fanout> {
+        self.fanout.as_ref()
+    }
+
+    /// Whether ffmpeg is still running — and the encoder in Nida, for a
+    /// stream encoded there, still encoding.
+    pub fn is_running(&mut self) -> bool {
+        !self.stopped
+            && !self.write_failed.load(Ordering::SeqCst)
+            && !self.native.as_ref().is_some_and(|n| n.shared.stuck())
+            && matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Whether this stream's video rate changes while live — to follow the
+    /// upload, or as the operator sets it: encoded in Nida.
+    pub fn changes_rate_live(&self) -> bool {
+        self.native.is_some()
+    }
+
+    /// How the stream is encoded, as it runs (see [`crate::streaming::RatePlan`]).
+    pub fn rate_plan(&self) -> Option<&crate::streaming::RatePlan> {
+        self.rate_plan.as_ref()
+    }
+
+    /// Hold the stream's rate as `mode` from the next frame on: between
+    /// Constant and Variable, for a stream encoded in Nida — only whether the
+    /// engine's padding is dropped. Whether it was taken.
+    pub fn set_rate_mode(&mut self, mode: crate::streaming::RateMode) -> bool {
+        use crate::streaming::RateMode;
+        let (Some(native), Some(plan)) = (&self.native, self.rate_plan.as_mut()) else {
+            return false;
+        };
+        let held = |m: RateMode| matches!(m, RateMode::Constant | RateMode::Variable);
+        if !(held(mode) && held(plan.mode)) {
+            return false;
+        }
+        native
+            .shared
+            .strip_filler
+            .store(mode == RateMode::Variable, Ordering::Relaxed);
+        plan.mode = mode;
+        true
+    }
+
+    /// Ask for a video rate of `kbps` from the next frame on, for a stream
+    /// whose rate changes while live.
+    pub fn set_video_kbps(&self, kbps: u32) {
+        if let Some(native) = &self.native {
+            native.shared.wanted_kbps.store(kbps, Ordering::Relaxed);
+        }
+    }
+
+    /// The video rate the engine last took, for a stream whose rate changes
+    /// while live — the rate a lost piece is reckoned at, sound and picture,
+    /// follows it by itself (see `Fanout::reckon_at`).
+    pub fn video_kbps(&self) -> Option<u32> {
+        let native = self.native.as_ref()?;
+        Some(native.shared.applied_kbps.load(Ordering::Relaxed))
     }
 
     /// Spawn an ffmpeg DASH output subprocess.
@@ -1729,11 +2732,11 @@ impl FfmpegSubprocess {
             StreamingProtocol::Dash,
             codec.clone(),
             request,
-            StreamingCapabilities::installed(),
+            StreamingCapabilities::for_request(request),
         );
 
         let mut cmd = Command::new("ffmpeg");
-        cmd.arg("-y")
+        cmd.args(["-hide_banner", "-nostats", "-y"])
             .args(["-f", "rawvideo"])
             .args(["-pix_fmt", plan.input_pixel_format])
             .args(["-s", &format!("{width}x{height}")])
@@ -1758,6 +2761,7 @@ impl FfmpegSubprocess {
         log::info!("DASH output started: {manifest} ({width}x{height} @ {fps}fps)");
 
         let stdin = child.stdin.take().expect("ffmpeg stdin not piped");
+        let stderr_tail = StderrTail::attach(&mut child);
         let counters = FrameCounters::new();
         let write_failed = Arc::new(AtomicBool::new(false));
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -1770,11 +2774,16 @@ impl FfmpegSubprocess {
             write_failed.clone(),
             shutting_down.clone(),
             name.to_string(),
+            prepared.as_ref().map(|p| p.started),
         );
         let audio = finalize_audio(prepared, name.to_string())?;
 
         Ok(Self {
             child,
+            stderr_tail,
+            fanout: None,
+            rate_plan: None,
+            native: None,
             frame_tx: Some(tx),
             writer_thread: Some(writer_thread),
             counters,
@@ -1835,6 +2844,8 @@ impl FfmpegSubprocess {
             | ReadbackFormat::P216 => 4,
             ReadbackFormat::Rgba16Float | ReadbackFormat::Rgba16Unorm => 8,
             ReadbackFormat::Uyvy => 2,
+            // Comes in through `feed_nv12`, whole.
+            ReadbackFormat::Nv12 => return false,
         };
         let expected_stride = contract.width * bytes_per_pixel;
         if frame.stride() != expected_stride {
@@ -1846,13 +2857,49 @@ impl FfmpegSubprocess {
             );
             return false;
         }
-        self.feed_frame(frame.bytes())
+        self.feed_frame_made(frame.bytes(), frame.made())
     }
 
-    /// Feed a frame of raw data to a byte-oriented streaming subprocess.
+    /// Feed an NV12 frame made on the GPU, drawn at `made`, to an encoder
+    /// started for them (`spawn_stream_with` / `spawn_record_with`). A frame
+    /// of another size, or an encoder waiting for RGBA, is refused rather than
+    /// let through to put the pipe out of step.
+    pub fn feed_nv12(&mut self, frame: &[u8], made: std::time::Instant) -> bool {
+        let Some(contract) = self.frame_contract else {
+            return false;
+        };
+        let expected = crate::renderer::nv12::nv12_len(contract.width, contract.height);
+        if contract.format != ReadbackFormat::Nv12 || frame.len() != expected {
+            log::error!(
+                "NV12 frame refused for '{}': the encoder takes {} {}x{} ({expected} bytes), got {} bytes",
+                self.label,
+                readback_label(contract.format),
+                contract.width,
+                contract.height,
+                frame.len()
+            );
+            return false;
+        }
+        self.feed_frame_made(frame, made)
+    }
+
+    /// Whether this encoder takes NV12 frames (`feed_nv12`).
+    pub fn takes_nv12(&self) -> bool {
+        self.frame_contract
+            .is_some_and(|c| c.format == ReadbackFormat::Nv12)
+    }
+
+    /// Feed a frame of raw data to a byte-oriented streaming subprocess,
+    /// timed by when it arrives here.
     /// Never blocks — drops the frame if the writer thread can't keep up.
     /// Returns false if the subprocess has failed (write error or process exited).
     pub fn feed_frame(&mut self, rgba: &[u8]) -> bool {
+        self.feed_frame_made(rgba, std::time::Instant::now())
+    }
+
+    /// [`Self::feed_frame`] for a frame drawn at `made`: the encoder puts it
+    /// where that moment falls in the take, however late it gets here.
+    pub fn feed_frame_made(&mut self, rgba: &[u8], made: std::time::Instant) -> bool {
         // Check if writer thread reported an error
         if self.write_failed.load(Ordering::SeqCst) {
             self.drain_stderr();
@@ -1871,7 +2918,13 @@ impl FfmpegSubprocess {
             return false;
         }
         if let Some(ref tx) = self.frame_tx {
-            if try_enqueue_frame(tx, &self.counters.dropped, &self.label, rgba) {
+            let before = self.counters.dropped.load(Ordering::Relaxed);
+            let alive = try_enqueue_frame(tx, &self.counters.dropped, &self.label, made, rgba);
+            let dropped = self.counters.dropped.load(Ordering::Relaxed) > before;
+            if let Ok(mut clock) = self.counters.drop_clock.lock() {
+                clock.offer(made, dropped);
+            }
+            if alive {
                 true
             } else {
                 self.drain_stderr();
@@ -1886,30 +2939,12 @@ impl FfmpegSubprocess {
     /// Each line is classified individually: lines containing error indicators
     /// are logged at ERROR, everything else (version info, codec config) at DEBUG.
     fn drain_stderr(&mut self) {
-        if let Some(mut stderr) = self.child.stderr.take() {
-            Self::drain_stderr_pipe(&mut stderr, &self.label);
-        }
+        self.stderr_tail.log(&self.label);
     }
 
-    /// Static helper: drain an ffmpeg stderr pipe and log each line.
-    fn drain_stderr_pipe(stderr: &mut std::process::ChildStderr, label: &str) {
-        use std::io::Read;
-        let mut buf = String::new();
-        let _ = stderr.read_to_string(&mut buf);
-        if !buf.is_empty() {
-            for line in buf.lines().take(30) {
-                let lower = line.to_ascii_lowercase();
-                if lower.contains("error")
-                    || lower.contains("failed")
-                    || lower.contains("invalid")
-                    || lower.contains("fatal")
-                {
-                    log::error!("ffmpeg [{label}]: {line}");
-                } else {
-                    log::debug!("ffmpeg [{label}]: {line}");
-                }
-            }
-        }
+    /// ffmpeg's most telling recent line — the last error it printed, if any.
+    pub fn last_error(&self) -> Option<String> {
+        self.stderr_tail.last_error()
     }
 
     /// Stop the subprocess. For recordings (`graceful_shutdown`), the heavy
@@ -1953,7 +2988,7 @@ impl FfmpegSubprocess {
             );
             let label = self.label.clone();
             let counters = self.counters.clone();
-            let stderr = child.stderr.take();
+            let stderr = self.stderr_tail.clone();
 
             std::thread::Builder::new()
                 .name(format!("ffmpeg-finalize-{label}"))
@@ -1999,15 +3034,16 @@ impl FfmpegSubprocess {
                     }
 
                     // 5. Log completion
-                    if let Some(mut pipe) = stderr {
-                        Self::drain_stderr_pipe(&mut pipe, &label);
-                    }
+                    stderr.log(&label);
                     let frames = counters.written.load(Ordering::Relaxed);
                     log::info!(
                         "ffmpeg finished: {} ({} frames{}, {:.1}s)",
                         label,
                         frames,
-                        Self::pad_summary(counters.padded.load(Ordering::Relaxed)),
+                        Self::timeline_summary(
+                            counters.padded.load(Ordering::Relaxed),
+                            counters.left_out.load(Ordering::Relaxed),
+                        ),
                         duration.as_secs_f32()
                     );
                 })
@@ -2029,36 +3065,66 @@ impl FfmpegSubprocess {
             }
 
             // 4. Now safe to join — the writer thread will see a broken pipe
-            //    or a closed channel and exit promptly.
-            if let Some(handle) = self.writer_thread.take() {
+            //    or a closed channel and exit promptly. An encoder in Nida
+            //    ends its session there, and the thread writing what it made
+            //    ends after it — waited for only so long, off this thread:
+            //    an engine that has stopped may never let it end.
+            if let Some(native) = self.native.as_mut() {
+                let threads: Vec<_> = self
+                    .writer_thread
+                    .take()
+                    .into_iter()
+                    .chain(native.output.take())
+                    .collect();
+                if !join_within(threads, NATIVE_STOP_WAIT) {
+                    log::warn!(
+                        "The stream's encoder in Nida did not end within {} s; left to end on its own",
+                        NATIVE_STOP_WAIT.as_secs()
+                    );
+                }
+            } else if let Some(handle) = self.writer_thread.take() {
                 let _ = handle.join();
             }
 
             // 5. Reap the child process
             let _ = self.child.wait();
 
+            // 6. The encoder is gone, so its destinations have seen the last
+            //    of the stream: let each finish sending and hang up.
+            if let Some(mut fanout) = self.fanout.take() {
+                fanout.stop();
+            }
+
             let frames = self.counters.written.load(Ordering::Relaxed);
             let padded = self.counters.padded.load(Ordering::Relaxed);
+            let left_out = self.counters.left_out.load(Ordering::Relaxed);
             self.drain_stderr();
             log::info!(
                 "ffmpeg finished: {} ({} frames{}, {:.1}s)",
                 self.label,
                 frames,
-                Self::pad_summary(padded),
+                Self::timeline_summary(padded, left_out),
                 duration.as_secs_f32()
             );
         }
     }
 
-    /// Completion-log fragment naming repeated frames, empty when there were
-    /// none. Padding is not an error — it is how a hitchy session still comes
-    /// out in sync — but it is worth knowing the renderer struggled.
-    fn pad_summary(padded: u64) -> String {
-        if padded == 0 {
-            String::new()
-        } else {
+    /// Completion-log fragment naming repeated and left-out frames, empty
+    /// when there were none. Neither is an error — repeats are how a hitchy
+    /// session still comes out in sync, and a show drawn a little faster than
+    /// the encoder's rate leaves the odd frame out — but it is worth knowing.
+    fn timeline_summary(padded: u64, left_out: u64) -> String {
+        let repeated = if padded > 0 {
             format!(" + {padded} repeated to cover renderer gaps")
-        }
+        } else {
+            String::new()
+        };
+        let left = if left_out > 0 {
+            format!(", {left_out} left out (drawn before the take, or for a slot already written)")
+        } else {
+            String::new()
+        };
+        repeated + &left
     }
 
     /// Duration since the subprocess was started.
@@ -2084,10 +3150,28 @@ impl FfmpegSubprocess {
         self.counters.padded.load(Ordering::Relaxed)
     }
 
-    /// Frames offered while the writer channel was full. The take continued;
-    /// those pixels never reached ffmpeg.
+    /// Frames offered while the writer channel was full — the take
+    /// continued; those pixels never reached ffmpeg — and, for a stream
+    /// encoded in Nida, frames the media engine dropped.
     pub fn frames_dropped(&self) -> u64 {
         self.counters.dropped.load(Ordering::Relaxed)
+            + self.native.as_ref().map_or(0, |n| n.shared.dropped())
+    }
+
+    /// The time those frames would have covered, in seconds (see
+    /// [`DropClock`]); one the media engine dropped, its slot.
+    pub fn dropped_secs(&self) -> f64 {
+        let offered = self
+            .counters
+            .drop_clock
+            .lock()
+            .map_or(0.0, |clock| clock.lost.as_secs_f64());
+        #[allow(clippy::cast_precision_loss)] // Frame counts stay far below 2^52.
+        let engine = self
+            .native
+            .as_ref()
+            .map_or(0.0, |n| n.shared.dropped() as f64 / f64::from(n.shared.fps));
+        offered + engine
     }
 
     /// Samples of silence spliced into the audio to replace PCM lost to
@@ -2112,6 +3196,45 @@ impl Drop for FfmpegSubprocess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Threads that end in time are joined; one that never does is left,
+    /// and the wait for it ends at the bound.
+    #[test]
+    fn a_stop_waits_for_an_encoder_only_so_long() {
+        let quick = std::thread::spawn(|| {});
+        assert!(join_within(vec![quick], std::time::Duration::from_secs(2)));
+        let (_hold, never) = mpsc::channel::<()>();
+        let stuck = std::thread::spawn(move || {
+            let _ = never.recv();
+        });
+        let start = std::time::Instant::now();
+        assert!(!join_within(vec![stuck], std::time::Duration::from_millis(200)));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1), "not held past the bound");
+    }
+
+    /// An encoder in Nida holding frames with none ending for three seconds
+    /// has stopped — however few it holds — while one idle, or ending what it
+    /// takes, has not; a show idle for a while is given the time again.
+    #[test]
+    fn an_encoder_in_nida_that_stops_ending_frames_is_stuck() {
+        let shared = NativeShared::new(6000, 160, 50);
+        let at = |ms: u64| shared.stuck_at(ms);
+        assert!(!at(60_000), "idle: holding nothing");
+        shared.going_in();
+        shared.going_in();
+        let start = shared.busy_since_ms.load(Ordering::Relaxed);
+        assert!(!at(start + 2_000), "two held, but not yet long");
+        assert!(at(start + 3_001), "two held three seconds, none ending: stuck");
+        shared.came_out();
+        shared.came_out();
+        assert!(!at(start + 60_000), "all ended: idle again");
+        // Drawing again after an idle minute: the three seconds start over.
+        shared.busy_since_ms.store(start + 60_000, Ordering::Relaxed);
+        shared.submitted.fetch_add(1, Ordering::Relaxed);
+        assert!(!at(start + 61_000));
+        shared.fail();
+        assert!(at(start + 61_000), "failed is stuck at once");
+    }
     use crate::engine::value::render::{PresentationDepth, PresentationRequest};
     use crate::renderer::ReadbackFormat;
 
@@ -2121,6 +3244,81 @@ mod tests {
     }
 
     // ── SRT URL mode injection tests (pure logic) ──────────────────
+
+    /// Eight bits — every Record and Stream — never ask what the installed
+    /// FFmpeg can do: asking runs ffmpeg, and the REC or STREAM that asked
+    /// would wait for it. Ten bits ask.
+    #[test]
+    fn only_ten_bits_ask_what_ffmpeg_can_do() {
+        let eight = PresentationRequest::default();
+        assert_eq!(eight.depth, PresentationDepth::Sdr8);
+        let _ = StreamingCapabilities::needed_for(eight, || panic!("FFmpeg asked for eight bits"));
+        let mut asked = false;
+        let ten = PresentationRequest {
+            depth: PresentationDepth::Sdr10,
+            ..eight
+        };
+        let found = StreamingCapabilities::needed_for(ten, || {
+            asked = true;
+            StreamingCapabilities {
+                hevc_main10: true,
+                ..StreamingCapabilities::default()
+            }
+        });
+        assert!(asked && found.hevc_main10);
+    }
+
+    #[test]
+    fn a_stream_can_fall_a_fifth_of_a_second_behind() {
+        assert_eq!(stream_frame_capacity(1920, 1080, 60, false), 12);
+        assert_eq!(stream_frame_capacity(1280, 720, 30, false), 6);
+        assert!(
+            stream_frame_capacity(3840, 2160, 60, false) < 12,
+            "held in memory at 4K"
+        );
+        assert_eq!(
+            stream_frame_capacity(3840, 2160, 60, true),
+            10,
+            "NV12 frames, 12 MB at 4K: most of a fifth of a second"
+        );
+        assert_eq!(
+            stream_frame_capacity(7680, 4320, 60, false),
+            FRAME_CHANNEL_CAPACITY,
+            "never less than a recording's"
+        );
+    }
+
+    #[test]
+    fn a_chatty_ffmpeg_is_not_stalled_by_its_own_log() {
+        // More than a pipe holds (64 KB), then the line that matters.
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                "i=0; while [ $i -lt 3000 ]; do \
+                 echo \"noise line $i ................................................\" >&2; \
+                 i=$((i+1)); done; echo 'rtmp: Connection refused' >&2",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let tail = StderrTail::attach(&mut child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the process blocked on a full stderr pipe"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            tail.last_error().as_deref(),
+            Some("rtmp: Connection refused")
+        );
+        assert!(tail.lines().len() <= STDERR_TAIL_LINES);
+    }
 
     #[test]
     fn spawn_srt_url_adds_listener_mode() {
@@ -2186,6 +3384,7 @@ mod tests {
         PresentationRequest {
             depth: PresentationDepth::Sdr10,
             dither: true,
+            video_levels: false,
         }
     }
 
@@ -2887,6 +4086,37 @@ mod tests {
         sub.stop();
     }
 
+    /// Each dropped frame counts its own slot, at the pace the show runs
+    /// then: three at 60 fps are 50 ms, thirty at 30 fps a second; the first
+    /// offer has nothing before it, and a stall before a drop counts at most
+    /// a quarter second.
+    #[test]
+    fn a_dropped_frame_counts_the_stretch_since_the_one_before() {
+        use std::time::{Duration, Instant};
+        let mut clock = DropClock::default();
+        let start = Instant::now();
+        clock.offer(start, true);
+        assert_eq!(clock.lost, Duration::ZERO, "nothing before the first");
+        let mut at = start;
+        let mut offer = |clock: &mut DropClock, gap: Duration, dropped: bool| {
+            at += gap;
+            clock.offer(at, dropped);
+        };
+        let sixtieth = Duration::from_nanos(16_666_667);
+        for _ in 0..3 {
+            offer(&mut clock, sixtieth, true);
+        }
+        assert!((clock.lost.as_secs_f64() - 0.05).abs() < 1e-6, "{:?}", clock.lost);
+        offer(&mut clock, sixtieth, false);
+        let thirtieth = Duration::from_nanos(33_333_333);
+        for _ in 0..30 {
+            offer(&mut clock, thirtieth, true);
+        }
+        assert!((clock.lost.as_secs_f64() - 1.05).abs() < 1e-6, "{:?}", clock.lost);
+        offer(&mut clock, Duration::from_secs(2), true);
+        assert!((clock.lost.as_secs_f64() - 1.3).abs() < 1e-6, "a stall: {:?}", clock.lost);
+    }
+
     #[test]
     fn feed_frame_returns_false_after_stop() {
         if !ffmpeg_available() {
@@ -2943,14 +4173,15 @@ mod tests {
     #[test]
     fn full_channel_counts_as_a_drop_and_keeps_the_pipe_alive() {
         let (tx, _rx) = mpsc::sync_channel(1);
-        tx.send(vec![0u8; 4]).unwrap();
+        let now = std::time::Instant::now();
+        tx.send((now, vec![0u8; 4])).unwrap();
         let dropped = AtomicU64::new(0);
         assert!(
-            try_enqueue_frame(&tx, &dropped, "test-rec", &[1, 2, 3, 4]),
+            try_enqueue_frame(&tx, &dropped, "test-rec", now, &[1, 2, 3, 4]),
             "Full must not look like a dead subprocess"
         );
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
-        assert!(try_enqueue_frame(&tx, &dropped, "test-rec", &[5, 6, 7, 8]));
+        assert!(try_enqueue_frame(&tx, &dropped, "test-rec", now, &[5, 6, 7, 8]));
         assert_eq!(dropped.load(Ordering::Relaxed), 2);
     }
 
@@ -2959,7 +4190,8 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(1);
         drop(rx);
         let dropped = AtomicU64::new(0);
-        assert!(!try_enqueue_frame(&tx, &dropped, "test-rec", &[1, 2, 3, 4]));
+        let now = std::time::Instant::now();
+        assert!(!try_enqueue_frame(&tx, &dropped, "test-rec", now, &[1, 2, 3, 4]));
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
     }
 
@@ -2972,6 +4204,7 @@ mod tests {
             sample_rate,
             channels,
             lost_samples: Arc::new(AtomicU64::new(0)),
+            started: std::time::Instant::now(),
         }
     }
 
@@ -3061,64 +4294,219 @@ mod tests {
 
     // ── A/V sync: holding the video timeline against the audio clock ────
 
-    /// A renderer keeping up must not be padded at all.
-    ///
-    /// Padding is repair work; doing it when nothing is broken would inflate
-    /// every recording with duplicate frames and make the encoder do work for
-    /// nothing.
+    /// `n` frames of a 60 fps show drawn from `start` on, each moved by
+    /// `jitter(i)` seconds, placed in order on a 60 fps timeline.
+    fn placed(
+        start: std::time::Instant,
+        from: std::time::Instant,
+        n: usize,
+        jitter: impl Fn(usize) -> f64,
+    ) -> (Timeline, Vec<Placed>) {
+        let mut timeline = Timeline::new(Some(start), 60.0);
+        let placed = (0..n)
+            .map(|i| {
+                let secs = (i as f64 / 60.0 + jitter(i)).max(0.0);
+                timeline.place(from + std::time::Duration::from_secs_f64(secs))
+            })
+            .collect();
+        (timeline, placed)
+    }
+
+    /// Frames drawn on time are written once each, nothing repeated or left
+    /// out — even jittered by a third of a frame, which the slots, set where
+    /// the first frame fell, take in their stride.
     #[test]
-    fn a_renderer_on_time_is_never_padded() {
-        let fps = 60.0;
-        // Frame N arrives exactly on its slot, having already emitted N frames.
-        for n in 0..120u64 {
-            let elapsed =
-                std::time::Duration::from_secs_f64(f64::from(u32::try_from(n).unwrap()) / fps);
-            assert_eq!(
-                FfmpegSubprocess::pad_count(elapsed, fps, n),
-                0,
-                "frame {n} arrived on time and should need no padding"
+    fn frames_drawn_on_time_are_written_once_each() {
+        let start = std::time::Instant::now();
+        for jitter in [0.0, 0.33 / 60.0] {
+            let wobble = |i: usize| if i % 2 == 1 { jitter } else { -jitter / 2.0 };
+            // Drawn 0.4 of a frame after the sound began: without the slots
+            // set by the first frame, a third of a frame late lands in the
+            // next slot.
+            let from = start + std::time::Duration::from_secs_f64(0.4 / 60.0);
+            let (timeline, placed) = placed(start, from, 120, wobble);
+            assert!(
+                placed.iter().all(|p| *p == Placed::After(0)),
+                "jitter {jitter}: {placed:?}"
             );
+            assert_eq!(timeline.written, 120);
         }
     }
 
-    /// A gap in the renderer is covered by exactly as many frames as it swallowed.
-    ///
-    /// This is what keeps the video timeline honest. Raw video is timed by
-    /// position — frame N is at N/fps whenever it was made — so a frame that is
-    /// never written does not register as a pause, it shortens the recording.
-    /// The audio track is timed by the capture device's sample clock and stays
-    /// true to real time, so every unwritten frame used to slide the two apart,
-    /// permanently and cumulatively. Repeating the last frame across the gap
-    /// costs almost nothing to encode and keeps the two clocks agreeing.
+    /// Frames timed by refresh calls that reach Nida late now and then — a
+    /// few milliseconds as a rule, half a frame at times, the first of all
+    /// among the late ones — are still written once each.
+    #[test]
+    fn frames_timed_by_late_refresh_calls_are_written_once_each() {
+        let start = std::time::Instant::now();
+        let frame = 1.0 / 60.0;
+        let late = |i: usize| {
+            let wobble = (i.wrapping_mul(2_654_435_761) % 1000) as f64 / 1000.0 * 0.004;
+            let spike = if i.is_multiple_of(37) { 0.6 * frame } else { 0.0 };
+            wobble + spike
+        };
+        let (timeline, placed) = placed(start, start, 1200, late);
+        // The first goes to whichever slot it falls nearest; every frame
+        // after it, to the next.
+        let Placed::After(first) = placed[0] else {
+            panic!("the first frame is written");
+        };
+        let (repeats, left_out) = placed[1..].iter().fold((0, 0), |(r, l), p| match p {
+            Placed::After(n) => (r + n, l),
+            Placed::LeftOut => (r, l + 1),
+        });
+        assert_eq!((repeats, left_out), (0, 0), "{placed:?}");
+        assert_eq!(timeline.written, 1200 + first);
+    }
+
+    /// A show drawn at 60.1 fps into a 60 fps take leaves a frame out about
+    /// every ten seconds, and one at 59.94 repeats one about every sixteen —
+    /// never both, as a real difference of rate.
+    #[test]
+    fn a_show_a_little_off_the_takes_rate_leaves_out_or_repeats_now_and_then() {
+        for (rate, repeats_wanted, left_out_wanted) in [(60.1, 0..=0, 3..=4), (59.94, 2..=3, 0..=0)] {
+            let start = std::time::Instant::now();
+            let mut timeline = Timeline::new(Some(start), 60.0);
+            let (mut repeats, mut left_out) = (0, 0);
+            for i in 0..(rate * 40.0) as u32 {
+                let made = start + std::time::Duration::from_secs_f64(f64::from(i) / rate);
+                match timeline.place(made) {
+                    Placed::After(n) => repeats += n,
+                    Placed::LeftOut => left_out += 1,
+                }
+            }
+            assert!(repeats_wanted.contains(&repeats), "{rate}: {repeats} repeated");
+            assert!(left_out_wanted.contains(&left_out), "{rate}: {left_out} left out");
+        }
+    }
+
+    /// What decides a frame's place is when it was drawn, never when it got
+    /// to the writer: the frames that waited behind an encoder still starting
+    /// went into the picture once by when they arrived and again as repeats,
+    /// and every take started with the picture behind the sound. A timeline
+    /// fed frames drawn at an even pace writes them once each, however they
+    /// came.
+    #[test]
+    fn frames_that_waited_on_their_way_take_their_own_slots() {
+        let start = std::time::Instant::now();
+        let (timeline, placed) = placed(start, start, 30, |_| 0.0);
+        assert!(placed.iter().all(|p| *p == Placed::After(0)), "{placed:?}");
+        assert_eq!(timeline.written, 30, "no repeats for frames that were drawn");
+    }
+
+    /// The picture starts with the sound: frames drawn half a second after
+    /// the sound began — a first take waiting for the encoder — are preceded
+    /// by that half second of the first frame, not pulled forward over it.
+    #[test]
+    fn the_take_starts_when_the_sound_does() {
+        let start = std::time::Instant::now();
+        let late = start + std::time::Duration::from_millis(400);
+        let (timeline, placed) = placed(start, late, 3, |_| 0.0);
+        assert_eq!(placed, [Placed::After(24), Placed::After(0), Placed::After(0)]);
+        assert_eq!(timeline.written, 27);
+    }
+
+    /// A frame drawn before the take began is not in it.
+    #[test]
+    fn frames_drawn_before_the_take_are_left_out() {
+        let start = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        let mut timeline = Timeline::new(Some(start), 60.0);
+        for before in [50, 5] {
+            let early = start.checked_sub(std::time::Duration::from_millis(before)).unwrap();
+            assert_eq!(timeline.place(early), Placed::LeftOut, "{before} ms before");
+        }
+        assert_eq!(timeline.place(start), Placed::After(0));
+        assert_eq!(timeline.place(start), Placed::LeftOut, "drawn at the same moment again");
+        assert_eq!(timeline.written, 1);
+    }
+
+    /// A show a little off the take's rate whose refresh calls come a
+    /// millisecond or two late — what the frame trace showed on a laptop —
+    /// leaves out or repeats a frame now and then, as the rates must, but
+    /// never a repeat and a frame left out together.
+    #[test]
+    fn a_show_off_the_takes_rate_with_late_calls_never_pairs_a_repeat_with_a_drop() {
+        for (rate, repeats_wanted, left_out_wanted) in [(60.1, 0..=0, 3..=4), (59.94, 2..=3, 0..=0)] {
+            let start = std::time::Instant::now();
+            let mut timeline = Timeline::new(Some(start), 60.0);
+            let (mut repeats, mut left_out) = (0, 0);
+            for i in 0..(rate * 40.0) as u32 {
+                let late = f64::from(i.wrapping_mul(2_654_435_761) % 1000) / 1000.0 * 0.002;
+                let made = start + std::time::Duration::from_secs_f64(f64::from(i) / rate + late);
+                match timeline.place(made) {
+                    Placed::After(n) => repeats += n,
+                    Placed::LeftOut => left_out += 1,
+                }
+            }
+            assert!(repeats_wanted.contains(&repeats), "{rate}: {repeats} repeated");
+            assert!(left_out_wanted.contains(&left_out), "{rate}: {left_out} left out");
+        }
+    }
+
+    /// A gap in the renderer is covered by exactly as many frames as it
+    /// swallowed, so the picture stays with the sound after it.
     #[test]
     fn a_renderer_gap_is_covered_frame_for_frame() {
-        let fps = 60.0;
-        // 10 frames written, then a 100 ms stall: 6 frames' worth of real time
-        // has passed unrecorded (10/60 s = 166.7 ms, +100 ms = 266.7 ms = 16
-        // frames due), so 6 repeats bring the timeline back to real time.
-        let elapsed = std::time::Duration::from_secs_f64(10.0 / fps + 0.1);
-        assert_eq!(FfmpegSubprocess::pad_count(elapsed, fps, 10), 6);
+        let start = std::time::Instant::now();
+        // Ten frames, then 100 ms (six frames) with none: the next frame goes
+        // to slot 16, after six repeats.
+        let (timeline, placed) =
+            placed(start, start, 11, |i| if i == 10 { 0.1 } else { 0.0 });
+        assert_eq!(placed[10], Placed::After(6));
+        assert_eq!(timeline.written, 17);
     }
 
-    /// A long freeze degrades gracefully instead of flooding the pipe.
+    /// A show drawn faster than the encoder's rate leaves frames out rather
+    /// than stretching the picture past the sound.
     #[test]
-    fn a_long_freeze_is_capped_rather_than_burst_written() {
-        let fps = 60.0;
-        let elapsed = std::time::Duration::from_secs(30);
-        assert_eq!(
-            FfmpegSubprocess::pad_count(elapsed, fps, 0),
-            MAX_PAD_FRAMES_PER_ARRIVAL,
-            "a 30 s stall must not emit 1800 frames in one go"
-        );
+    fn frames_for_a_slot_already_written_are_left_out() {
+        let start = std::time::Instant::now();
+        let mut timeline = Timeline::new(Some(start), 60.0);
+        let placed: Vec<Placed> = (0..240)
+            .map(|i| timeline.place(start + std::time::Duration::from_secs_f64(f64::from(i) / 120.0)))
+            .collect();
+        // The last frame, drawn at 239/120 s, falls in slot 120: every slot
+        // from 0 to 120 written once, every other frame left out.
+        let left_out = placed.iter().filter(|p| **p == Placed::LeftOut).count();
+        assert_eq!(timeline.written, 121, "{placed:?}");
+        assert_eq!(left_out, 240 - 121, "two seconds at 120 fps into 60 fps");
+        assert!(placed.iter().all(|p| matches!(p, Placed::After(0) | Placed::LeftOut)));
     }
 
-    /// Running ahead of the clock never produces negative padding.
+    /// A two-second freeze is filled before the frame after it, which keeps
+    /// its own slot — the picture stays with the sound through it.
     #[test]
-    fn a_renderer_ahead_of_the_clock_is_not_padded() {
-        let fps = 60.0;
+    fn a_long_freeze_is_filled_before_the_frame_after_it() {
+        let start = std::time::Instant::now();
+        let (timeline, placed) =
+            placed(start, start, 10, |i| if i >= 1 { 2.0 } else { 0.0 });
+        // Frame 1 was drawn at 1/60 s + 2 s: slot 121, after 120 repeats.
+        assert_eq!(placed[1], Placed::After(120));
+        assert!(placed[2..].iter().all(|p| *p == Placed::After(0)), "{placed:?}");
+        assert_eq!(timeline.written, 130, "{placed:?}");
+    }
+
+    /// A freeze of a minute is filled in full before the frame after it;
+    /// past two minutes it is not: the show was not being recorded, and one
+    /// frame must not become an hour of repeats.
+    #[test]
+    fn a_freeze_is_filled_in_full_up_to_two_minutes() {
+        let start = std::time::Instant::now();
+        let (_, minute) = placed(start, start, 2, |i| if i == 1 { 60.0 } else { 0.0 });
+        assert_eq!(minute[1], Placed::After(3600), "a minute: all of it");
+        let (_, ten) = placed(start, start, 2, |i| if i == 1 { 600.0 } else { 0.0 });
+        assert_eq!(ten[1], Placed::After(7200), "ten minutes: two of them");
+    }
+
+    /// With no sound to start from, the first frame starts the take.
+    #[test]
+    fn without_sound_the_first_frame_starts_the_take() {
+        let mut timeline = Timeline::new(None, 60.0);
+        let first = std::time::Instant::now();
+        assert_eq!(timeline.place(first), Placed::After(0));
         assert_eq!(
-            FfmpegSubprocess::pad_count(std::time::Duration::from_millis(1), fps, 100),
-            0
+            timeline.place(first + std::time::Duration::from_secs_f64(1.0 / 60.0)),
+            Placed::After(0)
         );
     }
 
@@ -3140,18 +4528,24 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         let (tx, rx) = crossbeam_channel::bounded::<PcmChunk>(4);
-        let lost_samples = Arc::new(AtomicU64::new(LOST));
 
-        let mut pipe = AudioPipe::start(listener, rx, lost_samples, "test".into()).expect("pipe");
+        let mut pipe = AudioPipe::start(listener, rx, "test".into()).expect("pipe");
 
-        // Stand in for ffmpeg: connect and read everything written.
+        // Stand in for ffmpeg: connect and read everything written. A chunk
+        // queued before the loss, then the one after it.
         let mut client = std::net::TcpStream::connect(addr).expect("connect");
         tx.send(PcmChunk {
+            samples: vec![0.25; CHUNK],
+            lost_before: 0,
+        })
+        .expect("send");
+        tx.send(PcmChunk {
             samples: vec![0.5; CHUNK],
+            lost_before: LOST,
         })
         .expect("send");
 
-        let expected_samples = LOST as usize + CHUNK;
+        let expected_samples = CHUNK + LOST as usize + CHUNK;
         let mut buf = vec![0u8; expected_samples * 4];
         client
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -3160,11 +4554,15 @@ mod tests {
 
         let samples: &[f32] = bytemuck::cast_slice(&buf);
         assert!(
-            samples[..LOST as usize].iter().all(|s| *s == 0.0),
-            "the gap should be filled with silence"
+            samples[..CHUNK].iter().all(|s| *s == 0.25),
+            "what came before the loss keeps its place"
         );
         assert!(
-            samples[LOST as usize..].iter().all(|s| *s == 0.5),
+            samples[CHUNK..CHUNK + LOST as usize].iter().all(|s| *s == 0.0),
+            "the gap should be filled with silence, where it was"
+        );
+        assert!(
+            samples[CHUNK + LOST as usize..].iter().all(|s| *s == 0.5),
             "the real chunk should follow the silence, intact"
         );
         assert_eq!(pipe.silence_spliced(), LOST);
@@ -3182,17 +4580,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         let (tx, rx) = crossbeam_channel::bounded::<PcmChunk>(4);
-        let mut pipe = AudioPipe::start(
-            listener,
-            rx,
-            Arc::new(AtomicU64::new(0)),
-            "test-clean".into(),
-        )
-        .expect("pipe");
+        let mut pipe = AudioPipe::start(listener, rx, "test-clean".into()).expect("pipe");
 
         let mut client = std::net::TcpStream::connect(addr).expect("connect");
         tx.send(PcmChunk {
             samples: vec![0.25; CHUNK],
+            lost_before: 0,
         })
         .expect("send");
 

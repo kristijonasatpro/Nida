@@ -4,11 +4,11 @@
 
 ### Connect a Controller
 
-1. Plug in a MIDI controller and it will appear in the **🎹 MIDI** section of the right panel
+1. Plug in a MIDI controller and it will appear in the **🎹 MIDI** section of the **Setup** panel
 2. **Enable** the device with its toggle switch
 3. Click **Rescan** if you hot-plug a device after launch
 
-Varda supports multiple simultaneous MIDI controllers. Each device is identified independently, so the same CC number on different controllers maps to different parameters.
+Nida supports multiple simultaneous MIDI controllers. Each device is identified independently, so the same CC number on different controllers maps to different parameters.
 
 ### Learn Mode
 
@@ -36,7 +36,7 @@ MIDI mappings are saved to `.varda/midi.json`, keyed by device name. Mappings pe
 
 ### Controller Profiles
 
-A controller profile teaches Varda the physical layout of a device such as its control ranges, LED capabilities, and an optional auto-map strategy. The Akai APC Mini profile is built in; you can add profiles for other controllers by dropping `.json` files into `.varda/controller-profiles/`. Files are loaded on startup and matched against connected devices by name.
+A controller profile teaches Nida the physical layout of a device such as its control ranges, LED capabilities, and an optional auto-map strategy. The Akai APC Mini profile is built in; you can add profiles for other controllers by dropping `.json` files into `.varda/controller-profiles/`. Files are loaded on startup and matched against connected devices by name.
 
 A profile has four sections:
 
@@ -82,7 +82,7 @@ A profile has four sections:
 
 ### Input
 
-Varda listens for OSC messages on **port 9000** (configurable via `--osc-port` or `.varda/osc.json`).
+Nida listens for OSC messages on **port 9000** (configurable via `--osc-port` or `.varda/osc.json`).
 
 All parameters use the `/varda/` namespace with the same paths as MIDI:
 
@@ -132,6 +132,9 @@ This enables visual feedback in TouchOSC, Lemur, and other bidirectional OSC con
 
 MIDI learn and keyboard learn are mutually exclusive — entering one exits the other.
 
+The [Rundown](25-rundown.md)'s **GO** is learned this way too: click **GO** in
+learn mode and press its key. It has none until then.
+
 ### Default Bindings
 
 | Key | Action |
@@ -171,7 +174,7 @@ Keyboard bindings are saved to `.varda/keymap.json`. Delete the file to restore 
 
 ## Clock Synchronization
 
-Varda derives BPM and beat phase from multiple sources with automatic priority resolution:
+Nida derives BPM and beat phase from multiple sources with automatic priority resolution:
 
 | Priority | Source | How |
 |----------|--------|-----|
@@ -180,11 +183,11 @@ Varda derives BPM and beat phase from multiple sources with automatic priority r
 | 3 | **Audio Detection** | Spectral flux onset detection from FFT analysis. 16-interval BPM history with outlier rejection. Range: 30–300 BPM. |
 | Forced only | **Manual** | User-set BPM value. Beat phase computed from elapsed wall-clock time. Manual never wins Auto resolution. |
 
-**Stale timeout**: if the active source hasn't sent data in 2 seconds, Varda falls back to the next priority source automatically.
+**Stale timeout**: if the active source hasn't sent data in 2 seconds, Nida falls back to the next priority source automatically.
 
 ### Clock Preference
 
-By default, Varda uses **Auto** mode (priority resolution). You can force a specific source:
+By default, Nida uses **Auto** mode (priority resolution). You can force a specific source:
 
 - **Auto** — highest-priority available source wins
 - **Force MIDI** — lock to a specific MIDI device
@@ -196,7 +199,7 @@ Click the **BPM display** in the top bar to open the clock preference popover. A
 
 ### What Uses the Clock
 
-Beat-synced features throughout Varda consume the resolved BPM and beat phase:
+Beat-synced features throughout Nida consume the resolved BPM and beat phase:
 
 - **Beat-synced crossfades** — crossfade triggered on the next beat boundary
 - **Deck auto-transitions** — play duration specified in beats
@@ -246,13 +249,13 @@ system and a broken one look identical on the output. The status tells you which
 
 ### The transport does not start itself
 
-Varda deliberately leaves the transport stopped at zero until you press Play. Nothing that reads the
+Nida deliberately leaves the transport stopped at zero until you press Play. Nothing that reads the
 position moves until then, so an unplugged cable or a mis-set input can never black your output
 before you have touched anything: you get the scene you saved, live.
 
 ### Source
 
-**Internal** advances the position on Varda's own clock, which is all you need for looping
+**Internal** advances the position on Nida's own clock, which is all you need for looping
 installations and for building a show before any timecode exists.
 
 **Chase timecode** hands position to an external master. While chasing, the position is **read-only**:
@@ -261,7 +264,7 @@ loop range you have set is kept but ignored, so switching back to Internal resto
 
 ### Following SMPTE
 
-Varda reads both flavours of SMPTE, and both produce the same thing: an absolute position the
+Nida reads both flavours of SMPTE, and both produce the same thing: an absolute position the
 transport chases.
 
 | Flavour | Where it arrives | What to do |
@@ -281,7 +284,7 @@ Set the source to **Chase timecode** and the popover grows the timecode controls
 | **Follow** | Which signal wins. **Auto** takes LTC if it is patched and arriving, otherwise MTC. **LTC** and a named MIDI port force one and ignore the other. **Off** ignores timecode entirely, for a rehearsal where the master is running and you do not want to be dragged around by it. |
 | **LTC in** | The audio input carrying LTC, and which channel of it. Field rigs commonly send programme audio down one channel and timecode down the other, so the channel matters. |
 
-Below those, every signal Varda can currently hear is listed with its own position and state, whether
+Below those, every signal Nida can currently hear is listed with its own position and state, whether
 or not it is the one driving. This is the part you want when something is wrong: an input that is
 listed but stopped is a master that is not rolling, and an input that is not listed at all is a
 patching problem. If nothing is arriving at all, the panel says so rather than sitting blank.
@@ -293,7 +296,7 @@ explicitly if that is what your master sends.
 
 The patch is saved with the venue (in `stage.json`, alongside surfaces and outputs) rather than with
 the show, because which cable carries timecode belongs to the room. Devices are remembered by name,
-so they survive being plugged into different ports. If a remembered device is missing at load, Varda
+so they survive being plugged into different ports. If a remembered device is missing at load, Nida
 says so in the notification bar instead of silently following nothing.
 
 Timecode is also republished over OSC as `/varda/timecode/position` (seconds) and
@@ -305,7 +308,7 @@ reports every input and which one resolved. See [API](13-api.md).
 The two readouts sit side by side in the top bar in both Performance and Arrangement mode, and
 neither is hidden when you switch. They answer different questions and you can be running on both at
 once: a timecode-locked intro while your beat-locked LFOs stay matched to the DJ, for example. This
-is the normal case rather than the exotic one, and it is why Varda does not treat them as
+is the normal case rather than the exotic one, and it is why Nida does not treat them as
 alternatives.
 
 There is also a technical reason they cannot be collapsed into one. **Timecode carries no tempo.**
@@ -319,7 +322,7 @@ To keep this readable rather than noisy, each readout is **dimmed when nothing i
 
 Hover either one and it tells you how many modulators follow it. That is usually what you actually
 want to know when something is moving unexpectedly: modulators set to **Free-run** move whenever
-Varda is open, ones set to **Beat** move whenever a clock is present, and only ones set to
+Nida is open, ones set to **Beat** move whenever a clock is present, and only ones set to
 **Transport** wait for Play. See [Timebase](10-resolution-and-monitoring.md#timebase).
 
 ### Frame rates and drop-frame
@@ -422,7 +425,7 @@ The behavior selector lives in the macro's detail editor (bottom bar). Momentary
 
 ### Mapping a Macro to MIDI / OSC / Keyboard
 
-Because a macro is addressable as `macro/<uuid>/value`, it inherits Varda's whole control plane with no extra setup:
+Because a macro is addressable as `macro/<uuid>/value`, it inherits Nida's whole control plane with no extra setup:
 
 - **MIDI** — enter **MIDI Learn** (right-click → *Enter MIDI Learn*), then click a macro's live control in the central column (it glows purple like any other control) and move a hardware control. A button macro maps naturally to a pad: note-on drives `1.0`, note-off drives `0.0`. See [MIDI](#midi).
 - **OSC** — send `/varda/macro/<uuid>/value <0..1>`. Discover the UUID via `GET /api/scene/macros` or `GET /api/state`.
@@ -459,7 +462,7 @@ MIDI, OSC, and keyboard shortcuts all use the same parameter path format:
 | `deck/<uuid>/capture/crop_w` | Screen-capture crop width (0.0–1.0) |
 | `deck/<uuid>/capture/crop_h` | Screen-capture crop height (0.0–1.0) |
 | `deck/<uuid>/capture/cursor` | Include the mouse pointer (toggle, > 0.5) |
-| `deck/<uuid>/capture/exclude_varda` | Omit Varda's own windows from a display capture (toggle, > 0.5) |
+| `deck/<uuid>/capture/exclude_varda` | Omit Nida's own windows from a display capture (toggle, > 0.5) |
 | `ch/<uuid>/opacity` | Channel opacity |
 | `ch/<uuid>/effect/<effect_uuid>/param/<name>` | Channel effect parameter |
 | `master/effect/<effect_uuid>/param/<name>` | Master effect parameter |

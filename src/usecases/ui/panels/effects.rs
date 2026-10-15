@@ -293,14 +293,14 @@ pub(super) fn render_channel_effect_detail(
                 name.clear();
                 ui.data_mut(|d| d.insert_temp(cleared_id, true));
             }
-            if ui.small_button("✓ Save").clicked() && !name.is_empty() {
+            if ui.small_button("✔ Save").clicked() && !name.is_empty() {
                 actions.commands.push(EngineCommand::SaveChannelPreset {
                     channel_uuid: ch.uuid.clone(),
                     name: name.clone(),
                 });
                 ui.data_mut(|d| d.insert_temp(prompt_id, false));
             }
-            if ui.small_button("✕").clicked() {
+            if ui.small_button("×").clicked() {
                 ui.data_mut(|d| d.insert_temp(prompt_id, false));
             }
             ui.data_mut(|d| d.insert_temp(name_id, name));
@@ -321,29 +321,21 @@ pub(super) fn render_channel_effect_detail(
                 if let Some(&tex_id) = data.channel_preview_textures.get(&ch_idx) {
                     let available_height = ui.available_height() - 12.0;
                     let preview = super::utils::preview_size(
-                        egui::vec2(ui.available_width(), available_height.max(60.0)),
+                        egui::vec2(
+                            (ui.available_width() - super::switcher::TAKE_COLUMN_WIDTH - 16.0)
+                                .max(160.0),
+                            available_height.max(60.0),
+                        ),
                         data.render_width,
                         data.render_height,
                     );
-                    let preview_width = preview.x;
-                    let preview_height = preview.y;
-                    egui::Frame::default()
-                        .inner_margin(6.0)
-                        .corner_radius(4.0)
-                        .fill(ui.visuals().faint_bg_color)
-                        .show(ui, |ui| {
-                            ui.set_min_width(preview_width + 12.0);
-                            ui.set_max_width(preview_width + 12.0);
-                            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                                ui.image(egui::load::SizedTexture::new(
-                                    tex_id,
-                                    egui::vec2(preview_width, preview_height),
-                                ));
-                                ui.label(egui::RichText::new(&ch.name).small().color(accent));
-                            });
-                        });
+                    super::deck_detail::channel_result_preview(
+                        ui, tex_id, preview, &ch.name, accent,
+                    );
                     ui.separator();
                 }
+                super::deck_detail::render_take_frame(ui, &ch.uuid, data, actions);
+                ui.separator();
                 let ch_chain_key = format!("ch_{}", ch.uuid);
                 {
                     for (eff_idx, (eff_uuid, eff_name, eff_enabled, eff_params)) in

@@ -1,8 +1,8 @@
-# Varda
+# Nida
 
-Varda is a free, open-source live visual mixer and broadcast router for Linux, macOS, and Windows, written in Rust. It routes video sources like shaders, video files, cameras, NDI, SRT, HLS/DASH streams, screen and window captures, and HTML/web pages through a broadcast-style signal matrix (Deck → Channel → Mixer → Surface → Output), composites them with per-parameter modulation and ISF effect chains, and delivers the result to projectors, network streams, recordings, and the web.
+Nida is a free, open-source live visual mixer and broadcast router for Linux, macOS, and Windows, written in Rust. It routes video sources like shaders, video files, cameras, NDI, SRT, HLS/DASH streams, screen and window captures, and HTML/web pages through a broadcast-style signal matrix (Deck → Channel → Mixer → Surface → Output), composites them with per-parameter modulation and ISF effect chains, and delivers the result to projectors, network streams, recordings, and the web.
 
-Varda is built for live VJ performance, dome projection, multi-projector installations, and headless media serving and is controlled via MIDI, OSC, keyboard shortcuts, or a full REST/WebSocket API.
+Nida is built for live VJ performance, dome projection, multi-projector installations, and headless media serving and is controlled via MIDI, OSC, keyboard shortcuts, or a full REST/WebSocket API.
 
 A scene can be worked two ways, and they are two views of the same thing rather than two projects. **Performance mode** is the mixer: channels, decks, faders, everything by hand. **[Arrangement mode](15-arrangement.md)** is that scene against show time, where regions decide when a deck is up, curves automate any parameter, cue points mark the moments worth returning to, and the transport can follow SMPTE timecode. Use either on its own or both together, and when both are running your hand wins: touch an automated control and it hands over until you re-arm it.
 
@@ -19,7 +19,8 @@ Here you will find everything you need to start throwing those pixels.
   - [Workspace & Content](01-getting-started.md#workspace--content) — project layout, supported formats
   - [Build from Source](01-getting-started.md#build-from-source)
   - [UI Layout](01-getting-started.md#ui-layout) — panel map
-  - [Load Content](01-getting-started.md#load-content)
+  - [Load Content](01-getting-started.md#load-content) — Library, or drop files and folders in from Finder
+  - [Adjusting a deck against the result](01-getting-started.md#adjusting-a-deck-against-the-result) — the channel result stays in the bottom bar with Cut/Fade to every bus; double-click a deck for its layer in Input Settings
   - [Output to a Display](01-getting-started.md#output-to-a-display)
   - [Audio Reactivity](01-getting-started.md#audio-reactivity) — input device, beat detection
   - [Next Steps](01-getting-started.md#next-steps)
@@ -42,9 +43,9 @@ Here you will find everything you need to start throwing those pixels.
   - [HTML Sources](03-library-panel.md#html-sources) — add web page URLs, drag-to-channel
   - [Cameras](03-library-panel.md#cameras) — rescan, resolution selector
   - [Screen Capture](03-library-panel.md#screen-capture) — displays and windows, rescan, permission prompt
-  - [Taps](03-library-panel.md#taps) — Varda's own master program and channels as sources
+  - [Taps](03-library-panel.md#taps) — Nida's own master program and channels as sources
 - **4. [Performance & Automation](04-performance.md)**
-  - [Video Playback](04-performance.md#video-playback) — loop modes, speed, scrub, HAP codecs, ping-pong cache
+  - [Video Playback](04-performance.md#video-playback) — loop modes, speed, scrub, hardware decoding on the Mac media engine (incl. AV1), HAP codecs, ping-pong cache
   - [Deck Auto-Transitions](04-performance.md#deck-auto-transitions) — timed/clip-end triggers, transition shaders
   - [Transition Sequences](04-performance.md#transition-sequences) — multi-step channel automation, easing, simultaneous sequences
   - [Undo / Redo](04-performance.md#undo--redo) — 50-level snapshot history
@@ -72,9 +73,11 @@ Here you will find everything you need to start throwing those pixels.
 
 - **7. [Outputs](07-outputs.md)**
   - [Creating an Output](07-outputs.md#creating-an-output) — windowed, recording, stream
-  - [Output Targets](07-outputs.md#output-targets) — display selection, hot-plug
+  - [Output Targets](07-outputs.md#output-targets) — display selection, hot-plug, naming screens
+  - [Levels](07-outputs.md#levels) — Full (0–255) or Video (16–235) per screen, for video gear
   - [Output Rotation](07-outputs.md#output-rotation) — 0/90/180/270 for portrait
   - [Source Routing](07-outputs.md#source-routing) — Master / Channel / Channels sub-mix / Deck
+  - [Blackmagic Outputs](07-outputs.md#blackmagic-outputs) — an UltraStudio or DeckLink as one more screen (HDMI + SDI)
   - [Recording Outputs](07-outputs.md#recording-outputs)
 - **8. [Projection Mapping](08-projection.md)**
   - [Basic Projection](08-projection.md#basic-projection) — drawing tools, surfaces, corner-pin warp, combine/multi-contour
@@ -89,8 +92,8 @@ Here you will find everything you need to start throwing those pixels.
   - [Stream Input Reliability](09-streaming-and-io.md#stream-input-reliability) — dedup, stall detection, reconnect
   - [HTML / Web Content](09-streaming-and-io.md#html--web-content)
   - [Syphon](09-streaming-and-io.md#syphon-macos)
-  - [Screen & Window Capture](09-streaming-and-io.md#screen--window-capture) — displays and windows as decks, permissions, crop and rate, capturing Varda itself
-  - [Program Tap](09-streaming-and-io.md#program-tap) — Varda's own output as a source, one frame behind, feedback loops
+  - [Screen & Window Capture](09-streaming-and-io.md#screen--window-capture) — displays and windows as decks, permissions, crop and rate, capturing Nida itself
+  - [Program Tap](09-streaming-and-io.md#program-tap) — Nida's own output or another channel as a source, feedback loops
 - **10. [Resolution, Settings & Monitoring](10-resolution-and-monitoring.md)**
   - [Render Resolution](10-resolution-and-monitoring.md#render-resolution) — presets, custom sizes
   - [Per-Deck Scaling](10-resolution-and-monitoring.md#per-deck-scaling) — fill, fit, stretch, center
@@ -136,11 +139,56 @@ Here you will find everything you need to start throwing those pixels.
   - [Idle Behaviour](15-arrangement.md#idle-behaviour) — what plays before the show starts
   - [Undo, Saving, and Load](15-arrangement.md#undo-saving-and-load) — scene version 7, memory
   - [Sleeping Clips](15-arrangement.md#sleeping-clips) — why a distant clip stops decoding, and what that changes
+- **16. [Audio Mixer](16-audio-mixer.md)** — vMix-style strips: buses, sends, solo, balance, Audio Auto
+  - [Inputs](16-audio-mixer.md#inputs) — clips, sound files and input devices
+  - [Audio Auto](16-audio-mixer.md#audio-auto) — a clip's sound on and off with its picture
+  - [Outputs](16-audio-mixer.md#outputs) — buses: sound devices, faders, delay
+  - [Headphones](16-audio-mixer.md#headphones) — listen bus and solo
+  - [Recordings and streams](16-audio-mixer.md#recordings-and-streams) — which bus an output carries
+  - [Lining up sound and picture](16-audio-mixer.md#lining-up-sound-and-picture)
+- **17. [Streaming](17-streaming.md)** — the STREAM button: one encode to four RTMP/RTMPS destinations, red when healthy, blinking yellow on trouble
+  - [Setting up](17-streaming.md#setting-up) — picture, sound, size, bit rate, hardware encoder
+  - [Destinations](17-streaming.md#destinations) — URL, stream key, username and password
+  - [While live](17-streaming.md#while-live) — states, reconnecting, stopping
+  - [If a destination will not connect](17-streaming.md#if-a-destination-will-not-connect)
+- **18. [Main mode](18-main.md)** — one channel on Main at a time, Space cuts, Enter fades, overlay channels on top; wide channel row with + Channel
+  - [Taking a channel to Main](18-main.md#taking-a-channel-to-main) — NEXT and ON MAIN tallies, one input alone
+  - [Overlays](18-main.md#overlays) — logo and lower third over whatever is on Main
+  - [Saved, and safe from undo](18-main.md#saved-and-safe-from-undo)
+- **19. [Recording](19-recording.md)** — the REC button: date-named files, hardware H.264/HEVC/ProRes, crash-safe MP4, red when recording, blinking yellow on trouble
+- **20. [Screen Layouts](20-layouts.md)** — Classic, Broadcast (Preview / Program over input tiles) and VJ (layers as rows); drag panels anywhere and save your own
+  - [Panels](20-layouts.md#panels) — what each one is
+  - [Making your own](20-layouts.md#making-your-own) — drag, save, update, reset, lock
+  - [Broadcast: Preview / Program and Inputs](20-layouts.md#broadcast-preview--program-and-inputs)
+  - [VJ: Layers](20-layouts.md#vj-layers)
+- **21. [Input Settings](21-input-settings.md)** — vMix's double-click window: a channel's layers (hide, reorder, delete, add), each layer's position, crop, colour, keys and effects, and the channel's own — with layout templates
+  - [Layers](21-input-settings.md#layers) — numbered as vMix numbers them, 1 at the back
+  - [A layer](21-input-settings.md#a-layer) — Position, Playback, Colour, Key, Effects
+  - [The whole channel](21-input-settings.md#the-whole-channel) — General, Layout templates, Colour, Key, Effects
+- **22. [LED Screens](22-led-screens.md)** — Resolume's Advanced Output: several LED screens on one HDMI feed to the processor, each at its own pixels, showing Main or a bus of its own
+  - [The feed](22-led-screens.md#the-feed) — on the processor's output, in a window, test card
+  - [Screens](22-led-screens.md#screens) — size, place, what it shows, Fit / Fill / Stretch / Part
+  - [One picture across several screens](22-led-screens.md#one-picture-across-several-screens)
+  - [Over the API](22-led-screens.md#over-the-api)
+- **23. [Adding Inputs](23-adding-inputs.md)** — vMix's Add Input: clips, pictures, cameras and capture cards, NDI, desktop capture, streams, web pages, colours and sound devices, each a new input
+  - [Cameras and capture cards](23-adding-inputs.md#cameras-and-capture-cards) — format (size and frame rate), the camera's own sound
+  - [NDI](23-adding-inputs.md#ndi) — the runtime, sources on the network, their sound; sending NDI with an audio bus
+  - [Desktop capture](23-adding-inputs.md#desktop-capture) — displays and windows, Screen Recording access
+  - [Over the API](23-adding-inputs.md#over-the-api) — `POST /api/inputs`
+- **24. [Zoom and Teams Calls](24-calls.md)** — a remote speaker over the ordinary call app: their sound straight from the app, their camera and slides as window inputs, Nida's programme back as the call's camera and microphone, and a bus that keeps the call from hearing itself
+  - [The call into Nida](24-calls.md#the-call-into-nida) — app sound, window capture
+  - [Nida back to the call](24-calls.md#nida-back-to-the-call) — NDI Virtual Input
+  - [The call must not hear itself](24-calls.md#the-call-must-not-hear-itself) — a mix-minus bus
+- **25. [Rundown](25-rundown.md)** — the show in order: steps that change every screen of a wall together, take Main and start clips, each taken with one press, and GO for the next
+  - [Making steps](25-rundown.md#making-steps) — + Step keeps what is on now; Duplicate; the step's window
+  - [Running the show](25-rundown.md#running-the-show) — GO, Cut and Fade; all of it or none; going on by itself
+  - [Clips, playlists and timers](25-rundown.md#clips-playlists-and-timers) — a sting on no screen, a talk's countdown
+  - [Over the API](25-rundown.md#over-the-api) — `/api/rundown/…`
 
 ---
 
 ## Additional Resources
 
-- **API Reference** — interactive Swagger UI at [`http://localhost:8080/api/docs`](http://localhost:8080/api/docs) (when Varda is running)
+- **API Reference** — interactive Swagger UI at [`http://localhost:8080/api/docs`](http://localhost:8080/api/docs) (when Nida is running)
 - **ISF Shader Format** — [isf.video](https://isf.video) (external)
 - **Contributing** — architecture overview, entity/address scheme, engineering conventions, and the benchmarking harness live in [`CONTRIBUTING.md`](../CONTRIBUTING.md)

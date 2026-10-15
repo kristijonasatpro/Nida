@@ -38,10 +38,8 @@ impl VardaApp {
             self.input.keymap.process_learn(combo.clone());
         }
 
-        let mut dismissals = ui_actions.session.notifications_to_dismiss.clone();
-        dismissals.sort_unstable_by(|a, b| b.cmp(a));
-        for idx in dismissals {
-            self.session.notifications.dismiss(idx);
+        for &id in &ui_actions.session.notifications_to_dismiss {
+            self.session.notifications.dismiss(id);
         }
 
         for msg in &ui_actions.session.info_notifications {
@@ -70,6 +68,28 @@ impl VardaApp {
         let commands = std::mem::take(&mut ui_actions.commands);
         for cmd in commands {
             let is_deck_add = command_is_deck_add(&cmd);
+            // What failed, said in a notification: nothing else shows it.
+            let failure = match &cmd {
+                EngineCommand::AddInput { .. } => Some("Input not added"),
+                EngineCommand::StartRecording => Some("Recording not started"),
+                EngineCommand::StartStream => Some("Stream not started"),
+                // A step not taken says so itself, wherever the press came
+                // from; these are the window's alone to say.
+                EngineCommand::AddRundownStep { .. } => Some("Step not added"),
+                EngineCommand::DuplicateRundownStep { .. }
+                | EngineCommand::RemoveRundownStep { .. }
+                | EngineCommand::RenameRundownStep { .. }
+                | EngineCommand::MoveRundownStep { .. }
+                | EngineCommand::SetRundownScreen { .. }
+                | EngineCommand::SetRundownMain { .. }
+                | EngineCommand::SetRundownOverlay { .. }
+                | EngineCommand::SetRundownPlay { .. }
+                | EngineCommand::SetRundownThen { .. }
+                | EngineCommand::CaptureRundownStep { .. }
+                | EngineCommand::SetRundownNext { .. }
+                | EngineCommand::SetRundownFade { .. } => Some("Step not changed"),
+                _ => None,
+            };
             // A resolution change recreates every GPU texture; flag it so the
             // runner re-points its egui texture registrations after the drain.
             let is_resolution_change = matches!(
@@ -85,6 +105,14 @@ impl VardaApp {
             }
             if is_deck_add {
                 self.notify_deck_add_outcome(&outcome);
+            }
+            if let Some(what) = failure {
+                if let CommandOutcome::Plain(CommandResult::Err { message, .. }) = &outcome {
+                    log::error!("{what}: {message}");
+                    self.session
+                        .notifications
+                        .error(format!("{what}: {message}"));
+                }
             }
             if is_resolution_change {
                 resolution_changed = true;
@@ -189,6 +217,8 @@ pub(crate) fn command_is_deck_add(cmd: &EngineCommand) -> bool {
             | EngineCommand::AddDashDeck { .. }
             | EngineCommand::AddRtmpDeck { .. }
             | EngineCommand::AddHtmlDeck { .. }
+            | EngineCommand::AddPlaylistDeck { .. }
+            | EngineCommand::AddTimerDeck { .. }
     )
 }
 
@@ -225,6 +255,7 @@ mod tests {
             EngineCommand::AddCameraDeck {
                 channel_uuid: ch(),
                 camera_id: 0,
+                mode: None,
             },
             EngineCommand::AddDepthSensorDeck {
                 channel_uuid: ch(),
@@ -260,8 +291,17 @@ mod tests {
                 channel_uuid: ch(),
                 url: "http://h".into(),
             },
+            EngineCommand::AddPlaylistDeck {
+                channel_uuid: ch(),
+                items: Vec::new(),
+                settings: None,
+            },
+            EngineCommand::AddTimerDeck {
+                channel_uuid: ch(),
+                settings: None,
+            },
         ];
-        assert_eq!(deck_adds.len(), 13, "expected 13 deck-add variants");
+        assert_eq!(deck_adds.len(), 15, "expected 15 deck-add variants");
         for cmd in &deck_adds {
             assert!(command_is_deck_add(cmd), "not recognized: {cmd:?}");
         }

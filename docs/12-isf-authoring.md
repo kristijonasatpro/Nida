@@ -1,8 +1,8 @@
 # Shader Authoring
 
-Varda shaders are **GLSL 450 (Vulkan)** with an [ISF](https://isf.video)-style JSON metadata header that declares parameters, inputs, and passes.
+Nida shaders are **GLSL 450 (Vulkan)** with an [ISF](https://isf.video)-style JSON metadata header that declares parameters, inputs, and passes.
 
-> **Read this first if you have existing ISF shaders.** Varda uses ISF's *metadata format*, not its *shader language*. A shader downloaded from isf.video, VDMX, or the ISF Editor will **not** load as-is. OG ISF is GLSL ES with implicitly injected uniforms, and Varda needs explicit Vulkan declarations. Porting is mechanical and usually takes a few minutes. See [Porting an ISF Shader](#porting-an-isf-shader).
+> **Read this first if you have existing ISF shaders.** Nida uses ISF's *metadata format*, not its *shader language*. A shader downloaded from isf.video, VDMX, or the ISF Editor will **not** load as-is. OG ISF is GLSL ES with implicitly injected uniforms, and Nida needs explicit Vulkan declarations. Porting is mechanical and usually takes a few minutes. See [Porting an ISF Shader](#porting-an-isf-shader).
 
 In exchange for not being drop-in ISF, the dialect gets you things ISF can't express: [compute shaders](#compute-shaders) with persistent storage buffers, [analyzer preprocessors](#analyzer-preprocessors) that inject ML/sensor data as textures, and [phase accumulators](#phase-accumulators) for jump-free speed changes.
 
@@ -14,7 +14,7 @@ In exchange for not being drop-in ISF, the dialect gets you things ISF can't exp
 | **Filter** | Has at least one `image` input | Processes an input image (blur, color grade, distort) |
 | **Transition** | Has `Transition` category + image inputs | Blends two images via a `progress` parameter (dissolve, wipe, push) |
 
-Varda classifies shaders automatically from their metadata.
+Nida classifies shaders automatically from their metadata.
 
 ## Metadata Format
 
@@ -58,7 +58,7 @@ All numeric parameters (float, color components, point2D axes) are MIDI/OSC-mapp
 
 ## Built-in Uniforms
 
-Varda injects these uniforms automatically at `set = 0, binding = 0`:
+Nida injects these uniforms automatically at `set = 0, binding = 0`:
 
 ```glsl
 layout(set = 0, binding = 0) uniform ISFUniforms {
@@ -261,11 +261,11 @@ void main() {
 
 ## Porting an ISF Shader
 
-Varda's JSON header is ISF-compatible, so the metadata usually needs no changes at all. The work is in the GLSL body.
+Nida's JSON header is ISF-compatible, so the metadata usually needs no changes at all. The work is in the GLSL body.
 
 ### What differs
 
-| | Real ISF | Varda |
+| | Real ISF | Nida |
 |---|---|---|
 | Language | GLSL ES (no `#version`) | GLSL 450 Vulkan, `#version 450` required |
 | Uniforms | Injected implicitly by name from `INPUTS` | Declared explicitly in a `UserParams` block |
@@ -279,9 +279,9 @@ Varda's JSON header is ISF-compatible, so the metadata usually needs no changes 
 
 ### Don't clamp your output
 
-Varda composites in linear-light float from the deck stage onward, so values above
-1.0 are meaningful and survive to the tonemap, which rolls them off (ACES by
-default). A terminal
+Nida composites in linear-light float from the deck stage onward, so values above
+1.0 are meaningful and survive to the tonemap, which rolls them off when a
+curve such as ACES is selected (the default, Off, clips them). A terminal
 
 ```glsl
 col = clamp(col, 0.0, 1.0);   // ← don't
@@ -305,7 +305,7 @@ Alpha is the exception: it is coverage, not light, and belongs in `[0, 1]`.
 Two related traps when porting:
 
 - **Don't apply your own gamma.** `col = sqrt(col)` or `pow(col, 1.0/2.2)` at the
-  end of a Shadertoy port is display encoding, which Varda does at the output
+  end of a Shadertoy port is display encoding, which Nida does at the output
   boundary. Doing it in the shader double-encodes. A few bundled shaders still do
   this and are flagged for review.
 - **`IMPORTED` textures are sRGB-tagged**, so sampling them already decodes to
@@ -332,7 +332,7 @@ Two related traps when porting:
 
 ### The vertical flip
 
-**ISF's `isf_FragNormCoord` has `(0,0)` at the bottom-left. Varda's `uv` has `(0,0)` at the top-left.** Substituting one for the other renders the shader upside down.
+**ISF's `isf_FragNormCoord` has `(0,0)` at the bottom-left. Nida's `uv` has `(0,0)` at the top-left.** Substituting one for the other renders the shader upside down.
 
 If the shader is vertically symmetric you won't notice — until you use it on something that isn't, like text or a logo. Check with an asymmetric source before you trust it.
 
@@ -345,7 +345,7 @@ void main() {
 }
 ```
 
-**Do not use the flipped coordinate for texture sampling.** Varda's textures are stored top-left, so `inputImage` and pass buffers are sampled with raw `uv`. Mixing the two is what produces a shader that generates correctly but samples mirrored, or vice versa.
+**Do not use the flipped coordinate for texture sampling.** Nida's textures are stored top-left, so `inputImage` and pass buffers are sampled with raw `uv`. Mixing the two is what produces a shader that generates correctly but samples mirrored, or vice versa.
 
 `gl_FragCoord` needs the same treatment — it is upper-left origin in Vulkan and lower-left in OpenGL:
 
@@ -441,7 +441,7 @@ frame, versus billions for the naive version.
 
 ### Two behaviours that will surprise you
 
-**`PERSISTENT` passes run four times per frame.** Varda substeps persistent passes for numerical stability — 4 iterations at `TIMEDELTA / 4`, with `FRAMEINDEX` advancing once per substep. Time-based simulations integrate correctly (4 × dt/4 == dt), but anything that steps once per invocation regardless of time — cellular automata, fixed-step reaction-diffusion, `FRAMEINDEX`-gated logic — advances **four generations per frame**.
+**`PERSISTENT` passes run four times per frame.** Nida substeps persistent passes for numerical stability — 4 iterations at `TIMEDELTA / 4`, with `FRAMEINDEX` advancing once per substep. Time-based simulations integrate correctly (4 × dt/4 == dt), but anything that steps once per invocation regardless of time — cellular automata, fixed-step reaction-diffusion, `FRAMEINDEX`-gated logic — advances **four generations per frame**.
 
 Design for it: drive state changes from `TIMEDELTA`, or rate-limit against `FRAMEINDEX` explicitly. `game_of_life.fs` does the latter. It also means a persistent multi-pass shader costs roughly 4× its apparent GPU budget, which matters when you are stacking decks.
 
@@ -454,7 +454,7 @@ vec2 snapped = (floor(uv * RENDERSIZE) + 0.5) * texel;
 
 ## Compute Shaders
 
-Beyond fragment shaders, Varda supports **GLSL 450 compute shaders** for work that doesn't fit the one-output-pixel-per-invocation model — particle systems, N-body simulations, cellular automata, and other GPU-native generators. Compute shaders use the **same language and compilation pipeline** as fragment shaders, with an ISF-style JSON header for metadata.
+Beyond fragment shaders, Nida supports **GLSL 450 compute shaders** for work that doesn't fit the one-output-pixel-per-invocation model — particle systems, N-body simulations, cellular automata, and other GPU-native generators. Compute shaders use the **same language and compilation pipeline** as fragment shaders, with an ISF-style JSON header for metadata.
 
 Compute shaders are **generators**: each one renders into its own output image that becomes the deck's source. There is no compute *effect* path — a compute shader does not receive an upstream input texture. If you need to process an incoming frame, use a fragment-shader filter (see [Shader Types](#shader-types)).
 
@@ -518,7 +518,7 @@ The smallest useful compute generator: one invocation per output pixel, no stora
 ```glsl
 /*{
     "DESCRIPTION": "Simple animated gradient (compute shader)",
-    "CREDIT": "Varda VJ",
+    "CREDIT": "Nida VJ",
     "ISFVSN": "2.0",
     "CATEGORIES": ["Generator"],
     "TYPE": "compute",
@@ -689,7 +689,7 @@ This "simulate, then render" split is exactly how `black_hole_sim.comp` works: p
 
 ### See Also
 
-Two reference compute shaders ship with Varda, each demonstrating a different idiom:
+Two reference compute shaders ship with Nida, each demonstrating a different idiom:
 
 - `shaders/black_hole_sim.comp` — a **stateful N-body** simulation: a `PERSISTENT: true` particle buffer that leapfrog-integrates frame to frame, a non-persistent scratch grid for atomic spatial binning, two-pass simulate/render, `PHASE_INPUTS`, and audio reactivity. It puts every feature in this section to work at once.
 - `shaders/cosmic_web.comp` — a **stateless, analytic** simulation: a scientifically grounded dark-matter cosmic web built from the *Zel'dovich approximation*. Pass 0 synthesises a Gaussian displacement field as plane-wave modes drawn from a CDM (BBKS) power spectrum; pass 1 displaces a grid of Lagrangian particles (`x = q + D·Ψ(q)`) and cloud-in-cell deposits them into a fixed-resolution density buffer; pass 2 tone-maps that field into a void→filament→node colormap. Because positions are recomputed each frame from a deterministic seed (no persistent state), it is fully scrubbable, and the growth factor `D` animates the collapse of structure.
@@ -731,7 +731,7 @@ Each preprocessor entry declares:
 
 ### How It Works
 
-1. Varda parses `PREPROCESSORS` from your shader's ISF header
+1. Nida parses `PREPROCESSORS` from your shader's ISF header
 2. The engine starts the requested analyzer(s) on dedicated background threads
 3. Analyzers receive downscaled input frames and produce data textures asynchronously
 4. Data textures are uploaded to the GPU and bound as `texture2D` samplers alongside your other inputs
@@ -820,7 +820,7 @@ void main() {
 
 ## Hot-Reload
 
-Shaders in the `shaders/` directory are watched for changes. Save a `.fs` file and Varda:
+Shaders in the `shaders/` directory are watched for changes. Save a `.fs` file and Nida:
 
 1. Detects the file change
 2. Recompiles GLSL → SPIR-V
@@ -831,12 +831,12 @@ No restart required. Edit shaders in any external editor and see results immedia
 
 ## File Location
 
-Varda loads shaders from a fixed hierarchy, lowest to highest precedence:
+Nida loads shaders from a fixed hierarchy, lowest to highest precedence:
 
 1. Bundled shaders (shipped inside the `.app` / AppImage / tarball)
 2. `./shaders/` in the working directory
 3. The workspace `.varda/shaders/`
-4. The platform user shader dir (`~/.local/share/varda/shaders`, `~/Library/Application Support/Varda/Shaders`, `%APPDATA%\Varda\Shaders`)
+4. The platform user shader dir (`~/.local/share/varda/shaders`, `~/Library/Application Support/Varda/Shaders`, `%APPDATA%\Nida\Shaders`)
 5. Any `--shader-dir <DIR>` flags (repeatable), in the order given
 
 On a name collision the higher-precedence directory wins, so a `--shader-dir` shader overrides a built-in of the same name. The order holds for the whole session: shaders hot-reload as you edit them, and deleting an override restores the shadowed built-in instead of dropping the shader. A `--shader-dir` that doesn't exist is skipped with a warning, not created.

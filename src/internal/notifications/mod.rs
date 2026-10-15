@@ -22,6 +22,10 @@ impl NotificationLevel {
 /// A single notification message
 #[derive(Debug, Clone)]
 pub struct Notification {
+    /// Which notification this is, for as long as it lives: a toast is put
+    /// away by it, not by its place in the stack, which changes as others
+    /// come and go.
+    pub id: u64,
     pub level: NotificationLevel,
     pub message: String,
     pub created_at: Instant,
@@ -51,6 +55,8 @@ pub struct NotificationSystem {
     max_visible: usize,
     /// Keys for which a one-shot notification has already been emitted.
     once_keys: HashSet<String>,
+    /// The id the next notification gets.
+    next_id: u64,
 }
 
 impl NotificationSystem {
@@ -60,22 +66,27 @@ impl NotificationSystem {
             history: Vec::new(),
             max_visible: 5,
             once_keys: HashSet::new(),
+            next_id: 0,
         }
     }
 
-    /// Push a notification with default duration based on severity
+    /// Push a notification, shown as long as its severity asks — longer for
+    /// a message that takes longer to read (see [`reading_time`]).
     pub fn notify(&mut self, level: NotificationLevel, message: impl Into<String>) {
-        let duration = match level {
+        let message = message.into();
+        let by_level = match level {
             NotificationLevel::Info => Duration::from_secs(3),
             NotificationLevel::Warning => Duration::from_secs(5),
             NotificationLevel::Error => Duration::from_secs(8),
         };
 
+        self.next_id += 1;
         let notification = Notification {
+            id: self.next_id,
             level,
-            message: message.into(),
+            duration: by_level.max(reading_time(&message)),
+            message,
             created_at: Instant::now(),
-            duration,
         };
 
         log::log!(
@@ -147,11 +158,14 @@ impl NotificationSystem {
         &self.active[..end]
     }
 
-    /// Dismiss a notification by index
-    pub fn dismiss(&mut self, index: usize) {
-        if index < self.active.len() {
-            self.active.remove(index);
-        }
+    /// Every notification given, oldest first — the last thousand.
+    pub fn history(&self) -> &[Notification] {
+        &self.history
+    }
+
+    /// Put away the notification `id`, if it is still up.
+    pub fn dismiss(&mut self, id: u64) {
+        self.active.retain(|n| n.id != id);
     }
 }
 
@@ -159,6 +173,21 @@ impl Default for NotificationSystem {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Characters a second a toast is read at, glanced at from the show.
+const READ_CHARS_PER_SEC: f32 = 20.0;
+
+/// The longest a toast stays up on its length alone.
+const LONGEST: Duration = Duration::from_secs(20);
+
+/// How long `message` takes to read. A notice of what happened and what to
+/// do about it runs to a few lines, which three seconds never gave anyone
+/// time for.
+fn reading_time(message: &str) -> Duration {
+    #[allow(clippy::cast_precision_loss)]
+    let secs = message.chars().count() as f32 / READ_CHARS_PER_SEC;
+    Duration::from_secs_f32(secs).min(LONGEST)
 }
 
 #[cfg(test)]
@@ -225,8 +254,13 @@ mod tests {
         ns.info("B");
         ns.info("C");
         assert_eq!(ns.visible().len(), 3);
-        ns.dismiss(0);
-        assert_eq!(ns.visible().len(), 2);
+        let b = ns.visible()[1].id;
+        ns.dismiss(b);
+        let left: Vec<&str> = ns.visible().iter().map(|n| n.message.as_str()).collect();
+        assert_eq!(left, ["C", "A"], "B, by its id");
+        ns.info("D");
+        ns.dismiss(b);
+        assert_eq!(ns.visible().len(), 3, "an id put away once is gone, not reused");
     }
 
     #[test]
@@ -234,7 +268,7 @@ mod tests {
         let mut ns = NotificationSystem::new();
         ns.info("A");
         ns.dismiss(10);
-        assert_eq!(ns.visible().len(), 1);
+        assert_eq!(ns.visible().len(), 1, "no such id: nothing put away");
     }
 
     #[test]
@@ -257,6 +291,7 @@ mod tests {
     #[test]
     fn notification_progress() {
         let n = Notification {
+            id: 1,
             level: NotificationLevel::Info,
             message: "Test".into(),
             created_at: Instant::now(),
@@ -270,6 +305,7 @@ mod tests {
     #[test]
     fn notification_is_expired() {
         let n = Notification {
+            id: 1,
             level: NotificationLevel::Info,
             message: "Test".into(),
             created_at: Instant::now()
@@ -283,6 +319,7 @@ mod tests {
     #[test]
     fn notification_not_expired() {
         let n = Notification {
+            id: 1,
             level: NotificationLevel::Info,
             message: "Test".into(),
             created_at: Instant::now(),
@@ -296,6 +333,7 @@ mod tests {
         let mut ns = NotificationSystem::new();
         ns.notify(NotificationLevel::Info, "Fresh");
         let _expired = Notification {
+            id: 1,
             level: NotificationLevel::Error,
             message: "Old".into(),
             created_at: Instant::now()
@@ -334,6 +372,18 @@ mod tests {
         let mut ns3 = NotificationSystem::new();
         ns3.error("e");
         assert_eq!(ns3.visible()[0].duration, Duration::from_secs(8));
+    }
+
+    /// A long notice stays up long enough to read, but not for ever.
+    #[test]
+    fn a_long_notice_stays_up_long_enough_to_read() {
+        let mut ns = NotificationSystem::new();
+        ns.info("x".repeat(300));
+        assert_eq!(ns.visible()[0].duration, Duration::from_secs(15));
+        ns.error("x".repeat(1000));
+        assert_eq!(ns.visible()[0].duration, Duration::from_secs(20), "at most");
+        ns.warn("x".repeat(40));
+        assert_eq!(ns.visible()[0].duration, Duration::from_secs(5), "short: by severity");
     }
 
     // ── Offensive: history must be capped at 1000 ────────────────────

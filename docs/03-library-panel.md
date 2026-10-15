@@ -14,7 +14,7 @@ The panel is a stack of collapsible sections, in this order:
 | **🎬 Video** | Per-channel **📁 Load to [Channel]** button (opens a file dialog). |
 | **📹 Cameras** | Detected camera devices, with a **🔄 Rescan** button. |
 | **🖥 Screen Capture** | Capturable displays and windows, with a **🔄 Rescan** button (see below). |
-| **🔁 Taps** | Varda's own master program and each channel, as sources (see below). |
+| **🔁 Taps** | Nida's own master program and each channel, as sources (see below). |
 | **📡 Stream Sources** | NDI, SRT, HLS, DASH, and RTMP sources (see below). |
 | **🌐 HTML Sources** | Web pages (HTML/CSS/JS) rendered by Servo (see below). |
 | **💾 Deck Presets** | Saved deck presets (shown only when presets exist). |
@@ -32,7 +32,7 @@ The Library is built around drag-and-drop. The core gesture is **drag an item on
 | **Effect** | `◇` | Drag onto a deck/channel/master **effect chain**, or onto the owner itself (mixer deck card, channel empty space, Main Output preview, arrangement lane / automation) → appends the effect and selects the owner. |
 | **Camera** | `📹` | Drag onto a channel → new camera deck. |
 | **Capture target** | `🖥` | Drag onto a channel → new screen or window capture deck. |
-| **Tap** | `🔁` | Drag onto a channel → new deck reading Varda's own output. |
+| **Tap** | `🔁` | Drag onto a channel → new deck reading Nida's own output. |
 | **NDI** | `📡` | Drag onto a channel → new NDI deck. |
 | **SRT / HLS / DASH / RTMP** | `📺` / `📡` | Drag onto a channel → new stream deck. |
 | **HTML** | `🌐` | Drag onto a channel → new HTML deck. |
@@ -77,7 +77,7 @@ Like stream library entries, the URLs you add here are session-only quick-access
 Camera devices are enumerated automatically at startup (AVFoundation on macOS, V4L2 on Linux) and listed under **📹 Cameras**. Each device is draggable onto a channel to create a camera deck.
 
 - **🔄 Rescan** re-enumerates connected devices. Use it after plugging in a USB camera.
-- Camera decks are persisted by device **name** in `scene.json`. On reload, Varda re-opens the camera by name; if it isn't connected, the deck is skipped with a warning.
+- Camera decks are persisted by device **name** (and the format chosen) in `scene.json`. On reload, Nida re-opens the camera by name; if it isn't connected, the layer is kept, waiting, and takes the camera as soon as it is plugged in (📹 *name* connected).
 
 ### Resolution
 
@@ -88,15 +88,15 @@ The **resolution selector** is not in the Library — it lives in the **deck det
 The **🖥 Screen Capture** section lists capturable displays and windows, split into **Displays** and **Windows** groups. Drag either onto a channel to create a live capture deck. Hovering a row shows the target's pixel size.
 
 - **🔄 Rescan** re-enumerates targets. The list is never polled in the background, because window lists change every time you switch apps, so press Rescan after opening or closing the app you want.
-- Varda's own windows are labeled `(Varda)` and tinted, so self-capture is deliberate rather than accidental.
-- On macOS the section also shows the Screen Recording permission state and, when access has not been granted, a **Grant Screen Recording access** button. Varda must be restarted after granting.
+- Nida's own windows are labeled `(Nida)` and tinted, so self-capture is deliberate rather than accidental.
+- On macOS the section also shows the Screen Recording permission state and, when access has not been granted, a **Grant Screen Recording access** button. Nida must be restarted after granting.
 - Capture decks are persisted in `scene.json` by display name or by application and window title. If the target is gone at load time the deck is kept and renders black rather than being dropped.
 
 Rate, crop, cursor, and Varda-exclusion controls live in the **deck detail panel** (bottom bar) when a capture deck is selected. See [Screen & Window Capture](09-streaming-and-io.md#screen--window-capture) for those controls, the permission flow, and performance notes.
 
 ## Taps
 
-The **🔁 Taps** section feeds Varda's own output back in as a deck source. It lists **Master Program** plus every channel, and is built from the live mixer rather than a device scan, so there is nothing to rescan.
+The **🔁 Taps** section feeds Nida's own output back in as a deck source. It lists **Master Program** plus every channel, and is built from the live mixer rather than a device scan, so there is nothing to rescan.
 
 - Drag an entry onto a channel to create a tap deck.
 - A tap always shows the **previous** frame, which is what keeps feedback loops stable and makes the delay independent of deck ordering.

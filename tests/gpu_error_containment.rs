@@ -94,7 +94,7 @@ fn the_device_still_works_after_a_validation_error() {
     let mut cmds = Vec::new();
     deck.render(&gpu, &audio, &modulation, 0, &mut cmds)
         .expect("render succeeds after a validation error");
-    gpu.queue.submit(cmds);
+    gpu.submit(cmds);
     let _ = gpu.device.poll(wgpu::PollType::Wait {
         submission_index: None,
         timeout: Some(std::time::Duration::from_secs(5)),

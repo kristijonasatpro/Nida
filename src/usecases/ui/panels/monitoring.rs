@@ -1,26 +1,48 @@
 //! Live system telemetry: frame rate, GPU load, CPU, and memory.
 //!
-//! Grouped as one health cluster rather than scattered through the top bar,
-//! because these are things you glance at when something feels wrong, not
-//! settings you change. They sit at the bottom of the right panel, and stay
-//! readable as a vertical strip when that panel is collapsed, so a performer
-//! who reclaims the screen space does not lose the frame rate with it.
+//! Grouped as one health cluster, because these are things you glance at when
+//! something feels wrong, not settings you change. They sit in the top bar,
+//! which every screen layout keeps, so no arrangement of panels loses the
+//! frame rate.
 
 use super::super::{UIActions, UIData};
 use super::popovers::{render_fps_popover, render_gpu_popover, status_popover};
 
-const GOOD: egui::Color32 = egui::Color32::from_rgb(100, 220, 100);
-const WARN: egui::Color32 = egui::Color32::from_rgb(220, 200, 60);
-const BAD: egui::Color32 = egui::Color32::from_rgb(220, 60, 60);
+pub(super) const GOOD: egui::Color32 = egui::Color32::from_rgb(100, 220, 100);
+pub(super) const WARN: egui::Color32 = egui::Color32::from_rgb(220, 200, 60);
+pub(super) const BAD: egui::Color32 = egui::Color32::from_rgb(220, 60, 60);
 
 /// Frame rate is the one metric where high is good, so it reads inverted.
-fn fps_color(fps: f32) -> egui::Color32 {
-    if fps > 55.0 {
+/// Judged against the target, as OBS shows "30.00 / 30.00 FPS": a show at
+/// 50 fps for an LED wall read yellow against a fixed 55. Uncapped, against
+/// 55 and 30.
+pub(super) fn fps_color(fps: f32, target: u32) -> egui::Color32 {
+    if target == 0 {
+        return if fps > 55.0 {
+            GOOD
+        } else if fps > 30.0 {
+            WARN
+        } else {
+            BAD
+        };
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let share = fps / target as f32;
+    if share >= 0.97 {
         GOOD
-    } else if fps > 30.0 {
+    } else if share >= 0.85 {
         WARN
     } else {
         BAD
+    }
+}
+
+/// "50/50 FPS" — the frame rate and its target — or, uncapped, "143 FPS".
+fn fps_text(fps: f32, target: u32) -> String {
+    if target == 0 {
+        format!("{fps:.0} FPS")
+    } else {
+        format!("{fps:.0}/{target} FPS")
     }
 }
 
@@ -71,7 +93,7 @@ fn ram_percent(data: &UIData) -> f32 {
     data.ram_used as f32 / data.ram_total as f32 * 100.0
 }
 
-/// The full cluster, for the bottom of the expanded right panel.
+/// The full cluster, in the row it is drawn in — the top bar.
 ///
 /// `actions` is unused today but kept in the signature: the popovers this opens
 /// are shared with paths that emit commands, and threading it later would touch
@@ -81,14 +103,14 @@ pub(super) fn render_monitoring_section(
     data: &UIData,
     _actions: &mut UIActions,
 ) {
-    ui.horizontal_wrapped(|ui| {
+    ui.scope(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
 
         let fps_response = ui
             .add(
                 egui::Label::new(
-                    egui::RichText::new(format!("{:.0} FPS", data.fps))
-                        .color(fps_color(data.fps))
+                    egui::RichText::new(fps_text(data.fps, data.target_fps))
+                        .color(fps_color(data.fps, data.target_fps))
                         .monospace()
                         .small(),
                 )
@@ -110,7 +132,11 @@ pub(super) fn render_monitoring_section(
                 )
                 .sense(egui::Sense::click()),
             )
-            .on_hover_text("GPU utilization — click for details");
+            .on_hover_text(if data.gpu_utilization_measured {
+                "How busy the GPU is, as macOS reports it — click for details"
+            } else {
+                "GPU load, estimated from the layers' costs — click for details"
+            });
         status_popover(&gpu_response, |ui| {
             render_gpu_popover(ui, data);
         });
@@ -155,58 +181,31 @@ pub(super) fn render_monitoring_section(
     });
 }
 
-/// The same four values stacked for the collapsed rail, which is 36 px wide.
-///
-/// Values only, no labels: at this width a label costs a whole row, and colour
-/// plus position already say which is which. Hover gives the full text.
-pub(super) fn render_monitoring_strip(ui: &mut egui::Ui, data: &UIData) {
-    let gpu = data.gpu_utilization;
-    let rows = [
-        (
-            format!("{:.0}", data.fps),
-            fps_color(data.fps),
-            format!("{:.0} FPS", data.fps),
-        ),
-        (
-            format!("{gpu:.0}%"),
-            load_color(gpu),
-            format!("GPU {gpu:.0}%"),
-        ),
-        (
-            format!("{:.0}%", data.cpu_usage),
-            load_color(data.cpu_usage),
-            format!("CPU {:.0}%", data.cpu_usage),
-        ),
-        (
-            format!("{:.1}G", ram_gb(data.ram_used)),
-            load_color(ram_percent(data)),
-            format!(
-                "RAM {:.1} of {:.0} GB",
-                ram_gb(data.ram_used),
-                ram_gb(data.ram_total)
-            ),
-        ),
-    ];
-
-    for (text, color, hover) in rows {
-        ui.label(egui::RichText::new(text).color(color).monospace().small())
-            .on_hover_text(hover);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn fps_colour_is_inverted_relative_to_load() {
-        assert_eq!(fps_color(60.0), GOOD);
-        assert_eq!(fps_color(45.0), WARN);
-        assert_eq!(fps_color(12.0), BAD);
+        assert_eq!(fps_color(60.0, 0), GOOD);
+        assert_eq!(fps_color(45.0, 0), WARN);
+        assert_eq!(fps_color(12.0, 0), BAD);
 
         assert_eq!(load_color(10.0), GOOD);
         assert_eq!(load_color(60.0), WARN);
         assert_eq!(load_color(95.0), BAD);
+    }
+
+    /// Against its target, the frame rate reads "50/50 FPS" and green: a
+    /// fixed 55 called a perfect 50 a warning and a perfect 30 bad.
+    #[test]
+    fn the_frame_rate_is_judged_against_its_target() {
+        assert_eq!(fps_text(50.0, 50), "50/50 FPS");
+        assert_eq!(fps_text(143.4, 0), "143 FPS", "uncapped: no target");
+        assert_eq!(fps_color(50.0, 50), GOOD);
+        assert_eq!(fps_color(29.9, 30), GOOD);
+        assert_eq!(fps_color(45.0, 50), WARN);
+        assert_eq!(fps_color(30.0, 60), BAD);
     }
 
     /// A machine reporting no total memory must not divide by zero.
@@ -247,17 +246,14 @@ mod tests {
     }
 
     #[test]
-    fn both_layouts_render() {
+    fn the_cluster_renders_in_a_row() {
         let data = UIData::test_fixture();
         let mut actions = UIActions::new();
         {
-            let _expanded = egui_kittest::Harness::new_ui(|ui| {
-                render_monitoring_section(ui, &data, &mut actions);
+            let _harness = egui_kittest::Harness::new_ui(|ui| {
+                ui.horizontal(|ui| render_monitoring_section(ui, &data, &mut actions));
             });
         }
-        let _collapsed = egui_kittest::Harness::new_ui(|ui| {
-            render_monitoring_strip(ui, &data);
-        });
         assert!(actions.commands.is_empty());
     }
 }

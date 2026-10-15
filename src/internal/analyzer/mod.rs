@@ -342,7 +342,7 @@ impl DeckAnalyzers {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Analyzer readback"),
         });
-        readback.begin_readback(&mut encoder, source_texture);
+        readback.begin_readback(&mut encoder, source_texture, std::time::Instant::now());
         Some(encoder.finish())
     }
 

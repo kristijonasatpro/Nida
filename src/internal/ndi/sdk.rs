@@ -6,9 +6,9 @@
 //! all NDI features gracefully degrade.
 
 use super::ffi::{
-    NDIlib_find_create_t, NDIlib_find_instance_t, NDIlib_frame_type_e, NDIlib_recv_create_v3_t,
-    NDIlib_recv_instance_t, NDIlib_send_create_t, NDIlib_send_instance_t, NDIlib_source_t,
-    NDIlib_video_frame_v2_t,
+    NDIlib_audio_frame_v3_t, NDIlib_find_create_t, NDIlib_find_instance_t, NDIlib_frame_type_e,
+    NDIlib_recv_create_v3_t, NDIlib_recv_instance_t, NDIlib_send_create_t, NDIlib_send_instance_t,
+    NDIlib_source_t, NDIlib_video_frame_v2_t,
 };
 use libloading::{Library, Symbol};
 use std::os::raw::{c_char, c_uint};
@@ -95,12 +95,18 @@ pub struct NdiSdk {
     ) -> NDIlib_frame_type_e,
     pub recv_free_video_v2:
         unsafe extern "C" fn(NDIlib_recv_instance_t, *const NDIlib_video_frame_v2_t),
+    /// Missing from runtimes before NDI 5: sound is then not taken.
+    pub recv_free_audio_v3:
+        Option<unsafe extern "C" fn(NDIlib_recv_instance_t, *const NDIlib_audio_frame_v3_t)>,
 
     // Send
     pub send_create: unsafe extern "C" fn(*const NDIlib_send_create_t) -> NDIlib_send_instance_t,
     pub send_destroy: unsafe extern "C" fn(NDIlib_send_instance_t),
     pub send_send_video_v2:
         unsafe extern "C" fn(NDIlib_send_instance_t, *const NDIlib_video_frame_v2_t),
+    /// Missing from runtimes before NDI 5: senders then carry no sound.
+    pub send_send_audio_v3:
+        Option<unsafe extern "C" fn(NDIlib_send_instance_t, *const NDIlib_audio_frame_v3_t)>,
 }
 
 impl NdiSdk {
@@ -224,6 +230,24 @@ impl NdiSdk {
         type FnSendDestroy = unsafe extern "C" fn(NDIlib_send_instance_t);
         type FnSendVideo =
             unsafe extern "C" fn(NDIlib_send_instance_t, *const NDIlib_video_frame_v2_t);
+        type FnRecvFreeAudio =
+            unsafe extern "C" fn(NDIlib_recv_instance_t, *const NDIlib_audio_frame_v3_t);
+        type FnSendAudio =
+            unsafe extern "C" fn(NDIlib_send_instance_t, *const NDIlib_audio_frame_v3_t);
+        macro_rules! optional_fn {
+            ($lib:expr, $name:expr, $ty:ty) => {{
+                match $lib.get::<$ty>($name) {
+                    Ok(sym) => Some(*sym.into_raw()),
+                    Err(_) => {
+                        log::info!(
+                            "NDI runtime has no {}: no sound over NDI",
+                            String::from_utf8_lossy($name)
+                        );
+                        None
+                    }
+                }
+            }};
+        }
 
         let version_fn = load_fn!(lib, b"NDIlib_version\0", FnVersion);
         let version_ptr = version_fn();
@@ -253,6 +277,8 @@ impl NdiSdk {
             send_create: load_fn!(lib, b"NDIlib_send_create\0", FnSendCreate),
             send_destroy: load_fn!(lib, b"NDIlib_send_destroy\0", FnSendDestroy),
             send_send_video_v2: load_fn!(lib, b"NDIlib_send_send_video_v2\0", FnSendVideo),
+            recv_free_audio_v3: optional_fn!(lib, b"NDIlib_recv_free_audio_v3\0", FnRecvFreeAudio),
+            send_send_audio_v3: optional_fn!(lib, b"NDIlib_send_send_audio_v3\0", FnSendAudio),
             runtime_version,
             lib,
         })

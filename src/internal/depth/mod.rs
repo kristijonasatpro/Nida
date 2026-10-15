@@ -557,7 +557,7 @@ mod tests {
             break;
         }
         assert!(uploaded, "mock backend never produced a frame to upload");
-        gpu.queue.submit(std::iter::empty());
+        gpu.submit(std::iter::empty());
         mgr.release(0);
     }
 

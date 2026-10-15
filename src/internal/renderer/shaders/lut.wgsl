@@ -58,7 +58,11 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     // Apply 1D shaper if present (redistributes precision in input range)
     if (params.has_shaper == 1u) {
         let shaper_range = params.shaper_domain_max - params.shaper_domain_min;
-        let shaper_uv = clamp((rgb - params.shaper_domain_min) / shaper_range, vec3(0.0), vec3(1.0));
+        let shaper_in = clamp((rgb - params.shaper_domain_min) / shaper_range, vec3(0.0), vec3(1.0));
+        // Entry i sits at the centre of texel i: 0 and 1 land on the first
+        // and last entries, not half a texel outside them.
+        let shaper_n = f32(textureDimensions(shaper_1d).x);
+        let shaper_uv = (shaper_in * (shaper_n - 1.0) + 0.5) / shaper_n;
         // Sample shaper as a 1D lookup — stored as a Nx1 2D texture, one sample per channel
         rgb = vec3(
             textureSample(shaper_1d, shaper_sampler, vec2(shaper_uv.r, 0.5)).r,
@@ -69,7 +73,12 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
 
     // Scale input from [domain_min, domain_max] to [0, 1] for 3D texture lookup
     let lut_range = params.domain_max - params.domain_min;
-    let lut_uv = clamp((rgb - params.domain_min) / lut_range, vec3(0.0), vec3(1.0));
+    let lut_in = clamp((rgb - params.domain_min) / lut_range, vec3(0.0), vec3(1.0));
+    // Grid point i sits at the centre of texel i, so the lookup is taken
+    // there: sampled at the raw input, everything between the grid's ends
+    // came out up to half a grid step off — an identity LUT was not one.
+    let n = vec3<f32>(textureDimensions(lut_3d));
+    let lut_uv = (lut_in * (n - 1.0) + 0.5) / n;
 
     // Sample 3D LUT with trilinear interpolation
     rgb = textureSample(lut_3d, lut_sampler, lut_uv).rgb;

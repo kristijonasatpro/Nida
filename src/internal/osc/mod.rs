@@ -69,10 +69,16 @@ impl OscConfig {
     /// Returns an error if the config cannot be serialized to JSON or if the
     /// atomic write to `path` fails (missing directory, permissions, disk full).
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let content =
-            serde_json::to_string_pretty(self).context("Failed to serialize OSC config")?;
-        crate::persistence::atomic_write(path.as_ref(), &content)?;
-        Ok(())
+        crate::persistence::atomic_write(path.as_ref(), &self.to_json()?)
+    }
+
+    /// The text [`OscConfig::save`] writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be serialized to JSON.
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string_pretty(self).context("Failed to serialize OSC config")
     }
 }
 

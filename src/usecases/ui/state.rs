@@ -102,6 +102,10 @@ pub struct UILayoutState {
     pub dome_geometry: DomeGeometry,
     /// Camera detection mode state
     pub camera_detect_mode: CameraDetectMode,
+    /// Which panels the window shows, and where.
+    pub screen: crate::usecases::ui::screen_layout::ScreenLayout,
+    /// Channels folded to a strip in the Inputs panel, by UUID.
+    pub collapsed_channels: Vec<String>,
 }
 
 impl Default for UILayoutState {
@@ -133,8 +137,26 @@ impl Default for UILayoutState {
             dome_preset: DomePreset::Quad,
             dome_geometry: DomeGeometry::default(),
             camera_detect_mode: CameraDetectMode::Off,
+            screen: crate::usecases::ui::screen_layout::ScreenLayout::default(),
+            collapsed_channels: Vec::new(),
         }
     }
+}
+
+/// Where a channel moved before another (or to the end) goes: its position
+/// now and after, in `order`. `None` when it is not there.
+pub fn move_target(order: &[String], uuid: &str, before: Option<&str>) -> Option<(usize, usize)> {
+    let from = order.iter().position(|u| u == uuid)?;
+    let rest: Vec<&String> = order.iter().filter(|u| *u != uuid).collect();
+    let to = before
+        .filter(|b| *b != uuid)
+        .and_then(|b| rest.iter().position(|u| *u == b))
+        .unwrap_or(if before == Some(uuid) {
+            from
+        } else {
+            rest.len()
+        });
+    Some((from, to))
 }
 
 /// Camera detection mode state machine.
@@ -257,6 +279,13 @@ impl UILayoutState {
         if session.toggle_right_panel {
             self.right_panel_open = !self.right_panel_open;
         }
+        if let Some(uuid) = &session.toggle_collapsed_channel {
+            if let Some(at) = self.collapsed_channels.iter().position(|u| u == uuid) {
+                self.collapsed_channels.remove(at);
+            } else {
+                self.collapsed_channels.push(uuid.clone());
+            }
+        }
         if session.toggle_dome_preview {
             self.dome_preview_open = !self.dome_preview_open;
         }
@@ -305,6 +334,28 @@ impl UILayoutState {
         }
     }
 
+    /// Keep the selection on the same channels after one moves from `from`
+    /// to `to`: selections are held by position.
+    pub fn fixup_channel_move(&mut self, from: usize, to: usize) {
+        let moved = |i: usize| {
+            if i == from {
+                to
+            } else if from < to && (from + 1..=to).contains(&i) {
+                i - 1
+            } else if to < from && (to..from).contains(&i) {
+                i + 1
+            } else {
+                i
+            }
+        };
+        if let Some((ch, deck)) = self.selected_deck {
+            self.selected_deck = Some((moved(ch), deck));
+        }
+        if let Some(ch) = self.selected_channel {
+            self.selected_channel = Some(moved(ch));
+        }
+    }
+
     /// Fix up selection indices after a channel is removed.
     pub fn fixup_channel_removal(&mut self, removed_ch: usize) {
         if let Some((sel_ch, _)) = self.selected_deck {
@@ -324,6 +375,57 @@ impl UILayoutState {
                 self.selected_channel = Some(sel_ch - 1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod channel_move_tests {
+    use super::*;
+
+    fn order() -> Vec<String> {
+        ["a", "b", "c", "d"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_channel_moves_before_another_or_to_the_end() {
+        assert_eq!(move_target(&order(), "d", Some("a")), Some((3, 0)));
+        assert_eq!(move_target(&order(), "a", Some("c")), Some((0, 1)));
+        assert_eq!(move_target(&order(), "b", None), Some((1, 3)));
+        assert_eq!(move_target(&order(), "b", Some("b")), Some((1, 1)));
+        assert_eq!(move_target(&order(), "x", None), None);
+    }
+
+    /// Selections are held by position, so a move carries them along.
+    #[test]
+    fn the_selection_follows_the_channels_it_was_on() {
+        let mut layout = UILayoutState {
+            selected_channel: Some(3),
+            ..Default::default()
+        };
+        layout.fixup_channel_move(3, 0);
+        assert_eq!(layout.selected_channel, Some(0), "the moved one");
+        let mut layout = UILayoutState {
+            selected_deck: Some((1, 2)),
+            ..Default::default()
+        };
+        layout.fixup_channel_move(3, 0);
+        assert_eq!(layout.selected_deck, Some((2, 2)), "pushed along");
+        layout.fixup_channel_move(0, 3);
+        assert_eq!(layout.selected_deck, Some((1, 2)), "and back");
+    }
+
+    #[test]
+    fn a_fold_toggles() {
+        let mut layout = UILayoutState::default();
+        let mut actions = crate::usecases::ui::UIActions::new();
+        actions.session.toggle_collapsed_channel = Some("ch1".into());
+        layout.apply_selections(&actions);
+        assert_eq!(layout.collapsed_channels, vec!["ch1".to_string()]);
+        layout.apply_selections(&actions);
+        assert!(layout.collapsed_channels.is_empty());
     }
 }
 

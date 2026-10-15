@@ -155,6 +155,11 @@ fn envelope_breakpoints<'a>(data: &'a UIData, envelope_uuid: &str) -> Option<&'a
 ///
 /// Intersection, not containment: a transition that begins a hair before the
 /// drag is still "this clip transition" and has to count.
+///
+/// Deliberately the raw rule, degenerate inputs included — see
+/// `chaos_hostile_region_geometry_has_deterministic_membership`. Whether a span
+/// *cuts* anything from a region it touches is [`region_slice`]'s question, not
+/// this one.
 fn intersects(region: &RegionConfig, start: f64, end: f64) -> bool {
     region.start < end && region.end > start
 }
@@ -188,6 +193,15 @@ fn region_slice(region: &RegionConfig, start: f64, end: f64) -> Option<RegionSli
 
     let selected_start = region.start.max(start);
     let selected_end = region.end.min(end);
+    // Touching is not cutting. A span with no width — a click that never became
+    // a drag — overlaps by the membership rule but removes nothing, and a
+    // zero-length `selected` piece is one `RegionConfig::is_valid` rejects and
+    // whose own docs say must never survive: "a drag that collapses on itself
+    // is harmless". The UI guards this with `MARQUEE_MIN_DRAG`; this is the
+    // matching guarantee at the geometry layer.
+    if selected_start >= selected_end {
+        return None;
+    }
     let selected = RegionConfig {
         start: selected_start,
         end: selected_end,
@@ -1065,6 +1079,52 @@ mod tests {
         assert!((floor - 6.0).abs() < 1e-9, "{floor}");
     }
 
+    /// A click that never became a drag cuts nothing.
+    ///
+    /// It still *touches* the region under it — membership is deliberately the
+    /// raw overlap rule — but `region_slice` must not hand back a zero-length
+    /// `selected` piece, which `is_valid` rejects. Found by the crop property
+    /// below, shrunk to region [3132, 6151] with the selection collapsed at
+    /// 6150.
+    #[test]
+    fn an_empty_span_touches_a_region_but_cuts_nothing() {
+        let region = RegionConfig {
+            start: 3132.0,
+            end: 6151.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+        };
+        assert!(
+            intersects(&region, 6150.0, 6150.0),
+            "membership is the raw rule and must not change"
+        );
+        assert!(
+            region_slice(&region, 6150.0, 6150.0).is_none(),
+            "but nothing is cut, so there is no slice"
+        );
+
+        // A span with any width at the same place still slices normally.
+        let sliced = region_slice(&region, 6150.0, 6151.0).expect("a real span slices");
+        assert!(sliced.selected.is_valid());
+        assert!(sliced.remainders.iter().all(|r| r.is_valid()));
+    }
+
+    /// A span that only grazes an edge cuts nothing either.
+    #[test]
+    fn a_span_meeting_a_region_edge_exactly_cuts_nothing() {
+        let region = RegionConfig {
+            start: 10.0,
+            end: 20.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+        };
+        // Overlap is strict at both ends, so these do not even touch.
+        assert!(!intersects(&region, 0.0, 10.0));
+        assert!(region_slice(&region, 0.0, 10.0).is_none());
+        assert!(!intersects(&region, 20.0, 30.0));
+        assert!(region_slice(&region, 20.0, 30.0).is_none());
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
@@ -1096,7 +1156,13 @@ mod tests {
                 prop_assert!(sliced.is_none());
                 return Ok(());
             }
-            let sliced = sliced.expect("an intersection always has a slice");
+            let Some(sliced) = sliced else {
+                // Touched, but nothing cut: only a span with no width can do
+                // that, and it is not a cut this property has anything to say
+                // about.
+                prop_assert!(selection_start >= selection_end);
+                return Ok(());
+            };
             let mut pieces = sliced.remainders.clone();
             pieces.push(sliced.selected);
             pieces.sort_by(|a, b| a.start.total_cmp(&b.start));

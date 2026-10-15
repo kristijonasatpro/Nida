@@ -182,6 +182,26 @@ impl SequencerState {
 }
 
 /// Active transition effect between channels A and B
+impl TransitionEffect {
+    /// `shader` compiled, its parameters at their defaults.
+    pub(super) fn compile(context: &GpuContext, shader: ISFShader) -> Result<Self> {
+        let name = shader.name();
+        let spirv = compile_glsl_to_spirv(&shader.fragment_source, &name)
+            .context("Failed to compile transition shader")?;
+        let pipeline = TransitionPipeline::new(&context.device, &spirv, context.compositing_format)
+            .context("Failed to create transition pipeline")?;
+        let inputs = shader.metadata.inputs.as_deref().unwrap_or(&[]);
+        let mut params = ShaderParams::from_inputs(inputs);
+        params.ensure_buffer(&context.device);
+        Ok(Self {
+            shader,
+            pipeline,
+            params,
+            name,
+        })
+    }
+}
+
 pub struct TransitionEffect {
     /// The ISF transition shader source
     pub shader: ISFShader,
@@ -263,25 +283,9 @@ impl Mixer {
     /// Returns an error if the shader's GLSL fails to compile to SPIR-V or if the
     /// transition render pipeline cannot be created from the resulting module.
     pub fn set_transition(&mut self, context: &GpuContext, shader: ISFShader) -> Result<()> {
-        let name = shader.name();
-        let spirv = compile_glsl_to_spirv(&shader.fragment_source, &name)
-            .context("Failed to compile transition shader")?;
-
-        let target_format = context.compositing_format;
-        let pipeline = TransitionPipeline::new(&context.device, &spirv, target_format)
-            .context("Failed to create transition pipeline")?;
-
-        let inputs = shader.metadata.inputs.as_deref().unwrap_or(&[]);
-        let mut params = ShaderParams::from_inputs(inputs);
-        params.ensure_buffer(&context.device);
-
-        log::info!("Active transition set: {name}");
-        self.active_transition = Some(TransitionEffect {
-            shader,
-            pipeline,
-            params,
-            name,
-        });
+        let effect = TransitionEffect::compile(context, shader)?;
+        log::info!("Active transition set: {}", effect.name);
+        self.active_transition = Some(effect);
         Ok(())
     }
 

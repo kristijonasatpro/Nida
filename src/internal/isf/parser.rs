@@ -1,5 +1,6 @@
 use super::metadata::ISFMetadata;
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Parsed ISF shader file
@@ -82,6 +83,33 @@ impl ISFShader {
         &self.fragment_source
     }
 
+    /// Whether each pixel this filter puts out depends on the input image at
+    /// that same pixel only: a single pass, nothing imported or kept from
+    /// frame to frame, and one texture read in all —
+    /// `texture(sampler2D(inputImage, texSampler), uv)`. Such a filter run on
+    /// part of the frame gives that part exactly as run on the whole. Colour
+    /// corrections, crop and single-pixel keys are; blur, warps and glitches,
+    /// which read round about, are not.
+    pub fn is_pointwise(&self) -> bool {
+        const READ_AT_UV: &str = "texture(sampler2D(inputImage, texSampler), uv)";
+        let m = &self.metadata;
+        let one_pass = m
+            .passes
+            .as_ref()
+            .is_none_or(|passes| passes.iter().all(|p| p.target.is_none()));
+        let nothing_more = m.imported.as_ref().is_none_or(HashMap::is_empty)
+            && m.persistent_buffers.as_ref().is_none_or(Vec::is_empty)
+            && m.preprocessors.is_empty()
+            && m.shader_type.is_none();
+        let source = &self.fragment_source;
+        // `uv` could be shadowed by a local of the same name.
+        one_pass
+            && nothing_more
+            && texture_reads(source) == 1
+            && source.matches(READ_AT_UV).count() == 1
+            && source.matches("vec2 uv").count() == 1
+    }
+
     /// Get shader author/credit
     pub fn credit(&self) -> String {
         self.metadata
@@ -89,6 +117,30 @@ impl ISFShader {
             .clone()
             .unwrap_or_else(|| "Unknown".to_string())
     }
+}
+
+/// Texture reads in GLSL source: calls of any function named `texture…` or
+/// `texel…`, comments included, which only errs towards counting more.
+fn texture_reads(source: &str) -> usize {
+    let bytes = source.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    source
+        .match_indices("tex")
+        .filter(|&(at, _)| {
+            let rest = &source[at..];
+            if at > 0 && is_ident(bytes[at - 1]) {
+                return false;
+            }
+            if !(rest.starts_with("texture") || rest.starts_with("texel")) {
+                return false;
+            }
+            let name_end = rest
+                .bytes()
+                .position(|b| !is_ident(b))
+                .unwrap_or(rest.len());
+            rest[name_end..].trim_start().starts_with('(')
+        })
+        .count()
 }
 
 /// Extract JSON metadata and GLSL code from ISF file content
@@ -119,6 +171,44 @@ fn extract_json_and_glsl(content: &str) -> Result<(ISFMetadata, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn library(name: &str) -> ISFShader {
+        ISFShader::from_file(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("shaders/{name}.fs")),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn filters_reading_only_their_own_pixel_are_pointwise() {
+        for name in [
+            "crop",
+            "brightness_contrast",
+            "color_correction",
+            "invert",
+            "vignette",
+        ] {
+            assert!(library(name).is_pointwise(), "{name}");
+        }
+        for name in [
+            "transform",
+            "blur",
+            "pixelate",
+            "chroma_key",
+            "feedback_trails",
+            "chroma_flow",
+        ] {
+            assert!(!library(name).is_pointwise(), "{name}");
+        }
+    }
+
+    #[test]
+    fn texture_reads_are_counted_by_their_calls() {
+        let source = "uniform texture2D inputImage; // texture( in a comment\n\
+                      vec4 a = texture(sampler2D(inputImage, texSampler), uv);\n\
+                      vec4 b = texelFetch (x, p, 0); float mytexture(float v);";
+        assert_eq!(texture_reads(source), 3);
+    }
 
     #[test]
     fn test_parse_simple_isf() {

@@ -57,6 +57,12 @@ impl WindowHost for ActiveEventLoop {
 }
 
 impl ApplicationHandler for UIRunner {
+    /// The engine thread drew a frame (see `engine_thread`): the control
+    /// window shows it at its next turn.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, (): ()) {
+        self.ui_due = true;
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Guard re-entry (resumed can be called multiple times on some platforms)
         if self.varda.is_some() {
@@ -78,6 +84,13 @@ impl ApplicationHandler for UIRunner {
                 }
             };
             self.finish_init(gpu, None, startup_t0, event_loop);
+            // Headless has no window, so no events ever arrive to wake the
+            // loop. winit's default `ControlFlow` is `Wait`, which suspends
+            // the thread until one does — so without this the loop runs only
+            // while incidental startup events trickle in, then blocks forever
+            // and stops draining commands. Pacing is handled by the sleep in
+            // `about_to_wait`, so polling here costs no spin.
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
         } else {
             // Windowed: create main UI window, then spawn GPU init on a background
             // thread so we return from resumed() immediately.  On macOS (especially
@@ -94,9 +107,12 @@ impl ApplicationHandler for UIRunner {
                     winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
                 })
             };
-            let mut window_attrs = Window::default_attributes()
-                .with_title("Varda VJ Software")
-                .with_inner_size(winit::dpi::LogicalSize::new(1920, 1080));
+            let mut window_attrs = crate::app::app_id::tagged(
+                Window::default_attributes()
+                    .with_title("Nida")
+                    .with_inner_size(winit::dpi::LogicalSize::new(1920, 1080)),
+                crate::app::app_id::MAIN,
+            );
             if let Some(icon) = window_icon {
                 window_attrs = window_attrs.with_window_icon(Some(icon));
             }
@@ -151,9 +167,9 @@ impl ApplicationHandler for UIRunner {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(varda) = self.varda.as_mut() else {
+        if self.varda.is_none() && self.engine.is_none() {
             return;
-        };
+        }
         if self.main_window_id == Some(window_id) {
             if let (Some(window), Some(egui_state)) = (self.window, &mut self.egui_state) {
                 if egui_state.on_window_event(window, &event).consumed {
@@ -163,19 +179,12 @@ impl ApplicationHandler for UIRunner {
             match event {
                 WindowEvent::CloseRequested => {
                     log::info!("Close requested, saving workspace and exiting...");
-                    if let Err(e) = varda.save_workspace(&self.layout) {
-                        log::error!("{e}");
-                    }
-                    if let Some(api) = self.api_handle.take() {
-                        api.shutdown();
-                    }
-                    event_loop.exit();
+                    self.quit(event_loop);
                 }
                 WindowEvent::Resized(new_size) => {
                     self.cached_screen_size = new_size;
-                    let device = &varda.gpu_context().device;
-                    if let Some(ws) = &mut self.window_surface {
-                        ws.resize(device, new_size);
+                    if let (Some(ws), Some(gpu)) = (&mut self.window_surface, &self.gpu) {
+                        ws.resize(gpu, new_size);
                     }
                 }
                 WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
@@ -184,26 +193,31 @@ impl ApplicationHandler for UIRunner {
                 WindowEvent::RedrawRequested => {
                     self.render(event_loop);
                     // Frame pacing: don't request_redraw() here.
-                    // about_to_wait() schedules the next frame via WaitUntil.
+                    // about_to_wait() asks for the next once the engine
+                    // thread has drawn one.
                 }
                 _ => {}
             }
         } else {
-            // Interactive HTML window: forward input to the WebView and consume.
-            #[cfg(feature = "html")]
-            if varda.handle_interactive_event(window_id, &event) {
-                return;
-            }
-            match event {
-                WindowEvent::CloseRequested => {
-                    if let Some(name) = varda.close_output_window_by_id(window_id) {
-                        log::info!("Output window '{name}' closed");
+            // An output (or interactive HTML) window: the engine's, so it is
+            // borrowed for events that change it — not for every pointer move.
+            let wanted = matches!(
+                event,
+                WindowEvent::CloseRequested
+                    | WindowEvent::Resized(_)
+                    | WindowEvent::Moved(_)
+                    | WindowEvent::Occluded(_)
+                    | WindowEvent::KeyboardInput { .. }
+            ) || cfg!(feature = "html");
+            if wanted {
+                let handled = self.with_engine(|this| {
+                    if let Some(varda) = this.varda.as_mut() {
+                        output_window_event(varda, window_id, event);
                     }
+                });
+                if handled.is_none() {
+                    log::warn!("An output window's event went unhandled: the engine was busy");
                 }
-                WindowEvent::Resized(new_size) => {
-                    varda.resize_output_window_by_id(window_id, new_size);
-                }
-                _ => {}
             }
         }
     }
@@ -232,13 +246,15 @@ impl ApplicationHandler for UIRunner {
             }
         }
 
-        // Read target_fps from engine state (runtime-mutable via UI/API).
-        let target_fps = self
-            .varda
-            .as_ref()
-            .map_or(self.config.target_fps, crate::app::VardaApp::target_fps);
-
         if self.config.headless {
+            // Read target_fps from engine state (runtime-mutable via UI/API).
+            let target_fps = self
+                .varda
+                .as_ref()
+                .map_or(self.config.target_fps, |varda| varda.target_fps());
+            // Reasserted every iteration so the loop cannot be left in `Wait`
+            // by any other code path; see the note in `resumed`.
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             // Headless: adaptive sleep-based pacing
             if target_fps > 0 {
                 if let Some(deadline) = self.cadence_anchor {
@@ -251,34 +267,120 @@ impl ApplicationHandler for UIRunner {
             self.render_headless(event_loop);
             self.advance_cadence_anchor(target_fps);
         } else {
-            // Windowed: adaptive cadence pacing.
-            // Only request_redraw when the cadence anchor says it's time.
-            // Between frames, let WaitUntil handle OS-level sleeping so we
-            // don't burn CPU or produce burst-pause patterns.
-            if target_fps > 0 {
-                let now = std::time::Instant::now();
-                let deadline = self.cadence_anchor.unwrap_or(now);
-
-                if deadline > now {
-                    // Not time yet — let the OS sleep until the deadline.
-                    // Do NOT request_redraw; winit will call about_to_wait
-                    // again when the timer fires.
-                    event_loop
-                        .set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
-                } else {
-                    // At or past deadline — render now.
-                    event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(now));
-                    if let Some(w) = self.window {
-                        w.request_redraw();
-                    }
-                }
-            } else {
-                // Uncapped: poll continuously
-                event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+            // Windowed: the engine thread paces the show (see
+            // `engine_thread`); the control window draws once it has drawn a
+            // frame — or every tenth of a second without one, so the UI
+            // stays live should the engine stop drawing.
+            if self.engine.as_ref().is_some_and(|e| e.baton().is_gone()) {
+                log::error!("The engine thread stopped: exiting");
+                self.quit(event_loop);
+                return;
+            }
+            let quiet = self
+                .last_ui_frame
+                .is_none_or(|at| at.elapsed() >= UI_FALLBACK);
+            if std::mem::take(&mut self.ui_due) || quiet {
                 if let Some(w) = self.window {
                     w.request_redraw();
                 }
             }
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                std::time::Instant::now() + UI_FALLBACK,
+            ));
+        }
+    }
+
+    /// The loop is ending. On macOS that includes Quit — ⌘Q, the Dock's
+    /// Quit, a script's `quit` — which never sends the window
+    /// `CloseRequested`: macOS closes the windows, winit calls this, and the
+    /// process ends as soon as it returns. Without saving here a show quit
+    /// that way lost everything since it was last saved (the show laptop,
+    /// 2026-09-30: a channel and an output set up over two hours). Headless
+    /// saves on its own way out (`render_headless`).
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if !self.config.headless && !self.shut_down {
+            log::info!("Quit: saving workspace and exiting...");
+            self.shut_down();
+        }
+    }
+}
+
+/// How long the control window goes without the engine thread drawing a
+/// frame before it draws one anyway.
+const UI_FALLBACK: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// An event on an output window (main thread, engine borrowed).
+fn output_window_event(varda: &mut VardaApp, window_id: WindowId, event: WindowEvent) {
+    // Interactive HTML window: forward input to the WebView and consume.
+    #[cfg(feature = "html")]
+    if varda.handle_interactive_event(window_id, &event) {
+        return;
+    }
+    match event {
+        WindowEvent::CloseRequested => {
+            if let Some(name) = varda.close_output_window_by_id(window_id) {
+                log::info!("Output window '{name}' closed");
+            }
+        }
+        WindowEvent::Resized(new_size) => {
+            varda.resize_output_window_by_id(window_id, new_size);
+        }
+        WindowEvent::Moved(position) => {
+            varda.move_output_window_by_id(window_id, position);
+        }
+        WindowEvent::Occluded(hidden) => {
+            varda.occlude_output_window_by_id(window_id, hidden);
+        }
+        // Esc on an output takes it off its screen, like leaving a
+        // slideshow: the way out when one lands on the wrong screen.
+        WindowEvent::KeyboardInput { event, .. }
+            if event.state.is_pressed()
+                && event.logical_key
+                    == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) =>
+        {
+            if let Some(name) = varda.take_output_off_screen_by_id(window_id) {
+                log::info!("Output '{name}' taken off its screen (Esc)");
+            }
+        }
+        _ => {}
+    }
+}
+
+impl UIRunner {
+    /// Save the show and end the app.
+    fn quit(&mut self, event_loop: &ActiveEventLoop) {
+        self.shut_down();
+        event_loop.exit();
+    }
+
+    /// Save the show and stop the API — once, however the windowed app ends:
+    /// its window closed, or Quit (see `exiting`). The engine thread is
+    /// stopped first, so nothing draws into windows that are going.
+    pub(super) fn shut_down(&mut self) {
+        if std::mem::replace(&mut self.shut_down, true) {
+            return;
+        }
+        if let Some(engine) = self.engine.take() {
+            if let Some(app) = engine.stop() {
+                self.varda = Some(app);
+            }
+        }
+        if let Some(varda) = self.varda.as_mut() {
+            if let Err(e) = varda.save_workspace(&self.layout) {
+                log::error!("{e}");
+            }
+            varda.refuse_commands();
+        }
+        // A Save As that landed as Nida quit moved the show: it is the one
+        // to open next time, the Recent list written before Nida goes.
+        if !self.config.headless {
+            self.show_moved();
+            if let Some(varda) = self.varda.as_mut() {
+                varda.flush_saves();
+            }
+        }
+        if let Some(api) = self.api_handle.take() {
+            api.shutdown();
         }
     }
 }

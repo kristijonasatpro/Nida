@@ -3,6 +3,7 @@
 use super::Workspace;
 use crate::scene::{ChannelConfig, DeckConfig};
 use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 
 /// A loaded deck preset with its name and config.
 #[derive(Debug, Clone)]
@@ -19,6 +20,7 @@ pub struct ChannelPreset {
 }
 
 /// In-memory collection of loaded presets from disk.
+#[derive(Debug)]
 pub struct PresetLibrary {
     pub deck_presets: Vec<DeckPreset>,
     pub channel_presets: Vec<ChannelPreset>,
@@ -27,37 +29,80 @@ pub struct PresetLibrary {
 impl PresetLibrary {
     /// Scan preset directories and load all valid JSON files.
     pub fn load(workspace: &Workspace) -> Self {
+        Self::load_from(&workspace.presets_dir())
+    }
+
+    /// The presets in `presets` — a show's `presets` folder, its `decks`
+    /// and `channels` — as a scan reads them.
+    pub fn load_from(presets: &Path) -> Self {
         let mut lib = Self {
             deck_presets: Vec::new(),
             channel_presets: Vec::new(),
         };
-        lib.scan_dir(&workspace.deck_presets_dir(), true);
-        lib.scan_dir(&workspace.channel_presets_dir(), false);
+        lib.scan_dir(&presets.join("decks"), true);
+        lib.scan_dir(&presets.join("channels"), false);
         lib
     }
 
-    /// Save a deck preset to disk.
+    /// A deck preset as saving writes it: where it goes in `workspace`, and
+    /// its text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `config` cannot be serialized to JSON.
+    pub fn deck_preset_file(
+        workspace: &Workspace,
+        name: &str,
+        config: &DeckConfig,
+    ) -> Result<(PathBuf, String)> {
+        let errors = config.validate("deck_preset");
+        for e in &errors {
+            log::error!("Deck preset '{name}' save: {e}");
+        }
+        let path = workspace.deck_presets_dir().join(sanitize_filename(name));
+        let json =
+            serde_json::to_string_pretty(config).context("Failed to serialize deck preset")?;
+        Ok((path, json))
+    }
+
+    /// A channel preset as saving writes it: where it goes in `workspace`,
+    /// and its text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `config` cannot be serialized to JSON.
+    pub fn channel_preset_file(
+        workspace: &Workspace,
+        name: &str,
+        config: &ChannelConfig,
+    ) -> Result<(PathBuf, String)> {
+        let errors = config.validate("channel_preset");
+        for e in &errors {
+            log::error!("Channel preset '{name}' save: {e}");
+        }
+        let path = workspace
+            .channel_presets_dir()
+            .join(sanitize_filename(name));
+        let json =
+            serde_json::to_string_pretty(config).context("Failed to serialize channel preset")?;
+        Ok((path, json))
+    }
+
+    /// Save a deck preset to disk, now.
     ///
     /// # Errors
     ///
     /// Returns an error if the `presets/decks/` directory cannot be created, if
     /// `config` cannot be serialized to JSON, or if the atomic write fails.
     pub fn save_deck_preset(workspace: &Workspace, name: &str, config: &DeckConfig) -> Result<()> {
-        let errors = config.validate("deck_preset");
-        for e in &errors {
-            log::error!("Deck preset '{name}' save: {e}");
-        }
+        let (path, json) = Self::deck_preset_file(workspace, name, config)?;
         workspace.ensure_preset_dirs()?;
-        let filename = sanitize_filename(name);
-        let path = workspace.deck_presets_dir().join(&filename);
-        let json =
-            serde_json::to_string_pretty(config).context("Failed to serialize deck preset")?;
         super::atomic_write(&path, &json)?;
         log::info!("Saved deck preset '{}' to {}", name, path.display());
         Ok(())
     }
 
-    /// Save a channel preset to disk.
+    /// Save a channel preset to disk, now.
     ///
     /// # Errors
     ///
@@ -68,18 +113,82 @@ impl PresetLibrary {
         name: &str,
         config: &ChannelConfig,
     ) -> Result<()> {
-        let errors = config.validate("channel_preset");
-        for e in &errors {
-            log::error!("Channel preset '{name}' save: {e}");
-        }
+        let (path, json) = Self::channel_preset_file(workspace, name, config)?;
         workspace.ensure_preset_dirs()?;
-        let filename = sanitize_filename(name);
-        let path = workspace.channel_presets_dir().join(&filename);
-        let json =
-            serde_json::to_string_pretty(config).context("Failed to serialize channel preset")?;
         super::atomic_write(&path, &json)?;
         log::info!("Saved channel preset '{}' to {}", name, path.display());
         Ok(())
+    }
+
+    /// Take in a deck preset just saved to `path` as `json`, before its
+    /// file has reached the disk: there to load at once, until the disk is
+    /// read again once it has landed ([`Self::settle`]). Returns it as kept.
+    pub fn keep_deck(&mut self, path: &Path, json: &str) -> Option<KeptPreset> {
+        match serde_json::from_str::<DeckConfig>(json) {
+            Ok(config) => {
+                let kept = KeptPreset::Deck(DeckPreset {
+                    name: preset_name(path),
+                    config,
+                });
+                self.put(&kept);
+                Some(kept)
+            }
+            Err(e) => {
+                log::warn!("Deck preset {} not kept: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    /// Take in a channel preset just saved to `path` as `json`, as
+    /// [`Self::keep_deck`] does a deck preset.
+    pub fn keep_channel(&mut self, path: &Path, json: &str) -> Option<KeptPreset> {
+        match serde_json::from_str::<ChannelConfig>(json) {
+            Ok(config) => {
+                let kept = KeptPreset::Channel(ChannelPreset {
+                    name: preset_name(path),
+                    config,
+                });
+                self.put(&kept);
+                Some(kept)
+            }
+            Err(e) => {
+                log::warn!("Channel preset {} not kept: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    /// The presets as the disk has them once a preset's file has landed —
+    /// `scanned`, read off the engine — with those still on their way
+    /// kept as they were saved: the names the disk gave, a file that did
+    /// not land gone, as a rescan after a save always showed.
+    pub fn settle<'a>(
+        &mut self,
+        scanned: PresetLibrary,
+        on_way: impl Iterator<Item = &'a KeptPreset>,
+    ) {
+        self.deck_presets = scanned.deck_presets;
+        self.channel_presets = scanned.channel_presets;
+        for kept in on_way {
+            self.put(kept);
+        }
+    }
+
+    /// `kept` in the library, in place of a preset of its kind and name.
+    fn put(&mut self, kept: &KeptPreset) {
+        match kept {
+            KeptPreset::Deck(preset) => {
+                self.deck_presets.retain(|p| p.name != preset.name);
+                self.deck_presets.push(preset.clone());
+                self.deck_presets.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+            KeptPreset::Channel(preset) => {
+                self.channel_presets.retain(|p| p.name != preset.name);
+                self.channel_presets.push(preset.clone());
+                self.channel_presets.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+        }
     }
 
     /// Rescan directories to pick up new/removed presets.
@@ -107,11 +216,7 @@ impl PresetLibrary {
                     continue;
                 }
             };
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string();
+            let stem = preset_name(&path);
 
             if is_deck {
                 match serde_json::from_str::<DeckConfig>(&content) {
@@ -147,6 +252,21 @@ impl PresetLibrary {
             self.channel_presets.sort_by(|a, b| a.name.cmp(&b.name));
         }
     }
+}
+
+/// A preset taken into the library before its file landed.
+#[derive(Debug, Clone)]
+pub enum KeptPreset {
+    Deck(DeckPreset),
+    Channel(ChannelPreset),
+}
+
+/// A preset's name: its file's, as a scan reads it.
+fn preset_name(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 /// Sanitize a user-provided name into a safe filename.
@@ -193,11 +313,13 @@ mod tests {
             auto_transition: None,
             modulation: vec![],
             render_fps: crate::channel::DeckRenderFps::default(),
+            render_scale: crate::deck::DeckRenderScale::default(),
         }
     }
 
     fn sample_channel_config() -> ChannelConfig {
         ChannelConfig {
+            overlay: false,
             uuid: crate::deck::generate_short_uuid(),
             name: "test_channel".to_string(),
             opacity: 1.0,

@@ -1,9 +1,13 @@
 mod effect;
+pub mod media;
+pub mod playlist;
 mod render;
 mod source;
 pub mod svg;
+pub mod timer;
 
 pub use render::get_current_date;
+pub(crate) use render::Framing;
 
 use crate::isf::{ISFPass, ISFShader};
 use crate::params::ShaderParams;
@@ -17,6 +21,59 @@ use std::time::Instant;
 /// Generate a short 8-character hex UUID for entity identity.
 pub fn generate_short_uuid() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+}
+
+/// How large a deck renders relative to the master resolution.
+///
+/// A generator computes every pixel every frame, so at 4K it is the costliest
+/// thing in a show; soft procedural content drawn at half size and scaled up
+/// on the way into the mix looks almost the same for a quarter of the work.
+/// The deck's texture is simply smaller: everything downstream samples it
+/// across the full frame, so it is scaled up where it is used.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+pub enum DeckRenderScale {
+    /// The master resolution.
+    #[default]
+    Full,
+    /// Half the width and height — a quarter of the pixels.
+    Half,
+    /// A quarter of the width and height — a sixteenth of the pixels.
+    Quarter,
+}
+
+impl DeckRenderScale {
+    pub const ALL: [Self; 3] = [Self::Full, Self::Half, Self::Quarter];
+
+    /// The deck size for a master of `width × height`, at least 1×1.
+    pub fn apply(self, width: u32, height: u32) -> (u32, u32) {
+        let divisor = match self {
+            Self::Full => 1,
+            Self::Half => 2,
+            Self::Quarter => 4,
+        };
+        (
+            width.div_ceil(divisor).max(1),
+            height.div_ceil(divisor).max(1),
+        )
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "Full",
+            Self::Half => "Half",
+            Self::Quarter => "Quarter",
+        }
+    }
 }
 
 /// Scaling mode for non-shader sources (images, video)
@@ -83,6 +140,28 @@ impl ScalingMode {
     }
 }
 
+/// Whether a picture of `source` pixels, scaled into `target` by `mode`,
+/// reaches every edge — leaves no transparent bar.
+pub(crate) fn fills_the_frame(mode: ScalingMode, source: (u32, u32), target: (u32, u32)) -> bool {
+    if source.0 == 0 || source.1 == 0 || target.0 == 0 || target.1 == 0 {
+        return false;
+    }
+    let (scale, offset) = mode.compute_uv_transform(source.0, source.1, target.0, target.1);
+    // Every target point lands inside the source: offset ≥ 0 and
+    // offset + scale ≤ 1 on both axes (a hair of slack for rounding).
+    (0..2).all(|i| offset[i] >= -1e-4 && offset[i] + scale[i] <= 1.0 + 1e-4)
+}
+
+/// A colour layer's name when nobody gave it one: its colour as hex.
+pub(crate) fn colour_name(color: [f32; 4]) -> String {
+    format!(
+        "#{:02X}{:02X}{:02X}",
+        (color[0] * 255.0) as u8,
+        (color[1] * 255.0) as u8,
+        (color[2] * 255.0) as u8,
+    )
+}
+
 /// Double-buffered staging buffers for non-blocking GPU texture uploads.
 ///
 /// Uses a ping-pong pattern: CPU writes to buffer\[current\], GPU copies from
@@ -138,6 +217,12 @@ impl VideoStagingBuffers {
         }
     }
 
+    /// Whether [`Self::upload`] can take a frame now: its buffer is mapped
+    /// again after the last one went to the GPU.
+    pub fn ready(&self) -> bool {
+        self.mapped[self.current].load(Ordering::Acquire)
+    }
+
     /// Write frame data into the current staging buffer and encode a copy
     /// to the destination texture. Returns true if the upload was performed.
     ///
@@ -156,6 +241,11 @@ impl VideoStagingBuffers {
         if !self.mapped[idx].load(Ordering::Acquire) {
             // Buffer not yet mapped — skip this upload.
             // The stale texture from last frame will remain on screen.
+            return false;
+        }
+        // A frame short of its size (a corrupt HAP frame) is skipped too:
+        // copying it would panic the render loop.
+        if data.len() < self.unpadded_bpr as usize * self.rows as usize {
             return false;
         }
 
@@ -250,6 +340,10 @@ pub enum DeckSource {
     /// Video file playback (ffmpeg CPU decode → RGBA, background decode thread)
     Video {
         handle: VideoDecodeHandle,
+        /// The file's soundtrack, when it has one.
+        audio: Option<crate::audio_mix::ClipAudio>,
+        /// A sound file: the picture is a clear stand-in.
+        sound_only: bool,
         texture: wgpu::Texture,
         texture_view: wgpu::TextureView,
         blit_pipeline: BlitPipeline,
@@ -261,6 +355,8 @@ pub enum DeckSource {
     /// HAP video playback (GPU-native `BCn`, background decode thread)
     HapVideo {
         handle: VideoDecodeHandle,
+        /// The file's soundtrack, when it has one.
+        audio: Option<crate::audio_mix::ClipAudio>,
         texture: wgpu::Texture,
         texture_view: wgpu::TextureView,
         alpha_texture: Option<wgpu::Texture>,
@@ -288,6 +384,9 @@ pub enum DeckSource {
         /// pixels. `None` for raster images, which have nothing to re-render.
         /// Boxed to keep the enum's other variants from paying for the tree.
         svg: Option<Box<usvg::Tree>>,
+        /// Every pixel of the decoded image is fully opaque, so the deck hides
+        /// whatever is composited below it (see [`Deck::covers_frame`]).
+        opaque: bool,
     },
     /// Solid color fill
     SolidColor { color: [f64; 4] },
@@ -310,6 +409,10 @@ pub enum DeckSource {
         shader: ISFShader,
         pipeline: ComputePipeline,
     },
+    /// Clips and pictures one after another (see [`playlist`]).
+    Playlist(Box<playlist::Playlist>),
+    /// A count down, count up or clock drawn as text (see [`timer`]).
+    Timer(Box<timer::Timer>),
 }
 
 /// Discriminant for external source types sharing the same `DeckSource` layout.
@@ -519,6 +622,18 @@ pub struct Effect {
     pub phase_accumulators: [f32; 4],
     /// Phase input config from shader metadata
     pub phase_inputs_config: Option<Vec<crate::isf::PhaseInput>>,
+    /// Frames this effect has actually been run on a deck — neutral framing
+    /// is skipped (see `Deck::render`).
+    runs: u64,
+    /// Each pixel it puts out reads the input at that pixel only (see
+    /// [`ISFShader::is_pointwise`]), so it can be run on part of the frame.
+    pointwise: bool,
+    /// Where the effect shows: only inside (or outside) this shape. `None`
+    /// is everywhere.
+    pub mask: Option<crate::engine::value::mask::EffectMask>,
+    /// The pass that mixes the effect in through its mask, made when there
+    /// first is one.
+    mask_pass: Option<crate::renderer::mask::MaskPass>,
 }
 
 // Effect impl is in effect.rs
@@ -585,6 +700,36 @@ pub struct Deck {
     /// See /spec/html-source.md §2 (Option A).
     transparent: bool,
 
+    /// What a clip does by itself going on and off air. Only clips (video
+    /// and sound files) use it.
+    pub auto_playback: crate::engine::value::video::AutoPlayback,
+
+    /// The size and rate chosen for a camera or capture card; `None` takes
+    /// its best. Only cameras use it.
+    pub camera_mode: Option<crate::engine::value::camera::CameraMode>,
+
+    /// The unique ID of a camera deck's device, for the show to find that
+    /// one of two identical cameras again; `None` for a show saved before
+    /// they were kept. Only cameras use it.
+    pub camera_device: Option<String>,
+
+    /// How a camera deck's picture is read into colours: as the camera says,
+    /// or range and matrix set by hand. Every deck on one camera shares its
+    /// capture, so they share this too. Only cameras use it.
+    pub camera_colour: crate::engine::value::camera::CameraColour,
+
+    /// Show the camera's newest picture each frame, a frame or so sooner but
+    /// with a judder whenever one comes late, rather than each in turn at
+    /// the delay that keeps them even (see `FramePicker::set_newest`).
+    /// Shared, like the colour, by every deck on one camera.
+    pub camera_lowest_latency: bool,
+
+    /// What a camera deck's picture is coded as — Rec.709, or a log or HLG
+    /// picture converted for the show (see `renderer::camera_profile`).
+    /// Shared, like the colour, by every deck on one camera. Only cameras
+    /// use it.
+    pub camera_profile: crate::engine::value::camera::CameraProfile,
+
     /// Accumulated render time for TIME uniform (advances by fixed dt each render).
     /// Decoupled from wall clock so skipped frames don't cause animation jumps.
     render_time: f32,
@@ -649,6 +794,53 @@ pub struct Deck {
     /// Cleared by [`Deck::clear_gpu_error`] when the shader is reloaded.
     /// See spec/error-handling.md § Shader Errors.
     gpu_error: Option<String>,
+
+    /// Resolution this deck renders at, relative to the master.
+    render_scale: DeckRenderScale,
+    /// The master size this deck was last sized for, so a new render scale
+    /// can be applied without being told it again.
+    master_size: (u32, u32),
+
+    /// For a still image: what its last render depended on. While that holds
+    /// the texture already has this frame's picture, so rendering is skipped
+    /// (see [`Deck::still_frame`]).
+    rendered_still: Option<StillFrame>,
+
+    /// The parts of the frame that show of this deck once the opaque decks
+    /// over it are drawn, set by its channel each frame; `None` for all of
+    /// it. Its passes draw only there (see [`crate::renderer::region`]).
+    visible: Option<Vec<crate::renderer::region::Area>>,
+    /// `visible` as it was when the deck last rendered: the rest of its
+    /// texture is stale, so a frame that shows more must render.
+    drawn_visible: Option<Vec<crate::renderer::region::Area>>,
+    /// The share of the frame its source drew in its last render.
+    drawn_share: f32,
+    /// Draws the picture cropped and placed in one pass, made when first
+    /// needed (see `Deck::fold`).
+    placed: Option<crate::renderer::placed_picture::PlacedPicturePipeline>,
+}
+
+/// Everything a still image deck's picture depends on: its size, how the
+/// image is fitted, and each framing effect's settings. Equal between frames
+/// means the texture is already right.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StillFrame {
+    size: (u32, u32),
+    scaling_mode: ScalingMode,
+    effects: Vec<(String, bool, Vec<u32>)>,
+}
+
+/// A parameter value as comparable bits, for [`StillFrame`].
+fn param_bits(value: Option<&crate::params::ParamValue>) -> Vec<u32> {
+    use crate::params::ParamValue;
+    match value {
+        None => vec![u32::MAX],
+        Some(ParamValue::Float(v)) => vec![v.to_bits()],
+        Some(ParamValue::Bool(v)) => vec![u32::from(*v)],
+        Some(ParamValue::Long(v)) => vec![v.cast_unsigned()],
+        Some(ParamValue::Color(c)) => c.iter().map(|v| v.to_bits()).collect(),
+        Some(ParamValue::Point2D(p)) => p.iter().map(|v| v.to_bits()).collect(),
+    }
 }
 
 /// Accessors for Deck properties.
@@ -685,6 +877,41 @@ impl Deck {
         self.source_path.as_deref()
     }
 
+    /// What the audio mixer reads of this deck's soundtrack: `None` unless
+    /// it is a video with sound.
+    pub fn clip_audio(&self) -> Option<std::sync::Arc<crate::audio_mix::ClipAudioShared>> {
+        match &self.source {
+            DeckSource::Video { audio, .. } | DeckSource::HapVideo { audio, .. } => {
+                audio.as_ref().map(crate::audio_mix::ClipAudio::shared)
+            }
+            DeckSource::Playlist(list) => list.clip_audio(),
+            _ => None,
+        }
+    }
+
+    /// Which decode thread plays this clip, to tell a clip rebuilt under the
+    /// same UUID (a structural undo) from the one it replaced. `None` for
+    /// anything but a clip.
+    pub fn playback_identity(&self) -> Option<usize> {
+        match &self.source {
+            DeckSource::Video { handle, .. } | DeckSource::HapVideo { handle, .. } => {
+                Some(std::sync::Arc::as_ptr(&handle.snapshot_cell()) as usize)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether this deck is a sound file, whose picture is a clear stand-in.
+    pub fn is_sound_only(&self) -> bool {
+        matches!(
+            self.source,
+            DeckSource::Video {
+                sound_only: true,
+                ..
+            }
+        )
+    }
+
     /// Get the source type as a string for serialization
     pub fn source_type(&self) -> &str {
         match &self.source {
@@ -694,6 +921,8 @@ impl Deck {
             DeckSource::SolidColor { .. } => "solid_color",
             DeckSource::ExternalSource { kind, .. } => kind.source_type(),
             DeckSource::ComputeShader { .. } => "compute_shader",
+            DeckSource::Playlist(_) => "playlist",
+            DeckSource::Timer(_) => "timer",
         }
     }
 
@@ -714,6 +943,10 @@ impl Deck {
             DeckSource::Video { handle, .. } | DeckSource::HapVideo { handle, .. } => {
                 handle.set_output_fps(fps);
             }
+            DeckSource::Playlist(list) => {
+                list.set_output_fps(fps);
+                list.for_each_deck(|d| d.set_video_output_fps(fps));
+            }
             _ => {}
         }
     }
@@ -725,6 +958,7 @@ impl Deck {
             DeckSource::Video { handle, .. } | DeckSource::HapVideo { handle, .. } => {
                 handle.set_suspended(suspended);
             }
+            DeckSource::Playlist(list) => list.for_each_deck(|d| d.set_video_suspended(suspended)),
             _ => {}
         }
     }
@@ -865,6 +1099,11 @@ impl Deck {
     /// Set the solid color value (only applies to `SolidColor` sources)
     pub fn set_solid_color(&mut self, new_color: [f32; 4]) {
         if let DeckSource::SolidColor { color } = &mut self.source {
+            // Still called after its colour: the name follows it.
+            let old = colour_name(color.map(|c| c as f32));
+            if self.source_name == old {
+                self.source_name = colour_name(new_color);
+            }
             *color = [
                 f64::from(new_color[0]),
                 f64::from(new_color[1]),
@@ -881,8 +1120,38 @@ impl Deck {
             | DeckSource::Video { scaling_mode, .. }
             | DeckSource::HapVideo { scaling_mode, .. }
             | DeckSource::ExternalSource { scaling_mode, .. } => Some(*scaling_mode),
+            DeckSource::Playlist(list) => Some(list.scaling_mode()),
             _ => None,
         }
+    }
+
+    /// The size of the picture a scaling mode fits into the frame, once known
+    /// (a live source reports it with its first frame).
+    pub fn source_size(&self) -> Option<[u32; 2]> {
+        let (w, h) = match &self.source {
+            DeckSource::Image {
+                source_width,
+                source_height,
+                ..
+            }
+            | DeckSource::Video {
+                source_width,
+                source_height,
+                ..
+            }
+            | DeckSource::HapVideo {
+                source_width,
+                source_height,
+                ..
+            }
+            | DeckSource::ExternalSource {
+                source_width,
+                source_height,
+                ..
+            } => (*source_width, *source_height),
+            _ => return None,
+        };
+        (w > 0 && h > 0).then_some([w, h])
     }
 
     /// Set the scaling mode (applies to Image, Video, `HapVideo`, and `ExternalSource` sources)
@@ -892,7 +1161,62 @@ impl Deck {
             | DeckSource::Video { scaling_mode, .. }
             | DeckSource::HapVideo { scaling_mode, .. }
             | DeckSource::ExternalSource { scaling_mode, .. } => *scaling_mode = mode,
+            DeckSource::Playlist(list) => list.set_scaling_mode(mode),
             _ => {}
+        }
+    }
+
+    /// A layer showing another input (a tap) whose input is not there: it
+    /// has no picture this frame.
+    pub fn shows_a_lost_input(&self) -> bool {
+        self.tap.is_some() && self.external_source_view.is_none()
+    }
+
+    /// The playlist this deck plays, if it is one.
+    pub fn playlist(&self) -> Option<&playlist::Playlist> {
+        match &self.source {
+            DeckSource::Playlist(list) => Some(list),
+            _ => None,
+        }
+    }
+
+    pub fn playlist_mut(&mut self) -> Option<&mut playlist::Playlist> {
+        match &mut self.source {
+            DeckSource::Playlist(list) => Some(list),
+            _ => None,
+        }
+    }
+
+    /// When the refresh that called for this frame came (see
+    /// [`crate::mixer::FrameTiming::refresh_at`]): a playlist moves its
+    /// transition on by it.
+    pub fn set_frame_refresh_at(&mut self, at: Option<std::time::Instant>) {
+        if let DeckSource::Playlist(list) = &mut self.source {
+            list.frame_refresh_at(at);
+        }
+    }
+
+    /// Each frame is held on screen a frame's time (see
+    /// [`crate::mixer::FrameTiming::held`]): a playlist steps a frame per
+    /// frame.
+    pub fn set_frame_held(&mut self, held: bool) {
+        if let DeckSource::Playlist(list) = &mut self.source {
+            list.frame_held(held);
+        }
+    }
+
+    /// The timer this deck shows, if it is one.
+    pub fn timer(&self) -> Option<&timer::Timer> {
+        match &self.source {
+            DeckSource::Timer(timer) => Some(timer),
+            _ => None,
+        }
+    }
+
+    pub fn timer_mut(&mut self) -> Option<&mut timer::Timer> {
+        match &mut self.source {
+            DeckSource::Timer(timer) => Some(timer),
+            _ => None,
         }
     }
 
@@ -1107,9 +1431,223 @@ impl Deck {
         }
     }
 
+    /// Resolution this deck renders at, relative to the master.
+    pub fn render_scale(&self) -> DeckRenderScale {
+        self.render_scale
+    }
+
+    /// Render at `scale` of the master resolution from now on.
+    pub fn set_render_scale(
+        &mut self,
+        context: &crate::renderer::GpuContext,
+        scale: DeckRenderScale,
+    ) {
+        if scale == self.render_scale {
+            return;
+        }
+        self.render_scale = scale;
+        let (width, height) = self.master_size;
+        self.resize(context, width, height);
+    }
+
+    /// Frames this deck has actually rendered — a still image skips the ones
+    /// where nothing it depends on changed (see [`Deck::still_frame`]).
+    pub fn rendered_frames(&self) -> u32 {
+        self.frame_count
+    }
+
     /// Whether this deck preserves source alpha (transparent compositing).
     pub fn transparent(&self) -> bool {
         self.transparent
+    }
+
+    /// Whether this deck draws its live source onto its frame one to one:
+    /// the source's frame exactly its own, with no bars and nothing cut off —
+    /// as a tap does of a picture the master's size, whatever its fit.
+    pub(crate) fn maps_source_one_to_one(&self) -> bool {
+        let DeckSource::ExternalSource {
+            source_width,
+            source_height,
+            scaling_mode,
+            ..
+        } = &self.source
+        else {
+            return false;
+        };
+        let (scale, offset) = scaling_mode.compute_uv_transform(
+            *source_width,
+            *source_height,
+            self.master_size.0,
+            self.master_size.1,
+        );
+        scale.iter().all(|s| (s - 1.0).abs() < 1e-6) && offset.iter().all(|o| o.abs() < 1e-6)
+    }
+
+    /// Whether this deck's picture is opaque over the whole frame, so that at
+    /// full opacity in Normal blend nothing composited below it can show.
+    ///
+    /// The channel skips those hidden decks — at 4K each cost a full-frame
+    /// copy and blend (~330 MB of GPU traffic) for pixels nobody sees. A wrong
+    /// "yes" would make layers vanish, so only what is known is trusted:
+    /// raster images with no transparent pixel, opaque solid colours, and
+    /// live sources flattened to opaque; carrying no effects other than crop
+    /// and transform at their neutral settings, with nothing modulating them.
+    /// Letterbox bars from Fit and Center are transparent, so an image scaled
+    /// that way covers only when its picture reaches every edge.
+    /// What this deck's picture depends on, if it is a still image that only
+    /// changes when that does; `None` for anything that may change by itself.
+    ///
+    /// A slide stack re-blitted every image at the full render size each
+    /// frame — at 4K about 100 MB of GPU traffic per slide — though a PNG never
+    /// changes. Only raster/vector images qualify, carrying no effects but
+    /// crop and transform with nothing modulating them (both are pure
+    /// functions of their settings), and no analyzer attached.
+    pub(crate) fn still_frame(
+        &self,
+        modulation: &crate::modulation::ModulationEngine,
+    ) -> Option<StillFrame> {
+        let DeckSource::Image { scaling_mode, .. } = &self.source else {
+            return None;
+        };
+        if self.analyzers.has_active_instances() {
+            return None;
+        }
+        let mut effects = Vec::with_capacity(self.effects.len());
+        for effect in &self.effects {
+            if effect.enabled && !effect.is_static_framing(modulation) {
+                return None;
+            }
+            let values = effect
+                .params
+                .param_order
+                .iter()
+                .flat_map(|name| param_bits(effect.params.values.get(name)))
+                .collect();
+            effects.push((effect.uuid().to_string(), effect.enabled, values));
+        }
+        Some(StillFrame {
+            size: (self.texture.width(), self.texture.height()),
+            scaling_mode: *scaling_mode,
+            effects,
+        })
+    }
+
+    pub fn covers_frame(&self, modulation: &crate::modulation::ModulationEngine) -> bool {
+        let source_opaque = match &self.source {
+            DeckSource::Image {
+                opaque,
+                source_width,
+                source_height,
+                scaling_mode,
+                ..
+            } => {
+                *opaque
+                    && fills_the_frame(
+                        *scaling_mode,
+                        (*source_width, *source_height),
+                        self.master_size,
+                    )
+            }
+            DeckSource::SolidColor { color } => color[3] >= 1.0,
+            DeckSource::ExternalSource { .. } => !self.transparent,
+            _ => false,
+        };
+        source_opaque
+            && self
+                .effects
+                .iter()
+                .all(|effect| !effect.enabled || effect.is_neutral_framing(modulation))
+    }
+
+    /// Where this deck's picture is certain to be opaque, in UV of the frame:
+    /// an opaque image where it is fitted, an opaque colour or camera
+    /// everywhere, then cut by its crop and moved by its transform, less a
+    /// margin for the soft edges those leave. `None` when that cannot be
+    /// told — a clip, a generator, anything but framing among its effects,
+    /// framing that is modulated, rotated or wrapped. A deck over another
+    /// hides that much of it.
+    pub fn opaque_area(
+        &self,
+        modulation: &crate::modulation::ModulationEngine,
+    ) -> Option<crate::renderer::region::Area> {
+        use crate::renderer::region::Area;
+        // Opaque past the frame's edges, where nothing can blend in.
+        const EVERYWHERE: Area = Area {
+            x0: -1.0,
+            y0: -1.0,
+            x1: 2.0,
+            y1: 2.0,
+        };
+        let (width, height) = self.master_size;
+        let mut area = match &self.source {
+            DeckSource::Image {
+                opaque: true,
+                source_width,
+                source_height,
+                scaling_mode,
+                ..
+            } if *source_width > 0 && *source_height > 0 && width > 0 && height > 0 => {
+                // The blit reads source UV `uv · scale + offset`; the picture
+                // is where that falls inside the image, cut sharp.
+                let (scale, offset) =
+                    scaling_mode.compute_uv_transform(*source_width, *source_height, width, height);
+                let lo = |v: f32| if v <= 0.0 { -1.0 } else { v };
+                let hi = |v: f32| if v >= 1.0 { 2.0 } else { v };
+                Area {
+                    x0: lo(-offset[0] / scale[0]),
+                    y0: lo(-offset[1] / scale[1]),
+                    x1: hi((1.0 - offset[0]) / scale[0]),
+                    y1: hi((1.0 - offset[1]) / scale[1]),
+                }
+            }
+            DeckSource::SolidColor { color } if color[3] >= 1.0 => EVERYWHERE,
+            // Drawn over black unless flagged transparent: opaque everywhere.
+            DeckSource::ExternalSource { kind, .. }
+                if !self.transparent && !matches!(kind, ExternalSourceKind::DepthSensor(_)) =>
+            {
+                EVERYWHERE
+            }
+            _ => return None,
+        };
+        let aspect = width as f32 / height.max(1) as f32;
+        // Texels an edge inside the frame may be soft by; a pixel more for
+        // the composite's own sampling of the texture.
+        let mut fringe = 0.0;
+        for effect in &self.effects {
+            if effect.enabled && !effect.is_neutral_framing(modulation) {
+                area = effect.opaque_after(area, aspect, modulation, &mut fringe)?;
+            }
+        }
+        let margin = fringe + 1.0;
+        let area = area
+            .shrunk(
+                margin / self.texture.width().max(1) as f32,
+                margin / self.texture.height().max(1) as f32,
+            )
+            .intersect(&Area::FRAME);
+        (!area.is_empty()).then_some(area)
+    }
+
+    /// Limit this deck to the parts of the frame that show of it, or `None`
+    /// for all of it. Its channel sets this each frame before rendering.
+    pub(crate) fn set_visible(&mut self, visible: Option<Vec<crate::renderer::region::Area>>) {
+        self.visible = visible;
+    }
+
+    /// The share of the frame this deck's source drew in its last render: 1
+    /// for all of it, less when parts covered on air were left out.
+    pub fn drawn_share(&self) -> f32 {
+        self.drawn_share
+    }
+
+    /// Whether this frame shows a part of the deck its last render did not
+    /// draw — its texture is stale there, so the frame must not be skipped.
+    pub(crate) fn shows_undrawn_part(&self) -> bool {
+        match (&self.drawn_visible, &self.visible) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(drawn), Some(now)) => drawn != now,
+        }
     }
 
     /// Set whether this deck preserves source alpha (transparent compositing).
@@ -1171,6 +1709,27 @@ impl Deck {
     }
 
     /// Get the camera ID (if source is a camera)
+    /// The camera a deck waiting for its device should open, by name: `None`
+    /// unless the deck's camera is [`crate::camera::UNBOUND_CAMERA`].
+    pub fn camera_waiting_for(&self) -> Option<&str> {
+        (self.camera_id() == Some(crate::camera::UNBOUND_CAMERA))
+            .then(|| self.source_name.trim_start_matches("📹 "))
+    }
+
+    /// Point a camera deck at an opened camera, `size` its picture.
+    pub fn bind_camera(&mut self, id: crate::camera::CameraId, size: (u32, u32)) {
+        if let DeckSource::ExternalSource {
+            kind: kind @ ExternalSourceKind::Camera(_),
+            source_width,
+            source_height,
+            ..
+        } = &mut self.source
+        {
+            *kind = ExternalSourceKind::Camera(id);
+            (*source_width, *source_height) = size;
+        }
+    }
+
     pub fn camera_id(&self) -> Option<crate::camera::CameraId> {
         match &self.source {
             DeckSource::ExternalSource {

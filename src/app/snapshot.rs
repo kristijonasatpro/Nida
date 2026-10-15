@@ -46,6 +46,7 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                             name: e.shader.name(),
                             enabled: e.enabled,
                             params: build_shader_params(&e.shader.name(), &e.params),
+                            mask: e.mask.clone(),
                         })
                         .collect();
 
@@ -67,6 +68,9 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                                     .deck
                                     .video_transport_sync()
                                     .unwrap_or_default(),
+                                hardware_decode: ps.hardware_decode,
+                                auto: slot.deck.auto_playback,
+                                sound_only: slot.deck.is_sound_only(),
                             });
 
                     let auto_transition =
@@ -197,6 +201,19 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                         depth_prepro_params,
                         screen_capture,
                         tap,
+                        playlist: slot
+                            .deck
+                            .playlist()
+                            .map(crate::deck::playlist::Playlist::snapshot),
+                        timer: slot.deck.timer().map(|timer| {
+                            timer.snapshot(crate::engine::value::timer::panel_of(slot.deck.uuid()))
+                        }),
+                        camera_colour: (slot.deck.source_type() == "camera")
+                            .then_some(slot.deck.camera_colour),
+                        camera_profile: (slot.deck.source_type() == "camera")
+                            .then(|| slot.deck.camera_profile.clone()),
+                        camera_lowest_latency: (slot.deck.source_type() == "camera")
+                            .then_some(slot.deck.camera_lowest_latency),
                         is_html_interactive: {
                             #[cfg(feature = "html")]
                             {
@@ -214,11 +231,14 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                         mute: slot.mute,
                         transparent: slot.deck.transparent(),
                         scaling_mode: slot.deck.scaling_mode(),
+                        source_size: slot.deck.source_size(),
+                        solid_color: slot.deck.solid_color(),
                         generator: gen_params,
                         effects,
                         video_playback,
                         auto_transition,
                         render_fps: slot.render_fps,
+                        render_scale: slot.deck.render_scale(),
                         effective_render_fps: if slot.render_cost_us > 0.0 {
                             1_000_000.0 / slot.render_cost_us
                         } else {
@@ -227,6 +247,7 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                         render_cost_us: slot.render_cost_us,
                         gpu_render_cost_us: slot.gpu_render_cost_us,
                         fps: slot.deck.fps(),
+                        still: slot.deck.still_frame(mixer.modulation()).is_some(),
                         source_asleep: !slot.source_demand.wants_frames(),
                         running_analyzers: slot
                             .deck
@@ -247,6 +268,7 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                     name: e.shader.name(),
                     enabled: e.enabled,
                     params: build_shader_params(&e.shader.name(), &e.params),
+                    mask: e.mask.clone(),
                 })
                 .collect();
 
@@ -260,6 +282,7 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                 effects: ch_effects,
                 render_time_ms: ch.render_time_ms,
                 active_deck_count: ch.active_deck_count,
+                overlay: ch.overlay,
             }
         })
         .collect();
@@ -272,6 +295,7 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
             name: e.shader.name(),
             enabled: e.enabled,
             params: build_shader_params(&e.shader.name(), &e.params),
+            mask: e.mask.clone(),
         })
         .collect();
 
@@ -304,6 +328,7 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
         active_lut: mixer
             .active_lut_filename()
             .map(std::string::ToString::to_string),
+        main: crate::mixer::MainSnapshot::of(mixer.mix_mode(), mixer.main()),
     }
 }
 
@@ -434,12 +459,15 @@ pub(crate) fn build_registry_snapshot(app: &VardaApp) -> RegistrySnapshot {
         .map(|(i, s)| (s.name(), i))
         .collect();
     generators.sort_by_key(|a| a.0.to_lowercase());
+    // A layer's own mask is made from Input Settings, not dropped from the
+    // Library: alone, it would just make the layer vanish.
     let mut filters: Vec<(String, usize)> = app
         .registry
         .filters()
         .iter()
         .enumerate()
         .map(|(i, s)| (s.name(), i))
+        .filter(|(name, _)| name != crate::engine::value::mask::LAYER_MASK_EFFECT)
         .collect();
     filters.sort_by_key(|a| a.0.to_lowercase());
     RegistrySnapshot {
@@ -506,6 +534,19 @@ pub(crate) fn build_camera_snapshot(app: &VardaApp) -> CameraSnapshot {
             .devices()
             .iter()
             .map(|d| (d.name.clone(), d.id))
+            .collect(),
+        modes: app
+            .camera_manager
+            .devices()
+            .iter()
+            .map(|d| (d.id, d.modes()))
+            .collect(),
+        access_denied: app.camera_manager.access_denied(),
+        video_effects: app
+            .camera_manager
+            .video_effects()
+            .iter()
+            .map(|e| (*e).to_string())
             .collect(),
     }
 }
@@ -666,13 +707,130 @@ pub(crate) fn build_arrangement_snapshot(
 }
 
 /// Build a full `EngineState` from all subsystem snapshots.
+/// Snapshot every production bus, in configured order.
+fn build_bus_snapshots(app: &VardaApp) -> Vec<crate::engine::types::BusSnapshot> {
+    use crate::engine::types::{BusSnapshot, BusTransitionSnapshot};
+    app.production_buses()
+        .iter()
+        .map(|bus| BusSnapshot {
+            uuid: bus.uuid().to_string(),
+            name: bus.name.clone(),
+            preview: bus.preview().clone(),
+            program: bus.program().clone(),
+            preview_resolved: bus.preview_resolved(),
+            program_resolved: bus.program_resolved(),
+            canvas: bus.canvas(),
+            audio_mix: bus.audio_mix().clone(),
+            auto_duration: bus.auto_duration,
+            hidden_layers: bus.hidden_layers().to_vec(),
+            transition: bus.transition().map(|t| BusTransitionSnapshot {
+                from: t.from.clone(),
+                to: t.to.clone(),
+                duration: t.duration as f32,
+                progress: t.progress(),
+                mix: t.mix(),
+                from_resolved: t.from_resolved,
+                to_resolved: t.to_resolved,
+            }),
+            screen: app.bus_screen(bus.uuid()),
+        })
+        .collect()
+}
+
+/// How evenly frames have been started, and each output window's presents.
+fn build_pacing_snapshot(app: &VardaApp) -> crate::engine::PacingSnapshot {
+    let stats = &app.frame_stats;
+    // The first interval after a pause (a launch, a dialog) is not a frame.
+    let intervals: Vec<f32> = stats
+        .intervals
+        .iter()
+        .copied()
+        .filter(|ms| *ms > 0.0 && *ms < 1000.0)
+        .collect();
+    let count = intervals.len().max(1) as f32;
+    let mean = intervals.iter().sum::<f32>() / count;
+    let variance = intervals.iter().map(|ms| (ms - mean).powi(2)).sum::<f32>() / count;
+    let frame_ms = if app.target_fps > 0 {
+        1000.0 / app.target_fps as f32
+    } else {
+        mean
+    };
+    let outputs = app
+        .output
+        .outputs
+        .iter()
+        .filter_map(|output| match output {
+            crate::renderer::context::UnifiedOutput::Window(w) => {
+                Some(crate::engine::OutputPacing {
+                    name: w.name.clone(),
+                    presents: w.presents,
+                    pace_skipped: w.pace_skipped,
+                    unavailable: w.unavailable,
+                    follows_clock: w.clock_display.is_some() && w.follows_clock(),
+                    on_screen: w.on_screen.stats(),
+                })
+            }
+            crate::renderer::context::UnifiedOutput::Headless(_) => None,
+        })
+        .collect();
+    #[allow(clippy::cast_possible_truncation)]
+    let inputs = app
+        .camera_manager
+        .picture_delays()
+        .into_iter()
+        .chain(app.screen_capture_manager.picture_delays())
+        .map(|(name, behind)| crate::engine::InputPacing {
+            name,
+            behind_ms: (behind * 1000.0) as f32,
+        })
+        .collect();
+    crate::engine::PacingSnapshot {
+        clock: stats.clock.clone(),
+        frames_in_flight: app.frames_in_flight(),
+        frame_pacing: app.frame_pacing(),
+        interval_mean_ms: mean,
+        interval_stdev_ms: variance.sqrt(),
+        interval_min_ms: intervals
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min)
+            .min(mean),
+        interval_max_ms: intervals.iter().copied().fold(0.0, f32::max),
+        intervals: u32::try_from(intervals.len()).unwrap_or(u32::MAX),
+        late_frames: u32::try_from(intervals.iter().filter(|ms| **ms > frame_ms * 1.5).count())
+            .unwrap_or(u32::MAX),
+        outputs,
+        inputs,
+        parts: stats.parts.stats(),
+        slow_frames: stats.parts.slow_frames(),
+        clock_timestamps: app.clock_timestamps(),
+        frame_hold: app.frame_hold(),
+        control_vsync: app.control_vsync(),
+        control_queue: stats.control_queue.clone(),
+        display_link: stats.display_link.clone(),
+        control_on_screen: stats.control_on_screen.clone(),
+        control_parts: stats.control_parts.clone(),
+        control_slow_frames: stats.control_slow_frames.clone(),
+        gpu_busy_pct: stats.system_monitor.gpu_busy(),
+        gpu_time: stats.gpu_time.snapshot(),
+    }
+}
+
 pub(crate) fn build_engine_state(app: &VardaApp) -> EngineState {
     use crate::engine::traits::{
         AnalyzerQueries, AudioQueries, MacroQueries, MixerQueries, ModulationQueries, OutputQueries,
     };
     EngineState {
         mixer: app.mixer_snapshot(),
+        buses: build_bus_snapshots(app),
+        rundown: app.rundown_snapshot(),
         audio: app.audio_snapshot(),
+        audio_mix: app.audio_mix().snapshot(),
+        stream: crate::streaming::StreamSnapshot::of(app.stream_settings(), app.stream_status()),
+        record: crate::record::RecordSnapshot {
+            options: app.record_settings().options.clone(),
+            status: app.record_status(),
+        },
         modulation: app.modulation_snapshot(),
         outputs: app.output_snapshot(),
         registry: build_registry_snapshot(app),
@@ -687,7 +845,9 @@ pub(crate) fn build_engine_state(app: &VardaApp) -> EngineState {
         fps: app.frame_stats.fps_smoothed,
         frame_count: app.frame_stats.frame_count,
         target_fps: app.target_fps,
+        pacing: build_pacing_snapshot(app),
         ndi_sources: app.external_io.ndi_manager.discovered_sources(),
+        decklink_devices: crate::decklink::known_devices(),
         ndi_available: app.external_io.ndi_manager.is_available(),
         #[cfg(target_os = "macos")]
         syphon_sources: app.external_io.syphon_manager.discovered_sources(),
@@ -794,8 +954,9 @@ mod tests {
 
         let snap = build_mixer_snapshot(&app);
         let effects = &snap.channels[0].decks[0].effects;
-        assert_eq!(effects.len(), 1);
-        assert_eq!(effects[0].uuid, effect_uuid);
+        let names: Vec<&str> = effects.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["crop", "transform", "invert"], "after the defaults");
+        assert_eq!(effects[2].uuid, effect_uuid);
     }
 
     #[test]
@@ -831,6 +992,20 @@ mod tests {
         assert!(p.label.is_none());
         assert!(p.min.is_none());
         assert!(p.max.is_none());
+    }
+
+    /// A layer's own mask is made in Input Settings: the Library does not
+    /// offer the effect that carries it, which alone would hide the layer.
+    #[test]
+    fn the_library_leaves_out_the_layer_mask_effect() {
+        let Some(app) = headless_app() else {
+            return;
+        };
+        let name = crate::engine::value::mask::LAYER_MASK_EFFECT;
+        assert!(app.registry.filters().iter().any(|s| s.name() == name));
+        let snap = build_registry_snapshot(&app);
+        assert!(!snap.filters.iter().any(|(n, _)| n == name));
+        assert!(snap.filters.iter().any(|(n, _)| n == "invert"));
     }
 
     #[test]

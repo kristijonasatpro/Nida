@@ -1,282 +1,204 @@
 #!/usr/bin/env bash
-# Build Varda macOS DMG (Universal binary)
-# Usage: ./scripts/ci/build-macos.sh [--skip-deps] [--skip-build] [--tag v0.2.0]
+# Build Nida.app for Apple silicon and the DMG to give it away in.
 #
-# Produces: Varda-macOS-universal.dmg in the project root
+# Unlike scripts/make-local-app.sh (this computer only: FFmpeg used from
+# where Homebrew put it), this app carries what it needs: the FFmpeg
+# libraries Nida links, the `ffmpeg` program it runs for REC and STREAM, and
+# every library those load (bundle-macos-libs.py), and the shaders. It opens
+# on any Mac with Apple silicon and macOS 15 or later — Homebrew's libraries
+# need the macOS they were built for, so build this on macOS 15 (as the
+# release workflow does) for the DMG to open there.
+#
+# The FFmpeg inside is Homebrew's `ffmpeg-full`, under GPL version 3 or later,
+# so the app as a whole is given away under the GPLv3; Nida's own source
+# stays MIT. Resources/licenses has every bundled library's licence and where
+# its source is. The NDI runtime is not bundled — its licence and the GPL's do
+# not mix — so NDI works once the NDI runtime is installed (docs/23).
+#
+# Signed ad hoc, not by Apple: the first time, macOS needs Open Anyway in
+# System Settings → Privacy & Security.
+#
+# The GPL asks for the corresponding source to be offered beside the DMG:
+# Nida-<version>-third-party-source.tar.gz holds the exact source Homebrew built
+# each bundled library from, with its formula (see bundle-macos-libs.py).
+# Shaders whose licence is non-commercial or not stated are left out
+# (shaders-left-out.txt).
+#
+# Usage: scripts/ci/build-macos.sh [--skip-deps] [--binary PATH] [--out DIR]
+#          [--min-macos 15.0] [--no-sources]
+#   --binary      package a nida already built, instead of building one
+#   --no-sources  skip the source archive (a try-out, not for giving away)
+# Produces in DIR (the project root by default): Nida-<version>-macOS-arm64.dmg,
+# its .sha256, and Nida-<version>-third-party-source.tar.gz
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-cd "$PROJECT_ROOT"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$ROOT"
 
 SKIP_DEPS=false
-SKIP_BUILD=false
-NATIVE_ONLY=false
-TAG="${GITHUB_REF_NAME:-v0.0.0-dev}"
-TARGET=""
-LIB_DIR=""
+SOURCES=true
+BINARY=""
+OUT="$ROOT"
+MIN_MACOS="15.0"
+BUNDLE_ID="lt.proconf.nida"
+FEATURES="--no-default-features --features screen-capture"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --skip-deps)    SKIP_DEPS=true ;;
-    --skip-build)   SKIP_BUILD=true ;;
-    --native-only)  NATIVE_ONLY=true ;;
-    --tag=*)        TAG="${1#--tag=}" ;;
-    --tag)          shift; TAG="$1" ;;
-    --target=*)     TARGET="${1#--target=}" ;;
-    --target)       shift; TARGET="$1" ;;
-    --lib-dir=*)    LIB_DIR="${1#--lib-dir=}" ;;
-    --lib-dir)      shift; LIB_DIR="$1" ;;
-    *) echo "Unknown arg: $1"; exit 1 ;;
+    --skip-deps) SKIP_DEPS=true ;;
+    --binary) shift; BINARY="$1" ;;
+    --out) shift; OUT="$1" ;;
+    --min-macos) shift; MIN_MACOS="$1" ;;
+    --no-sources) SOURCES=false ;;
+    *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
   shift
 done
-VERSION="${TAG#v}"
-NATIVE_ARCH="$(uname -m)"
-if [ "$NATIVE_ARCH" = "arm64" ]; then
-  NATIVE_TARGET="aarch64-apple-darwin"
-  CROSS_TARGET="x86_64-apple-darwin"
-else
-  NATIVE_TARGET="x86_64-apple-darwin"
-  CROSS_TARGET="aarch64-apple-darwin"
-fi
-# Override target if explicitly specified
-if [ -n "$TARGET" ]; then
-  NATIVE_TARGET="$TARGET"
-fi
 
-echo "==> Project root: $PROJECT_ROOT"
-echo "==> Version: $VERSION (tag: $TAG)"
+if [ "$(uname -m)" != "arm64" ]; then
+  echo "Build this on a Mac with Apple silicon" >&2
+  exit 1
+fi
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+echo "==> Nida $VERSION for macOS $MIN_MACOS and later"
 
-# --- Install system dependencies ---
 if [ "$SKIP_DEPS" = false ]; then
-  echo "==> Installing system dependencies..."
-  brew tap homebrew-ffmpeg/ffmpeg
-  brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-srt
-  brew install cmake pkg-config create-dmg
-  # libfreenect (Kinect v1) backs the default-on `depth` feature on the arm64
-  # slice. See spec/depth-sensors.md. The x86_64 slice builds
-  # --no-default-features, so depth (and libfreenect) is excluded there.
-  brew install libfreenect
+  brew install ffmpeg-full
+fi
+BREW="$(brew --prefix)"
+FFMPEG_FULL="$BREW/opt/ffmpeg-full"
+[ -x "$FFMPEG_FULL/bin/ffmpeg" ] || { echo "No ffmpeg-full: brew install ffmpeg-full" >&2; exit 1; }
+
+if [ -z "$BINARY" ]; then
+  # The flags .cargo/config.toml gives, which RUSTFLAGS would replace, and
+  # room in the load commands for bundle-macos-libs.py to rewrite them.
+  export MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS"
+  export RUSTFLAGS="-L native=$FFMPEG_FULL/lib -L native=$BREW/lib -C link-arg=-Wl,-headerpad_max_install_names"
+  export PKG_CONFIG_PATH="$FFMPEG_FULL/lib/pkgconfig"
+  # shellcheck disable=SC2086
+  cargo build --release --locked $FEATURES
+  BINARY="${CARGO_TARGET_DIR:-target}/release/varda"
 fi
 
-# Cargo feature flags for a given target. The face-detection feature pulls in
-# ONNX Runtime, which has no x86_64 macOS dylib, so disable it on that slice
-# (see spec/plugin-architecture.md, decision 5). The html feature is also
-# disabled on x86_64: although Servo's software RenderingContext compiles for
-# x86_64, Servo deck-creation hangs under Rosetta at runtime, so the Intel slice
-# ships without HTML (matches .github/workflows/release.yml) — see
-# spec/html-source.md ("Platform Support"). HTML is Apple-Silicon-native only on
-# macOS (plus Linux x86_64).
-cargo_features_for() {
-  case "$1" in
-    x86_64-apple-darwin) echo "--no-default-features" ;;
-    *) echo "" ;;
-  esac
-}
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+APP="$STAGE/Nida.app"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/licenses"
+cp "$BINARY" "$APP/Contents/MacOS/nida"
+cp -L "$FFMPEG_FULL/bin/ffmpeg" "$APP/Contents/MacOS/ffmpeg"
+chmod 755 "$APP/Contents/MacOS/ffmpeg"
+mkdir -p "$APP/Contents/Resources/shaders"
+rsync -a --exclude-from=<(grep -v -E '^(#|$)' scripts/ci/shaders-left-out.txt) \
+  shaders/ "$APP/Contents/Resources/shaders/"
+cp LICENSE "$APP/Contents/Resources/licenses/LICENSE-Nida-MIT"
+cp "$FFMPEG_FULL/COPYING.GPLv3" "$APP/Contents/Resources/licenses/COPYING-GPLv3"
 
-# Homebrew's arm64 prefix (/opt/homebrew/lib) is not on the default linker
-# search path, so the `depth` feature's `-lfreenect` won't resolve without it.
-# Only the default-feature (arm64) slice pulls in libfreenect; the x86_64 slice
-# builds --no-default-features, so we scope the search path to the native build.
-link_env_for() {
-  case "$(cargo_features_for "$1")" in
-    *--no-default-features*) echo "" ;;
-    *) echo "LIBRARY_PATH=$(brew --prefix)/lib:${LIBRARY_PATH:-}" ;;
-  esac
-}
-
-# --- Build architectures ---
-if [ "$SKIP_BUILD" = false ]; then
-  echo "==> Building $NATIVE_TARGET..."
-  env $(link_env_for "$NATIVE_TARGET") \
-    cargo build --release --target "$NATIVE_TARGET" $(cargo_features_for "$NATIVE_TARGET")
-
-  if [ "$NATIVE_ONLY" = false ]; then
-    echo "==> Building $CROSS_TARGET (cross)..."
-    env $(link_env_for "$CROSS_TARGET") \
-      cargo build --release --target "$CROSS_TARGET" $(cargo_features_for "$CROSS_TARGET")
-  fi
-fi
-
-# --- Create binary (universal or single-arch) ---
-if [ "$NATIVE_ONLY" = true ]; then
-  echo "==> Using native-only binary ($NATIVE_TARGET)..."
-  cp "target/$NATIVE_TARGET/release/varda" varda-universal
-else
-  echo "==> Creating universal binary..."
-  lipo -create \
-    "target/aarch64-apple-darwin/release/varda" \
-    "target/x86_64-apple-darwin/release/varda" \
-    -output varda-universal
-  lipo -info varda-universal
-fi
-
-# --- Build .app bundle ---
-echo "==> Building .app bundle..."
-rm -rf Varda.app
-mkdir -p Varda.app/Contents/MacOS
-mkdir -p Varda.app/Contents/Frameworks
-mkdir -p Varda.app/Contents/Resources/shaders
-mkdir -p Varda.app/Contents/Resources/licenses
-
-cp varda-universal Varda.app/Contents/MacOS/varda
-cp assets/icon.png Varda.app/Contents/Resources/varda.png
-
-# Bundle shaders
-cp -r shaders/* Varda.app/Contents/Resources/shaders/
-
-# Bundle FFmpeg dylibs and fix load paths using @rpath (Apple-recommended approach).
-# See: https://developer.apple.com/forums/thread/736728
-#
-# Strategy:
-#   1. Copy each dylib into Contents/Frameworks/
-#   2. Set each dylib's install name (id) to @rpath/<basename>
-#   3. Rewrite the main binary's load commands from absolute paths to @rpath/<basename>
-#   4. Add LC_RPATH = @executable_path/../Frameworks to the main binary
-#   5. Fix inter-library references (e.g. libavcodec → libavutil) the same way
-#
-# This works regardless of where libs were built (Homebrew, /tmp cross-compile, etc.)
-# because we use otool -L to discover the actual baked-in paths.
-
-HOMEBREW_LIB="${LIB_DIR:-$(brew --prefix)/lib}"
-BINARY="Varda.app/Contents/MacOS/varda"
-FRAMEWORKS="Varda.app/Contents/Frameworks"
-
-# Step 1: Discover which dylibs the binary actually needs via otool, copy them in.
-# This is authoritative — we copy exactly the filenames the linker recorded,
-# not whatever find happens to return.
-BUNDLED_LIBS=()
-for lib in libavcodec libavformat libavutil libswscale libswresample libavdevice libavfilter libsrt libfreenect; do
-  old_path=$(otool -L "$BINARY" | grep "$lib" | awk '{print $1}' | head -1 || true)
-  [ -z "$old_path" ] && continue
-  case "$old_path" in @*) continue ;; esac  # already relative — skip
-
-  libname=$(basename "$old_path")
-  # Resolve the source file (may be a symlink chain)
-  src="$HOMEBREW_LIB/$libname"
-  if [ ! -e "$src" ]; then
-    # Fallback: search for any matching file
-    src=$(find "$HOMEBREW_LIB" -maxdepth 1 -name "${lib}*.dylib" | head -1)
-  fi
-  if [ -n "$src" ] && [ -e "$src" ]; then
-    cp -L "$src" "$FRAMEWORKS/$libname"   # -L follows symlinks, copies actual file
-    BUNDLED_LIBS+=("$libname")
-  fi
+# The icon, at every size macOS asks for.
+ICONSET="$STAGE/nida.iconset"
+mkdir -p "$ICONSET"
+for size in 16 32 128 256 512; do
+  sips -z "$size" "$size" assets/icon.png --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+  double=$((size * 2))
+  sips -z "$double" "$double" assets/icon.png --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
 done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/nida.icns"
 
-# Step 2: Set each dylib's install name (id) to @rpath/<basename>
-for libname in "${BUNDLED_LIBS[@]}"; do
-  install_name_tool -id "@rpath/$libname" "$FRAMEWORKS/$libname"
-done
-
-# Step 3: Rewrite the main binary's load commands from absolute paths to @rpath/<basename>
-for libname in "${BUNDLED_LIBS[@]}"; do
-  lib_prefix=$(echo "$libname" | sed 's/\.[0-9].*//')
-  otool -L "$BINARY" | { grep "$lib_prefix" || true; } | awk '{print $1}' | while read -r old_path; do
-    case "$old_path" in @*) continue ;; esac
-    install_name_tool -change "$old_path" "@rpath/$libname" "$BINARY"
-  done
-done
-
-# Step 4: Add LC_RPATH so dyld resolves @rpath to Contents/Frameworks/
-install_name_tool -add_rpath "@executable_path/../Frameworks" "$BINARY" 2>/dev/null || true
-
-# Step 5: Fix inter-library references and bundle transitive deps.
-# Run multiple passes: first bundle any missing transitive deps, then rewrite
-# all non-system absolute paths to @rpath. Two passes handles typical depth.
-for _pass in 1 2 3; do
-  for fw_dylib in "$FRAMEWORKS"/*.dylib; do
-    deps=$(otool -L "$fw_dylib" | tail -n +2 | awk '{print $1}')
-    for dep_path in $deps; do
-      case "$dep_path" in /usr/*|/System/*) continue ;; esac
-      dep_name=$(basename "$dep_path")
-      # Already bundled? Just rewrite the reference if needed
-      if [ -f "$FRAMEWORKS/$dep_name" ]; then
-        case "$dep_path" in @*) continue ;; esac  # already @rpath — nothing to do
-        install_name_tool -change "$dep_path" "@rpath/$dep_name" "$fw_dylib"
-        continue
-      fi
-      # Not bundled — try to find and copy it
-      if [ "${dep_path#@rpath/}" != "$dep_path" ]; then
-        # @rpath reference but not bundled — search LIB_DIR/HOMEBREW_LIB
-        src_path=""
-        [ -f "$HOMEBREW_LIB/$dep_name" ] && src_path="$HOMEBREW_LIB/$dep_name"
-      else
-        # Absolute path — use it directly, fallback to LIB_DIR
-        src_path="$dep_path"
-        [ ! -f "$src_path" ] && [ -f "$HOMEBREW_LIB/$dep_name" ] && src_path="$HOMEBREW_LIB/$dep_name"
-      fi
-      if [ -n "$src_path" ] && [ -f "$src_path" ]; then
-        cp -L "$src_path" "$FRAMEWORKS/$dep_name"
-        install_name_tool -id "@rpath/$dep_name" "$FRAMEWORKS/$dep_name"
-        BUNDLED_LIBS+=("$dep_name")
-        case "$dep_path" in @*) ;; *)
-          install_name_tool -change "$dep_path" "@rpath/$dep_name" "$fw_dylib"
-        ;; esac
-      fi
-    done
-  done
-done
-
-# Bundle NDI SDK (runtime-loaded via libloading, universal binary from cask)
-NDI_LIB="/Library/NDI SDK for Apple/lib/macOS/libndi.dylib"
-if [ -f "$NDI_LIB" ]; then
-  echo "==> Bundling NDI SDK..."
-  cp "$NDI_LIB" Varda.app/Contents/Frameworks/libndi.dylib
-  install_name_tool -id "@rpath/libndi.dylib" Varda.app/Contents/Frameworks/libndi.dylib 2>/dev/null || true
-else
-  echo "==> NDI SDK not found, skipping bundle (install with: brew install --cask libndi)"
-fi
-
-# ONNX Runtime is statically linked into the arm64 binary via ort's
-# `download-binaries` feature — no dylib to bundle. See spec/plugin-architecture.md.
-
-# Bundle licenses
-cp LICENSE Varda.app/Contents/Resources/licenses/ 2>/dev/null || echo "MIT License" > Varda.app/Contents/Resources/licenses/LICENSE
-echo "FFmpeg is licensed under the LGPL v2.1+. See https://ffmpeg.org/legal.html" > Varda.app/Contents/Resources/licenses/FFMPEG-LICENSE
-
-
-# Info.plist
-cat > Varda.app/Contents/Info.plist << PLIST_EOF
+# As make-local-app.sh's, without this computer's settings: the shaders are
+# found in Resources, the API port is the default, and no command-line tool
+# is offered (it asks for an administrator's password).
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Varda</string>
-  <key>CFBundleDisplayName</key><string>Varda</string>
-  <key>CFBundleIdentifier</key><string>com.varda.app</string>
+  <key>CFBundleName</key><string>Nida</string>
+  <key>CFBundleDisplayName</key><string>Nida</string>
+  <key>CFBundleIdentifier</key><string>${BUNDLE_ID}</string>
   <key>CFBundleVersion</key><string>${VERSION}</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
-  <key>CFBundleExecutable</key><string>varda</string>
+  <key>CFBundleExecutable</key><string>nida</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleIconFile</key><string>varda.png</string>
-  <key>LSMinimumSystemVersion</key><string>10.15</string>
+  <key>CFBundleIconFile</key><string>nida.icns</string>
+  <key>LSMinimumSystemVersion</key><string>${MIN_MACOS}</string>
   <key>NSHighResolutionCapable</key><true/>
-  <key>NSCameraUsageDescription</key><string>Varda uses the camera for live video input</string>
-  <key>NSMicrophoneUsageDescription</key><string>Varda uses the microphone for audio-reactive visuals</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
+  <key>NSCameraUsageDescription</key><string>Nida shows cameras and capture cards as inputs.</string>
+  <key>NSCameraReactionEffectGesturesEnabledDefault</key><false/>
+  <key>NSMicrophoneUsageDescription</key><string>Nida mixes microphones and other sound inputs.</string>
+  <key>NSAudioCaptureUsageDescription</key><string>Nida takes an app's sound, such as a Zoom or Teams call's, as an input to mix.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>Nida finds and sends NDI video on the local network.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_ndi._tcp</string>
+  </array>
+  <key>LSEnvironment</key>
+  <dict>
+    <key>VARDA_NO_CLI_INSTALL</key><string>1</string>
+  </dict>
 </dict>
 </plist>
-PLIST_EOF
+PLIST
+plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
-# --- Code sign ---
-echo "==> Ad-hoc code signing..."
-codesign --force --deep --sign - Varda.app
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
+SOURCE_TAR="Nida-$VERSION-third-party-source.tar.gz"
+SOURCE_ARGS=()
+[ "$SOURCES" = true ] && SOURCE_ARGS=(--sources "$OUT/$SOURCE_TAR")
+python3 scripts/ci/bundle-macos-libs.py "$APP" --min-macos "$MIN_MACOS" \
+  --identifier "$BUNDLE_ID" --origin "nida=$BINARY" --origin "ffmpeg=$FFMPEG_FULL/bin/ffmpeg" \
+  --cargo-args "$FEATURES" --version "$VERSION" ${SOURCE_ARGS[@]+"${SOURCE_ARGS[@]}"}
 
-# --- Create DMG ---
-echo "==> Creating DMG..."
-rm -f Varda-macOS-universal.dmg
-create-dmg \
-  --volname "Varda" \
-  --window-pos 200 120 \
-  --window-size 600 400 \
-  --icon-size 100 \
-  --icon "Varda.app" 150 190 \
-  --app-drop-link 450 190 \
-  --no-internet-enable \
-  "Varda-macOS-universal.dmg" \
-  "Varda.app"
+# Both programs start, every library found inside the app.
+VARDA_NO_CLI_INSTALL=1 "$APP/Contents/MacOS/nida" --version
+"$APP/Contents/MacOS/ffmpeg" -hide_banner -version | head -1
+for program in nida ffmpeg; do
+  arg=--version
+  [ "$program" = ffmpeg ] && arg=-version
+  loaded="$(DYLD_PRINT_LIBRARIES=1 VARDA_NO_CLI_INSTALL=1 "$APP/Contents/MacOS/$program" "$arg" 2>&1 >/dev/null || true)"
+  if grep -q -E '/opt/homebrew|/usr/local' <<<"$loaded"; then
+    echo "$program loaded from outside the app:" >&2
+    grep -E '/opt/homebrew|/usr/local' <<<"$loaded" >&2
+    exit 1
+  fi
+done
 
-echo "==> Done: Varda-macOS-universal.dmg"
-ls -lh Varda-macOS-universal.dmg
-echo ""
-echo "The 'varda' CLI wrapper is auto-installed on first launch."
+DMG_DIR="$STAGE/dmg"
+mkdir -p "$DMG_DIR"
+ditto "$APP" "$DMG_DIR/Nida.app"
+ln -s /Applications "$DMG_DIR/Applications"
+cat > "$DMG_DIR/Read me first.txt" <<TXT
+Nida $VERSION — for Macs with Apple silicon, macOS $MIN_MACOS or later
+
+1. Drag Nida to Applications.
+2. Open it. The first time, macOS says it cannot check Nida for malicious
+   software: Nida is not signed by Apple. Open System Settings → Privacy &
+   Security, and next to "Nida was blocked" click Open Anyway. Only once.
+3. For NDI, install the free NDI runtime from ndi.video: the NDI SDK for
+   Apple, or with Homebrew: brew install --cask libndi
+
+Manual: https://github.com/kristijonasatpro/Nida/blob/main/docs/README.md
+
+Nida's own code is under the MIT licence. Built with FFmpeg under the GPL,
+the app as a whole is given away under the GPL version 3: see
+Nida.app/Contents/Resources/licenses. Its source: Nida's at
+https://github.com/kristijonasatpro/Nida/tree/v$VERSION, and that of every
+library inside in $SOURCE_TAR on the release page,
+https://github.com/kristijonasatpro/Nida/releases/tag/v$VERSION.
+
+vMix and Resolume are trademarks of their owners; Nida is not affiliated
+with either.
+TXT
+
+DMG="$OUT/Nida-$VERSION-macOS-arm64.dmg"
+rm -f "$DMG"
+# hdiutil is known to fail now and then with "Resource busy" on CI Macs.
+for attempt in 1 2 3; do
+  if hdiutil create -volname "Nida $VERSION" -srcfolder "$DMG_DIR" -ov -format UDZO "$DMG" >/dev/null; then
+    break
+  fi
+  [ "$attempt" = 3 ] && exit 1
+  sleep 5
+done
+# Named as it is downloaded, so `shasum -c` works beside it.
+(cd "$OUT" && shasum -a 256 "$(basename "$DMG")" | tee "$(basename "$DMG").sha256")
+ls -lh "$OUT"/Nida-"$VERSION"-*
