@@ -25,3 +25,6 @@ tests/media/
 /varda-universal
 /arm64-app/
 /x86-app/
+# Python bytecode (scripts/ci)
+__pycache__/
+*.pyc
