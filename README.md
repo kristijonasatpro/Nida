@@ -109,6 +109,14 @@ The [Varda releases](https://github.com/im-knots/varda/releases) (`Varda-macOS-u
 ## Getting Started
 See the [manual](docs/README.md) for a complete guide to using Nida.
 
+## Buy me a coffee
+
+Nida is free. If you find it useful, you can [buy me a coffee ☕](https://donate.stripe.com/4gM00j1Jqf9V9bl1xQ0RG00): it keeps me working on new updates. The link opens a Stripe page where you choose the amount. I use that one page for all my open-source projects, Nida among them; it was set up for my Lithuanian speech tools, so it says Kalamo.ai and names them.
+
+Or scan it with your phone:
+
+<a href="https://donate.stripe.com/4gM00j1Jqf9V9bl1xQ0RG00"><img src="docs/img/coffee-qr.png" width="180" alt="QR code for the coffee link"></a>
+
 ---
 
 ## Build from source
