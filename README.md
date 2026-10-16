@@ -1,39 +1,84 @@
 # Nida
 
-A live switcher for conferences and events — vMix-style inputs, Preview and Program, buses, an audio mixer, streaming, recording, NDI and LED screens — with broadcast style routing for visuals underneath.
+**A live production switcher for conferences and events, on the Mac.** Cameras, slides, clips and remote speakers go through Preview and Program to the stage screens and LED walls, to recordings and to up to four streaming destinations at once, with an audio mixer for the room, the stream and the call.
 
-Nida is built on **[Varda](https://github.com/im-knots/varda)** by im-knots, a visual performance tool for VJs and installation artists, and keeps its MIT license (see [LICENSE](LICENSE)). Varda's community is on #varda at [Libera.Chat](https://web.libera.chat/#varda).
+If you have run shows on vMix, Nida will feel familiar: inputs built from layers, Preview and Program with Cut and Fade, overlays, an audio mixer with buses, and STREAM and REC buttons.
+
+![Nida in the Broadcast layout: Preview and Program over the input tiles, the audio mixer beside them](tests/snapshots/full_ui_broadcast_layout.png)
+
+Nida is built on **[Varda](https://github.com/im-knots/varda)** by im-knots, a visual performance tool for VJs and installation artists, and keeps its MIT licence (see [LICENSE](LICENSE)). Varda's engine is still underneath: see [Underneath: Varda](#underneath-varda). Varda's community is on #varda at [Libera.Chat](https://web.libera.chat/#varda).
 
 vMix and Resolume are trademarks of their owners. Nida is not affiliated with or endorsed by either; their names are used only to compare.
 
-![Nida Performance Mode](docs/img/varda-performance.png)
+## Built for conferences and events
 
-![Nida Arrangement Mode](docs/img/varda-arrangement.png)
+### Switching
 
-Nida applies broadcast video workflows to live visuals. Sources (video, cameras, generative shaders, streams, images) flow through a routing graph of decks, channels, and surfaces to reach outputs (projectors, streams, recordings). Instead of a clip-launch grid, you control what's live by adjusting opacity, blend modes, crossfaders, mute/solo, and effect chains. When a show has to land the same way every night, the same scene can be laid out against a timeline instead, and you can still take over manual control on any of it while it runs.
+- **Preview and Program**: in Main mode (**Main mode…** switches it on), one input is on air at a time. Click an input to put it in Preview; **Space** cuts it to Program and **Enter** takes it with the chosen transition.
+- **Transitions**: Fade, **Merge**, Wipe, Slide, Zoom and Iris. Merge moves the layers two inputs share into their new places: a picture-in-picture grows to full screen, two speakers trade places, a speaker in a round bubble opens into the whole picture. Layers it cannot move (blended other than Normal, say, or in an input with effects of its own) fade across instead, and a notice says why.
+- **Overlays**: a logo or a lower third stays on top of whatever is on air, with its own buttons to take it on and off.
 
-- **Routing matrix**: Sources > Decks > Channels > Mixer > Surfaces > Outputs. Any source to any output, split, branch, or sub-mix at every junction
-- **Two views of one scene**: **Performance mode** is the mixer, played by hand with live performance controls. **Arrangement mode** is the same scene with a show timeline: regions say when each deck is up, automation curves draw any parameter over the timeline, cue points mark the moments worth jumping to, and the transport can chase SMPTE timecode. An edit in either view appears immediately in the other
-- **Sources**: video (HAP GPU-native + ffmpeg), cameras, GLSL shaders (generators/filters, ISF-style metadata), NDI, SRT, HLS, DASH, RTMP/RTMPS, Syphon (macOS receive), screen and window capture, program taps of Nida's own output, images, and html/css/js sources (Servo)
-- **Mixing**: N-channel compositing, A/B crossfader, per-deck opacity, 15 blend modes, linear-light HDR pipeline
-- **Color**: 9 tonemap presets (ACES, AgX, Reinhard, Hable, etc.), 3D LUT support (.cube/.3dl) for color grading
-- **Transitions**: ISF shader transitions between channels, deck auto-transitions (timer/clip-end triggers), multi-channel transition sequencer with beat-synced or timed triggers (seconds, minutes, hours). Allowing for quick automated live transitions or long running automated installations.
-- **Effect chains**: 3-level hierarchy (deck > channel > master), drag-and-drop from library, reorderable
-- **Modulation**: LFO, audio-reactive, ADSR, step sequencer, mod-on-mod chaining on any parameter
-- **Analyzer preprocessors**: ML-powered analysis, sensor data interpretation, and more injected as shader data textures via ISF `PREPROCESSORS` declarations. CPU/GPU hybrid pipeline for effects that need structured data vanilla GLSL can't produce
-- **Audio**: 2048-bin FFT, beat detection, bass/mid/treble bands, BPM with beat phase
-- **Control**: MIDI, OSC, and HTTP API co-equal consumers of the same engine
-- **Projection mapping**: 2D stage editor, polygon/circle surfaces, per-surface corner-pin warp, calibration cards, edge blending (Auto with precise polygon overlap detection, Manual per-edge)
-- **Multi-output**: multiple windows, fullscreen on any display, headless outputs with surface assignments
-- **Network I/O**: NDI, SRT, HLS, LL-HLS, DASH, and RTMP/RTMPS send/receive
-- **Recording**: H.264, h.265, AV1, ProRes 422, HAP Q per-output
-- **Presets**: save/load deck and channel presets with modulation recipes
-- **Persistence**: full scene/venue/MIDI state saved and restored across sessions
+### Inputs built from layers
 
-Experimental:
-- **Dome projection**: fisheye to equirectangular (360°) and cubemap (3D) rendering with configurable lens correction and chromatic aberration.
-- **Surface overlap zones**: manual and auto-detect modes for precise edge blending.
-- **Compute shader support**: ISF compute shaders for particle simulations, fluid dynamics, ect
+- **Layers**: an input is a stack of them — a camera or capture card, a clip, a picture, NDI, a screen or window, a stream (SRT, RTMP, HLS), a colour, a web page (in builds with the web engine, not the DMG), or **another input**, drawn once and shown in both.
+- **Per layer**: position, crop, colour correction, chroma and luma keys, flip and effects.
+- **Borders**: colour, thickness and roundness. **Circle** puts a speaker in a ringed circle, the way podcasts show them.
+- **Masks**: a rectangle, an ellipse or a shape drawn by hand, cut out of a layer, with feather and invert.
+- **Layout templates**: side by side, top and bottom, picture-in-picture, 2 × 2. One click places the layers; then drag them to fine-tune.
+- **Input Settings**: double-click an input to open them.
+
+### Screens
+
+- **Buses**: each screen in the room shows Main or a bus of its own — the stage screens, a confidence monitor, the stream.
+- **LED screens**: several LED screens on one feed to the LED processor, each at its exact pixels, with a true-size test card.
+- **Outputs**: Blackmagic UltraStudio and DeckLink devices (HDMI and SDI), and windows on any display — each at Full or Video levels.
+
+### Streaming and recording
+
+- **STREAM**: one encode, sent to up to **four RTMP or RTMPS destinations** at once — YouTube, a CDN, the client's own server.
+  - H.264 or HEVC, on the Mac's media engine or in software, at a Constant, Variable or Average bit rate.
+  - With the media engine, it can lower the bit rate by itself while the venue's upload cannot keep up.
+  - When the network changes, a destination that stops getting through reconnects within seconds.
+  - Live stats sit beside the button.
+- **REC**: H.264, HEVC or ProRes 422 / 422 HQ. With the Hardware encoder (the default), the Mac's media engine encodes it wherever it has the codec, and recording costs almost no CPU.
+  - MP4 files survive a crash: they are written in one-second pieces.
+  - It records Main or any bus.
+  - Files are named by the date and time they started.
+  - It warns before the disk fills up.
+
+### Sound
+
+- **Audio mixer**: buses go to sound devices, recordings and streams, each with its own fader and delay. Solo and headphones too.
+- **Clip sound**: it can follow its picture on and off air.
+- **Sources with sound**: cameras and NDI sources bring their own sound, and NDI goes out with a bus of its own. One microphone can be delayed on its own, to line up with its picture.
+- **Zoom and Teams calls**:
+  - the call's sound comes straight from the app;
+  - the guest's camera and slides come in as window inputs;
+  - Nida's programme goes back to the call as a camera — through the free NDI Virtual Input, OBS's Virtual Camera or a USB capture device;
+  - a bus made for the call (a mix-minus: everything but the call) keeps it from hearing itself.
+
+### Running the show
+
+- **Rundown**: the show as steps. A step changes every screen together, takes Main, and starts clips, playlists or timers, all with one press. **GO** takes the next step, or steps go on by themselves.
+- **Timers**: count down, count up, count to a time, or show the time of day, on screen in their own font and colours. A countdown turns colour as it nears zero, and its control panel adds or takes off a minute or ten seconds.
+- **Playlists**, and a clip transport under Preview with in and out points.
+- **Screen layouts**: **Broadcast** (Preview and Program over the input tiles), **Classic** and **VJ**. Drag any panel and save your own.
+- **Long days**: the Mac and its displays stay awake while Nida runs, and a show's files are written in the background, so the outputs never wait for the disk.
+
+### Smooth, low-latency output
+
+In the app (not in headless mode), Nida draws the show on a thread of its own, each frame started by the screen's refresh whenever the screen's rate fits the show's.
+
+- **The control window does not hold up the screens.** A busy moment, an open menu or a dialog does not touch the outputs. Only reconfiguring a window (resizing it, or moving it to another screen) can cost them a frame or two.
+- **A stalled screen stalls only itself.** Each output window shows its frames from a thread of its own, so a screen that macOS holds up costs that screen alone.
+- **Cameras stay even.** Each picture is shown by when it was captured. Tick **Lowest latency** on a camera to show its newest picture every frame instead.
+- **Low latency is the default.** Each frame is finished before the next one starts. **Normal** or **High** give a heavy 4K show on a laptop one or two frames of headroom.
+- **Hardware does the heavy work.** Clips decode on the Mac's media engine when it has their codec (AV1 on M3 and newer), and with the Hardware encoder, recordings and streams are encoded there too, wherever it has the codec.
+- **Hitches are counted.** macOS reports when each frame of Nida's windows came up on screen; Nida counts the hitches, and warns when an output display's refresh rate cannot show the show's frame rate evenly.
+
+## Underneath: Varda
+
+Varda's engine is still there: the routing matrix, ISF shaders and effect chains, modulation, projection mapping and edge blending, the arrangement timeline with SMPTE timecode, MIDI, OSC, and an HTTP API with a WebSocket. The VJ layout is laid out for it. The DMG leaves out web pages, depth sensors and face detection; a build from source with the default features has them. The [manual](docs/README.md) covers both.
 
 ## Install
 
@@ -71,6 +116,8 @@ See the [manual](docs/README.md) for a complete guide to using Nida.
 For bleeding edge features and bug fixes you can compile Nida from source.
 
 Requires [Rust](https://rustup.rs/) (stable) and a GPU with Metal (macOS) or Vulkan (Linux) support.
+
+Nida is made and tested on Macs with Apple silicon. The Linux build below is Varda's; Nida's own features have not been tested on Linux.
 
 ### Ubuntu / Debian
 

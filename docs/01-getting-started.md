@@ -2,7 +2,10 @@
 
 ## Install
 
-On a Mac, build the release and wrap it in an app:
+The quickest way is the DMG under [Releases](https://github.com/kristijonasatpro/Nida/releases),
+for Macs with Apple silicon: see [Download](../README.md#download-macos).
+
+To build it yourself, on a Mac, build the release and wrap it in an app:
 
 ```bash
 cargo build --release --no-default-features --features screen-capture
@@ -107,7 +110,7 @@ cargo run --release
 
 ## UI Layout
 
-![Nida UI](img/screenshot.png)
+![Nida in the Classic layout](../tests/snapshots/full_ui_default.png)
 
 - **Top bar** — undo, redo, save and the **🎬** show menu (New, Open, Save As) on the left, then **Arrange**, **Layout**, **STREAM**, **REC** — while live, each with its figures beside it, as OBS's status bar shows them — and the live performance metrics (frame rate against its target, `50/50 FPS`, GPU, CPU, RAM). On the right, reading right to left: the **BPM / clock** readout, the **transport position** as timecode, the **📐 render resolution**, and the **🎯 target frame rate**. Each one is clickable and opens its settings.
 - Below it, **panels** as tabs, arranged by the screen layout — **Classic** (shown), **Broadcast**, **VJ** or your own. See [Screen Layouts](20-layouts.md).

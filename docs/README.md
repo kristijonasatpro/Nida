@@ -1,12 +1,10 @@
 # Nida
 
-Nida is a free, open-source live visual mixer and broadcast router for Linux, macOS, and Windows, written in Rust. It routes video sources like shaders, video files, cameras, NDI, SRT, HLS/DASH streams, screen and window captures, and HTML/web pages through a broadcast-style signal matrix (Deck → Channel → Mixer → Surface → Output), composites them with per-parameter modulation and ISF effect chains, and delivers the result to projectors, network streams, recordings, and the web.
+Nida is a free, open-source live production switcher for conferences and events, on the Mac, written in Rust. Cameras, slides, clips, NDI, screens and remote speakers become inputs built from layers. They go through Preview and Program — Cut, Fade, Merge and other transitions, with overlays on top — to the stage screens, LED walls and Blackmagic outputs, to recordings and to up to four streaming destinations, with an audio mixer for the room, the stream and the call. A rundown and timers keep the show in order. [Part II](#part-ii--running-a-conference-or-event) is all of that.
 
-Nida is built for live VJ performance, dome projection, multi-projector installations, and headless media serving and is controlled via MIDI, OSC, keyboard shortcuts, or a full REST/WebSocket API.
+Nida is built on [Varda](https://github.com/im-knots/varda), and Varda's engine is still underneath: a broadcast-style signal matrix (Deck → Channel → Mixer → Surface → Output), ISF shaders and effect chains, modulation, projection mapping, MIDI, OSC and a REST/WebSocket API.
 
 A scene can be worked two ways, and they are two views of the same thing rather than two projects. **Performance mode** is the mixer: channels, decks, faders, everything by hand. **[Arrangement mode](15-arrangement.md)** is that scene against show time, where regions decide when a deck is up, curves automate any parameter, cue points mark the moments worth returning to, and the transport can follow SMPTE timecode. Use either on its own or both together, and when both are running your hand wins: touch an automated control and it hands over until you re-arm it.
-
-Here you will find everything you need to start throwing those pixels. 
 
 ---
 
@@ -15,7 +13,7 @@ Here you will find everything you need to start throwing those pixels.
 ### Part I — Getting Started
 
 - **1. [Getting Started](01-getting-started.md)**
-  - [Install](01-getting-started.md#install) — macOS DMG, Linux tarball, Windows ZIP
+  - [Install](01-getting-started.md#install) — the Mac DMG, or build it yourself
   - [Workspace & Content](01-getting-started.md#workspace--content) — project layout, supported formats
   - [Build from Source](01-getting-started.md#build-from-source)
   - [UI Layout](01-getting-started.md#ui-layout) — panel map
@@ -32,9 +30,61 @@ Here you will find everything you need to start throwing those pixels.
   - [Effect Chains](02-concepts.md#effect-chains) — deck, channel, and master FX levels
   - [Modulation](02-concepts.md#modulation) — LFO, audio bands, ADSR, step sequencer, analyzer
   - [Copy and Paste](02-concepts.md#copy-and-paste) — right-click or Cmd+C/V/D on decks, channels, effects
-  - [Persistence](02-concepts.md#persistence) — scene vs stage, presets, asset handling
+  - [The Nida workspace](02-concepts.md#the-nida-workspace) — scene vs stage, presets, asset handling
 
-### Part II — Performing
+### Part II — Running a conference or event
+
+New to Nida? Start with [Main mode](18-main.md), [Screen Layouts](20-layouts.md) and [Adding Inputs](23-adding-inputs.md).
+
+- **16. [Audio Mixer](16-audio-mixer.md)** — vMix-style strips: buses, sends, solo, balance, Audio Auto
+  - [Inputs](16-audio-mixer.md#inputs) — clips, sound files and input devices
+  - [Audio Auto](16-audio-mixer.md#audio-auto) — a clip's sound on and off with its picture
+  - [Outputs](16-audio-mixer.md#outputs) — buses: sound devices, faders, delay
+  - [Headphones](16-audio-mixer.md#headphones) — listen bus and solo
+  - [Recordings and streams](16-audio-mixer.md#recordings-and-streams) — which bus an output carries
+  - [Lining up sound and picture](16-audio-mixer.md#lining-up-sound-and-picture)
+- **17. [Streaming](17-streaming.md)** — the STREAM button: one encode to four RTMP/RTMPS destinations, red when healthy, blinking yellow on trouble
+  - [Setting up](17-streaming.md#setting-up) — picture, sound, size, bit rate, hardware encoder
+  - [Destinations](17-streaming.md#destinations) — URL, stream key, username and password
+  - [While live](17-streaming.md#while-live) — states, reconnecting, stopping
+  - [If a destination will not connect](17-streaming.md#if-a-destination-will-not-connect)
+- **18. [Main mode](18-main.md)** — one channel on Main at a time, Space cuts, Enter takes the chosen transition, overlay channels on top; wide channel row with + Channel
+  - [Taking a channel to Main](18-main.md#taking-a-channel-to-main) — NEXT and ON MAIN tallies, one input alone
+  - [Overlays](18-main.md#overlays) — logo and lower third over whatever is on Main
+  - [Saved, and safe from undo](18-main.md#saved-and-safe-from-undo)
+- **19. [Recording](19-recording.md)** — the REC button: date-named files, hardware H.264/HEVC/ProRes, crash-safe MP4, red when recording, blinking yellow on trouble
+- **20. [Screen Layouts](20-layouts.md)** — Classic, Broadcast (Preview / Program over input tiles) and VJ (layers as rows); drag panels anywhere and save your own
+  - [Panels](20-layouts.md#panels) — what each one is
+  - [Making your own](20-layouts.md#making-your-own) — drag, save, update, reset, lock
+  - [Broadcast: Preview / Program and Inputs](20-layouts.md#broadcast-preview--program-and-inputs)
+  - [VJ: Layers](20-layouts.md#vj-layers)
+- **21. [Input Settings](21-input-settings.md)** — like vMix's double-click window: a channel's layers (hide, reorder, delete, add), each layer's position, crop, colour, keys and effects, and the channel's own — with layout templates
+  - [Layers](21-input-settings.md#layers) — numbered as vMix numbers them, 1 at the back
+  - [A layer](21-input-settings.md#a-layer) — Position, Playback, Colour, Key, Effects
+  - [The whole channel](21-input-settings.md#the-whole-channel) — General, Layout templates, Colour, Key, Effects
+- **22. [LED Screens](22-led-screens.md)** — like Resolume's Advanced Output: several LED screens on one HDMI feed to the processor, each at its own pixels, showing Main or a bus of its own
+  - [The feed](22-led-screens.md#the-feed) — on the processor's output, in a window, test card
+  - [Screens](22-led-screens.md#screens) — size, place, what it shows, Fit / Fill / Stretch / Part
+  - [One picture across several screens](22-led-screens.md#one-picture-across-several-screens)
+  - [Over the API](22-led-screens.md#over-the-api)
+- **23. [Adding Inputs](23-adding-inputs.md)** — like vMix's Add Input: clips, pictures, cameras and capture cards, NDI, desktop capture, streams, web pages, colours and sound devices, each a new input
+  - [Cameras and capture cards](23-adding-inputs.md#cameras-and-capture-cards) — format (size and frame rate), the camera's own sound
+  - [NDI](23-adding-inputs.md#ndi) — the runtime, sources on the network, their sound; sending NDI with an audio bus
+  - [Desktop capture](23-adding-inputs.md#desktop-capture) — displays and windows, Screen Recording access
+  - [Over the API](23-adding-inputs.md#over-the-api) — `POST /api/inputs`
+- **24. [Zoom and Teams Calls](24-calls.md)** — a remote speaker over the ordinary call app: their sound straight from the app, their camera and slides as window inputs, Nida's programme back as the call's camera (through NDI Virtual Input, OBS or a capture device) with its sound, and a bus that keeps the call from hearing itself
+  - [The call into Nida](24-calls.md#the-call-into-nida) — app sound, window capture
+  - [Nida back to the call](24-calls.md#nida-back-to-the-call) — NDI Virtual Input
+  - [The call must not hear itself](24-calls.md#the-call-must-not-hear-itself) — a mix-minus bus
+- **25. [Rundown](25-rundown.md)** — the show in order: steps that change every screen of a wall together, take Main and start clips, each taken with one press, and GO for the next
+  - [Making steps](25-rundown.md#making-steps) — + Step keeps what is on now; Duplicate; the step's window
+  - [Running the show](25-rundown.md#running-the-show) — GO, Cut and Fade; all of it or none; going on by itself
+  - [Clips, playlists and timers](25-rundown.md#clips-playlists-and-timers) — a sting on no screen, a talk's countdown
+  - [Over the API](25-rundown.md#over-the-api) — `/api/rundown/…`
+
+Parts III–VI are the engine underneath, from Varda, with Nida's additions.
+
+### Part III — Performing
 
 - **3. [Library Panel](03-library-panel.md)** — content browser
   - [Sections](03-library-panel.md#sections) — generators, effects, images, video, cameras, screen capture, taps, streams, HTML, presets
@@ -67,9 +117,9 @@ Here you will find everything you need to start throwing those pixels.
     - [Binding Targets](06-control-surfaces.md#binding-targets) — per-target range, curve, invert
     - [Buttons](06-control-surfaces.md#buttons) — momentary, toggle, trigger actions
     - [Mapping to MIDI / OSC / Keyboard](06-control-surfaces.md#mapping-a-macro-to-midi--osc--keyboard)
-    - [Macro HTTP API](06-control-surfaces.md#macro-http-api)
+    - [Macro HTTP API](13-api.md#create-a-macro-and-bind-a-target)
 
-### Part III — Output & Display
+### Part IV — Output & Display
 
 - **7. [Outputs](07-outputs.md)**
   - [Creating an Output](07-outputs.md#creating-an-output) — windowed, recording, stream
@@ -99,7 +149,7 @@ Here you will find everything you need to start throwing those pixels.
   - [Per-Deck Scaling](10-resolution-and-monitoring.md#per-deck-scaling) — fill, fit, stretch, center
   - [Performance Monitoring](10-resolution-and-monitoring.md#performance-monitoring) — FPS, GPU, CPU/RAM
 
-### Part IV — Reference
+### Part V — Reference
 
 - **11. [Shader Library](11-shader-library.md)** — catalog of bundled generators, filters, transitions, and compute shaders
 - **12. [Shader Authoring](12-isf-authoring.md)**
@@ -116,7 +166,7 @@ Here you will find everything you need to start throwing those pixels.
   - [Headless Mode](13-api.md#headless-mode)
   - [WebSocket](13-api.md#websocket)
   - [Common Patterns](13-api.md#common-patterns)
-  - [Route Groups](13-api.md#route-groups)
+  - [Route Reference](13-api.md#route-reference)
 - **14. [Frame Analysis & Preprocessors](14-frame-analysis.md)** — one analyzer engine, two paths
   - [What's Implemented](14-frame-analysis.md#whats-implemented) — brightness, face_detect, depth_sensor; planned types
   - [Analysis as Modulation](14-frame-analysis.md#analysis-as-modulation-performers) — brightness/face scalars drive any parameter
@@ -124,7 +174,7 @@ Here you will find everything you need to start throwing those pixels.
   - [Preprocessors](14-frame-analysis.md#preprocessors-concept) — structured data as shader textures
   - [Analyzer HTTP API](14-frame-analysis.md#analyzer-http-api)
 
-### Part V — Arranging
+### Part VI — Arranging
 
 - **15. [Arrangement Mode](15-arrangement.md)** — the mixer turned ninety degrees, laid out against show time
   - [What Changes and What Doesn't](15-arrangement.md#what-changes-and-what-doesnt) — only the central area
@@ -139,51 +189,6 @@ Here you will find everything you need to start throwing those pixels.
   - [Idle Behaviour](15-arrangement.md#idle-behaviour) — what plays before the show starts
   - [Undo, Saving, and Load](15-arrangement.md#undo-saving-and-load) — scene version 7, memory
   - [Sleeping Clips](15-arrangement.md#sleeping-clips) — why a distant clip stops decoding, and what that changes
-- **16. [Audio Mixer](16-audio-mixer.md)** — vMix-style strips: buses, sends, solo, balance, Audio Auto
-  - [Inputs](16-audio-mixer.md#inputs) — clips, sound files and input devices
-  - [Audio Auto](16-audio-mixer.md#audio-auto) — a clip's sound on and off with its picture
-  - [Outputs](16-audio-mixer.md#outputs) — buses: sound devices, faders, delay
-  - [Headphones](16-audio-mixer.md#headphones) — listen bus and solo
-  - [Recordings and streams](16-audio-mixer.md#recordings-and-streams) — which bus an output carries
-  - [Lining up sound and picture](16-audio-mixer.md#lining-up-sound-and-picture)
-- **17. [Streaming](17-streaming.md)** — the STREAM button: one encode to four RTMP/RTMPS destinations, red when healthy, blinking yellow on trouble
-  - [Setting up](17-streaming.md#setting-up) — picture, sound, size, bit rate, hardware encoder
-  - [Destinations](17-streaming.md#destinations) — URL, stream key, username and password
-  - [While live](17-streaming.md#while-live) — states, reconnecting, stopping
-  - [If a destination will not connect](17-streaming.md#if-a-destination-will-not-connect)
-- **18. [Main mode](18-main.md)** — one channel on Main at a time, Space cuts, Enter fades, overlay channels on top; wide channel row with + Channel
-  - [Taking a channel to Main](18-main.md#taking-a-channel-to-main) — NEXT and ON MAIN tallies, one input alone
-  - [Overlays](18-main.md#overlays) — logo and lower third over whatever is on Main
-  - [Saved, and safe from undo](18-main.md#saved-and-safe-from-undo)
-- **19. [Recording](19-recording.md)** — the REC button: date-named files, hardware H.264/HEVC/ProRes, crash-safe MP4, red when recording, blinking yellow on trouble
-- **20. [Screen Layouts](20-layouts.md)** — Classic, Broadcast (Preview / Program over input tiles) and VJ (layers as rows); drag panels anywhere and save your own
-  - [Panels](20-layouts.md#panels) — what each one is
-  - [Making your own](20-layouts.md#making-your-own) — drag, save, update, reset, lock
-  - [Broadcast: Preview / Program and Inputs](20-layouts.md#broadcast-preview--program-and-inputs)
-  - [VJ: Layers](20-layouts.md#vj-layers)
-- **21. [Input Settings](21-input-settings.md)** — vMix's double-click window: a channel's layers (hide, reorder, delete, add), each layer's position, crop, colour, keys and effects, and the channel's own — with layout templates
-  - [Layers](21-input-settings.md#layers) — numbered as vMix numbers them, 1 at the back
-  - [A layer](21-input-settings.md#a-layer) — Position, Playback, Colour, Key, Effects
-  - [The whole channel](21-input-settings.md#the-whole-channel) — General, Layout templates, Colour, Key, Effects
-- **22. [LED Screens](22-led-screens.md)** — Resolume's Advanced Output: several LED screens on one HDMI feed to the processor, each at its own pixels, showing Main or a bus of its own
-  - [The feed](22-led-screens.md#the-feed) — on the processor's output, in a window, test card
-  - [Screens](22-led-screens.md#screens) — size, place, what it shows, Fit / Fill / Stretch / Part
-  - [One picture across several screens](22-led-screens.md#one-picture-across-several-screens)
-  - [Over the API](22-led-screens.md#over-the-api)
-- **23. [Adding Inputs](23-adding-inputs.md)** — vMix's Add Input: clips, pictures, cameras and capture cards, NDI, desktop capture, streams, web pages, colours and sound devices, each a new input
-  - [Cameras and capture cards](23-adding-inputs.md#cameras-and-capture-cards) — format (size and frame rate), the camera's own sound
-  - [NDI](23-adding-inputs.md#ndi) — the runtime, sources on the network, their sound; sending NDI with an audio bus
-  - [Desktop capture](23-adding-inputs.md#desktop-capture) — displays and windows, Screen Recording access
-  - [Over the API](23-adding-inputs.md#over-the-api) — `POST /api/inputs`
-- **24. [Zoom and Teams Calls](24-calls.md)** — a remote speaker over the ordinary call app: their sound straight from the app, their camera and slides as window inputs, Nida's programme back as the call's camera and microphone, and a bus that keeps the call from hearing itself
-  - [The call into Nida](24-calls.md#the-call-into-nida) — app sound, window capture
-  - [Nida back to the call](24-calls.md#nida-back-to-the-call) — NDI Virtual Input
-  - [The call must not hear itself](24-calls.md#the-call-must-not-hear-itself) — a mix-minus bus
-- **25. [Rundown](25-rundown.md)** — the show in order: steps that change every screen of a wall together, take Main and start clips, each taken with one press, and GO for the next
-  - [Making steps](25-rundown.md#making-steps) — + Step keeps what is on now; Duplicate; the step's window
-  - [Running the show](25-rundown.md#running-the-show) — GO, Cut and Fade; all of it or none; going on by itself
-  - [Clips, playlists and timers](25-rundown.md#clips-playlists-and-timers) — a sting on no screen, a talk's countdown
-  - [Over the API](25-rundown.md#over-the-api) — `/api/rundown/…`
 
 ---
 
