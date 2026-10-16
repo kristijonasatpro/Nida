@@ -154,6 +154,11 @@ sudo ldconfig
 ```
 Without it, NDI features are silently disabled
 
+### Windows (development)
+
+The Windows port is being validated. See [Windows development](docs/windows-development.md)
+for native build prerequisites, a minimal feature profile, and validation commands.
+
 ### macOS
 
 ```bash

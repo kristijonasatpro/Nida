@@ -1099,7 +1099,7 @@ fn kill(child: &mut Child) {
 
 /// Parse ffmpeg's `-progress` blocks: `key=value` lines, each block ending
 /// in `progress=continue`. Reports stream time sent (µs) and bytes sent.
-fn read_progress(stdout: ChildStdout, reports: &crossbeam_channel::Sender<(i64, u64)>) {
+fn read_progress(stdout: impl Read, reports: &crossbeam_channel::Sender<(i64, u64)>) {
     let mut out_us: Option<i64> = None;
     let mut bytes: u64 = 0;
     for line in std::io::BufReader::new(stdout).lines() {
@@ -1669,18 +1669,10 @@ mod tests {
 
     #[test]
     fn progress_blocks_are_read_as_time_and_bytes() {
-        let mut child = Command::new("sh")
-            .args([
-                "-c",
-                "printf 'frame=1\\nout_time_us=500000\\ntotal_size=1000\\nprogress=continue\\n\
-                 out_time_us=N/A\\nprogress=continue\\nout_time_us=1000000\\ntotal_size=2000\\nprogress=end\\n'",
-            ])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let progress = b"frame=1\nout_time_us=500000\ntotal_size=1000\nprogress=continue\n\
+                         out_time_us=N/A\nprogress=continue\nout_time_us=1000000\ntotal_size=2000\nprogress=end\n";
         let (tx, rx) = crossbeam_channel::unbounded();
-        read_progress(child.stdout.take().unwrap(), &tx);
-        let _ = child.wait();
+        read_progress(&progress[..], &tx);
         let got: Vec<(i64, u64)> = rx.try_iter().collect();
         assert_eq!(
             got,
