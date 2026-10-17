@@ -2191,9 +2191,12 @@ mod tests {
     #[test]
     fn only_luts_named_in_the_show_move_with_it() {
         use crate::engine::value::camera::CameraProfile;
+        let root = tempfile::tempdir().unwrap();
+        let from = root.path().join("A").join(".varda").join("luts");
+        let to = root.path().join("B").join(".varda").join("luts");
         let lut = |file: &str| CameraProfile::Lut { file: file.into() };
         let named = lut("look.cube");
-        let by_path = lut("/shows/A/.varda/luts/look.cube");
+        let by_path = lut(from.join("look.cube").to_str().unwrap());
         let built_in = CameraProfile::SonySLog3;
         let moves = lut_moves(
             [
@@ -2206,10 +2209,10 @@ mod tests {
                 (5, &by_path),
             ]
             .into_iter(),
-            std::path::Path::new("/shows/A/.varda/luts"),
-            std::path::Path::new("/shows/B/.varda/luts"),
+            &from,
+            &to,
         );
-        let in_b = lut("/shows/B/.varda/luts/look.cube");
+        let in_b = lut(to.join("look.cube").to_str().unwrap());
         assert_eq!(
             moves,
             vec![(1, by_path.clone(), in_b.clone()), (4, by_path, in_b)]
@@ -2221,22 +2224,31 @@ mod tests {
     #[test]
     fn a_camera_lut_named_by_file_is_found_in_the_shows_lut_folder() {
         use crate::engine::value::camera::CameraProfile;
-        let luts = std::path::Path::new("/Shows/conference/.varda/luts");
+        let root = tempfile::tempdir().unwrap();
+        let luts = root.path().join(".varda").join("luts");
         let named = CameraProfile::Lut {
             file: "Film to Video.cube".into(),
         };
         assert_eq!(
-            lut_in_full(&named, luts),
+            lut_in_full(&named, &luts),
             CameraProfile::Lut {
-                file: "/Shows/conference/.varda/luts/Film to Video.cube".into()
+                file: luts
+                    .join("Film to Video.cube")
+                    .to_string_lossy()
+                    .into_owned()
             }
         );
         let chosen = CameraProfile::Lut {
-            file: "/Volumes/LUTs/s709.cube".into(),
+            file: root
+                .path()
+                .join("external")
+                .join("s709.cube")
+                .to_string_lossy()
+                .into_owned(),
         };
-        assert_eq!(lut_in_full(&chosen, luts), chosen);
+        assert_eq!(lut_in_full(&chosen, &luts), chosen);
         assert_eq!(
-            lut_in_full(&CameraProfile::SonyHlg, luts),
+            lut_in_full(&CameraProfile::SonyHlg, &luts),
             CameraProfile::SonyHlg
         );
     }
