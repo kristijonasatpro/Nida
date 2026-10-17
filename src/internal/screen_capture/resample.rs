@@ -94,12 +94,29 @@ pub fn downscale(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> 
     let mut out = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
     let x_ratio = src_w as f32 / dst_w as f32;
     let y_ratio = src_h as f32 / dst_h as f32;
+    let stride = src_w as usize * 4;
+    let complete = src.len() >= stride * src_h as usize;
     for y in 0..dst_h {
         let y0 = ((y as f32) * y_ratio) as u32;
         let y1 = ((((y + 1) as f32) * y_ratio) as u32).clamp(y0 + 1, src_h);
         for x in 0..dst_w {
             let x0 = ((x as f32) * x_ratio) as u32;
             let x1 = ((((x + 1) as f32) * x_ratio) as u32).clamp(x0 + 1, src_w);
+            let o = ((y as usize) * (dst_w as usize) + (x as usize)) * 4;
+            if complete {
+                let offset = y0 as usize * stride + x0 as usize * 4;
+                let pixel = match (x1 - x0, y1 - y0) {
+                    (1, 1) => Some(average_box::<1, 1>(src, stride, offset)),
+                    (2, 1) => Some(average_box::<2, 1>(src, stride, offset)),
+                    (1, 2) => Some(average_box::<1, 2>(src, stride, offset)),
+                    (2, 2) => Some(average_box::<2, 2>(src, stride, offset)),
+                    _ => None,
+                };
+                if let Some(pixel) = pixel {
+                    out[o..o + 4].copy_from_slice(&pixel);
+                    continue;
+                }
+            }
             let mut acc = [0u32; 4];
             let mut n = 0u32;
             for sy in y0..y1 {
@@ -115,15 +132,41 @@ pub fn downscale(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> 
                     }
                 }
             }
-            let o = ((y as usize) * (dst_w as usize) + (x as usize)) * 4;
-            let n = n.max(1);
-            out[o] = (acc[0] / n) as u8;
-            out[o + 1] = (acc[1] / n) as u8;
-            out[o + 2] = (acc[2] / n) as u8;
-            out[o + 3] = (acc[3] / n) as u8;
+            // Desktop-to-deck reductions commonly average one, two, or four
+            // pixels (for example 2560x1080 to 1920x810, or 4K to 1080p).
+            // Keep those exact integer averages free of per-channel division.
+            let pixel = match n {
+                0 => [0; 4],
+                1 => acc.map(|v| v as u8),
+                2 => acc.map(|v| (v >> 1) as u8),
+                4 => acc.map(|v| (v >> 2) as u8),
+                _ => acc.map(|v| (v / n) as u8),
+            };
+            out[o..o + 4].copy_from_slice(&pixel);
         }
     }
     out
+}
+
+/// Fixed small boxes let the compiler unroll the reads and replace division
+/// with shifts, while preserving the generic filter's exact integer rounding.
+#[inline]
+fn average_box<const W: usize, const H: usize>(
+    src: &[u8],
+    stride: usize,
+    offset: usize,
+) -> [u8; 4] {
+    let mut sum = [0u32; 4];
+    for y in 0..H {
+        for x in 0..W {
+            let i = offset + y * stride + x * 4;
+            let pixel = &src[i..i + 4];
+            for channel in 0..4 {
+                sum[channel] += u32::from(pixel[channel]);
+            }
+        }
+    }
+    sum.map(|value| (value / (W * H) as u32) as u8)
 }
 
 #[cfg(test)]
@@ -294,5 +337,32 @@ mod tests {
         let src = vec![7u8; 4 * 4 * 4 / 2];
         let out = downscale(&src, 4, 4, 2, 2);
         assert_eq!(out.len(), 2 * 2 * 4);
+    }
+
+    #[test]
+    fn mixed_small_boxes_preserve_each_channels_integer_average() {
+        let values = [1u8, 20, 43, 65, 81, 107, 127, 149, 173];
+        let source: Vec<u8> = values
+            .into_iter()
+            .flat_map(|v| [v, 255 - v, 17, 255])
+            .collect();
+        assert_eq!(
+            downscale(&source, 3, 3, 2, 2),
+            [1, 254, 17, 255, 31, 223, 17, 255, 96, 159, 17, 255, 127, 127, 17, 255]
+        );
+        // The larger-box path keeps the same floor rounding too.
+        assert_eq!(downscale(&source, 3, 3, 1, 1), [85, 169, 17, 255]);
+    }
+
+    #[test]
+    fn incomplete_boxes_average_only_the_available_pixels() {
+        let source: Vec<u8> = [1u8, 20, 43, 65, 81]
+            .into_iter()
+            .flat_map(|v| [v, 255 - v, 17, 255])
+            .collect();
+        assert_eq!(
+            downscale(&source, 3, 3, 2, 2),
+            [1, 254, 17, 255, 31, 223, 17, 255, 65, 190, 17, 255, 81, 174, 17, 255]
+        );
     }
 }
