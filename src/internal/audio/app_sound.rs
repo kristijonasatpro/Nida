@@ -494,7 +494,7 @@ mod other {
             bail!("an app's sound can be taken only on macOS")
         }
 
-        pub fn device(&self) -> &str {
+        pub fn device(&self) -> &'static str {
             ""
         }
     }

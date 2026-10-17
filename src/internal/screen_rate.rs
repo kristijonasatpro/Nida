@@ -306,6 +306,8 @@ thread_local! {
 }
 
 #[cfg(not(target_os = "macos"))]
+// Match the fallible platform backend while reporting that no rate was changed.
+#[allow(clippy::unnecessary_wraps)]
 fn set_rate(_display: u32, _fps: u32) -> Result<Option<(f64, f64)>, String> {
     Ok(None)
 }
