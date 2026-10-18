@@ -59,3 +59,37 @@ cargo bench --bench shader_compilation -- --baseline before
 ```
 
 Use identical profiles and toolchains and run with other builds idle.
+
+## Windows observations (18 October 2026)
+
+On a Ryzen 9 5950X with Rust 1.99.1, a sequential before/after run of the
+Criterion target measured these central estimates:
+
+| Compilation | Uncached baseline | With cache |
+|---|---:|---:|
+| Repeated fragment | 217.56 ms | 135.15 ns |
+| Repeated compute | 217.50 ms | 163.11 ns |
+| Cold fragment | 225.95 ms | 222.46 ms |
+| Cold compute | 218.93 ms | 226.16 ms |
+
+Criterion detected no statistically significant change for the cold cases.
+These are small synthetic shaders. The target was compiled directly with
+`rustc -O -C lto=thin -C codegen-units=1` against the repository's existing
+release dependencies, using the same harness before and after, to isolate the
+compiler from upstream's Windows build blockers. Each case used ten samples,
+a one-second warmup and a three-second measurement target, with other builds
+idle. This does not establish effect-load times for arbitrary shaders.
+
+A separate headless Windows application smoke test added and removed the
+`invert` master effect four times via HTTP. The first request took 283.5 ms;
+the next three took 19.8, 20.5 and 20.8 ms. Those requests include frame/command
+scheduling and GPU pipeline creation, so they measure more than the compiler.
+
+The Windows integration build passed 87 UI and 73 GPU rendering tests,
+including pipeline construction for every bundled shader. Its full library
+run passed 3,316 tests, ignored four and reproduced two previously recorded
+DeckLink level-conversion failures (`full_levels_span_the_range` and
+`levels_change_with_the_next_picture`). The production library and benchmark
+passed Clippy with warnings denied. Whole-repository formatting and all-target
+Clippy remain blocked by existing formatting and `assert_is_empty` test lint
+issues. The changed Rust files pass rustfmt.
