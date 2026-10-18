@@ -136,11 +136,11 @@ Each output can record to a video file independently. Multiple simultaneous reco
 ### Usage
 
 1. In the output panel, click **+ Recording** to create a recording output (repeat for each simultaneous recording, each runs its own ffmpeg subprocess).
-2. Set the **File:** path (plain text input; default `output.mp4`, relative to the working directory). Paths are literal there is **no automatic timestamping**, so give each recording a distinct name.
+2. Click the pencil beside the recorder's title to set its name, and use **Folder → Choose…** to select its destination. New outputs default to Videos/Movies → Nida. Each Start creates `Name timestamp.ext`, adding a collision number if needed; existing files are not overwritten. The codec selects the extension. **Writing / Last take** shows the full actual path, with **Show file** and **Copy path** actions. See [Recording more than one feed](19-recording.md#recording-more-than-one-feed).
 3. Pick a **Codec:** from the table above.
 4. Click **▶ Start** to begin; the button becomes **⏹ Stop** and a red elapsed-time counter shows while recording.
 
-Each recording starts and stops independently, and ffmpeg writes directly to the path you specify. Recording uses non-blocking frame delivery such that if the encoder can't keep up, frames are dropped rather than stalling the render thread, and the previous frame is repeated in the file so the recording keeps constant frame rate and stays the right length.
+Each recording starts and stops independently, using a fresh file in the folder you specify. Recording uses non-blocking frame delivery such that if the encoder can't keep up, frames are dropped rather than stalling the render thread, and the previous frame is repeated in the file so the recording keeps constant frame rate and stays the right length.
 
 > **Add audio with passthrough.** To include sound, pick a device in the output's **Audio:** dropdown — see [Audio Passthrough](#audio-passthrough) below.
 

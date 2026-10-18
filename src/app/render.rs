@@ -1851,9 +1851,34 @@ impl VardaApp {
                         .as_mut()
                         .is_some_and(|subprocess| !subprocess.feed_nv12(&frame, made))
                     {
-                        // The recording or stream starts its encoder again
-                        // itself, reading why it stopped from the subprocess.
-                        h.active = false;
+                        if matches!(
+                            h.target,
+                            crate::renderer::context::OutputTarget::Recording { .. }
+                        ) {
+                            let reason = h
+                                .subprocess
+                                .as_ref()
+                                .and_then(|sub| sub.last_error())
+                                .unwrap_or_else(|| {
+                                    "Recording encoder stopped accepting frames".into()
+                                });
+                            if let Some(mut sub) = h.subprocess.take() {
+                                sub.stop();
+                            }
+                            if let Some(pass) = h.audio_pcm.take() {
+                                pass.release(sinks.audio_manager);
+                            }
+                            stop_headless_output(
+                                &h.name,
+                                &mut h.active,
+                                sinks.notifications,
+                                reason,
+                            );
+                        } else {
+                            // Top-bar recording/streaming polls its own encoder
+                            // and needs the subprocess to inspect the failure.
+                            h.active = false;
+                        }
                         break;
                     }
                 }

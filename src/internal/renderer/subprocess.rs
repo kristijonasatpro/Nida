@@ -287,7 +287,12 @@ impl RecordingPlan {
         };
 
         let use_ten_bit = request.depth == PresentationDepth::Sdr10 && fallback_reason.is_none();
-        let (input_pixel_format, output_pixel_format, expected_readback) = if use_ten_bit {
+        let (input_pixel_format, output_pixel_format, expected_readback) = if !use_ten_bit
+            && readback == ReadbackFormat::Nv12
+            && matches!(codec, RecordingCodec::H264 | RecordingCodec::H265)
+        {
+            ("nv12", eight_bit_output_format(codec), ReadbackFormat::Nv12)
+        } else if use_ten_bit {
             if matches!(codec, RecordingCodec::ProRes4444) {
                 (
                     "rgba64le",
@@ -1122,7 +1127,7 @@ const FRAME_CHANNEL_CAPACITY: usize = 2;
 const STREAM_QUEUE_BYTES: usize = 128 * 1024 * 1024;
 
 /// Frames the stream's encoder may fall behind before one is dropped: a
-/// fifth of a second, where a recording has two frames. The encoder is fast
+/// fifth of a second. The encoder is fast
 /// enough on average but pauses now and then; with two frames of slack each
 /// pause dropped one, and a platform's stream is seconds behind anyway, so
 /// 0.2 s more costs nothing. Capped in memory for large pictures.
@@ -1828,6 +1833,8 @@ impl FfmpegSubprocess {
             anyhow::anyhow!("FFmpeg encoder '{encoder}' is not installed or cannot be queried")
         })?;
         let plan = RecordingPlan::resolve(codec, request, readback_format, Some(&encoder_help));
+        let file = crate::record::OutputRecordingFile::reserve(std::path::Path::new(path))?;
+        let path = file.path().to_string_lossy().into_owned();
         // Recording keeps the device's native sample rate (Decision 5).
         let prepared = prepare_audio(audio, false)?;
         let empty: Vec<String> = Vec::new();
@@ -1839,6 +1846,9 @@ impl FfmpegSubprocess {
         cmd.args(["-hide_banner", "-nostats", "-y"])
             .args(["-f", "rawvideo"])
             .args(["-pix_fmt", plan.input_pixel_format])
+            .args(nv12_input_colour(
+                plan.expected_readback == ReadbackFormat::Nv12,
+            ))
             .args(["-s", &format!("{width}x{height}")])
             .args(["-r", &fps.to_string()])
             .args(["-i", "-"])
@@ -1848,7 +1858,7 @@ impl FfmpegSubprocess {
         }
         cmd.args(&plan.video_args);
         cmd.args(a_out)
-            .arg(path)
+            .arg(&path)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -1868,7 +1878,19 @@ impl FfmpegSubprocess {
         let counters = FrameCounters::new();
         let write_failed = Arc::new(AtomicBool::new(false));
         let shutting_down = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::sync_channel(FRAME_CHANNEL_CAPACITY);
+        let mut capacity = stream_frame_capacity(
+            width,
+            height,
+            fps,
+            plan.expected_readback == ReadbackFormat::Nv12,
+        );
+        if plan.expected_readback == ReadbackFormat::Rgba16Unorm {
+            capacity = capacity.min(
+                (STREAM_QUEUE_BYTES / (width as usize * height as usize * 8).max(1))
+                    .max(FRAME_CHANNEL_CAPACITY),
+            );
+        }
+        let (tx, rx) = mpsc::sync_channel(capacity);
         let writer_thread = Self::start_writer_thread(
             stdin,
             rx,
@@ -1876,10 +1898,18 @@ impl FfmpegSubprocess {
             counters.clone(),
             write_failed.clone(),
             shutting_down.clone(),
-            path.to_string(),
+            path.clone(),
             prepared.as_ref().map(|p| p.started),
         );
-        let audio = finalize_audio(prepared, path.to_string())?;
+        let audio = match finalize_audio(prepared, path.clone()) {
+            Ok(audio) => audio,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        file.keep();
 
         Ok(Self {
             child,
@@ -1892,7 +1922,7 @@ impl FfmpegSubprocess {
             counters,
             write_failed,
             shutting_down,
-            label: path.to_string(),
+            label: path,
             start_time: std::time::Instant::now(),
             stopped: false,
             audio,
@@ -4018,7 +4048,9 @@ mod tests {
             FfmpegSubprocess::spawn_recording(path_str, &RecordingCodec::H264, 64, 64, 30, None)
                 .expect("failed to spawn recording");
 
-        assert_eq!(sub.label(), path_str);
+        let actual = std::path::PathBuf::from(sub.label());
+        assert_ne!(actual, path);
+        assert_eq!(actual.parent(), path.parent());
         assert_eq!(sub.frames_written(), 0);
 
         // Feed a few frames
@@ -4034,7 +4066,7 @@ mod tests {
         assert!(sub.duration().as_millis() > 0);
 
         // Cleanup
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(actual);
     }
 
     #[test]
@@ -4050,10 +4082,11 @@ mod tests {
         let mut sub =
             FfmpegSubprocess::spawn_recording(path_str, &RecordingCodec::H264, 64, 64, 30, None)
                 .unwrap();
+        let actual = std::path::PathBuf::from(sub.label());
         sub.stop();
         sub.stop();
 
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(actual);
     }
 
     #[test]
@@ -4130,6 +4163,7 @@ mod tests {
         let mut sub =
             FfmpegSubprocess::spawn_recording(path_str, &RecordingCodec::H264, 64, 64, 30, None)
                 .unwrap();
+        let actual = std::path::PathBuf::from(sub.label());
 
         sub.stop();
 
@@ -4137,7 +4171,7 @@ mod tests {
         let frame = vec![0u8; 64 * 64 * 4];
         assert!(!sub.feed_frame(&frame));
 
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(actual);
     }
 
     #[test]
@@ -4153,6 +4187,7 @@ mod tests {
         let mut sub =
             FfmpegSubprocess::spawn_recording(path_str, &RecordingCodec::ProRes, 64, 64, 30, None)
                 .expect("failed to spawn ProRes recording");
+        let actual = std::path::PathBuf::from(sub.label());
 
         let frame = vec![0u8; 64 * 64 * 4];
         for _ in 0..3 {
@@ -4161,13 +4196,45 @@ mod tests {
         }
         sub.stop();
 
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(actual);
     }
 
     #[test]
     fn frame_channel_capacity_is_bounded() {
         // Verify the channel capacity constant
         assert_eq!(FRAME_CHANNEL_CAPACITY, 2);
+    }
+
+    #[test]
+    fn output_recording_nv12_keeps_codec_and_precision_contracts() {
+        for codec in [RecordingCodec::H264, RecordingCodec::H265] {
+            let plan = RecordingPlan::resolve(
+                &codec,
+                PresentationRequest::default(),
+                ReadbackFormat::Nv12,
+                Some("Supported pixel formats: yuv420p yuv420p10le"),
+            );
+            assert_eq!(plan.expected_readback, ReadbackFormat::Nv12);
+            assert_eq!(plan.input_pixel_format, "nv12");
+            assert_eq!(plan.output_pixel_format, "yuv420p");
+            assert!(!plan.unpremultiply);
+        }
+        let ten = RecordingPlan::resolve(
+            &RecordingCodec::H265,
+            ten_bit_request(),
+            ReadbackFormat::Rgb10A2,
+            Some("Supported pixel formats: yuv420p10le"),
+        );
+        assert_eq!(ten.resolved.resolved, PresentationDepth::Sdr10);
+        assert_eq!(ten.expected_readback, ReadbackFormat::Rgb10A2);
+        let alpha = RecordingPlan::resolve(
+            &RecordingCodec::ProRes4444,
+            PresentationRequest::default(),
+            ReadbackFormat::Rgba8,
+            Some("Supported pixel formats: yuva444p10le"),
+        );
+        assert_eq!(alpha.expected_readback, ReadbackFormat::Rgba8);
+        assert!(alpha.unpremultiply);
     }
 
     #[test]

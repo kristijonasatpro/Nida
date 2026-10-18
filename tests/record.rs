@@ -249,6 +249,18 @@ fn a_crashed_encoder_leaves_a_playable_file_and_recording_goes_on_in_a_new_one()
     ));
     ok(send_cmd(&mut app, EngineCommand::StartRecording));
     run(&mut app, 2.5);
+    let original_name = app.record_status().file.clone().unwrap();
+    let next_options = RecordOptions {
+        name: "Next session".into(),
+        ..app.record_settings().options.clone()
+    };
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::SetRecordOptions {
+            options: next_options,
+        },
+    ));
+    assert_eq!(app.record_status().file.as_ref(), Some(&original_name));
     app.kill_record_encoder_for_test();
     run(&mut app, 3.5);
     let status = app.record_status();
@@ -262,6 +274,10 @@ fn a_crashed_encoder_leaves_a_playable_file_and_recording_goes_on_in_a_new_one()
         "and says so: {status:?}"
     );
     assert!(status.files[1].ends_with("(2).mp4"), "{:?}", status.files);
+    assert!(
+        !status.files[1].contains("Next session"),
+        "recovery keeps the current take's name"
+    );
     ok(send_cmd(&mut app, EngineCommand::StopRecording));
     let (first, secs) = probe(Path::new(&status.files[0]));
     assert!(
@@ -274,6 +290,14 @@ fn a_crashed_encoder_leaves_a_playable_file_and_recording_goes_on_in_a_new_one()
     );
     let (second, _) = probe(Path::new(&status.files[1]));
     assert!(second.starts_with("h264"), "{second}");
+    ok(send_cmd(&mut app, EngineCommand::StartRecording));
+    let next = app.record_status().file.unwrap();
+    assert!(Path::new(&next)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("Next session "));
+    ok(send_cmd(&mut app, EngineCommand::StopRecording));
 }
 
 #[test]
@@ -295,6 +319,7 @@ fn the_recording_settings_are_kept_with_the_stage() {
         .unwrap()
     };
     let options = RecordOptions {
+        name: "Conference".into(),
         folder: dir.path().join("takes"),
         codec: RecordCodec::Hevc,
         format: RecordFormat::Mkv,

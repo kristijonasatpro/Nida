@@ -806,6 +806,7 @@ fn led_output(layout: varda::engine::value::led::LedLayout) -> varda::usecases::
         name: "LED".into(),
         target: varda::renderer::context::OutputTarget::Windowed,
         target_label: "Windowed".into(),
+        recording_file: None,
         is_windowed: true,
         is_active: true,
         active_duration: std::time::Duration::ZERO,

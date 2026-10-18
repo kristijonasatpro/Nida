@@ -1037,6 +1037,9 @@ pub struct OutputWindowSnapshot {
     /// Full output target (carries `audio_device` for ffmpeg-backed outputs).
     pub target: crate::engine::value::render::OutputTarget,
     pub target_label: String,
+    /// Actual last recording take, distinct from the configured filename stem.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_file: Option<String>,
     pub is_on_display: bool,
     /// Whether a headless output is actively recording/streaming.
     pub is_active: bool,

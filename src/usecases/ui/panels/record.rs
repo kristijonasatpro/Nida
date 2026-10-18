@@ -23,6 +23,42 @@ fn stop_armed_id() -> egui::Id {
     egui::Id::new("record_stop_armed")
 }
 
+/// Commit on Enter/blur, cancel on Escape, retaining the draft between frames.
+pub(super) fn edit_name(ui: &mut egui::Ui, current: &str, id: egui::Id) -> (Option<String>, bool) {
+    let mut draft = ui
+        .data(|d| d.get_temp::<String>(id))
+        .unwrap_or_else(|| current.to_string());
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut draft)
+            .id(id)
+            .desired_width(180.0),
+    );
+    if response.changed() {
+        ui.data_mut(|d| d.insert_temp(id, draft.clone()));
+    }
+    let focused = response.has_focus() || response.lost_focus();
+    let cancel = focused && ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let finished = cancel
+        || response.lost_focus()
+        || (focused && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+    if finished {
+        ui.data_mut(|d| d.remove::<String>(id));
+        ui.memory_mut(|m| m.surrender_focus(id));
+        ui.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+        });
+    }
+    (
+        if finished && !cancel && draft != current {
+            Some(draft)
+        } else {
+            None
+        },
+        finished,
+    )
+}
+
 /// How long a first click on Stop waits for the second.
 const STOP_CONFIRM_SECS: f64 = 3.0;
 
@@ -284,6 +320,7 @@ fn render_options(
     data: &UIData,
     actions: &mut UIActions,
 ) {
+    let mut committed_name = None;
     let set = |actions: &mut UIActions, options: RecordOptions| {
         actions
             .commands
@@ -352,6 +389,23 @@ fn render_options(
                             }
                         }
                     });
+            });
+            ui.end_row();
+
+            ui.label("Recording name");
+            ui.vertical(|ui| {
+                if let (Some(name), _) =
+                    edit_name(ui, &options.name, egui::Id::new("top_recording_name"))
+                {
+                    committed_name = Some(name);
+                }
+                if recording {
+                    ui.label(
+                        egui::RichText::new("Applies to the next take")
+                            .small()
+                            .weak(),
+                    );
+                }
             });
             ui.end_row();
 
@@ -608,13 +662,33 @@ fn render_options(
             });
             ui.end_row();
         });
+    if let Some(name) = committed_name {
+        // A click can also change another option or start the first take.
+        // Preserve that change and apply the name before Start is processed.
+        let mut updated = false;
+        for command in &mut actions.commands {
+            if let EngineCommand::SetRecordOptions { options } = command {
+                options.name.clone_from(&name);
+                updated = true;
+            }
+        }
+        if !updated {
+            actions.commands.insert(
+                0,
+                EngineCommand::SetRecordOptions {
+                    options: RecordOptions {
+                        name,
+                        ..options.clone()
+                    },
+                },
+            );
+        }
+    }
     if recording {
         ui.label(
-            egui::RichText::new(
-                "Stop recording to change the settings — the picture can change now",
-            )
-            .small()
-            .weak(),
+            egui::RichText::new("Stop recording to change the other settings")
+                .small()
+                .weak(),
         );
     }
 }
@@ -837,6 +911,54 @@ mod tests {
             h.state().session.choose_record_folder,
             "the folder picker is asked for"
         );
+    }
+
+    #[test]
+    fn recording_name_blur_is_applied_before_clicking_start() {
+        let mut data = UIData::test_fixture();
+        data.record.options.name.clear();
+        let mut h = harness(data);
+        h.run();
+        h.get_by_label("REC").click();
+        h.run();
+        h.get_by_role(egui::accesskit::Role::TextInput).click();
+        h.run();
+        h.get_by_role(egui::accesskit::Role::TextInput)
+            .type_text("Stage feed");
+        h.run();
+        h.get_by_label("Start recording").click();
+        h.run();
+        let commands = &h.state().commands;
+        let name = commands.iter().position(|c| matches!(c, EngineCommand::SetRecordOptions { options } if options.name == "Stage feed")).expect("name committed");
+        let start = commands
+            .iter()
+            .position(|c| matches!(c, EngineCommand::StartRecording))
+            .expect("start requested");
+        assert!(name < start, "the first take must use the name just typed");
+    }
+
+    #[test]
+    fn recording_name_blur_survives_changing_another_option() {
+        let mut data = UIData::test_fixture();
+        data.record.options.name.clear();
+        let mut h = harness(data);
+        h.run();
+        h.get_by_label("REC").click();
+        h.run();
+        h.get_by_role(egui::accesskit::Role::TextInput).click();
+        h.run();
+        h.get_by_role(egui::accesskit::Role::TextInput)
+            .type_text("Stage feed");
+        h.run();
+        h.get_by_label("Auto").click();
+        h.run();
+        assert!(h.state().commands.iter().any(|c| matches!(c,
+            EngineCommand::SetRecordOptions { options }
+                if options.name == "Stage feed" && options.video_kbps.is_some()
+        )));
+        assert!(h.state().commands.iter().all(|c| !matches!(c,
+            EngineCommand::SetRecordOptions { options } if options.name != "Stage feed"
+        )));
     }
 
     #[test]
