@@ -442,8 +442,13 @@ impl DeckLinkSender {
     /// # Errors
     ///
     /// When the selected device or mode is absent, or an output worker fails.
-    pub fn start_audio(name: &str, device: &str, mode: &str, full_range: bool,
-        audio: Option<AudioInput>) -> anyhow::Result<Self> {
+    pub fn start_audio(
+        name: &str,
+        device: &str,
+        mode: &str,
+        full_range: bool,
+        audio: Option<AudioInput>,
+    ) -> anyhow::Result<Self> {
         let find =
             |devices: Vec<DeckLinkDevice>| devices.into_iter().find(|d| d.name == device);
         // As last copied, at once; else as discovery has it this moment — a
@@ -1020,9 +1025,14 @@ mod sdk {
             modes: *mut Mode,
             max: i32,
         ) -> i32;
-        fn nida_dl_open_with_audio(id: u64, mode: u32,
+        fn nida_dl_open_with_audio(
+            id: u64,
+            mode: u32,
             read: Option<extern "C" fn(*mut c_void, i64, u32, *mut i32)>,
-            context: *mut c_void, err: *mut c_char, errlen: i32) -> *mut c_void;
+            context: *mut c_void,
+            err: *mut c_char,
+            errlen: i32,
+        ) -> *mut c_void;
         fn nida_dl_audio_preroll(handle: *mut c_void) -> u32;
         fn nida_dl_show(
             handle: *mut c_void,
@@ -1267,7 +1277,7 @@ mod sdk {
 
     impl Drop for Device {
         fn drop(&mut self) {
-            // SAFETY: opened by `nida_dl_open`, closed once.
+            // SAFETY: opened by `nida_dl_open_with_audio`, closed once.
             unsafe { nida_dl_close(self.handle) };
         }
     }
@@ -1277,7 +1287,11 @@ mod sdk {
         // frames. close stops callbacks before Device drops the boxed mutex.
         let output = unsafe { std::slice::from_raw_parts_mut(out, frames as usize * 2) };
         let state = unsafe { &*context.cast::<std::sync::Mutex<super::audio::Pull>>() };
-        if let Ok(mut audio) = state.lock() { audio.read(frame, output); } else { output.fill(0); }
+        if let Ok(mut audio) = state.lock() {
+            audio.read(frame, output);
+        } else {
+            output.fill(0);
+        }
     }
 
     pub(super) fn open_audio(
@@ -1289,15 +1303,23 @@ mod sdk {
     ) -> Result<Box<dyn Screen>, String> {
         let width = i32::try_from(width).map_err(|e| e.to_string())?;
         let height = i32::try_from(height).map_err(|e| e.to_string())?;
-        let mut audio = audio.map(|input| Box::new(std::sync::Mutex::new(super::audio::Pull::new(input))));
+        let mut audio =
+            audio.map(|input| Box::new(std::sync::Mutex::new(super::audio::Pull::new(input))));
         let context = audio.as_deref_mut().map_or(std::ptr::null_mut(), |state| {
             std::ptr::from_mut(state).cast::<c_void>()
         });
         let mut err = [0 as c_char; 256];
         // SAFETY: a buffer of the length given.
-        let handle = unsafe { nida_dl_open_with_audio(arrival, code,
-            audio.as_ref().map(|_| read_audio as extern "C" fn(*mut c_void, i64, u32, *mut i32)),
-            context, err.as_mut_ptr(), 256) };
+        let handle = unsafe {
+            nida_dl_open_with_audio(
+                arrival,
+                code,
+                audio.as_ref().map(|_| read_audio as extern "C" fn(*mut c_void, i64, u32, *mut i32)),
+                context,
+                err.as_mut_ptr(),
+                256,
+            )
+        };
         if handle.is_null() {
             // SAFETY: NUL-terminated by the shim.
             return Err(unsafe { CStr::from_ptr(err.as_ptr()) }

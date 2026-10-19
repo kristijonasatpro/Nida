@@ -68,11 +68,7 @@ jobs:
         if: always() && runner.os == 'Linux'
         run: |
           rustfmt --edition 2021 --check build.rs src/internal/decklink/convert.rs
-          python - <<'PY'
-          import base64, subprocess
-          result = subprocess.run(['rustfmt', '--edition', '2021', '--emit', 'stdout', 'src/internal/decklink/audio.rs'], capture_output=True, check=True)
-          print('FORMATTED_AUDIO=' + base64.b64encode(result.stdout).decode())
-          PY
+          rustfmt --edition 2021 --check src/internal/decklink/audio.rs
       - name: Compile shared shim against behavioral SDK double
         if: runner.os == 'Linux'
         run: |

@@ -50,6 +50,13 @@ struct OutputDouble : IDeckLinkOutput {
     IDeckLinkAudioOutputCallback* audio_callback = nullptr;
     unsigned int buffered_audio = 0, write_limit = 500;
     int audio_disabled = 0, playback_started = 0, playback_stopped = 0;
+    int64_t stream_frame = -1;
+    HRESULT GetScheduledStreamTime(BMDTimeScale scale, BMDTimeValue* now, double* speed) override {
+        if (stream_frame < 0) return E_FAIL;
+        *now = stream_frame * scale / 48000;
+        *speed = 1.0;
+        return S_OK;
+    }
     std::vector<int64_t> video_times, audio_times;
     std::vector<int32_t> audio_samples;
     HRESULT DoesSupportVideoMode(int, BMDDisplayMode mode, int, int, int,
@@ -233,7 +240,12 @@ int main(int argc, char**) {
     av_device.output.fail_audio = false;
     handle = nida_dl_open_with_audio(id, 1, Sound::read, &sound, error, sizeof(error));
     assert(handle != nullptr && nida_dl_audio_preroll(handle) == 2403);
+    av_device.output.write_limit = 0;
     assert(nida_dl_show(handle, data.data(), 8, 4, 2) == 0);
+    assert(av_device.output.playback_started == 0);
+    assert(sound.reads == 1); // Zero writes retain the same scratch samples.
+    av_device.output.write_limit = 500;
+    assert(av_device.output.audio_callback->RenderAudioSamples(true) == S_OK);
     assert(av_device.output.playback_started == 1);
     assert((av_device.output.video_times == std::vector<int64_t>{0, 1001, 2002}));
     for (int64_t frame = 1; frame <= 120; ++frame) {
@@ -249,6 +261,17 @@ int main(int argc, char**) {
         assert(av_device.output.audio_samples[2 * i] == static_cast<int32_t>(i));
         assert(av_device.output.audio_samples[2 * i + 1] == -static_cast<int32_t>(i));
     }
+    // Recover a late callback against the real stream timestamp instead of
+    // replaying old sound or submitting video behind the hardware clock.
+    const size_t before_jump = av_device.output.audio_times.size();
+    av_device.output.stream_frame = 240000;
+    av_device.output.buffered_audio = 0;
+    assert(av_device.output.audio_callback->RenderAudioSamples(false) == S_OK);
+    assert(av_device.output.audio_times[before_jump] == 240000);
+    assert(av_device.output.video_callback->ScheduledFrameCompleted(&av_device.output.frames[0], 0) == S_OK);
+    assert(av_device.output.video_times.back() == (300000 / 1001 + 1) * 1001);
+    assert(av_device.output.video_callback->ScheduledPlaybackHasStopped() == S_OK);
+    assert(nida_dl_show(handle, data.data(), 8, 4, 2) == -4);
     // An SDK may retain a callback while stop unregisters it. It must never
     // dereference the Rust context once close has returned.
     auto* late = av_device.output.audio_callback;

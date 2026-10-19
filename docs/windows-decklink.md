@@ -1,4 +1,4 @@
-# Windows DeckLink video output
+# Windows DeckLink video and embedded audio output
 
 This change adds a Windows COM backend to Nida's existing Blackmagic output.
 It is prepared separately against upstream Nida main at `c74d97e`, without
@@ -27,10 +27,37 @@ full levels use the same 1–254 clamps as the macOS implementation. HD uses
 BT.709 and SD uses BT.601. NDI continues to use video levels. The existing two
 full-range regressions now exercise the portable implementation too.
 
-This is video output at the existing 8-bit YUV precision. Embedded audio,
-DeckLink capture, HDR/10-bit output, scheduled/genlocked playback and automatic
-profile switching are separate features. In particular, a device configured
-for input-only use must be configured for output in Desktop Video first.
+Video remains at the existing 8-bit YUV precision. DeckLink capture,
+HDR/10-bit output, external genlock configuration and automatic profile switching
+are separate features. A device configured for input-only use must be configured
+for output in Desktop Video first.
+
+## Embedded audio
+
+While the output is stopped, choose its **Audio** mixer bus in the output panel.
+New headless outputs inherit the default bus; saved outputs with no bus stay
+video-only until a bus is selected. Microphones, capture audio and other sources
+reach the card through their mixer-bus routing. The tap includes bus gain, mute
+and delay, as mixed by Nida.
+
+With a bus selected, the card embeds two interleaved channels at 48 kHz, using
+32-bit integer PCM. Video and audio use the same scheduled DeckLink playback
+clock. Three video frames and their corresponding audio duration are buffered
+before playback starts; fractional video rates keep exact rational timestamps
+instead of rounding to a whole number of audio samples per video frame. Initial
+preroll repeats the first picture and uses silence before the tap's start.
+
+The source receiver and native audio scratch storage are bounded. Underruns and
+reported source losses become silence; late source samples are discarded at
+their original timeline positions. Partial or zero SDK writes retain pending
+samples, and callbacks that fall behind the hardware clock skip elapsed time.
+Stopping unregisters callbacks before their Rust audio context is freed.
+
+A missing selected bus or rejected audio setup fails the output rather than
+falling back to silent video. Choosing **None (silent)** explicitly retains the
+existing video-only path. Change the bus while stopped, then restart the output.
+Physical lip sync, connector routing and long-running clock behavior still need
+a Windows PC with an actual card and receiving equipment.
 
 ## Building
 
@@ -83,12 +110,16 @@ output connector, mode and receiving device. Verify discovery, start/stop and
 restarts; check HD/SD colour bars and black/white patches in both level modes;
 run sustained playback at the intended rate; unplug/reconnect and confirm
 recovery; and check the existing source/bus routing and saved-show restore.
-Audio must be checked separately through the show's actual audio path.
+Check embedded left/right test tones, mixer mute/gain/delay, restart and bus
+selection, silence recovery and a flash/click lip-sync source at integer and
+fractional rates. Measure sustained sync on the actual SDI/HDMI receiver.
 
 Do not use a successful SDK build or a fake-SDK test as evidence of a passing
 physical SDI/HDMI output, sustained frame rate, colour measurement or sync test.
 
-## Current validation
+## Earlier video-only validation
+
+The audio extension is undergoing fresh CI checks; the run below predates it.
 
 Checked code revision: `2ef4e044f4f93bb6a8ee60a75913bd73547c7e62`.
 All three jobs in [this focused CI run](https://github.com/pingvis/Nida-Windows/actions/runs/39309216791)
