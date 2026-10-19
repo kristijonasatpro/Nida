@@ -241,7 +241,7 @@ fn render_output_name(ui: &mut egui::Ui, output: &super::super::OutputUI, action
     } else {
         ui.label(egui::RichText::new(&output.name).strong());
         if ui
-            .small_button("✎")
+            .small_button("Rename")
             .on_hover_text(if output.is_active {
                 "Rename recording — applies to the next take"
             } else {
@@ -1706,7 +1706,7 @@ mod tests {
                 h.state().session.choose_output_record_folder.as_deref(),
                 Some("out00001")
             );
-            h.get_by_label("✎").click();
+            h.get_by_label("Rename").click();
             h.run();
             h.get_by_role(egui::accesskit::Role::TextInput)
                 .type_text("Clean feed");
