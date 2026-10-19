@@ -1,4 +1,5 @@
-//! Blackmagic video outputs on macOS and Windows: a DeckLink card or box — an UltraStudio Monitor 3G on
+//! Blackmagic video outputs on macOS and Windows: a DeckLink card or box —
+//! an UltraStudio Monitor 3G on
 //! Thunderbolt — as one more screen for the show, beside the two a laptop
 //! drives itself (an M1 Pro, two). Its picture goes out on HDMI and SDI at
 //! once, in one of the device's own video formats (1080p60 …).
@@ -196,12 +197,19 @@ impl Converter {
         if self.width == 0 || !self.width.is_multiple_of(2) || self.height == 0 {
             return Err("DeckLink UYVY needs a nonzero picture with an even width".into());
         }
-        let pixels = (self.width as usize).checked_mul(self.height as usize)
-            .and_then(|p| p.checked_mul(4)).ok_or_else(|| "a picture too large".to_string())? / 4;
-        if rgba.len() < pixels * 4 || uyvy.len() < pixels * 2 {
+        let bytes = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|p| p.checked_mul(4))
+            .ok_or_else(|| "a picture too large".to_string())?;
+        if rgba.len() < bytes || uyvy.len() < bytes / 2 {
             return Err(format!("a picture not {}×{}", self.width, self.height));
         }
-        self.inner.run(&rgba[..pixels * 4], &mut uyvy[..pixels * 2], self.width, self.height)
+        self.inner.run(
+            &rgba[..bytes],
+            &mut uyvy[..bytes / 2],
+            self.width,
+            self.height,
+        )
     }
 }
 
@@ -1050,15 +1058,22 @@ mod sdk {
                 let mut arrival = 0;
                 // SAFETY: live scalar and name buffer, and room for 128 modes.
                 let found = unsafe {
-                    nida_dl_device_snapshot(index, &raw mut arrival, name.as_mut_ptr(), 256,
-                        modes.as_mut_ptr(), 128)
+                    nida_dl_device_snapshot(
+                        index,
+                        &raw mut arrival,
+                        name.as_mut_ptr(),
+                        256,
+                        modes.as_mut_ptr(),
+                        128,
+                    )
                 };
                 if found < 0 || arrival == 0 {
                     return None;
                 }
                 // SAFETY: NUL-terminated by the shim, copied with a bound.
                 let name = unsafe { CStr::from_ptr(name.as_ptr()) }
-                    .to_string_lossy().into_owned();
+                    .to_string_lossy()
+                    .into_owned();
                 modes.truncate(usize::try_from(found).unwrap_or(0));
                 let modes = modes
                     .iter()
@@ -1578,8 +1593,10 @@ mod tests {
         assert!(converter.run(&[0; 31], &mut [0; 16]).is_err());
         assert!(converter.run(&[0; 32], &mut [0; 15]).is_err());
         for (width, height) in [(0, 2), (3, 2), (4, 0)] {
-            assert!(Converter::new(width, height, true).unwrap()
-                .run(&[0; 32], &mut [0; 16]).is_err());
+            assert!(Converter::new(width, height, true)
+                .unwrap()
+                .run(&[0; 32], &mut [0; 16])
+                .is_err());
         }
         let mut out = [99; 20];
         converter.run(&[255; 40], &mut out).unwrap();
@@ -1591,15 +1608,25 @@ mod tests {
     #[test]
     fn portable_full_range_matches_accelerate_for_colour_patches() {
         for height in [576, 1080] {
-            let patches = [[0, 0, 0, 255], [255; 4], [255, 0, 0, 255],
-                [0, 255, 0, 255], [0, 0, 255, 255], [128, 128, 128, 255]];
+            let patches = [
+                [0, 0, 0, 255],
+                [255; 4],
+                [255, 0, 0, 255],
+                [0, 255, 0, 255],
+                [0, 0, 255, 255],
+                [128, 128, 128, 255],
+            ];
             let rgba = patches.concat().repeat(height as usize);
             let mut ours = vec![0; 12 * height as usize];
             let mut theirs = vec![0; ours.len()];
-            convert::Converter::new(height, true).unwrap()
-                .run(&rgba, &mut ours, 6, height).unwrap();
-            Converter::new(6, height, true).unwrap()
-                .run(&rgba, &mut theirs).unwrap();
+            convert::Converter::new(height, true)
+                .unwrap()
+                .run(&rgba, &mut ours, 6, height)
+                .unwrap();
+            Converter::new(6, height, true)
+                .unwrap()
+                .run(&rgba, &mut theirs)
+                .unwrap();
             for (a, b) in ours.iter().zip(theirs) {
                 assert!(a.abs_diff(b) <= 1, "portable {a}, Accelerate {b}");
             }
