@@ -3,7 +3,7 @@
 //! Two codec paths:
 //! - **HAP path**: GPU-native `BCn` compressed textures — near-zero CPU decode cost.
 //!   Supports Hap (BC1), Hap Alpha (BC3), Hap R (BC7).
-//! - **ffmpeg path**: CPU decode for H.264, `ProRes`, VP9, etc. — fallback for all other codecs.
+//! - **ffmpeg path**: hardware decoding where supported, with CPU fallback for other codecs.
 
 pub mod chase;
 pub mod hap;
@@ -1581,6 +1581,9 @@ pub struct VideoPlayer {
     /// seeked to, until a frame due at it comes out: a file that seeks past
     /// the time asked (broadcast files may) is seeked again from further back.
     sought: Option<(f64, f64)>,
+    /// A nearby seek retained the current decoded picture. A paused caller
+    /// still gets the one frame it requested if the next frame is not due.
+    retained_seek_frame: bool,
     /// Seconds per tick of the video stream's timestamps.
     time_base: f64,
     /// When the file starts, in seconds: clip time 0. Non-zero in broadcast
@@ -1619,10 +1622,10 @@ impl VideoPlayer {
             .context("No video stream found")?;
         let video_stream_index = video_stream.index();
         let (decoder, hardware) = match hwdecode::open(video_stream.parameters(), hardware) {
-            Ok(decoder) => (decoder, hardware),
+            Ok(opened) => opened,
             Err(e) if hardware => {
                 log::warn!("Hardware decoder would not open ({e}); decoding in software");
-                (hwdecode::open(video_stream.parameters(), false)?, false)
+                hwdecode::open(video_stream.parameters(), false)?
             }
             Err(e) => return Err(e),
         };
@@ -1681,6 +1684,7 @@ impl VideoPlayer {
             last_at: 0.0,
             eof_sent: false,
             sought: None,
+            retained_seek_frame: false,
             time_base,
             start,
             rgb_frame: Video::empty(),
@@ -1837,6 +1841,7 @@ impl VideoPlayer {
             }
         }
         if current {
+            self.retained_seek_frame = false;
             if !converted {
                 self.convert_current()?;
             }
@@ -1844,6 +1849,9 @@ impl VideoPlayer {
         }
         if self.lookahead_at.is_some() {
             // The next frame is not due yet.
+            if std::mem::take(&mut self.retained_seek_frame) {
+                return Ok(Some(&self.frame_data));
+            }
             return Ok(None);
         }
         // No frames left. The last holds until the playhead reaches the
@@ -2032,7 +2040,10 @@ impl VideoPlayer {
             .stream(self.video_stream_index)
             .context("The video stream is gone")?
             .parameters();
-        self.decoder = hwdecode::open(parameters, false)?;
+        self.decoder = hwdecode::open(parameters, false)?.0;
+        // A replacement decoder has no reference pictures. It must seek to
+        // a keyframe even if the old decoder had a nearby lookahead frame.
+        self.lookahead_at = None;
         self.seek(self.playback.position)
     }
 
@@ -2045,13 +2056,41 @@ impl VideoPlayer {
     /// The file seeks to the keyframe at or before it; the frames from there
     /// to it are decoded, not shown (see `next_frame`).
     fn seek(&mut self, time_secs: f64) -> Result<()> {
-        self.seek_file(time_secs)?;
-        self.sought = Some((time_secs, 0.0));
+        if self.can_decode_forward_to(time_secs) {
+            // Retain reference frames, the queued next picture and the GPU
+            // decoder's surfaces. Starting at the keyframe again for every
+            // frame-sized scrub does much more work than decoding forward.
+            self.retained_seek_frame = true;
+        } else {
+            self.seek_file(time_secs)?;
+            self.sought = Some((time_secs, 0.0));
+        }
         self.playback.position = time_secs;
         // The playhead moves on from the time sought, not from the last
         // tick before it: the frame there shows, not the one after.
         self.playback.last_advance = std::time::Instant::now();
         Ok(())
+    }
+
+    fn can_decode_forward_to(&self, target: f64) -> bool {
+        // Ping-pong can display a cached reverse picture while `decoded`
+        // still holds the forward endpoint. It must use the normal seek.
+        if self.playback.loop_mode == LoopMode::PingPong
+            || self.playback.reverse
+            || self.sought.is_some()
+            || self.eof_sent
+            || self.lookahead_at.is_none()
+            || !target.is_finite()
+        {
+            return false;
+        }
+        let Some(pts) = self.decoded.timestamp().or_else(|| self.decoded.pts()) else {
+            return false;
+        };
+        let shown = pts as f64 * self.time_base - self.start;
+        // Keep the extra decode work bounded. Backward and large jumps still
+        // seek by keyframe; timestamps, not frame numbers, handle VFR clips.
+        target >= shown && target - shown <= 0.25
     }
 
     /// Seek the file to its very start, by bytes.
@@ -2071,6 +2110,7 @@ impl VideoPlayer {
             return self.seek_file(0.0);
         }
         self.decoder.flush();
+        self.retained_seek_frame = false;
         self.lookahead_at = None;
         self.eof_sent = false;
         self.last_at = 0.0;
@@ -2083,6 +2123,7 @@ impl VideoPlayer {
             ((time_secs.max(0.0) + self.start) * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
         self.ictx.seek(timestamp, ..timestamp)?;
         self.decoder.flush();
+        self.retained_seek_frame = false;
         self.lookahead_at = None;
         self.eof_sent = false;
         self.last_at = time_secs;
@@ -2310,8 +2351,8 @@ mod tests {
         let made = std::process::Command::new("ffmpeg")
             .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi"])
             .args(["-i", "testsrc2=size=640x360:rate=25", "-t", "2"])
-            .args(codec)
             .args(["-pix_fmt", "yuv420p"])
+            .args(codec)
             .arg(&path)
             .status()
             .is_ok_and(|s| s.success());
@@ -2330,6 +2371,45 @@ mod tests {
         let frames: Vec<Vec<u8>> = (0..n).filter_map(|_| step(player)).collect();
         assert!(frames.len() > n / 2, "frames came out: {}", frames.len());
         frames
+    }
+
+    /// Compare decoded pictures through the same packed YUV -> RGB path.
+    /// swscale's planar and semiplanar SIMD converters interpolate coloured
+    /// edges differently even when the decoded YUV samples are identical.
+    fn decode_reference(
+        player: &mut VideoPlayer,
+        n: usize,
+        packing: Option<Pixel>,
+    ) -> Vec<Vec<u8>> {
+        let Some(packing) = packing else {
+            return decode(player, n);
+        };
+        (0..n)
+            .filter_map(|_| {
+                step(player)?;
+                let source = &player.decoded;
+                let mut repacked = Video::empty();
+                let mut repacker = Scaler::get(
+                    source.format(),
+                    source.width(),
+                    source.height(),
+                    packing,
+                    source.width(),
+                    source.height(),
+                    yuv::rgba_flags(),
+                )
+                .unwrap();
+                repacker.run(source, &mut repacked).unwrap();
+                // Repacking must preserve colour tags, range and frame timing.
+                unsafe {
+                    ffmpeg::ffi::av_frame_copy_props(repacked.as_mut_ptr(), source.as_ptr());
+                }
+                let native = std::mem::replace(&mut player.decoded, repacked);
+                player.convert_current().unwrap();
+                player.decoded = native;
+                Some(player.frame_data.clone())
+            })
+            .collect()
     }
 
     /// A clip of `seconds` from the ffmpeg tool's moving test picture, every
@@ -2640,6 +2720,94 @@ mod tests {
         assert_eq!(which(&frames, &next), 38);
     }
 
+    #[test]
+    fn nearby_forward_scrubbing_reuses_the_decoder_and_keeps_the_right_picture() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = test_clip(dir.path(), "forward.mp4", 3, &[]) else {
+            return;
+        };
+        for hardware in [false, true] {
+            let mut player = VideoPlayer::open(&path, hardware).unwrap();
+            player.set_playing(false);
+            player.seek_and_reset(1.01).unwrap();
+            player.next_frame().unwrap().expect("initial frame");
+            let lookahead = player.lookahead_at.expect("next picture queued");
+            player.seek_and_reset(1.05).unwrap();
+            assert_eq!(
+                player.lookahead_at,
+                Some(lookahead),
+                "nearby forward seek must keep queued references"
+            );
+            assert_eq!(player.sought, None);
+            player
+                .next_frame()
+                .unwrap()
+                .expect("frame at the new position");
+            let at = player.decoded.timestamp().unwrap() as f64 * player.time_base - player.start;
+            assert!((at - 1.04).abs() < 1e-6, "frame 26 at 1.04 s, got {at}");
+            let held = player.frame_data.clone();
+            player.seek_and_reset(1.041).unwrap();
+            assert_eq!(
+                player
+                    .next_frame()
+                    .unwrap()
+                    .expect("paused seek owes one frame"),
+                held
+            );
+            assert!(!player.retained_seek_frame);
+            assert!(
+                player.next_frame().unwrap().is_none(),
+                "paused image holds without repeated uploads"
+            );
+
+            player.set_playing(true);
+            step(&mut player).expect("playing resumes");
+            let at = player.decoded.timestamp().unwrap() as f64 * player.time_base - player.start;
+            assert!((at - 1.08).abs() < 1e-6);
+            player.set_playing(false);
+            player.seek_and_reset(0.48).unwrap();
+            assert_eq!(player.lookahead_at, None, "backwards must really seek");
+            player.next_frame().unwrap().expect("backwards frame");
+            player.seek_and_reset(2.2).unwrap();
+            assert_eq!(player.lookahead_at, None, "large jumps must really seek");
+            player.next_frame().unwrap().expect("large jump frame");
+
+            // Ping-pong may be showing a cached picture rather than `decoded`.
+            player.playback.loop_mode = LoopMode::PingPong;
+            player.seek_and_reset(2.24).unwrap();
+            assert_eq!(
+                player.lookahead_at, None,
+                "ping-pong keeps its established seek path"
+            );
+        }
+    }
+
+    #[test]
+    fn hardware_fallback_restarts_at_a_keyframe_after_a_retained_seek() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = test_clip(dir.path(), "fallback.mp4", 3, &[]) else {
+            return;
+        };
+        let mut player = VideoPlayer::open(&path, true).unwrap();
+        player.set_playing(false);
+        player.seek_and_reset(1.01).unwrap();
+        player.next_frame().unwrap().expect("initial frame");
+        player.seek_and_reset(1.05).unwrap();
+        assert!(player.retained_seek_frame);
+        player
+            .fall_back_to_software("test decoder replacement")
+            .unwrap();
+        assert!(!player.hardware);
+        assert!(!player.retained_seek_frame);
+        assert_eq!(player.lookahead_at, None);
+        player
+            .next_frame()
+            .unwrap()
+            .expect("software replacement frame");
+        let at = player.decoded.timestamp().unwrap() as f64 * player.time_base - player.start;
+        assert!((at - 1.04).abs() < 1e-6);
+    }
+
     /// A clip whose frames come further apart after its first second (half
     /// the rate: phones and screen recordings vary so) plays in time: 2 s in,
     /// it shows the frame from 2 s, not the 50th.
@@ -2722,13 +2890,26 @@ mod tests {
         mean
     }
 
-    const CODECS: [(&str, &[&str]); 3] = [
+    const CODECS: [(&str, &[&str]); 4] = [
         ("h264.mp4", &["-c:v", "libx264", "-preset", "veryfast"]),
         (
             "hevc.mp4",
             &["-c:v", "libx265", "-preset", "veryfast", "-tag:v", "hvc1"],
         ),
         ("av1.mp4", &["-c:v", "libsvtav1", "-preset", "12"]),
+        (
+            "hevc10.mp4",
+            &[
+                "-c:v",
+                "libx265",
+                "-preset",
+                "veryfast",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-tag:v",
+                "hvc1",
+            ],
+        ),
     ];
 
     #[test]
@@ -2741,17 +2922,23 @@ mod tests {
             };
             let mut software = VideoPlayer::open(&path, false).unwrap();
             let mut hardware = VideoPlayer::open(&path, true).unwrap();
-            let reference = decode(&mut software, 40);
             let got = decode(&mut hardware, 12);
+            let packing = hardware
+                .hardware_decode()
+                .then(|| hardware.engine_frame.format());
+            let reference = decode_reference(&mut software, 40, packing);
             all_found(&reference, &got, name);
             assert!(
                 !software.hardware_decode(),
                 "{name}: software stays in software"
             );
-            if cfg!(target_os = "macos") && name != "av1.mp4" {
+            if (cfg!(target_os = "macos") && name != "av1.mp4")
+                || (cfg!(target_os = "windows")
+                    && std::env::var_os("VARDA_REQUIRE_HW_DECODE").is_some())
+            {
                 assert!(
                     hardware.hardware_decode(),
-                    "{name}: every Apple-silicon Mac decodes this on the media engine"
+                    "{name}: hardware decoding was required but did not run"
                 );
             }
             eprintln!("{name}: media engine = {}", hardware.hardware_decode());

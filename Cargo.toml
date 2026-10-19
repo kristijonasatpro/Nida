@@ -341,6 +341,10 @@ harness = false
 name = "presentation"
 harness = false
 
+[[bench]]
+name = "video_decode"
+harness = false
+
 
 # Dev and test builds carry line tables only: panics and backtraces keep
 # file and line, and the build cache is a fraction of the size — full debug

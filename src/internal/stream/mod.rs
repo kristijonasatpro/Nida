@@ -907,8 +907,13 @@ fn open_decoder(
             log::warn!("Stream: hardware decoder would not open ({e}); software");
             *use_hardware = false;
             crate::video::hwdecode::open_with(params.clone(), false, true)
+                .map(|(decoder, _)| decoder)
         }
-        opened => opened,
+        Ok((decoder, hardware)) => {
+            *use_hardware = hardware;
+            Ok(decoder)
+        }
+        Err(error) => Err(error),
     }
 }
 

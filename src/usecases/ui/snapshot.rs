@@ -640,6 +640,8 @@ pub(crate) fn build_ui_data(
         library_panel_open: layout.library_panel_open,
         right_panel_open: layout.right_panel_open,
         screen: layout.screen.clone(),
+        windows_hardware_decode: false,
+        software_decode_forced: false,
         saved_layouts: std::sync::Arc::default(), // populated by UIRunner
         show_name: app.show_name(),
         show_folder: app.show_folder().to_path_buf(),
