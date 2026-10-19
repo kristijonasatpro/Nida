@@ -13,6 +13,8 @@ on:
       - 'vendor/decklink-sdk/**'
       - 'tests/decklink-native/**'
       - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'clippy.toml'
       - '.github/workflows/decklink.yml'
   pull_request:
@@ -25,6 +27,8 @@ on:
       - 'vendor/decklink-sdk/**'
       - 'tests/decklink-native/**'
       - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'clippy.toml'
       - '.github/workflows/decklink.yml'
 

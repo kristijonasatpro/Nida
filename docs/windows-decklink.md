@@ -119,9 +119,31 @@ fractional rates. Measure sustained sync on the actual SDI/HDMI receiver.
 Do not use a successful SDK build or a fake-SDK test as evidence of a passing
 physical SDI/HDMI output, sustained frame rate, colour measurement or sync test.
 
-## Earlier video-only validation
+## Embedded audio validation
 
-The audio extension is undergoing fresh CI checks; the run below predates it.
+Checked code revision: `1a06baad4a417e7bd3bcf761b7509ed8386635a3`.
+The module jobs in [this audio CI run](https://github.com/pingvis/Nida-Windows/actions/runs/39318376740)
+passed on Windows, Linux and macOS: 24 tests on Windows/Linux and 25 on macOS,
+plus production module Clippy, real native SDK builds on Windows/macOS, the
+Windows COM adapter checks, and Linux Rust formatting and behavioral shim tests.
+The C++ audio tests also pass locally under AddressSanitizer and
+UndefinedBehaviorSanitizer (discovery's process-lifetime storage is excluded
+from leak detection).
+
+Audio regressions cover stereo order, clipping/nonfinite floats, source loss,
+underflow with late-sample discard, source/presentation time offsets, bounded
+large gaps, zero/partial SDK writes, 59.94 timestamps, hardware-clock recovery,
+start failure, unexpected playback stop and callbacks retained across close.
+
+That run's application build failed because its locked `cc` 1.4.0 lacks
+`Tool::get_envs`, although the harness's newer resolved version supported it.
+The follow-up fix reads the compiler environment through the standard
+`Command::get_envs` API and pins the harness to the application's locked `cc`
+version. Fresh validation of that fix is pending; the earlier module passes
+are not evidence of a passing locked application build. Physical embedded
+audio, lip sync and sustained performance have not been tested on a card.
+
+## Earlier video-only validation
 
 Checked code revision: `2ef4e044f4f93bb6a8ee60a75913bd73547c7e62`.
 All three jobs in [this focused CI run](https://github.com/pingvis/Nida-Windows/actions/runs/39309216791)

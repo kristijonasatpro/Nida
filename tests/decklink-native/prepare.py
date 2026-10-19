@@ -6,10 +6,14 @@ the NDI video-range conversion, build.rs and SDK files are copied verbatim.
 from pathlib import Path
 import shutil
 import sys
+import tomllib
 
 
 def prepare(destination: Path) -> None:
     root = Path(__file__).resolve().parents[2]
+    # Match the application instead of silently testing a newer cc API.
+    lock = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
+    cc_version = next(package["version"] for package in lock["package"] if package["name"] == "cc")
     destination.mkdir(parents=True, exist_ok=True)
     for directory in ("src/internal/decklink", "vendor/decklink-sdk"):
         shutil.copytree(root / directory, destination / directory, dirs_exist_ok=True)
@@ -44,7 +48,7 @@ crossbeam-channel = "0.5"
 
 [build-dependencies]
 cc = "1"
-''', encoding="utf-8")
+'''.replace('cc = "1"', f'cc = "={cc_version}"'), encoding="utf-8")
     # Apply the production module's actual pedantic lint policy too.
     manifest = (root / "Cargo.toml").read_text(encoding="utf-8")
     lint_start = manifest.index("[lints.clippy]")
