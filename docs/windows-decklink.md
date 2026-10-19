@@ -2,7 +2,7 @@
 
 This change adds a Windows COM backend to Nida's existing Blackmagic output.
 It is prepared separately against upstream Nida main at `c74d97e`, without
-the Windows integration fork's other features. No PR has been opened for it.
+the Windows integration fork's other features. It remains a separate change from the Windows integration fork.
 
 ## Behavior
 
@@ -121,27 +121,32 @@ physical SDI/HDMI output, sustained frame rate, colour measurement or sync test.
 
 ## Embedded audio validation
 
-Checked code revision: `1a06baad4a417e7bd3bcf761b7509ed8386635a3`.
-The module jobs in [this audio CI run](https://github.com/pingvis/Nida-Windows/actions/runs/39318376740)
-passed on Windows, Linux and macOS: 24 tests on Windows/Linux and 25 on macOS,
-plus production module Clippy, real native SDK builds on Windows/macOS, the
-Windows COM adapter checks, and Linux Rust formatting and behavioral shim tests.
-The C++ audio tests also pass locally under AddressSanitizer and
-UndefinedBehaviorSanitizer (discovery's process-lifetime storage is excluded
-from leak detection).
+Checked code revision: `deb5056db4ad75684f2d9135edd96bcd0cb96cac`.
+All four jobs in [this audio CI run](https://github.com/pingvis/Nida-Windows/actions/runs/39319183811)
+passed: the real native module builds/tests and production module Clippy on
+Windows and macOS, the Linux module checks and behavioral C++ shim tests,
+and the Linux application integration build with
+`cargo check --locked --lib --no-default-features --features screen-capture`.
+There are 24 module tests on Windows/Linux and 25 on macOS; the existing
+manual conversion measurement is run separately in release mode.
+
+The harness now matches the application's locked `cc` version (1.4.0).
+A prior unlocked harness resolved a newer version and missed a build-script
+API mismatch; the script now reads the compiler environment through the
+standard `Command::get_envs` API. The application's lockfile is unchanged.
 
 Audio regressions cover stereo order, clipping/nonfinite floats, source loss,
 underflow with late-sample discard, source/presentation time offsets, bounded
 large gaps, zero/partial SDK writes, 59.94 timestamps, hardware-clock recovery,
 start failure, unexpected playback stop and callbacks retained across close.
+The C++ audio tests also pass locally under AddressSanitizer and
+UndefinedBehaviorSanitizer, excluding process-lifetime discovery storage from
+leak detection.
 
-That run's application build failed because its locked `cc` 1.4.0 lacks
-`Tool::get_envs`, although the harness's newer resolved version supported it.
-The follow-up fix reads the compiler environment through the standard
-`Command::get_envs` API and pins the harness to the application's locked `cc`
-version. Fresh validation of that fix is pending; the earlier module passes
-are not evidence of a passing locked application build. Physical embedded
-audio, lip sync and sustained performance have not been tested on a card.
+This does not establish a passing complete application test suite or Windows
+application build. Other upstream Windows portability gaps remain separate.
+Physical embedded audio, lip sync and sustained performance have not been
+tested on a card.
 
 ## Earlier video-only validation
 
