@@ -17,6 +17,54 @@ const LOOK_FOR_DEVICE: std::time::Duration = std::time::Duration::from_secs(1);
 const DEVICE_MISSING_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl VardaApp {
+    /// Configure the next take. Renaming never stops an active encoder.
+    pub fn cmd_configure_recording_output(
+        &mut self,
+        output_uuid: &str,
+        name: Option<&str>,
+        folder: Option<&str>,
+    ) -> CommandResult {
+        let idx = match self.resolve_output(output_uuid) {
+            Ok(idx) => idx,
+            Err(error) => return error.into(),
+        };
+        let Some(UnifiedOutput::Headless(h)) = self.output.outputs.get_mut(idx) else {
+            return CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                message: "This output is not a recording".into(),
+            };
+        };
+        let OutputTarget::Recording { path, codec, .. } = &mut h.target else {
+            return CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                message: "This output is not a recording".into(),
+            };
+        };
+        if h.active && folder.is_some() {
+            return CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                message: "Stop recording to change its folder".into(),
+            };
+        }
+        if folder.is_some_and(|folder| folder.trim().is_empty()) {
+            return CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                message: "Choose a recording folder".into(),
+            };
+        }
+        if let Some(name) = name {
+            h.name = crate::record::recording_name(name, "Recording");
+        }
+        let folder = folder.map_or_else(
+            || crate::record::output_recording_folder(path),
+            std::path::Path::new,
+        );
+        *path = crate::record::output_recording_base(folder, &h.name, codec)
+            .display()
+            .to_string();
+        CommandResult::Ok
+    }
+
     /// Set the output target for a windowed or headless output.
     pub fn cmd_set_output_target(&mut self, idx: usize, target: OutputTarget) -> CommandResult {
         let ndi_resolution = matches!(&target, OutputTarget::NdiSend { .. }).then(|| {
@@ -137,7 +185,11 @@ impl VardaApp {
     /// Create a new headless output with the given target.
     pub fn cmd_create_headless_output(&mut self, target: OutputTarget) -> CommandResult {
         let idx = self.output.outputs.len() + 1;
-        let name = format!("Output {idx}");
+        let name = if matches!(target, OutputTarget::Recording { .. }) {
+            format!("Recording {idx}")
+        } else {
+            format!("Output {idx}")
+        };
         let is_ndi = matches!(&target, OutputTarget::NdiSend { .. });
         let mut headless = HeadlessOutput::new(
             &self.context.device,
@@ -282,7 +334,20 @@ impl VardaApp {
             };
             if let Some(UnifiedOutput::Headless(output)) = self.output.outputs.get_mut(idx) {
                 output.set_resolved_presentation(device, resolved);
-                readback_format = output.readback.format();
+                let nv12 = matches!(
+                    codec,
+                    crate::renderer::context::RecordingCodec::H264
+                        | crate::renderer::context::RecordingCodec::H265
+                ) && output.resolved_presentation.resolved
+                    == crate::engine::value::render::PresentationDepth::Sdr8;
+                // A new take must not receive readbacks left by the last take.
+                output.keep_nv12(device, false);
+                output.keep_nv12(device, nv12);
+                readback_format = if output.nv12.is_some() {
+                    crate::renderer::ReadbackFormat::Nv12
+                } else {
+                    output.readback.format()
+                };
             }
         }
         self.release_passthrough(stale.map(|b| *b));
@@ -315,8 +380,13 @@ impl VardaApp {
                 )
             }
             OutputTarget::Recording { path, codec, .. } => {
+                let path = crate::record::output_recording_base(
+                    crate::record::output_recording_folder(path),
+                    &name,
+                    codec,
+                );
                 crate::renderer::FfmpegSubprocess::spawn_recording_with_presentation(
-                    path,
+                    &path.display().to_string(),
                     codec,
                     width,
                     height,
@@ -445,6 +515,10 @@ impl VardaApp {
                 if let Some(UnifiedOutput::Headless(h)) = self.output.outputs.get_mut(idx) {
                     if let Some(resolved) = presentation {
                         h.set_resolved_presentation(&self.context.device, resolved);
+                    }
+                    h.keep_nv12(&self.context.device, sub.takes_nv12());
+                    if matches!(target, OutputTarget::Recording { .. }) {
+                        h.recording_file = Some(sub.label().into());
                     }
                     h.subprocess = Some(Box::new(sub));
                     h.audio_pcm = passthrough.map(Box::new);
@@ -1295,6 +1369,98 @@ mod tests {
     fn headless_app() -> Option<super::VardaApp> {
         let gpu = crate::renderer::context::GpuContext::new_headless().ok()?;
         super::VardaApp::new(gpu, &crate::testing::headless_config()).ok()
+    }
+
+    #[test]
+    fn recording_outputs_start_stop_and_restart_independently() {
+        use crate::engine::CommandResult;
+        use crate::renderer::context::{OutputTarget, RecordingCodec, UnifiedOutput};
+        if !std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            return;
+        }
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        app.set_render_resolution(64, 64);
+        let dir = tempfile::tempdir().unwrap();
+        let configured = dir.path().join("Shared.mp4");
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            assert!(matches!(
+                app.cmd_create_headless_output(OutputTarget::Recording {
+                    path: configured.display().to_string(),
+                    codec: RecordingCodec::H264,
+                    audio_device: None
+                }),
+                CommandResult::Ok
+            ));
+            ids.push(app.output.outputs.last().unwrap().uuid().to_string());
+        }
+        for id in &ids {
+            assert!(matches!(app.cmd_start_output(id), CommandResult::Ok));
+        }
+        let files: Vec<_> = app
+            .output
+            .outputs
+            .iter()
+            .filter_map(|o| match o {
+                UnifiedOutput::Headless(h) => {
+                    assert!(h.active);
+                    assert!(h.nv12.is_some());
+                    assert!(h.subprocess.as_ref().unwrap().takes_nv12());
+                    h.recording_file.clone()
+                }
+                UnifiedOutput::Window(_) => None,
+            })
+            .collect();
+        assert_eq!(files.len(), 2);
+        assert_ne!(files[0], files[1]);
+        assert!(matches!(
+            app.cmd_configure_recording_output(&ids[0], Some("Clean feed"), None),
+            CommandResult::Ok
+        ));
+        let renamed = app
+            .output
+            .outputs
+            .iter()
+            .find(|o| o.uuid() == ids[0])
+            .unwrap();
+        assert!(
+            matches!(renamed, UnifiedOutput::Headless(h) if h.active && h.name == "Clean feed" && h.recording_file.as_ref() == Some(&files[0]))
+        );
+        assert!(matches!(
+            app.cmd_configure_recording_output(&ids[0], None, Some("new folder")),
+            CommandResult::Err { .. }
+        ));
+        assert!(matches!(app.cmd_stop_output(&ids[0]), CommandResult::Ok));
+        let other = app
+            .output
+            .outputs
+            .iter()
+            .find(|o| o.uuid() == ids[1])
+            .unwrap();
+        assert!(matches!(other, UnifiedOutput::Headless(h) if h.active));
+        assert!(matches!(app.cmd_start_output(&ids[0]), CommandResult::Ok));
+        let restarted = app
+            .output
+            .outputs
+            .iter()
+            .find(|o| o.uuid() == ids[0])
+            .unwrap();
+        assert!(
+            matches!(restarted, UnifiedOutput::Headless(h) if h.recording_file.as_ref() != Some(&files[0]))
+        );
+        assert!(
+            matches!(restarted, UnifiedOutput::Headless(h) if h.recording_file.as_ref().unwrap().file_name().unwrap().to_string_lossy().starts_with("Clean feed "))
+        );
+        for id in &ids {
+            app.cmd_stop_output(id);
+        }
+        assert!(!configured.exists(), "configured base is never overwritten");
     }
 
     /// A screen for these tests: takes every picture, at once.

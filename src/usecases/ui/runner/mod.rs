@@ -32,6 +32,11 @@ use preview::PreviewEncoder;
 use deck_load::{apply_deck_texture_outcomes, register_deck_preview_texture, DeckLoadTargets};
 use detect::{spawn_detect_thread, DetectRequest, DetectResponse};
 
+struct RecordingFolderChoice {
+    output_uuid: Option<String>,
+    folder: Option<std::path::PathBuf>,
+}
+
 // The flags are unrelated (a frame due, a detection under way, a gesture, the
 // show saved on the way out), not one state enum.
 #[allow(clippy::struct_excessive_bools)]
@@ -55,7 +60,7 @@ pub struct UIRunner {
     drawn_px: std::collections::HashMap<egui::TextureId, [u32; 2]>,
     deck_preview_textures: std::collections::HashMap<String, egui::TextureId>,
     /// A folder picker for recordings, open on its own thread.
-    record_folder_pick: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
+    record_folder_pick: Option<std::sync::mpsc::Receiver<RecordingFolderChoice>>,
     /// A Show menu dialog (Open…, Save As…), open on its own thread.
     show_pick: Option<shows::PendingPick>,
     /// Wakes the event loop from other threads (the engine thread, after
@@ -1280,30 +1285,74 @@ impl UIRunner {
             }
 
             // Where recordings go: a folder picker, off the frame.
-            if std::mem::take(&mut ui_actions.session.choose_record_folder)
-                && self.record_folder_pick.is_none()
+            let folder_request = if std::mem::take(&mut ui_actions.session.choose_record_folder) {
+                Some(None)
+            } else {
+                ui_actions
+                    .session
+                    .choose_output_record_folder
+                    .take()
+                    .map(Some)
+            };
+            if let Some(output_uuid) = folder_request.filter(|_| self.record_folder_pick.is_none())
             {
                 let (tx, rx) = std::sync::mpsc::channel();
-                let start = varda.record_settings().options.folder.clone();
+                let start = output_uuid
+                    .as_ref()
+                    .and_then(|uuid| {
+                        varda
+                            .output
+                            .outputs
+                            .iter()
+                            .find(|o| o.uuid() == uuid)
+                            .and_then(|o| match o {
+                                crate::renderer::context::UnifiedOutput::Headless(h) => match &h
+                                    .target
+                                {
+                                    crate::renderer::context::OutputTarget::Recording {
+                                        path,
+                                        ..
+                                    } => Some(
+                                        crate::record::output_recording_folder(path).to_path_buf(),
+                                    ),
+                                    _ => None,
+                                },
+                                crate::renderer::context::UnifiedOutput::Window(_) => None,
+                            })
+                    })
+                    .unwrap_or_else(|| varda.record_settings().options.folder.clone());
                 std::thread::spawn(move || {
-                    let _ = tx.send(
-                        rfd::FileDialog::new()
-                            .set_title("Where recordings go")
-                            .set_directory(&start)
-                            .pick_folder(),
-                    );
+                    let folder = rfd::FileDialog::new()
+                        .set_title("Where recordings go")
+                        .set_directory(&start)
+                        .pick_folder();
+                    let _ = tx.send(RecordingFolderChoice {
+                        output_uuid,
+                        folder,
+                    });
                 });
                 self.record_folder_pick = Some(rx);
             }
             if let Some(rx) = &self.record_folder_pick {
                 if let Ok(picked) = rx.try_recv() {
                     self.record_folder_pick = None;
-                    if let Some(folder) = picked {
-                        let options = crate::record::RecordOptions {
-                            folder,
-                            ..varda.record_settings().options.clone()
+                    if let Some(folder) = picked.folder {
+                        let result = if let Some(uuid) = picked.output_uuid {
+                            varda.cmd_configure_recording_output(
+                                &uuid,
+                                None,
+                                Some(&folder.display().to_string()),
+                            )
+                        } else {
+                            let options = crate::record::RecordOptions {
+                                folder,
+                                ..varda.record_settings().options.clone()
+                            };
+                            varda.cmd_set_record_options(options)
                         };
-                        let _ = varda.cmd_set_record_options(options);
+                        if let crate::engine::CommandResult::Err { message, .. } = result {
+                            varda.session.notifications.warn(message);
+                        }
                     }
                 }
             }

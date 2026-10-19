@@ -1287,6 +1287,15 @@ impl VardaApp {
                 self.cmd_create_headless_output(target)
             }
             EngineCommand::StartOutput { output_uuid } => self.cmd_start_output(&output_uuid),
+            EngineCommand::ConfigureRecordingOutput {
+                output_uuid,
+                name,
+                folder,
+            } => self.cmd_configure_recording_output(
+                &output_uuid,
+                name.as_deref(),
+                folder.as_deref(),
+            ),
             EngineCommand::StopOutput { output_uuid } => self.cmd_stop_output(&output_uuid),
             EngineCommand::SetCalibrationMode { output_uuid, mode } => {
                 self.cmd_set_calibration_mode(&output_uuid, mode)
@@ -2361,6 +2370,7 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::SetOutputDisplay { .. }
             | C::SetOutputTarget { .. }
             | C::StartOutput { .. }
+            | C::ConfigureRecordingOutput { .. }
             | C::StopOutput { .. }
             | C::SetCalibrationMode { .. }
             | C::SetOutputRotation { .. }

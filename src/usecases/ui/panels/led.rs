@@ -921,6 +921,7 @@ mod tests {
             name: "LED".into(),
             target: crate::renderer::context::OutputTarget::Windowed,
             target_label: "Windowed".into(),
+            recording_file: None,
             is_windowed: true,
             is_active: true,
             active_duration: std::time::Duration::ZERO,

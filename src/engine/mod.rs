@@ -832,6 +832,12 @@ pub enum EngineCommand {
     StartOutput {
         output_uuid: String,
     },
+    /// Update a recording's next-take name or destination without restarting it.
+    ConfigureRecordingOutput {
+        output_uuid: String,
+        name: Option<String>,
+        folder: Option<String>,
+    },
     StopOutput {
         output_uuid: String,
     },

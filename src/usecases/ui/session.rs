@@ -76,6 +76,8 @@ pub struct UISession {
     /// Open a folder picker for where recordings go (outside the frame, like
     /// the file dialogs).
     pub choose_record_folder: bool,
+    /// Recording output whose destination folder should be picked.
+    pub choose_output_record_folder: Option<String>,
     /// Show a file in Finder (or the system's file manager).
     pub reveal_file: Option<std::path::PathBuf>,
     /// Notifications to put away, by id (see `Notification::id`).
@@ -197,6 +199,7 @@ impl UISession {
             open_video_dialog_for_new_inputs: false,
             files_to_add: Vec::new(),
             choose_record_folder: false,
+            choose_output_record_folder: None,
             reveal_file: None,
             notifications_to_dismiss: Vec::new(),
             info_notifications: Vec::new(),

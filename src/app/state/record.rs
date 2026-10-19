@@ -29,6 +29,8 @@ pub(crate) struct Recording {
     started_at: Option<Instant>,
     /// The take's time stamp, shared by every file of it.
     stamp: String,
+    /// Frozen for the take, including encoder-recovery files.
+    take_name: String,
     /// Files of this take, in order.
     files: Vec<PathBuf>,
     last_file: Option<PathBuf>,
@@ -143,14 +145,14 @@ impl super::super::VardaApp {
         }
     }
 
-    /// Change what is recorded and how. While recording only the source can
-    /// change; the rest waits for a stop.
+    /// Source changes apply live; a name change applies to the next take.
     pub fn cmd_set_record_options(&mut self, options: RecordOptions) -> CommandResult {
         let options = options.normalized();
         if self.record_running() {
             let current = &self.recording.settings.options;
             let only_source = RecordOptions {
                 source: current.source.clone(),
+                name: current.name.clone(),
                 ..options.clone()
             } == *current;
             if !only_source {
@@ -191,6 +193,7 @@ impl super::super::VardaApp {
             .or_else(|| self.audio_mix.default_bus().map(str::to_string));
         self.recording.output = vec![UnifiedOutput::Headless(output)];
         self.recording.stamp = crate::record::timestamp_now();
+        self.recording.take_name.clone_from(&options.name);
         self.recording.files.clear();
         self.recording.problem = None;
         self.recording.retry_at = None;
@@ -258,6 +261,7 @@ impl super::super::VardaApp {
         let options = &recording.settings.options;
         let path = crate::record::file_path(
             &options.folder,
+            &recording.take_name,
             &recording.stamp,
             recording.files.len() + 1,
             options.format.extension(),

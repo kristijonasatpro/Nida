@@ -1485,6 +1485,10 @@ impl OutputQueries for VardaApp {
                         uuid: o.uuid().to_string(),
                         name: o.name().to_string(),
                         target_label,
+                        recording_file: match o {
+                            UnifiedOutput::Headless(h) => h.recording_file.as_ref().map(|p| p.display().to_string()),
+                            UnifiedOutput::Window(_) => None,
+                        },
                         target,
                         is_on_display,
                         is_active,

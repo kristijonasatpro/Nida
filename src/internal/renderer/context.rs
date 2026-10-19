@@ -2380,6 +2380,8 @@ pub struct HeadlessOutput {
     /// unboxed it made `HeadlessOutput` 224 bytes larger than `OutputWindow` on
     /// Windows, tripping `clippy::large_enum_variant` on that platform only.
     pub subprocess: Option<Box<super::FfmpegSubprocess>>,
+    /// Last take's actual path, retained after Stop; not a saved-show setting.
+    pub recording_file: Option<std::path::PathBuf>,
     /// A Blackmagic output's device while it runs (see `crate::decklink`).
     pub decklink: Option<Box<crate::decklink::DeckLinkSender>>,
     /// A Blackmagic output the operator started and has not stopped: saved
@@ -2589,6 +2591,7 @@ impl HeadlessOutput {
             width,
             height,
             subprocess: None,
+            recording_file: None,
             decklink: None,
             keep_running: false,
             waiting_since: None,

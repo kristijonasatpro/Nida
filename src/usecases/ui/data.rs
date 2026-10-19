@@ -810,6 +810,8 @@ pub struct OutputUI {
     pub target: crate::renderer::context::OutputTarget,
     /// Current display target label (e.g. "Windowed", "Rec: /path", "SRT: srt://...")
     pub target_label: String,
+    /// Actual last take, also available after the recording stops.
+    pub recording_file: Option<String>,
     /// Whether this output is windowed (has an OS window)
     pub is_windowed: bool,
     /// Whether this output is actively recording/streaming (headless only)

@@ -31,7 +31,7 @@ pub async fn get_record(State(state): State<SharedState>) -> impl IntoResponse {
     }
 }
 
-#[utoipa::path(put, path = "/api/record/options", request_body = crate::record::RecordOptions, responses((status = 200, body = CommandResult), (status = 400, description = "Only the source can change while recording")), tag = "Record")]
+#[utoipa::path(put, path = "/api/record/options", request_body = crate::record::RecordOptions, responses((status = 200, body = CommandResult), (status = 400, description = "Only the source and next-take name can change while recording")), tag = "Record")]
 pub async fn set_options(
     State(s): State<SharedState>,
     Json(options): Json<crate::record::RecordOptions>,

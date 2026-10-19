@@ -7,7 +7,7 @@ An **output** renders its assigned surfaces (or the master mix directly) onto a 
 The output panel (right side) has three buttons:
 
 - **+ Windowed** — a floating, resizable output window
-- **+ Recording** — a headless recording output (defaults to H.264 → `output.mp4`)
+- **+ Recording** — an independent recording output (defaults to H.264 in Videos/Movies → Nida, with a new timestamped file for every take)
 - **+ Stream** — a headless network sender (defaults to NDI)
 - **+ *device name*** — one per Blackmagic device connected, e.g. **+ UltraStudio Monitor 3G**: see [Blackmagic Outputs](#blackmagic-outputs)
 
@@ -290,7 +290,7 @@ MacBook Pro drives itself. Its picture goes out on its HDMI and SDI at once.
 
 ## Recording Outputs
 
-Click **+ Recording** to add a recording output; each runs its own ffmpeg subprocess, so several feeds can record at once. Codecs, file-path rules, and the **▶ Start / ⏹ Stop** controls are covered in [Recording](09-streaming-and-io.md#recording).
+Click **+ Recording** to add a recording output; each runs its own ffmpeg subprocess, so several feeds can record at once. Use the pencil beside its title to set the filename prefix, and **Folder → Choose…** for its destination. Choose each output's source, audio and codec, then start and stop it independently. The actual file path remains visible after Stop. See [Recording more than one feed](19-recording.md#recording-more-than-one-feed).
 
 > **Sound.** Recording and all streaming targets carry an audio bus from the [Audio Mixer](16-audio-mixer.md) — **Bus: Master** by default — or a capture device directly, chosen in the output's **Audio:** menu. See also [Audio Passthrough](09-streaming-and-io.md#audio-passthrough).
 

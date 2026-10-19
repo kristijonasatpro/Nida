@@ -402,6 +402,10 @@ pub(crate) fn build_ui_data(
                 name: o.name().to_string(),
                 target,
                 target_label,
+                recording_file: match o {
+                    crate::renderer::context::UnifiedOutput::Headless(h) => h.recording_file.as_ref().map(|p| p.display().to_string()),
+                    crate::renderer::context::UnifiedOutput::Window(_) => None,
+                },
                 is_windowed,
                 is_active,
                 active_duration,
