@@ -21,6 +21,9 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 #[cfg(any(not(target_os = "macos"), test))]
 mod convert;
 
+mod audio;
+pub use audio::AudioInput;
+
 /// One of a device's video formats.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct DeckLinkMode {
@@ -431,6 +434,16 @@ impl DeckLinkSender {
     ///
     /// When there is no such device or format.
     pub fn start(name: &str, device: &str, mode: &str, full_range: bool) -> anyhow::Result<Self> {
+        Self::start_audio(name, device, mode, full_range, None)
+    }
+
+    /// Start a Blackmagic output with an optional post-mix stereo audio tap.
+    ///
+    /// # Errors
+    ///
+    /// When the selected device or mode is absent, or an output worker fails.
+    pub fn start_audio(name: &str, device: &str, mode: &str, full_range: bool,
+        audio: Option<AudioInput>) -> anyhow::Result<Self> {
         let find =
             |devices: Vec<DeckLinkDevice>| devices.into_iter().find(|d| d.name == device);
         // As last copied, at once; else as discovery has it this moment — a
@@ -455,7 +468,7 @@ impl DeckLinkSender {
             let held = hold_device(&device, arrival, DEVICE_FREED_WITHIN)?;
             *ours.lock().unwrap_or_else(PoisonError::into_inner) =
                 Some((held.device.clone(), held.token));
-            let screen = sdk::open(arrival, code, width, height)?;
+            let screen = sdk::open_audio(arrival, code, width, height, audio)?;
             Ok(Box::new(Held {
                 screen,
                 _held: held,
@@ -1007,7 +1020,10 @@ mod sdk {
             modes: *mut Mode,
             max: i32,
         ) -> i32;
-        fn nida_dl_open(id: u64, mode: u32, err: *mut c_char, errlen: i32) -> *mut c_void;
+        fn nida_dl_open_with_audio(id: u64, mode: u32,
+            read: Option<extern "C" fn(*mut c_void, i64, u32, *mut i32)>,
+            context: *mut c_void, err: *mut c_char, errlen: i32) -> *mut c_void;
+        fn nida_dl_audio_preroll(handle: *mut c_void) -> u32;
         fn nida_dl_show(
             handle: *mut c_void,
             data: *const u8,
@@ -1104,6 +1120,7 @@ mod sdk {
 
     struct Device {
         handle: *mut c_void,
+        audio: Option<Box<std::sync::Mutex<super::audio::Pull>>>,
         width: i32,
         height: i32,
     }
@@ -1118,6 +1135,13 @@ mod sdk {
                 return Err(super::Refused::TooSmall);
             }
             let row = i32::try_from(row_bytes).map_err(|_| super::Refused::TooSmall)?;
+            if let Some(audio) = &self.audio {
+                // SAFETY: a live output handle, used only on its owning worker.
+                let preroll = unsafe { nida_dl_audio_preroll(self.handle) };
+                if let Ok(mut audio) = audio.lock() {
+                    audio.begin(std::time::Instant::now(), preroll);
+                }
+            }
             // SAFETY: a picture of `height` lines of `row_bytes`.
             let shown =
                 unsafe { nida_dl_show(self.handle, uyvy.as_ptr(), row, self.width, self.height) };
@@ -1248,17 +1272,32 @@ mod sdk {
         }
     }
 
-    pub(super) fn open(
+    extern "C" fn read_audio(context: *mut c_void, frame: i64, frames: u32, out: *mut i32) {
+        // SAFETY: the SDK shim calls with fixed storage for at most 2048 stereo
+        // frames. close stops callbacks before Device drops the boxed mutex.
+        let output = unsafe { std::slice::from_raw_parts_mut(out, frames as usize * 2) };
+        let state = unsafe { &*context.cast::<std::sync::Mutex<super::audio::Pull>>() };
+        if let Ok(mut audio) = state.lock() { audio.read(frame, output); } else { output.fill(0); }
+    }
+
+    pub(super) fn open_audio(
         arrival: u64,
         code: u32,
         width: u32,
         height: u32,
+        audio: Option<super::AudioInput>,
     ) -> Result<Box<dyn Screen>, String> {
         let width = i32::try_from(width).map_err(|e| e.to_string())?;
         let height = i32::try_from(height).map_err(|e| e.to_string())?;
+        let mut audio = audio.map(|input| Box::new(std::sync::Mutex::new(super::audio::Pull::new(input))));
+        let context = audio.as_deref_mut().map_or(std::ptr::null_mut(), |state| {
+            std::ptr::from_mut(state).cast::<c_void>()
+        });
         let mut err = [0 as c_char; 256];
         // SAFETY: a buffer of the length given.
-        let handle = unsafe { nida_dl_open(arrival, code, err.as_mut_ptr(), 256) };
+        let handle = unsafe { nida_dl_open_with_audio(arrival, code,
+            audio.as_ref().map(|_| read_audio as extern "C" fn(*mut c_void, i64, u32, *mut i32)),
+            context, err.as_mut_ptr(), 256) };
         if handle.is_null() {
             // SAFETY: NUL-terminated by the shim.
             return Err(unsafe { CStr::from_ptr(err.as_ptr()) }
@@ -1267,6 +1306,7 @@ mod sdk {
         }
         let device = Device {
             handle,
+            audio,
             width,
             height,
         };
@@ -1292,11 +1332,12 @@ mod sdk {
 
     pub(super) use super::convert::Converter;
 
-    pub(super) fn open(
+    pub(super) fn open_audio(
         _arrival: u64,
         _code: u32,
         _width: u32,
         _height: u32,
+        _audio: Option<super::AudioInput>,
     ) -> Result<Box<dyn Screen>, String> {
         Err("Blackmagic outputs require macOS or Windows".into())
     }

@@ -406,16 +406,28 @@ impl VardaApp {
                 mode,
                 full_range,
             } => {
-                // No ffmpeg subprocess and, for now, no sound: the device's
-                // own thread puts each picture up (see `crate::decklink`), at
-                // its format's size, the show scaled to it.
-                self.release_passthrough(passthrough);
-                return match crate::decklink::DeckLinkSender::start(&name, device, mode, *full_range) {
+                if audio_bus.is_some() && audio_input.is_none() {
+                    self.release_passthrough(passthrough);
+                    return CommandResult::Err {
+                        code: ErrorCode::Unavailable,
+                        message: format!("Blackmagic output '{name}': selected audio bus is unavailable"),
+                    };
+                }
+                // Mixer-bus audio is already stereo at 48 kHz, after gain,
+                // mute and delay. Keep its subscription for health/teardown.
+                let audio = audio_input.map(|input| crate::decklink::AudioInput {
+                    receiver: input.rx,
+                    opened: input.started,
+                });
+                return match crate::decklink::DeckLinkSender::start_audio(
+                    &name, device, mode, *full_range, audio,
+                ) {
                     Ok(sender) => {
                         let device = &self.context.device;
                         if let Some(UnifiedOutput::Headless(h)) = self.output.outputs.get_mut(idx) {
                             h.resize(device, sender.width, sender.height);
                             h.decklink = Some(Box::new(sender));
+                            h.audio_pcm = passthrough.map(Box::new);
                             h.keep_running = true;
                             h.waiting_since = None;
                             h.active = true;
@@ -424,10 +436,13 @@ impl VardaApp {
                         log::info!("Blackmagic output '{name}' on {target}");
                         CommandResult::Ok
                     }
-                    Err(e) => CommandResult::Err {
-                        code: ErrorCode::Unavailable,
-                        message: format!("Blackmagic output '{name}': {e}"),
-                    },
+                    Err(e) => {
+                        self.release_passthrough(passthrough);
+                        CommandResult::Err {
+                            code: ErrorCode::Unavailable,
+                            message: format!("Blackmagic output '{name}': {e}"),
+                        }
+                    }
                 };
             }
             _ => {

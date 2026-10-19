@@ -24,6 +24,10 @@ def prepare(destination: Path) -> None:
         depth += (ndi[end] == "{") - (ndi[end] == "}")
         end += 1
     (destination / "src/ndi_conversion.rs").write_text(ndi[start:end] + "\n", encoding="utf-8")
+    audio = (root / "src/internal/audio/mod.rs").read_text(encoding="utf-8")
+    chunk_start = audio.index("pub struct PcmChunk {")
+    chunk_end = audio.index("\n}", chunk_start) + 2
+    (destination / "src/pcm_chunk.rs").write_text(audio[chunk_start:chunk_end] + "\n", encoding="utf-8")
     (destination / "Cargo.toml").write_text('''[package]
 name = "nida-decklink-check"
 version = "0.0.0"
@@ -36,6 +40,7 @@ log = "0.4"
 serde = { version = "1", features = ["derive"] }
 utoipa = "5"
 libc = "0.2"
+crossbeam-channel = "0.5"
 
 [build-dependencies]
 cc = "1"
@@ -49,6 +54,7 @@ cc = "1"
     (destination / "src/lib.rs").write_text('''#![allow(dead_code)]
 #[path = "internal/decklink/mod.rs"]
 pub mod decklink;
+mod audio { include!("pcm_chunk.rs"); }
 mod ndi { include!("ndi_conversion.rs"); }
 mod renderer {
     pub mod presenter {

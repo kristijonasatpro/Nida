@@ -21,6 +21,11 @@ constexpr int bmdVideoConnectionUnspecified = 0, bmdFormat8BitYUV = 0;
 constexpr int bmdNoVideoOutputConversion = 0, bmdSupportedVideoModeDefault = 0;
 constexpr int bmdVideoOutputFlagDefault = 0, bmdFrameFlagDefault = 0;
 constexpr int bmdDeckLinkStatusCurrentVideoOutputMode = 0, BMDDeckLinkAPIVersion = 0;
+constexpr int IID_IDeckLinkVideoOutputCallback = 4, IID_IDeckLinkAudioOutputCallback = 5;
+constexpr int bmdAudioSampleRate48kHz = 48000, bmdAudioSampleType32bitInteger = 32;
+constexpr int bmdAudioOutputStreamTimestamped = 1;
+using BMDOutputFrameCompletionResult = int;
+constexpr int bmdOutputFrameFlushed = 3;
 
 struct IDeckLinkDisplayMode {
     virtual BMDDisplayMode GetDisplayMode() = 0;
@@ -34,9 +39,23 @@ struct IDeckLinkDisplayModeIterator {
     virtual HRESULT Next(IDeckLinkDisplayMode**) = 0;
     virtual ULONG Release() = 0;
 };
-struct IDeckLinkMutableVideoFrame {
+struct IDeckLinkVideoFrame {
     virtual HRESULT GetBytes(void**) = 0;
     virtual long GetRowBytes() = 0;
+    virtual ULONG Release() = 0;
+};
+struct IDeckLinkMutableVideoFrame : IDeckLinkVideoFrame {};
+struct IDeckLinkVideoOutputCallback {
+    virtual HRESULT ScheduledFrameCompleted(IDeckLinkVideoFrame*, BMDOutputFrameCompletionResult) = 0;
+    virtual HRESULT ScheduledPlaybackHasStopped() = 0;
+    virtual HRESULT QueryInterface(REFIID, LPVOID*) = 0;
+    virtual ULONG AddRef() = 0;
+    virtual ULONG Release() = 0;
+};
+struct IDeckLinkAudioOutputCallback {
+    virtual HRESULT RenderAudioSamples(DlSupported) = 0;
+    virtual HRESULT QueryInterface(REFIID, LPVOID*) = 0;
+    virtual ULONG AddRef() = 0;
     virtual ULONG Release() = 0;
 };
 struct IDeckLinkOutput {
@@ -47,7 +66,20 @@ struct IDeckLinkOutput {
     virtual HRESULT EnableVideoOutput(BMDDisplayMode, int) = 0;
     virtual HRESULT DisableVideoOutput() = 0;
     virtual HRESULT CreateVideoFrame(int, int, int, int, int, IDeckLinkMutableVideoFrame**) = 0;
-    virtual HRESULT DisplayVideoFrameSync(IDeckLinkMutableVideoFrame*) = 0;
+    virtual HRESULT DisplayVideoFrameSync(IDeckLinkVideoFrame*) = 0;
+    virtual HRESULT ScheduleVideoFrame(IDeckLinkVideoFrame*, BMDTimeValue, BMDTimeValue, BMDTimeScale) { return E_FAIL; }
+    virtual HRESULT SetScheduledFrameCompletionCallback(IDeckLinkVideoOutputCallback*) { return S_OK; }
+    virtual HRESULT EnableAudioOutput(int, int, unsigned int, int) { return E_FAIL; }
+    virtual HRESULT DisableAudioOutput() { return S_OK; }
+    virtual HRESULT SetAudioCallback(IDeckLinkAudioOutputCallback*) { return S_OK; }
+    virtual HRESULT BeginAudioPreroll() { return E_FAIL; }
+    virtual HRESULT EndAudioPreroll() { return E_FAIL; }
+    virtual HRESULT GetBufferedAudioSampleFrameCount(unsigned int*) { return E_FAIL; }
+    virtual HRESULT ScheduleAudioSamples(void*, unsigned int, BMDTimeValue, BMDTimeScale, unsigned int*) { return E_FAIL; }
+    virtual HRESULT StartScheduledPlayback(BMDTimeValue, BMDTimeScale, double) { return E_FAIL; }
+    virtual HRESULT StopScheduledPlayback(BMDTimeValue, BMDTimeValue*, BMDTimeScale) { return S_OK; }
+    virtual HRESULT GetScheduledStreamTime(BMDTimeScale, BMDTimeValue*, double*) { return E_FAIL; }
+    virtual ULONG AddRef() { return 1; }
     virtual HRESULT GetHardwareReferenceClock(BMDTimeScale, BMDTimeValue*, BMDTimeValue*, BMDTimeValue*) = 0;
     virtual ULONG Release() = 0;
 };

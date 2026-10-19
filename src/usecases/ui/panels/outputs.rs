@@ -629,8 +629,11 @@ fn render_headless_controls(
         });
     }
 
-    // An NDI sender carries an audio bus, changed over at once, on air too.
-    if matches!(output.target, OutputTarget::NdiSend { .. }) {
+    // NDI changes bus live; Blackmagic chooses its embedded stereo bus while
+    // stopped. No selection preserves existing video-only saved shows.
+    if matches!(output.target, OutputTarget::NdiSend { .. })
+        || matches!(output.target, OutputTarget::DeckLink { .. }) && !output.is_active
+    {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Audio:").small());
             let bus_name = |uuid: &str| {

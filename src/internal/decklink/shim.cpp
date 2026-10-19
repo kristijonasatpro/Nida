@@ -23,8 +23,11 @@
 #define NIDA_DECKLINK_PLATFORM_HEADER "platform.hpp"
 #endif
 #include NIDA_DECKLINK_PLATFORM_HEADER
+#include "scheduled.hpp"
 
 extern "C" {
+
+void nida_dl_close(void* handle);
 
 struct nida_dl_mode {
     uint32_t code;
@@ -202,6 +205,7 @@ struct Output {
     int32_t width;
     int32_t height;
     BMDDisplayMode mode;
+    Scheduled* scheduled;
 };
 
 }  // namespace
@@ -269,7 +273,7 @@ int32_t nida_dl_device_snapshot(int32_t index, uint64_t* id, char* name,
 
 // Open the output device of arrival `id` in display mode `mode`, 8-bit YUV;
 // null on failure, why in `err`.
-void* nida_dl_open(uint64_t id, uint32_t mode, char* err, int32_t errlen) {
+void* nida_dl_open_with_audio(uint64_t id, uint32_t mode, AudioRead read, void* context, char* err, int32_t errlen) {
     auto fail = [&](const char* why) -> void* {
         if (errlen > 0) {
             std::strncpy(err, why, static_cast<size_t>(errlen) - 1);
@@ -305,6 +309,9 @@ void* nida_dl_open(uint64_t id, uint32_t mode, char* err, int32_t errlen) {
     }
     const int32_t width = static_cast<int32_t>(display->GetWidth());
     const int32_t height = static_cast<int32_t>(display->GetHeight());
+    BMDTimeValue duration = 0;
+    BMDTimeScale scale = 0;
+    display->GetFrameRate(&duration, &scale);
     display->Release();
     if (width <= 0 || height <= 0 || width % 2 != 0 ||
         width > std::numeric_limits<int32_t>::max() / 4) {
@@ -321,7 +328,19 @@ void* nida_dl_open(uint64_t id, uint32_t mode, char* err, int32_t errlen) {
     if (device->QueryInterface(IID_IDeckLinkStatus, reinterpret_cast<void**>(&status)) != S_OK) {
         status = nullptr;
     }
-    auto* out = new Output{device, output, status, {nullptr, nullptr}, 0, width, height, static_cast<BMDDisplayMode>(mode)};
+    auto* out = new Output{device, output, status, {nullptr, nullptr}, 0, width, height, static_cast<BMDDisplayMode>(mode), nullptr};
+    if (read != nullptr) {
+        if (duration <= 0 || scale <= 0 || duration > scale || scale > 1000000000) {
+            nida_dl_close(out);
+            return fail("the device returned an invalid audio/video clock");
+        }
+        out->scheduled = new Scheduled(output, width, height, duration, scale, read, context);
+        if (!out->scheduled->enable()) {
+            nida_dl_close(out);
+            return fail("the device would not start embedded 48 kHz stereo audio");
+        }
+        return out;
+    }
     for (auto& frame : out->frames) {
         if (output->CreateVideoFrame(width, height, width * 2, bmdFormat8BitYUV, bmdFrameFlagDefault, &frame) != S_OK) {
             frame = nullptr;
@@ -345,6 +364,16 @@ void* nida_dl_open(uint64_t id, uint32_t mode, char* err, int32_t errlen) {
     return out;
 }
 
+// The existing video-only entry point, also used by native lifecycle tests.
+void* nida_dl_open(uint64_t id, uint32_t mode, char* err, int32_t errlen) {
+    return nida_dl_open_with_audio(id, mode, nullptr, nullptr, err, errlen);
+}
+
+uint32_t nida_dl_audio_preroll(void* handle) {
+    auto* out = static_cast<Output*>(handle);
+    return out != nullptr && out->scheduled != nullptr ? out->scheduled->preroll : 0;
+}
+
 // Put one 8-bit YUV ('2vuy') picture up on the device at its next frame:
 // `row_bytes` per line, `width`×`height` as opened. 0 when shown.
 int32_t nida_dl_show(void* handle, const uint8_t* data, int32_t row_bytes, int32_t width, int32_t height) {
@@ -353,6 +382,7 @@ int32_t nida_dl_show(void* handle, const uint8_t* data, int32_t row_bytes, int32
         row_bytes < width * 2) {
         return -1;
     }
+    if (out->scheduled != nullptr) return out->scheduled->submit(data, row_bytes);
     IDeckLinkMutableVideoFrame* frame = out->frames[out->next];
     out->next ^= 1;
     void* bytes = nullptr;
@@ -468,6 +498,10 @@ void nida_dl_close(void* handle) {
     auto* out = static_cast<Output*>(handle);
     if (out == nullptr) {
         return;
+    }
+    if (out->scheduled != nullptr) {
+        out->scheduled->stop();
+        out->scheduled->Release();
     }
     out->output->DisableVideoOutput();
     for (auto* frame : out->frames) {

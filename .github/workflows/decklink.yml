@@ -7,6 +7,9 @@ on:
     paths:
       - 'src/internal/decklink/**'
       - 'src/internal/ndi/mod.rs'
+      - 'src/internal/audio/mod.rs'
+      - 'src/app/state/outputs.rs'
+      - 'src/usecases/ui/panels/outputs.rs'
       - 'vendor/decklink-sdk/**'
       - 'tests/decklink-native/**'
       - 'build.rs'
@@ -16,6 +19,9 @@ on:
     paths:
       - 'src/internal/decklink/**'
       - 'src/internal/ndi/mod.rs'
+      - 'src/internal/audio/mod.rs'
+      - 'src/app/state/outputs.rs'
+      - 'src/usecases/ui/panels/outputs.rs'
       - 'vendor/decklink-sdk/**'
       - 'tests/decklink-native/**'
       - 'build.rs'
@@ -60,10 +66,31 @@ jobs:
         run: cargo test --release --manifest-path "${{ runner.temp }}/nida-decklink-check/Cargo.toml" converting_1080p_is_quick -- --ignored --nocapture
       - name: Check new Rust file formatting
         if: always() && runner.os == 'Linux'
-        run: rustfmt --edition 2021 --check build.rs src/internal/decklink/convert.rs
+        run: |
+          rustfmt --edition 2021 --check build.rs src/internal/decklink/convert.rs
+          python - <<'PY'
+          import base64, subprocess
+          result = subprocess.run(['rustfmt', '--edition', '2021', '--emit', 'stdout', 'src/internal/decklink/audio.rs'], capture_output=True, check=True)
+          print('FORMATTED_AUDIO=' + base64.b64encode(result.stdout).decode())
+          PY
       - name: Compile shared shim against behavioral SDK double
         if: runner.os == 'Linux'
         run: |
           g++ -std=c++17 -Wall -Wextra -Werror -pthread -Itests/decklink-native tests/decklink-native/shim_test.cpp -o /tmp/nida-decklink-shim-test
           /tmp/nida-decklink-shim-test
           /tmp/nida-decklink-shim-test --missing-driver
+
+  application:
+    name: Application integration (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install application build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libvulkan-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libavdevice-dev libsrt-gnutls-dev libasound2-dev libv4l-dev libpipewire-0.3-dev libwayland-dev libxkbcommon-dev libx11-dev libxrandr-dev libxi-dev libgtk-3-dev
+      - name: Check application audio routing and output UI
+        run: cargo check --locked --lib --no-default-features --features screen-capture
