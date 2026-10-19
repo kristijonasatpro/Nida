@@ -56,6 +56,8 @@ jobs:
         run: cargo test --manifest-path "${{ runner.temp }}/nida-decklink-check/Cargo.toml" -- --test-threads=1 --skip an_outputs_threads_run_in_real_time
       - name: Lint production module with repository policy
         run: cargo clippy --manifest-path "${{ runner.temp }}/nida-decklink-check/Cargo.toml" --lib -- -D warnings
+      - name: Measure optimized video and full range conversion
+        run: cargo test --release --manifest-path "${{ runner.temp }}/nida-decklink-check/Cargo.toml" converting_1080p_is_quick -- --ignored --nocapture
       - name: Check new Rust file formatting
         if: always() && runner.os == 'Linux'
         run: rustfmt --edition 2021 --check build.rs src/internal/decklink/convert.rs

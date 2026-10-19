@@ -1658,15 +1658,17 @@ mod tests {
             .map(|i| u8::try_from(i % 251).unwrap_or(0))
             .collect();
         let mut uyvy = vec![0u8; 1920 * 1080 * 2];
-        let mut converter = Converter::new(1920, 1080, false).expect("made");
-        converter.run(&rgba, &mut uyvy).expect("converted");
-        let runs = 100;
-        let started = std::time::Instant::now();
-        for _ in 0..runs {
+        for full_range in [false, true] {
+            let mut converter = Converter::new(1920, 1080, full_range).expect("made");
             converter.run(&rgba, &mut uyvy).expect("converted");
+            let runs = 100;
+            let started = std::time::Instant::now();
+            for _ in 0..runs {
+                converter.run(&rgba, &mut uyvy).expect("converted");
+            }
+            let each = started.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
+            println!("1080p RGBA → 2vuy (full={full_range}): {each:.2} ms each");
         }
-        let each = started.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
-        println!("1080p RGBA → 2vuy: {each:.2} ms each");
     }
 
     /// Stopping an output does not wait for its device — busy putting a
