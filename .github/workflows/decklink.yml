@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
+        os: [ubuntu-24.04, windows-2022, macos-14]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -38,7 +38,14 @@ jobs:
       - name: Prepare exact DeckLink source harness
         run: python tests/decklink-native/prepare.py "${{ runner.temp }}/nida-decklink-check"
       - name: Compile native SDK shim and run module tests
-        run: cargo test --manifest-path "${{ runner.temp }}/nida-decklink-check/Cargo.toml" -- --test-threads=1
+        # Priority calls are no-ops in this harness, so their macOS integration
+        # check belongs to the full application suite instead.
+        run: cargo test --manifest-path "${{ runner.temp }}/nida-decklink-check/Cargo.toml" -- --test-threads=1 --skip an_outputs_threads_run_in_real_time
+      - name: Lint production module with repository policy
+        run: cargo clippy --manifest-path "${{ runner.temp }}/nida-decklink-check/Cargo.toml" --lib -- -D warnings
+      - name: Check new Rust file formatting
+        if: runner.os == 'Linux'
+        run: rustfmt --edition 2021 --check build.rs src/internal/decklink/convert.rs
       - name: Compile shared shim against behavioral SDK double
         if: runner.os == 'Linux'
         run: |

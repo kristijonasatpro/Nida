@@ -47,23 +47,61 @@ fn build_windows_decklink() {
     let compiler = cc::Build::new().cpp(true).get_compiler();
     // cc discovers the installed MSVC/Windows SDK even outside a Developer
     // Prompt. Use the same PATH and INCLUDE for MIDL's C preprocessor.
-    let search = compiler.env().iter().find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
-        .map(|(_, value)| value.clone()).or_else(|| std::env::var_os("PATH"));
-    let midl = std::env::var_os("MIDL").map(PathBuf::from).or_else(|| {
-        search.as_ref().and_then(|paths| std::env::split_paths(paths)
-            .map(|dir| dir.join("midl.exe")).find(|file| file.is_file()))
-    }).expect("midl.exe not found: install the Windows SDK with MSVC Build Tools, or set MIDL");
+    let search = compiler
+        .env()
+        .iter()
+        .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var_os("PATH"));
+    let midl = std::env::var_os("MIDL")
+        .map(PathBuf::from)
+        .or_else(|| {
+            search.as_ref().and_then(|paths| {
+                std::env::split_paths(paths)
+                    .map(|dir| dir.join("midl.exe"))
+                    .find(|file| file.is_file())
+            })
+        })
+        .expect("midl.exe not found: install the Windows SDK with MSVC Build Tools, or set MIDL");
     let mut command = Command::new(midl);
     command.envs(compiler.env().iter().cloned());
-    let result = command.args(["/nologo", "/env", arch, "/char", "signed", "/h", "DeckLinkAPI.h",
-        "/iid", "DeckLinkAPI_i.c", "/tlb", "DeckLinkAPI.tlb", "/out"])
-        .arg(&out).arg("/I").arg(&sdk).arg(sdk.join("DeckLinkAPI.idl"))
-        .status().expect("run Windows SDK midl.exe");
-    assert!(result.success(), "MIDL failed to generate the Windows DeckLink SDK interfaces");
-    cc::Build::new().cpp(true).std("c++17").include(&out)
-        .define("NOMINMAX", None).define("WIN32_LEAN_AND_MEAN", None)
-        .file("src/internal/decklink/shim.cpp").warnings(true).compile("nida_decklink");
-    cc::Build::new().file(out.join("DeckLinkAPI_i.c")).warnings(false)
+    let result = command
+        .args([
+            "/nologo",
+            "/env",
+            arch,
+            "/char",
+            "signed",
+            "/h",
+            "DeckLinkAPI.h",
+            "/iid",
+            "DeckLinkAPI_i.c",
+            "/tlb",
+            "DeckLinkAPI.tlb",
+            "/out",
+        ])
+        .arg(&out)
+        .arg("/I")
+        .arg(&sdk)
+        .arg(sdk.join("DeckLinkAPI.idl"))
+        .status()
+        .expect("run Windows SDK midl.exe");
+    assert!(
+        result.success(),
+        "MIDL failed to generate the Windows DeckLink SDK interfaces"
+    );
+    cc::Build::new()
+        .cpp(true)
+        .std("c++17")
+        .include(&out)
+        .define("NOMINMAX", None)
+        .define("WIN32_LEAN_AND_MEAN", None)
+        .file("src/internal/decklink/shim.cpp")
+        .warnings(true)
+        .compile("nida_decklink");
+    cc::Build::new()
+        .file(out.join("DeckLinkAPI_i.c"))
+        .warnings(false)
         .compile("nida_decklink_guids");
     println!("cargo:rustc-link-lib=ole32");
     println!("cargo:rustc-link-lib=oleaut32");

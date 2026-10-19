@@ -39,6 +39,12 @@ libc = "0.2"
 [build-dependencies]
 cc = "1"
 ''', encoding="utf-8")
+    # Apply the production module's actual pedantic lint policy too.
+    manifest = (root / "Cargo.toml").read_text(encoding="utf-8")
+    lint_start = manifest.index("[lints.clippy]")
+    lint_end = manifest.index("\n[dependencies]", lint_start)
+    with (destination / "Cargo.toml").open("a", encoding="utf-8") as output:
+        output.write("\n" + manifest[lint_start:lint_end] + "\n")
     (destination / "src/lib.rs").write_text('''#![allow(dead_code)]
 #[path = "internal/decklink/mod.rs"]
 pub mod decklink;
@@ -48,12 +54,18 @@ mod renderer {
         pub fn raise_priority(_: &str) {}
         pub fn run_in_real_time(_: &str, _: std::time::Duration,
             _: std::time::Duration, _: std::time::Duration) {}
+        #[cfg(target_os = "macos")]
+        pub fn real_time_of(_: &std::thread::JoinHandle<()>) -> Option<(
+            std::time::Duration, std::time::Duration, std::time::Duration)> { None }
     }
     pub mod present_trace {
         pub enum Step { Taken, Presented }
         pub struct Trace;
         pub static TRACE: Trace = Trace;
-        impl Trace { pub fn note_if_free(&self, _: &str, _: u64, _: Step) {} }
+        impl Trace {
+            #[allow(clippy::unused_self)] // Deliberate tracing no-op in this harness.
+            pub fn note_if_free(&self, _: &str, _: u64, _: Step) {}
+        }
     }
 }
 ''', encoding="utf-8")

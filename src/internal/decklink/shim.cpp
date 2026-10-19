@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -287,6 +288,15 @@ void* nida_dl_open(uint64_t id, uint32_t mode, char* err, int32_t errlen) {
         device->Release();
         return fail("the device puts out no video");
     }
+    DlSupported supported = false;
+    if (output->DoesSupportVideoMode(bmdVideoConnectionUnspecified,
+            static_cast<BMDDisplayMode>(mode), bmdFormat8BitYUV,
+            bmdNoVideoOutputConversion, bmdSupportedVideoModeDefault,
+            nullptr, &supported) != S_OK || !supported) {
+        output->Release();
+        device->Release();
+        return fail("the device does not support 8-bit YUV in that video format");
+    }
     IDeckLinkDisplayMode* display = nullptr;
     if (output->GetDisplayMode(static_cast<BMDDisplayMode>(mode), &display) != S_OK || display == nullptr) {
         output->Release();
@@ -296,6 +306,12 @@ void* nida_dl_open(uint64_t id, uint32_t mode, char* err, int32_t errlen) {
     const int32_t width = static_cast<int32_t>(display->GetWidth());
     const int32_t height = static_cast<int32_t>(display->GetHeight());
     display->Release();
+    if (width <= 0 || height <= 0 || width % 2 != 0 ||
+        width > std::numeric_limits<int32_t>::max() / 4) {
+        output->Release();
+        device->Release();
+        return fail("the device returned an invalid video frame size");
+    }
     if (output->EnableVideoOutput(static_cast<BMDDisplayMode>(mode), bmdVideoOutputFlagDefault) != S_OK) {
         output->Release();
         device->Release();

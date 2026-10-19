@@ -123,6 +123,8 @@ int main(int argc, char**) {
     assert(nida_dl_device_snapshot(1, &id, name, sizeof(name), modes, 4) == -1 && id == 0);
     nida_dl_device_snapshot(0, &id, name, sizeof(name), modes, 4);
     char error[256];
+    assert(nida_dl_open(id, 2, error, sizeof(error)) == nullptr);
+    assert(device.refs == 1 && device.output.refs == 0);
     fake_ready = false;
     assert(nida_dl_open(id, 1, error, sizeof(error)) == nullptr);
     assert(std::string(error).find("COM apartment") != std::string::npos);

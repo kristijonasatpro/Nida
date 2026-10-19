@@ -24,11 +24,13 @@ impl Converter {
         }
         // Match vImage's full-range matrix and clamp, rather than expanding
         // already quantized video-range bytes (which loses precision).
-        let (kr, kb) = if height >= 720 { (0.2126, 0.0722) } else { (0.299, 0.114) };
-        let kg = 1.0 - kr - kb;
-        let luma = |p: &[u8]| {
-            kr * f32::from(p[0]) + kg * f32::from(p[1]) + kb * f32::from(p[2])
+        let (kr, kb) = if height >= 720 {
+            (0.2126, 0.0722)
+        } else {
+            (0.299, 0.114)
         };
+        let kg = 1.0 - kr - kb;
+        let luma = |p: &[u8]| kr * f32::from(p[0]) + kg * f32::from(p[1]) + kb * f32::from(p[2]);
         let code = |v: f32| (v + 0.5).clamp(1.0, 254.0) as u8;
         for (pair, out) in rgba.chunks_exact(8).zip(uyvy.chunks_exact_mut(4)) {
             let (a, b) = pair.split_at(4);
@@ -51,15 +53,24 @@ mod tests {
     fn pair(pixels: [[u8; 4]; 2], height: u32, full: bool) -> [u8; 4] {
         let rgba = pixels.concat().repeat(height as usize);
         let mut uyvy = vec![0; 4 * height as usize];
-        Converter::new(height, full).unwrap().run(&rgba, &mut uyvy, 2, height).unwrap();
+        Converter::new(height, full)
+            .unwrap()
+            .run(&rgba, &mut uyvy, 2, height)
+            .unwrap();
         uyvy[..4].try_into().unwrap()
     }
 
     #[test]
     fn full_range_keeps_each_pixels_luma_and_averages_chroma() {
         for height in [576, 1080] {
-            assert_eq!(pair([[0, 0, 0, 255], [255; 4]], height, true), [128, 1, 128, 254]);
-            assert_eq!(pair([[0, 0, 0, 255], [255; 4]], height, false), [128, 16, 128, 235]);
+            assert_eq!(
+                pair([[0, 0, 0, 255], [255; 4]], height, true),
+                [128, 1, 128, 254]
+            );
+            assert_eq!(
+                pair([[0, 0, 0, 255], [255; 4]], height, false),
+                [128, 16, 128, 235]
+            );
         }
     }
 
