@@ -46,11 +46,19 @@ Use that portability work when validating the complete Windows application.
 
 ## Checks without hardware
 
-The focused `DeckLink backend` workflow builds the actual module on Windows
-and Linux. Its isolated harness copies the module, tests, portable converter,
+The focused `DeckLink backend` workflow builds the actual module on Windows,
+Linux and macOS. Its isolated harness copies the module, tests, portable converter,
 NDI conversion, build script and SDK sources verbatim. Only thread-priority
 requests and presentation tracing are no-ops. It does not validate application
-integration, actual thread priority or real-time performance.
+integration, actual thread priority or real-time performance. The macOS thread
+priority integration test is deliberately excluded from this no-op scheduling
+harness; it remains part of the complete application suite.
+
+On Windows the workflow also compiles and runs `windows_platform_test.cpp`
+against the real COM APIs and MIDL-generated SDK types. It checks MTA setup,
+rejection of an existing STA, independent MTA discovery from an STA caller,
+and Unicode name conversion including truncation at UTF-8 boundaries. This
+requires neither Desktop Video nor hardware.
 
 To run the same harness locally with Python and Rust:
 
@@ -82,6 +90,39 @@ physical SDI/HDMI output, sustained frame rate, colour measurement or sync test.
 
 ## Current validation
 
-- Linux C++ behavioral tests pass with warnings treated as errors.
-- Native Windows and isolated Rust module checks are pending.
+Checked code revision: `2ef4e044f4f93bb6a8ee60a75913bd73547c7e62`.
+All three jobs in [this focused CI run](https://github.com/pingvis/Nida-Windows/actions/runs/39309216791)
+passed. This document is recorded separately after the checked code revision.
+
+- Windows Server 2022: real SDK/MIDL build, 19 module tests and production
+  module Clippy pass. Real COM apartment and Unicode adapter tests pass.
+- Ubuntu 24.04: 19 module tests, production module Clippy, new-file Rust
+  formatting and behavioral C++ shim tests pass.
+- macOS 14: real SDK/Accelerate build, 20 module tests and production module
+  Clippy pass, including portable/full-range Accelerate parity. One priority
+  integration test is excluded because scheduling is a no-op in this harness.
+- One existing manual performance measurement is ignored on each platform.
+- The C++ behavioral tests also pass locally under AddressSanitizer and
+  UndefinedBehaviorSanitizer, with leak detection disabled for deliberately
+  process-lifetime discovery storage.
+- The complete application build/test matrix is not claimed green by these
+  focused checks. Existing upstream Windows portability work is separate.
 - No physical DeckLink hardware has been exercised for this change.
+
+### Conversion timing
+
+The existing ignored measurement now warms each converter and runs 100
+1080p RGBA-to-UYVY conversions in the release profile. The final CI run reported:
+
+| Hosted runner | Video levels | Full levels |
+| --- | ---: | ---: |
+| Windows Server 2022 | 8.48 ms/frame | 5.68 ms/frame |
+| Ubuntu 24.04 | 8.88 ms/frame | 5.66 ms/frame |
+| macOS 14 (Accelerate) | 0.95 ms/frame | 1.18 ms/frame |
+
+These are per-conversion means on different hosted machines, not a platform
+comparison, a before/after application benchmark, or a sustained output-rate
+claim. The measurement includes no GPU readback, device transfer or display.
+Video range still calls the existing NDI converter; full range previously had
+no working portable implementation. SDK files on the review branch were also
+checked by Git blob SHA against the pinned OBS sources and are unmodified.
