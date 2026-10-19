@@ -222,6 +222,7 @@ objc2-app-kit            = { version = "0.3", default-features = false, features
 # Windows Graphics Capture for the Windows screen/window capture backend
 # (spec/screen-capture.md). Microsoft-maintained, so no third-party binding.
 [target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Power", "Win32_System_Threading", "Win32_System_SystemServices"] }
 windows = { version = "0.62", optional = true, features = [
     "Foundation",
     "Graphics",

@@ -11994,6 +11994,7 @@ dependencies = [
  "walkdir",
  "wgpu",
  "windows 0.62.2",
+ "windows-sys 0.61.2",
  "winit",
  "x11rb 0.14.0",
  "yuvutils-rs",

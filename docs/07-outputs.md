@@ -56,8 +56,11 @@ screensaver or lock. A sleeping display is an HDMI port with no signal, so
 without this an idle machine blacked out the LED wall and TV mid-talk. On macOS
 this is a user-initiated activity (it also stops App Nap throttling rendering
 when Nida's windows are covered) listed in `pmset -g assertions`; on Linux a
-`systemd-inhibit` idle + sleep lock listed in `systemd-inhibit --list`. It is
-released when Nida quits.
+`systemd-inhibit` idle + sleep lock listed in `systemd-inhibit --list`. On Windows,
+Nida holds display and system power requests listed in `powercfg /requests`
+(run from an administrator terminal). Windows still honours explicit sleep,
+lock, and screensaver policy; disable the screensaver separately for a show.
+The hold is released when Nida quits, including if its Windows process crashes.
 
 An output opened while its display sleeps waits as a window and moves onto the
 display as soon as it wakes.
