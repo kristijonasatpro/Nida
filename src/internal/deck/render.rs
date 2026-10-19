@@ -1103,7 +1103,7 @@ impl Deck {
             .iter()
             .enumerate()
             .filter(|(_, e)| {
-                e.enabled && !e.is_neutral_framing(modulation) && !e.is_idle_layer_mask()
+                e.is_active() && !e.is_neutral_framing(modulation) && !e.is_idle_layer_mask()
             })
             .map(|(i, _)| i)
             .collect()

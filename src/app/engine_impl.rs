@@ -790,7 +790,15 @@ impl MixerCommands for VardaApp {
                     self.acquire_depth_preprocessor(&metadata, shader_name)?
                 };
 
-                let effect = Effect::new(&self.context, shader)?;
+                let effect = match self.load_effect(shader) {
+                    Ok(effect) => effect,
+                    Err(error) => {
+                        if let Some(sensor) = acquired {
+                            self.depth_manager.release(sensor.id);
+                        }
+                        return Err(error);
+                    }
+                };
                 let uuid = effect.uuid().to_owned();
                 let ch = self
                     .mixer
@@ -819,11 +827,9 @@ impl MixerCommands for VardaApp {
                          available on deck effect chains — not channel or master chains."
                     );
                 }
-                let effect = Effect::new_with_format(
-                    &self.context,
-                    (*shader).clone(),
-                    self.context.compositing_format,
-                )?;
+                let shader = (*shader).clone();
+                drop(filters);
+                let effect = self.load_effect(shader)?;
                 let uuid = effect.uuid().to_owned();
                 let ch = self
                     .mixer
@@ -840,11 +846,9 @@ impl MixerCommands for VardaApp {
                          available on deck effect chains — not channel or master chains."
                     );
                 }
-                let effect = Effect::new_with_format(
-                    &self.context,
-                    (*shader).clone(),
-                    self.context.compositing_format,
-                )?;
+                let shader = (*shader).clone();
+                drop(filters);
+                let effect = self.load_effect(shader)?;
                 let uuid = effect.uuid().to_owned();
                 self.mixer.add_master_effect(effect);
                 log::info!("Added master effect {shader_name} ({uuid})");
