@@ -46,6 +46,10 @@ jobs:
         if: runner.os == 'Windows'
       - name: Prepare exact DeckLink source harness
         run: python tests/decklink-native/prepare.py "${{ runner.temp }}/nida-decklink-check"
+      - name: Check real Windows COM apartments and Unicode names
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tests/decklink-native/check-windows-platform.ps1
       - name: Compile native SDK shim and run module tests
         # Priority calls are no-ops in this harness, so their macOS integration
         # check belongs to the full application suite instead.
