@@ -369,9 +369,9 @@ void* nida_dl_open(uint64_t id, uint32_t mode, char* err, int32_t errlen) {
     return nida_dl_open_with_audio(id, mode, nullptr, nullptr, err, errlen);
 }
 
-uint32_t nida_dl_audio_preroll(void* handle) {
+uint32_t nida_dl_audio_delay(void* handle) {
     auto* out = static_cast<Output*>(handle);
-    return out != nullptr && out->scheduled != nullptr ? out->scheduled->preroll : 0;
+    return out != nullptr && out->scheduled != nullptr ? out->scheduled->source_delay : 0;
 }
 
 // Put one 8-bit YUV ('2vuy') picture up on the device at its next frame:

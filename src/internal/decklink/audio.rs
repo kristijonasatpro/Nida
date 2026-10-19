@@ -32,9 +32,9 @@ impl Pull {
         }
     }
 
-    pub(super) fn begin(&mut self, now: Instant, preroll_frames: u32) {
+    pub(super) fn begin(&mut self, now: Instant, delay_frames: u32) {
         if self.origin.is_none() {
-            let delay = std::time::Duration::from_secs_f64(f64::from(preroll_frames) / 48_000.0);
+            let delay = std::time::Duration::from_secs_f64(f64::from(delay_frames) / 48_000.0);
             self.origin = Some(now.checked_sub(delay).unwrap_or(now));
         }
     }
@@ -185,7 +185,7 @@ mod tests {
         assert_eq!(out, [i32::MAX; 4]);
     }
     #[test]
-    fn preroll_and_open_time_share_one_timeline() {
+    fn presentation_delay_and_open_time_share_one_timeline() {
         let (tx, receiver) = crossbeam_channel::bounded(1);
         let opened = Instant::now();
         let mut pull = Pull::new(AudioInput { receiver, opened });

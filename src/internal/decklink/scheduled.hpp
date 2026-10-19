@@ -45,13 +45,17 @@ public:
     // Three display frames of headroom, rounded once at 48 kHz. Never round
     // samples per video frame: 29.97 and 59.94 require fractional counts.
     const uint32_t preroll;
+    // Completion is after a displayed frame: the three-frame queue has two
+    // frames ahead of the newly completed one. Match audio to that latency.
+    const uint32_t source_delay;
 
     Scheduled(IDeckLinkOutput* output, int32_t width, int32_t height,
               BMDTimeValue duration, BMDTimeScale scale, AudioRead read, void* context)
         : output_(output), width_(width), height_(height), duration_(duration), scale_(scale),
           read_(read), context_(context), latest_(static_cast<size_t>(width) * height * 2),
           preroll(static_cast<uint32_t>(std::min<int64_t>(24000,
-              (48000 * duration * 3 + scale - 1) / scale))) {
+              (48000 * duration * 3 + scale - 1) / scale))),
+          source_delay(static_cast<uint32_t>((48000 * duration * 2 + scale - 1) / scale)) {
         output_->AddRef();
     }
 

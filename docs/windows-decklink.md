@@ -46,6 +46,8 @@ clock. Three video frames and their corresponding audio duration are buffered
 before playback starts; fractional video rates keep exact rational timestamps
 instead of rounding to a whole number of audio samples per video frame. Initial
 preroll repeats the first picture and uses silence before the tap's start.
+The source audio offset matches the two frames ahead of a completed video
+frame in the three-frame queue (rounded once at 48 kHz).
 
 The source receiver and native audio scratch storage are bounded. Underruns and
 reported source losses become silence; late source samples are discarded at

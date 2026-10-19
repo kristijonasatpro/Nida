@@ -239,7 +239,7 @@ int main(int argc, char**) {
     assert(av_device.refs == 1 && av_device.output.refs == 0);
     av_device.output.fail_audio = false;
     handle = nida_dl_open_with_audio(id, 1, Sound::read, &sound, error, sizeof(error));
-    assert(handle != nullptr && nida_dl_audio_preroll(handle) == 2403);
+    assert(handle != nullptr && nida_dl_audio_delay(handle) == 1602);
     av_device.output.write_limit = 0;
     assert(nida_dl_show(handle, data.data(), 8, 4, 2) == 0);
     assert(av_device.output.playback_started == 0);

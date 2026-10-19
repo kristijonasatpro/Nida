@@ -1033,7 +1033,7 @@ mod sdk {
             err: *mut c_char,
             errlen: i32,
         ) -> *mut c_void;
-        fn nida_dl_audio_preroll(handle: *mut c_void) -> u32;
+        fn nida_dl_audio_delay(handle: *mut c_void) -> u32;
         fn nida_dl_show(
             handle: *mut c_void,
             data: *const u8,
@@ -1147,9 +1147,9 @@ mod sdk {
             let row = i32::try_from(row_bytes).map_err(|_| super::Refused::TooSmall)?;
             if let Some(audio) = &self.audio {
                 // SAFETY: a live output handle, used only on its owning worker.
-                let preroll = unsafe { nida_dl_audio_preroll(self.handle) };
+                let delay = unsafe { nida_dl_audio_delay(self.handle) };
                 if let Ok(mut audio) = audio.lock() {
-                    audio.begin(std::time::Instant::now(), preroll);
+                    audio.begin(std::time::Instant::now(), delay);
                 }
             }
             // SAFETY: a picture of `height` lines of `row_bytes`.
