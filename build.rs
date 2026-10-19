@@ -48,10 +48,10 @@ fn build_windows_decklink() {
     // cc discovers the installed MSVC/Windows SDK even outside a Developer
     // Prompt. Use the same PATH and INCLUDE for MIDL's C preprocessor.
     let search = compiler
-        .env()
-        .iter()
+        .get_envs()
+        .rev()
         .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("PATH"))
-        .map(|(_, value)| value.clone())
+        .map(|(_, value)| value.to_owned())
         .or_else(|| std::env::var_os("PATH"));
     let midl = std::env::var_os("MIDL")
         .map(PathBuf::from)
@@ -64,7 +64,7 @@ fn build_windows_decklink() {
         })
         .expect("midl.exe not found: install the Windows SDK with MSVC Build Tools, or set MIDL");
     let mut command = Command::new(midl);
-    command.envs(compiler.env().iter().cloned());
+    command.envs(compiler.get_envs());
     let result = command
         .args([
             "/nologo",

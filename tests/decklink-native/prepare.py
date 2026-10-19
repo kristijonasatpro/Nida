@@ -14,6 +14,7 @@ def prepare(destination: Path) -> None:
     for directory in ("src/internal/decklink", "vendor/decklink-sdk"):
         shutil.copytree(root / directory, destination / directory, dirs_exist_ok=True)
     shutil.copyfile(root / "build.rs", destination / "build.rs")
+    shutil.copyfile(root / "clippy.toml", destination / "clippy.toml")
     ndi = (root / "src/internal/ndi/mod.rs").read_text(encoding="utf-8")
     start = ndi.index("pub(crate) fn rgba_to_uyvy(")
     opening = ndi.index("{", start)

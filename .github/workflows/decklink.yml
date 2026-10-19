@@ -4,6 +4,14 @@ on:
   workflow_dispatch:
   push:
     branches: [codex/windows-decklink-output]
+    paths:
+      - 'src/internal/decklink/**'
+      - 'src/internal/ndi/mod.rs'
+      - 'vendor/decklink-sdk/**'
+      - 'tests/decklink-native/**'
+      - 'build.rs'
+      - 'clippy.toml'
+      - '.github/workflows/decklink.yml'
   pull_request:
     paths:
       - 'src/internal/decklink/**'
@@ -11,6 +19,7 @@ on:
       - 'vendor/decklink-sdk/**'
       - 'tests/decklink-native/**'
       - 'build.rs'
+      - 'clippy.toml'
       - '.github/workflows/decklink.yml'
 
 permissions:
@@ -44,7 +53,7 @@ jobs:
       - name: Lint production module with repository policy
         run: cargo clippy --manifest-path "${{ runner.temp }}/nida-decklink-check/Cargo.toml" --lib -- -D warnings
       - name: Check new Rust file formatting
-        if: runner.os == 'Linux'
+        if: always() && runner.os == 'Linux'
         run: rustfmt --edition 2021 --check build.rs src/internal/decklink/convert.rs
       - name: Compile shared shim against behavioral SDK double
         if: runner.os == 'Linux'
