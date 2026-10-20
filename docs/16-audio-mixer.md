@@ -1,5 +1,27 @@
 # Audio Mixer
 
+## Reading the meters
+
+Input and output strip meters use a **dBFS** scale, separate from fader gain.
+The numbered scale includes a highlighted **−6 dBFS** mark. Green indicates
+levels below −12 dBFS, yellow the remaining headroom; red is a **0 dBFS or
+higher** warning, not a −6 dBFS warning. These are sample peaks, not true peak
+or perceived loudness (LUFS).
+
+Stereo bars show decaying post-fader levels. White markers and the **Peak**
+number below each meter hold the highest level since reset (the number is the
+higher of L/R). Hover for separate L/R values; click the meter to reset its
+peak markers and full-scale warning without changing audio. Peaks are captured
+on the audio thread, so a transient between UI refreshes is not lost. They are
+session telemetry, not saved show settings. Source replacement/show load clears
+them; ordinary fader edits do not.
+
+For a target such as −6 dBFS, watch the **output bus** peak readout. A fader at
+0 dB means unity gain, not a signal at 0 dBFS. Internal floating-point inputs
+can exceed full scale without necessarily clipping until delivery; the red
+warning shows lost headroom, not proof of where distortion occurred. The
+Dynamics panel uses the same scale, but its Pre/Post FX taps are before the fader.
+
 Audio effects are being designed separately; they are not available yet. See
 the [audio-processing proposal and implementation stages](audio-processing-plan.md)
 for the planned gear-accessed inspector, signal flow and regression checks.

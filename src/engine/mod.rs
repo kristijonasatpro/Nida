@@ -1733,6 +1733,18 @@ pub enum EngineCommand {
         uuid: String,
         gain_db: f32,
     },
+    SetAudioBusCompressor {
+        uuid: String,
+        config: crate::audio_mix::CompressorConfig,
+    },
+    ResetAudioMeter {
+        uuid: String,
+        bus: bool,
+    },
+    SetAudioSourceCompressor {
+        uuid: String,
+        config: crate::audio_mix::CompressorConfig,
+    },
     SetAudioBusMute {
         uuid: String,
         muted: bool,

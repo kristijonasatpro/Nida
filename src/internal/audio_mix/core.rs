@@ -147,6 +147,8 @@ impl InputFeed {
 
 /// One source strip: a feed with its fader, mute and bus sends.
 pub struct Source {
+    pub(super) held_peak: Frame,
+    pub(super) dynamics: super::dynamics::Dynamics,
     /// Deck UUID for a clip; the input's own UUID for a capture device.
     pub uuid: String,
     pub feed: Feed,
@@ -181,6 +183,8 @@ impl Source {
         Self {
             uuid: uuid.into(),
             feed,
+            dynamics: super::dynamics::Dynamics::default(),
+            held_peak: [0.0; 2],
             gain_db: 0.0,
             muted: false,
             sends: Vec::new(),
@@ -258,6 +262,8 @@ impl OutputRing {
 /// One bus: the sum of what is sent to it, with its own fader, mute and delay,
 /// going to sound devices and to recordings and streams.
 pub struct Bus {
+    pub(super) held_peak: Frame,
+    pub(super) dynamics: super::dynamics::Dynamics,
     pub uuid: String,
     pub gain_db: f32,
     pub muted: bool,
@@ -278,6 +284,8 @@ impl Bus {
         Self {
             uuid: uuid.into(),
             gain_db: 0.0,
+            dynamics: super::dynamics::Dynamics::default(),
+            held_peak: [0.0; 2],
             muted: false,
             delay_ms: 0.0,
             outputs: Vec::new(),
@@ -467,11 +475,13 @@ impl MixCore {
             if source.solo {
                 add_into(&mut self.solo_sum, &self.scratch);
             }
+            source.dynamics.process(&mut self.scratch);
             source.delay.run(&mut self.scratch, source.delay_ms);
             let target = source.target_gain();
             let peak = ramp_sides(&mut self.scratch, source.current, target);
             source.current = target;
             source.meter = fall(source.meter, peak);
+            source.held_peak = std::array::from_fn(|channel|source.held_peak[channel].max(peak[channel]));
             for send in &source.sends {
                 if let Some(i) = self.buses.iter().position(|b| &b.uuid == send) {
                     for (acc, frame) in self.sums[i].iter_mut().zip(&self.scratch) {
@@ -498,6 +508,7 @@ impl MixCore {
         };
 
         for (bus, sum) in self.buses.iter_mut().zip(&mut self.sums) {
+            bus.dynamics.process(sum);
             let target = if bus.muted {
                 0.0
             } else {
@@ -506,6 +517,7 @@ impl MixCore {
             let peak = ramp(sum, bus.current, target);
             bus.current = target;
             bus.meter = fall(bus.meter, peak);
+            bus.held_peak = std::array::from_fn(|channel|bus.held_peak[channel].max(peak[channel]));
             if !soloing && listen.as_deref() == Some(bus.uuid.as_str()) {
                 heard.copy_from_slice(sum);
             }
@@ -669,6 +681,69 @@ mod tests {
         }
         let s = last.expect("a block").samples;
         [s[s.len() - 2], s[s.len() - 1]]
+    }
+
+    #[test]
+    fn source_compression_is_once_before_sends_and_fader_but_not_raw_pfl() {
+        let (mut source, _) = fifo_source("mic", 0.5, 20);
+        source.sends = vec!["main".into(), "aux".into()];
+        source.solo = true;
+        source.gain_db = -6.0;
+        let config = super::super::CompressorConfig {
+            enabled: true,
+            threshold_db: -18.0618,
+            ratio: 4.0,
+            attack_ms: 0.1,
+            knee_db: 0.0,
+            ..super::super::CompressorConfig::default()
+        };
+        source
+            .dynamics
+            .configure(config, Some(super::super::dynamics::Processor::new(config)));
+        let mut core = core_with(vec![source], &["main", "aux"]);
+        let main = core.tap("main").unwrap();
+        let aux = core.tap("aux").unwrap();
+        let phones = core.tap_monitor();
+        for _ in 0..8 {
+            core.process_block();
+        }
+        let expected = 0.1767767 * db_to_gain(-6.0);
+        assert!((last_frame(&main)[0] - expected).abs() < 1e-4);
+        assert!((last_frame(&aux)[0] - expected).abs() < 1e-4);
+        assert!((last_frame(&phones)[0] - 0.5).abs() < 1e-5);
+        assert!((core.source("mic").unwrap().dynamics.snapshot().pre_db[0] + 6.0206).abs() < 1e-3);
+    }
+
+    #[test]
+    fn bus_compression_reaches_outputs_and_normal_monitor_before_delay() {
+        let (mut source, _) = fifo_source("mic", 0.5, 20);
+        source.sends = vec!["main".into()];
+        let mut core = core_with(vec![source], &["main"]);
+        let config = super::super::CompressorConfig {
+            enabled: true,
+            threshold_db: -18.0618,
+            ratio: 4.0,
+            attack_ms: 0.1,
+            knee_db: 0.0,
+            ..super::super::CompressorConfig::default()
+        };
+        let bus = core.bus_mut("main").unwrap();
+        bus.dynamics
+            .configure(config, Some(super::super::dynamics::Processor::new(config)));
+        bus.gain_db = -6.0;
+        bus.delay_ms = 100.0;
+        let main = core.tap("main").unwrap();
+        let phones = core.tap_monitor();
+        for _ in 0..8 {
+            core.process_block();
+        }
+        let expected = 0.1767767 * db_to_gain(-6.0);
+        assert!((last_frame(&phones)[0] - expected).abs() < 1e-4);
+        assert_eq!(last_frame(&main), [0.0, 0.0]);
+        for _ in 0..8 {
+            core.process_block();
+        }
+        assert!((last_frame(&main)[0] - expected).abs() < 1e-4);
     }
 
     /// A source held back by 100 ms reaches its bus 100 ms after one that is
@@ -923,6 +998,20 @@ mod tests {
             core.source("mic").unwrap().meter()[0] < 0.1,
             "a second later it has fallen"
         );
+    }
+
+    #[test]
+    fn over_full_scale_peaks_survive_until_ui_reads_them() {
+        let (mut source,fifo)=fifo_source("mic",1.25,4);
+        source.sends=vec!["m".into()];
+        let mut core=core_with(vec![source],&["m"]);
+        core.process_block();
+        core.process_block();
+        fifo.lock().unwrap().clear();
+        for _ in 0..100 {core.process_block();}
+        assert!(core.bus("m").unwrap().meter()[0]<1.0);
+        assert_eq!(core.bus("m").unwrap().held_peak,[1.25;2]);
+        assert_eq!(core.source("mic").unwrap().held_peak,[1.25;2]);
     }
 
     #[test]

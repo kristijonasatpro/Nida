@@ -21,6 +21,7 @@ mod apps;
 mod clip;
 mod core;
 mod device;
+mod dynamics;
 mod outputs;
 pub mod reader;
 
@@ -32,6 +33,7 @@ use std::time::{Duration, Instant};
 use self::core::{Bus, Feed, InputFeed, MixCore, OutputRing, Source};
 pub use self::core::{BusTap, BLOCK_FRAMES, MAX_DELAY_MS, SAMPLE_RATE};
 pub use clip::{ClipAudio, ClipAudioShared};
+pub use dynamics::{CompressorConfig, DynamicsSnapshot};
 use reader::gain_to_db;
 
 // ── Persisted configuration ─────────────────────────────────────────
@@ -39,6 +41,8 @@ use reader::gain_to_db;
 /// One audio bus as saved.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct AudioBusConfig {
+    #[serde(default)]
+    pub compressor: CompressorConfig,
     pub uuid: String,
     pub name: String,
     /// Fader, in dB (-96 is off).
@@ -68,6 +72,7 @@ impl AudioBusConfig {
             delay_ms: 0.0,
             device: None,
             first_channel: 0,
+            compressor: CompressorConfig::default(),
         }
     }
 }
@@ -104,6 +109,8 @@ pub const FOLLOW_MAIN: &str = "main";
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(from = "StripOnDisk")]
 pub struct AudioStripConfig {
+    #[serde(default)]
+    pub compressor: CompressorConfig,
     pub uuid: String,
     #[serde(default)]
     pub gain_db: f32,
@@ -140,6 +147,8 @@ fn is_zero(ms: &f32) -> bool {
 /// meant heard all the time; that becomes Audio Auto on, on air anywhere.
 #[derive(serde::Deserialize)]
 struct StripOnDisk {
+    #[serde(default)]
+    compressor: CompressorConfig,
     uuid: String,
     #[serde(default)]
     gain_db: f32,
@@ -165,6 +174,7 @@ impl From<StripOnDisk> for AudioStripConfig {
         };
         Self {
             uuid: s.uuid,
+            compressor: s.compressor.sanitized(),
             gain_db: s.gain_db,
             muted: s.muted,
             sends: s.sends,
@@ -226,6 +236,8 @@ impl AudioMixConfig {
 /// One bus, as shown.
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct AudioBusSnapshot {
+    pub peak_db: [f32; 2],
+    pub dynamics: DynamicsSnapshot,
     #[serde(flatten)]
     pub config: AudioBusConfig,
     /// Whether the chosen device is playing. `None` with no device chosen.
@@ -260,6 +272,8 @@ pub enum AudioSourceKind {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct AudioSourceSnapshot {
+    pub peak_db: [f32; 2],
+    pub dynamics: DynamicsSnapshot,
     pub uuid: String,
     pub name: String,
     pub kind: AudioSourceKind,
@@ -511,7 +525,13 @@ impl AudioEngine {
     }
 
     /// Replace every setting, as a workspace load does.
-    pub fn load(&mut self, config: AudioMixConfig) {
+    pub fn load(&mut self, mut config: AudioMixConfig) {
+        for bus in &mut config.buses {
+            bus.compressor = bus.compressor.sanitized();
+        }
+        for strip in &mut config.strips {
+            strip.compressor = strip.compressor.sanitized();
+        }
         // An app's sound whose input the show no longer has, or has as
         // something else — another app, a microphone under the same UUID —
         // stops now, not when the app sound thread next looks.
@@ -530,6 +550,14 @@ impl AudioEngine {
             .collect();
         if let Ok(mut core) = self.core.lock() {
             core.sources.retain(|s| !stale.contains(&s.uuid));
+            for source in &mut core.sources {
+                source.dynamics = dynamics::Dynamics::default();
+                source.held_peak=[0.0;2];
+            }
+            for bus in &mut core.buses {
+                bus.dynamics = dynamics::Dynamics::default();
+                bus.held_peak=[0.0;2];
+            }
         }
         for uuid in stale {
             // Its refusal was the old app's: another app under the UUID,
@@ -546,6 +574,19 @@ impl AudioEngine {
     /// The first bus, which new recordings and streams take.
     pub fn default_bus(&self) -> Option<&str> {
         self.config.buses.first().map(|b| b.uuid.as_str())
+    }
+
+    /// Clear a strip's held sample peaks without changing its audio settings.
+    pub fn reset_meter(&mut self, uuid: &str, bus: bool) {
+        if let Ok(mut core) = self.core.lock() {
+            if bus {
+                if let Some(target) = core.buses.iter_mut().find(|target|target.uuid==uuid) {
+                    target.held_peak=[0.0;2];
+                }
+            } else if let Some(target) = core.sources.iter_mut().find(|target|target.uuid==uuid) {
+                target.held_peak=[0.0;2];
+            }
+        }
     }
 
     /// Whether a bus with this UUID exists.
@@ -615,6 +656,7 @@ impl AudioEngine {
         edit(bus);
         bus.gain_db = bus.gain_db.clamp(-96.0, 12.0);
         bus.delay_ms = bus.delay_ms.clamp(0.0, MAX_DELAY_MS);
+        bus.compressor = bus.compressor.sanitized();
         self.apply();
         Ok(())
     }
@@ -660,6 +702,7 @@ impl AudioEngine {
         });
         let sends = self.default_bus().map(str::to_string).into_iter().collect();
         self.config.strips.push(AudioStripConfig {
+            compressor: CompressorConfig::default(),
             uuid: uuid.clone(),
             gain_db: 0.0,
             muted: deck.is_some(),
@@ -678,13 +721,8 @@ impl AudioEngine {
     /// its UUID: taken straight from the app while it runs (see
     /// [`Self::keep_apps`]), on like a microphone.
     pub fn add_app_input(&mut self, name: &str, app: &str) -> String {
-        let uuid = self.add_device_input(
-            name,
-            &crate::audio::app_sound::device_name(app),
-            0,
-            1,
-            None,
-        );
+        let uuid =
+            self.add_device_input(name, &crate::audio::app_sound::device_name(app), 0, 1, None);
         if let Some(input) = self.config.inputs.iter_mut().find(|i| i.uuid == uuid) {
             input.app = Some(app.to_string());
         }
@@ -789,6 +827,7 @@ impl AudioEngine {
             0.0
         };
         strip.sends.dedup();
+        strip.compressor = strip.compressor.sanitized();
         self.apply();
         Ok(())
     }
@@ -859,6 +898,7 @@ impl AudioEngine {
         for clip in &clips {
             if !self.config.strips.iter().any(|s| s.uuid == clip.deck_uuid) {
                 self.config.strips.push(AudioStripConfig {
+                    compressor: CompressorConfig::default(),
                     uuid: clip.deck_uuid.clone(),
                     gain_db: 0.0,
                     // Off air until it is taken there.
@@ -925,6 +965,7 @@ impl AudioEngine {
         for sound in &sounds {
             if !self.config.strips.iter().any(|s| s.uuid == sound.deck_uuid) {
                 self.config.strips.push(AudioStripConfig {
+                    compressor: CompressorConfig::default(),
                     uuid: sound.deck_uuid.clone(),
                     gain_db: 0.0,
                     muted: true,
@@ -1311,6 +1352,14 @@ impl AudioEngine {
             .buses
             .iter()
             .map(|b| AudioBusSnapshot {
+                peak_db: core.bus(&b.uuid).map_or([-96.0;2],|bus|meter_db(bus.held_peak)),
+                dynamics: core.bus(&b.uuid).map_or_else(
+                    || DynamicsSnapshot {
+                        config: b.compressor,
+                        ..DynamicsSnapshot::default()
+                    },
+                    |bus| bus.dynamics.snapshot(),
+                ),
                 config: b.clone(),
                 device_ok: b.device.as_ref().map(|_| self.outputs.is_playing(&b.uuid)),
                 meter_db: core
@@ -1371,6 +1420,14 @@ impl AudioEngine {
             };
             let live = core.source(&uuid);
             sources.push(AudioSourceSnapshot {
+                peak_db: live.map_or([-96.0;2],|source|meter_db(source.held_peak)),
+                dynamics: live.map_or_else(
+                    || DynamicsSnapshot {
+                        config: s.compressor,
+                        ..DynamicsSnapshot::default()
+                    },
+                    |source| source.dynamics.snapshot(),
+                ),
                 uuid: uuid.clone(),
                 name,
                 kind,
@@ -1418,6 +1475,38 @@ impl AudioEngine {
 
     /// Copy the settings onto the mixing thread's buses and sources.
     fn apply(&mut self) {
+        let requests: Vec<_> = {
+            let Ok(core) = self.core.lock() else {
+                return;
+            };
+            self.config
+                .buses
+                .iter()
+                .filter(|cfg| {
+                    cfg.compressor.enabled
+                        && core
+                            .bus(&cfg.uuid)
+                            .is_none_or(|bus| bus.dynamics.needs_prepare(cfg.compressor))
+                })
+                .map(|cfg| ((true, cfg.uuid.clone()), cfg.compressor))
+                .chain(
+                    self.config
+                        .strips
+                        .iter()
+                        .filter(|cfg| {
+                            cfg.compressor.enabled
+                                && core.source(&cfg.uuid).is_some_and(|source| {
+                                    source.dynamics.needs_prepare(cfg.compressor)
+                                })
+                        })
+                        .map(|cfg| ((false, cfg.uuid.clone()), cfg.compressor)),
+                )
+                .collect()
+        };
+        let mut prepared: HashMap<_, _> = requests
+            .into_iter()
+            .map(|(key, config)| (key, dynamics::Processor::new(config)))
+            .collect();
         let Ok(mut core) = self.core.lock() else {
             return;
         };
@@ -1432,6 +1521,8 @@ impl AudioEngine {
             bus.gain_db = cfg.gain_db;
             bus.muted = cfg.muted;
             bus.delay_ms = cfg.delay_ms;
+            bus.dynamics
+                .configure(cfg.compressor, prepared.remove(&(true, cfg.uuid.clone())));
             bus.outputs = match (&cfg.device, self.outputs.is_playing(&cfg.uuid)) {
                 (Some(_), true) => self.rings.get(&cfg.uuid).cloned().into_iter().collect(),
                 _ => Vec::new(),
@@ -1444,6 +1535,10 @@ impl AudioEngine {
                 source.muted = strip.muted;
                 source.balance = strip.balance;
                 source.delay_ms = strip.delay_ms;
+                source.dynamics.configure(
+                    strip.compressor,
+                    prepared.remove(&(false, strip.uuid.clone())),
+                );
                 source.sends.clone_from(&strip.sends);
             }
             source.solo = self.solos.contains(&source.uuid);
@@ -1882,7 +1977,9 @@ mod tests {
         ];
         for (n, gone) in ways.into_iter().enumerate() {
             let mut engine = AudioEngine::with_parts(
-                Box::new(|_: &str, _: u16, _: Arc<OutputRing>| Err(anyhow::anyhow!("no devices here"))),
+                Box::new(|_: &str, _: u16, _: Arc<OutputRing>| {
+                    Err(anyhow::anyhow!("no devices here"))
+                }),
                 Box::new(OneApp(Arc::new(AtomicBool::new(false)))),
             );
             let uuid = engine.add_input("Lectern", "USB Mixer", 0, 1);
@@ -2278,13 +2375,29 @@ mod tests {
     #[test]
     fn a_sources_delay_is_kept_in_range_saved_and_mixed() {
         let mut engine = with_clip("d1");
-        for (asked, kept) in [(170.0, 170.0), (5_000.0, MAX_DELAY_MS), (-20.0, 0.0), (f32::NAN, 0.0)] {
-            engine.edit_source("d1", |s| s.delay_ms = asked).expect("the clip");
-            assert!((strip(&engine).delay_ms - kept).abs() < 1e-6, "{asked} kept as {kept}");
+        for (asked, kept) in [
+            (170.0, 170.0),
+            (5_000.0, MAX_DELAY_MS),
+            (-20.0, 0.0),
+            (f32::NAN, 0.0),
+        ] {
+            engine
+                .edit_source("d1", |s| s.delay_ms = asked)
+                .expect("the clip");
+            assert!(
+                (strip(&engine).delay_ms - kept).abs() < 1e-6,
+                "{asked} kept as {kept}"
+            );
         }
-        engine.edit_source("d1", |s| s.delay_ms = 170.0).expect("the clip");
+        engine
+            .edit_source("d1", |s| s.delay_ms = 170.0)
+            .expect("the clip");
         let core = engine.core.lock().unwrap();
-        let mixed = core.sources.iter().find(|s| s.uuid == "d1").expect("in the mix");
+        let mixed = core
+            .sources
+            .iter()
+            .find(|s| s.uuid == "d1")
+            .expect("in the mix");
         assert!((mixed.delay_ms - 170.0).abs() < 1e-6);
         drop(core);
 
@@ -2294,7 +2407,113 @@ mod tests {
         assert_eq!(back, strip(&engine));
         let old: AudioStripConfig = serde_json::from_str(r#"{"uuid":"d1"}"#).unwrap();
         assert_eq!(old.delay_ms, 0.0, "saved before there was one");
-        engine.edit_source("d1", |s| s.delay_ms = 0.0).expect("the clip");
-        assert!(!serde_json::to_string(&strip(&engine)).unwrap().contains("delay_ms"));
+        engine
+            .edit_source("d1", |s| s.delay_ms = 0.0)
+            .expect("the clip");
+        assert!(!serde_json::to_string(&strip(&engine))
+            .unwrap()
+            .contains("delay_ms"));
+    }
+
+    #[test]
+    fn compressor_settings_round_trip_and_old_shows_remain_disabled() {
+        let old: AudioStripConfig = serde_json::from_str(r#"{"uuid":"d1","auto":true}"#).unwrap();
+        assert_eq!(old.compressor, CompressorConfig::default());
+        let old_bus: AudioBusConfig =
+            serde_json::from_str(r#"{"uuid":"main","name":"Master"}"#).unwrap();
+        assert_eq!(old_bus.compressor, CompressorConfig::default());
+        let mut engine = with_clip("d1");
+        let config = CompressorConfig {
+            enabled: true,
+            ratio: 7.0,
+            makeup_db: 3.0,
+            ..CompressorConfig::default()
+        };
+        engine
+            .edit_source("d1", |strip| strip.compressor = config)
+            .unwrap();
+        let bus = engine.default_bus().unwrap().to_string();
+        engine
+            .edit_bus(&bus, |bus| bus.compressor = config)
+            .unwrap();
+        let saved = serde_json::to_string(engine.config()).unwrap();
+        let back: AudioMixConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(&back, engine.config());
+        assert_eq!(back.strips[0].compressor, config);
+        assert_eq!(back.buses[0].compressor, config);
+        let snapshot = engine.snapshot();
+        assert!(snapshot.sources[0].dynamics.ready);
+        assert!(snapshot.buses[0].dynamics.ready);
+        engine
+            .edit_source("d1", |strip| strip.compressor.ratio = f32::NAN)
+            .unwrap();
+        assert_eq!(strip(&engine).compressor, CompressorConfig::default());
+    }
+
+    #[test]
+    fn unrelated_edits_preserve_compressor_history_and_reconnect_recreates_it() {
+        let mut engine = with_clip("d1");
+        engine.stop.store(true, Ordering::Relaxed);
+        engine.thread.take().unwrap().join().unwrap();
+        let config = CompressorConfig {
+            enabled: true,
+            threshold_db: -30.0,
+            ..CompressorConfig::default()
+        };
+        engine
+            .edit_source("d1", |strip| strip.compressor = config)
+            .unwrap();
+        {
+            let mut core = engine.core.lock().unwrap();
+            let source = core
+                .sources
+                .iter_mut()
+                .find(|source| source.uuid == "d1")
+                .unwrap();
+            let mut block = vec![[0.5; 2]; BLOCK_FRAMES];
+            for _ in 0..10 {
+                block.fill([0.5; 2]);
+                source.dynamics.process(&mut block);
+            }
+        }
+        let before = engine.snapshot().sources[0].dynamics.reduction_db;
+        assert!(before > 10.0);
+        engine
+            .edit_source("d1", |strip| strip.gain_db = -6.0)
+            .unwrap();
+        assert_eq!(engine.snapshot().sources[0].dynamics.reduction_db, before);
+        engine.load(engine.config().clone());
+        assert!(engine.snapshot().sources[0].dynamics.ready);
+        assert_eq!(engine.snapshot().sources[0].dynamics.reduction_db, 0.0);
+        engine.sync_clips(vec![]);
+        engine.sync_clips(vec![ClipSource {
+            deck_uuid: "d1".into(),
+            name: "reconnected".into(),
+            shared: Arc::new(ClipAudioShared::default()),
+        }]);
+        let snapshot = engine.snapshot();
+        assert!(snapshot.sources[0].dynamics.ready);
+        assert_eq!(snapshot.sources[0].dynamics.config, config);
+        assert_eq!(snapshot.sources[0].dynamics.reduction_db, 0.0);
+    }
+
+    #[test]
+    fn peak_reset_is_per_target_and_does_not_edit_audio_settings() {
+        let mut engine=with_clip("d1");
+        engine.stop.store(true,Ordering::Relaxed);
+        engine.thread.take().unwrap().join().unwrap();
+        let bus=engine.default_bus().unwrap().to_string();
+        let config=engine.config().clone();
+        {
+            let mut core=engine.core.lock().unwrap();
+            core.sources.iter_mut().find(|source|source.uuid=="d1").unwrap().held_peak=[0.5;2];
+            core.buses.iter_mut().find(|target|target.uuid==bus).unwrap().held_peak=[1.0;2];
+        }
+        engine.reset_meter("d1",false);
+        assert_eq!(engine.snapshot().sources[0].peak_db,[-96.0;2]);
+        assert_eq!(engine.snapshot().buses[0].peak_db,[0.0;2]);
+        engine.reset_meter(&bus,true);
+        assert_eq!(engine.snapshot().buses[0].peak_db,[-96.0;2]);
+        assert_eq!(engine.config(),&config);
     }
 }

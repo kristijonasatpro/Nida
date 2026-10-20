@@ -110,6 +110,25 @@ impl VardaApp {
 
     // ── Commands ────────────────────────────────────────────────────
 
+    pub fn cmd_set_audio_compressor(
+        &mut self,
+        uuid: &str,
+        bus: bool,
+        config: crate::audio_mix::CompressorConfig,
+    ) -> CommandResult {
+        if let Err(message) = config.validate() {
+            return CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                message: message.into(),
+            };
+        }
+        if bus {
+            self.cmd_edit_audio_bus(uuid, |target| target.compressor = config)
+        } else {
+            self.cmd_edit_audio_source(uuid, |target| target.compressor = config)
+        }
+    }
+
     pub fn cmd_add_audio_bus(&mut self, name: &str) -> CommandResult {
         CommandResult::OkWithId {
             uuid: self.audio_mix.add_bus(name),

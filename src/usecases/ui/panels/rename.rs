@@ -263,9 +263,11 @@ mod tests {
         let mut bus = crate::audio_mix::AudioBusConfig::new("Bus A");
         bus.uuid = "astream1".into();
         data.audio_mix.buses = vec![crate::audio_mix::AudioBusSnapshot {
+            dynamics: crate::audio_mix::DynamicsSnapshot::default(),
             config: bus,
             device_ok: None,
             meter_db: [f32::NEG_INFINITY; 2],
+            peak_db: [-96.0;2],
         }];
         let data = std::rc::Rc::new(data);
         let mut opened = false;

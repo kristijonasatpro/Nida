@@ -1,13 +1,15 @@
 # Audio processing: design and implementation plan
 
-Status: layout prototype approved for further development; processors remain proposals, not shipped.
+Status: layout approved; the local branch now implements the first FFmpeg
+compressor in the second, Dynamics category. See [compressor behavior and
+validation](audio-compressor.md). Later processors below remain proposals.
 Prepared on 20 October 2026 on `codex/audio-improvements`, based on fork main
 `82c668d`. The initial prototype reuses the existing settings on one page with
 compact/expanded controls. It remembers the view per target within the current
 run; restart persistence is deferred until the layout is approved. Expand/restore
 sits immediately left of the close button in a shared header. Expanded mode has
-a left-hand General category and the existing settings on the right. No compressor,
-EQ or other new audio processing is implemented. Keep this work separate
+a left-hand General category and the existing settings on the right. Dynamics
+now adds compression and pre/post FX meters; no EQ or other DSP. Keep this work separate
 from the Windows GPU and Properties-layout PRs.
 
 Scheduled layout pass: 21 mixer UI tests pass, including header-button ordering,
@@ -18,17 +20,18 @@ from `work/audio-layout-review/nida-audio-layout-v2.exe` in its own workspace
 (API port 8102). Automated live visual verification was blocked by Computer Use
 app approval timeout. The user subsequently reviewed and approved the layout.
 
-Next scope: evaluate FFmpeg's embedded `acompressor` for the Dynamics category,
+Selected implementation: FFmpeg's embedded `acompressor` for the Dynamics category,
 with separate stereo pre-processing and post-processing meters plus gain
 reduction. These meter taps describe processor input/output, not pre/post fader;
 the existing strip/output meters remain distinct. Compression stays disabled by
-default. Benchmark and test the candidate before selecting the production DSP.
+default. Packaged listening and other-platform validation remain release gates.
 
 Initial evaluation is now available in
 [`tools/audio-compressor-probe`](../tools/audio-compressor-probe/README.md):
 11 signal/bridge tests and repeatable release measurements of 1/8/16/32 stereo
 strips. The embedded FFmpeg compressor is a viable candidate on the tested
-Windows CPU, not yet integrated or production-qualified. Direct f64 bridging
+Windows CPU. The following measurements predate production integration and do
+not qualify the whole application. Direct f64 bridging
 reduces typical service cost compared with automatic format conversions;
 runtime makeup changes are abrupt and need host smoothing. No application
 meters or DSP controls have been added by the probe.
@@ -124,9 +127,8 @@ Signal: Trim -> HPF/EQ -> Expander -> Compressor -> Fader
 ```
 
 Show only implemented processors in the shipping UI; the sketch is a roadmap,
-not a reason to ship nonfunctional controls. The first compressor version can
-has only a General category. Other categories above are future design ideas,
-not empty pages to add to this prototype.
+not a reason to ship nonfunctional controls. The current inspector has General
+and Dynamics only. Other categories above are future design ideas.
 
 - Clicking a different strip's gear changes the explicit target; selecting a video
   input or channel elsewhere does not silently retarget an open audio editor.

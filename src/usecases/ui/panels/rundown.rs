@@ -1550,6 +1550,7 @@ mod tests {
     fn a_clip_that_would_not_be_heard_says_so() {
         use crate::audio_mix::{AudioSourceKind, AudioSourceSnapshot};
         let strip = |muted: bool, auto: bool| AudioSourceSnapshot {
+            dynamics: crate::audio_mix::DynamicsSnapshot::default(),
             uuid: "strip001".into(),
             name: "Sting".into(),
             kind: AudioSourceKind::Clip { deck_uuid: "a0000001".into() },
@@ -1565,6 +1566,7 @@ mod tests {
             solo: false,
             live: true,
             meter_db: [-96.0, -96.0],
+            peak_db: [-96.0;2],
             refused: None,
         };
         let mut data = show();
