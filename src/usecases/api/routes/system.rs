@@ -43,25 +43,25 @@ pub async fn get_state(State(state): State<SharedState>) -> impl IntoResponse {
 
 // ── Write commands ──────────────────────────────────────────────────
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::command_response;
 use serde::Deserialize;
 
-#[utoipa::path(post, path = "/api/shutdown", responses((status = 200, body = CommandResult)), tag = "System")]
+#[utoipa::path(post, path = "/api/shutdown", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "System")]
 pub async fn shutdown(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::Shutdown).await {
         Ok(r) => command_response(r),
         Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/undo", responses((status = 200, body = CommandResult)), tag = "System")]
+#[utoipa::path(post, path = "/api/undo", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "System")]
 pub async fn undo(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::Undo).await {
         Ok(r) => command_response(r),
         Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/redo", responses((status = 200, body = CommandResult)), tag = "System")]
+#[utoipa::path(post, path = "/api/redo", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "System")]
 pub async fn redo(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::Redo).await {
         Ok(r) => command_response(r),
@@ -76,7 +76,7 @@ pub struct ResolutionBody {
     /// Render height in pixels.
     pub height: u32,
 }
-#[utoipa::path(put, path = "/api/resolution", request_body = ResolutionBody, responses((status = 200, body = CommandResult)), tag = "System")]
+#[utoipa::path(put, path = "/api/resolution", request_body = ResolutionBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "System")]
 pub async fn set_resolution(
     State(state): State<SharedState>,
     Json(b): Json<ResolutionBody>,
@@ -100,7 +100,7 @@ pub struct ResolutionAutoBody {
     /// Setting a resolution with `PUT /api/resolution` also turns Auto off.
     pub enabled: bool,
 }
-#[utoipa::path(put, path = "/api/resolution/auto", request_body = ResolutionAutoBody, responses((status = 200, body = CommandResult)), tag = "System")]
+#[utoipa::path(put, path = "/api/resolution/auto", request_body = ResolutionAutoBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "System")]
 pub async fn set_resolution_auto(
     State(state): State<SharedState>,
     Json(b): Json<ResolutionAutoBody>,
@@ -120,7 +120,7 @@ pub struct DomemasterResolutionBody {
     /// and height: `R1K` (1024²), `R2K` (2048²), or `R4K` (4096²).
     pub resolution: crate::renderer::dome::DomemasterResolution,
 }
-#[utoipa::path(put, path = "/api/domemaster/resolution", request_body = DomemasterResolutionBody, responses((status = 200, body = CommandResult)), tag = "System")]
+#[utoipa::path(put, path = "/api/domemaster/resolution", request_body = DomemasterResolutionBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "System")]
 pub async fn set_domemaster_resolution(
     State(state): State<SharedState>,
     Json(b): Json<DomemasterResolutionBody>,
@@ -141,7 +141,7 @@ pub struct TargetFpsBody {
     /// Target FPS (0 = uncapped).
     pub fps: u32,
 }
-#[utoipa::path(put, path = "/api/target-fps", request_body = TargetFpsBody, responses((status = 200, body = CommandResult)), tag = "System")]
+#[utoipa::path(put, path = "/api/target-fps", request_body = TargetFpsBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "System")]
 pub async fn set_target_fps(
     State(state): State<SharedState>,
     Json(b): Json<TargetFpsBody>,
@@ -164,7 +164,7 @@ pub struct PerfProfileBody {
 fn default_perf_frames() -> u32 {
     60
 }
-#[utoipa::path(post, path = "/api/perf-profile", request_body = PerfProfileBody, responses((status = 200, body = CommandResult)), tag = "System")]
+#[utoipa::path(post, path = "/api/perf-profile", request_body = PerfProfileBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "System")]
 pub async fn start_perf_profile(
     State(state): State<SharedState>,
     Json(b): Json<PerfProfileBody>,
@@ -183,7 +183,7 @@ pub struct ClockPreferenceBody {
     /// Clock source preference.
     pub preference: crate::clock::ClockPreference,
 }
-#[utoipa::path(put, path = "/api/clock/preference", request_body = ClockPreferenceBody, responses((status = 200, body = CommandResult)), tag = "System")]
+#[utoipa::path(put, path = "/api/clock/preference", request_body = ClockPreferenceBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "System")]
 pub async fn set_clock_preference(
     State(state): State<SharedState>,
     Json(b): Json<ClockPreferenceBody>,
@@ -204,7 +204,7 @@ pub struct ManualBpmBody {
     /// Beats per minute.
     pub bpm: f32,
 }
-#[utoipa::path(put, path = "/api/clock/manual-bpm", request_body = ManualBpmBody, responses((status = 200, body = CommandResult)), tag = "System")]
+#[utoipa::path(put, path = "/api/clock/manual-bpm", request_body = ManualBpmBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "System")]
 pub async fn set_manual_bpm(
     State(state): State<SharedState>,
     Json(b): Json<ManualBpmBody>,
@@ -217,14 +217,14 @@ pub async fn set_manual_bpm(
         Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/workspace/save", responses((status = 200, body = CommandResult)), tag = "System")]
+#[utoipa::path(post, path = "/api/workspace/save", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "System")]
 pub async fn save_workspace(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::SaveWorkspace).await {
         Ok(r) => command_response(r),
         Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/workspace/load", responses((status = 200, body = CommandResult)), tag = "System")]
+#[utoipa::path(post, path = "/api/workspace/load", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "System")]
 pub async fn load_workspace(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::LoadWorkspace).await {
         Ok(r) => command_response(r),
@@ -234,35 +234,35 @@ pub async fn load_workspace(State(state): State<SharedState>) -> impl IntoRespon
 
 // ── Device Scanning & MIDI ─────────────────────────────────────────
 
-#[utoipa::path(post, path = "/api/devices/ndi/scan", responses((status = 200, body = CommandResult)), tag = "Devices")]
+#[utoipa::path(post, path = "/api/devices/ndi/scan", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Devices")]
 pub async fn scan_ndi(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::RescanNdi).await {
         Ok(r) => command_response(r),
         Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/devices/syphon/scan", responses((status = 200, body = CommandResult)), tag = "Devices")]
+#[utoipa::path(post, path = "/api/devices/syphon/scan", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Devices")]
 pub async fn scan_syphon(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::RescanSyphon).await {
         Ok(r) => command_response(r),
         Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/devices/cameras/scan", responses((status = 200, body = CommandResult)), tag = "Devices")]
+#[utoipa::path(post, path = "/api/devices/cameras/scan", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Devices")]
 pub async fn scan_cameras(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::RescanCameras).await {
         Ok(r) => command_response(r),
         Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/devices/depth/scan", responses((status = 200, body = CommandResult)), tag = "Depth Sensors")]
+#[utoipa::path(post, path = "/api/devices/depth/scan", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Depth Sensors")]
 pub async fn scan_depth_sensors(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::RescanDepthSensors).await {
         Ok(r) => command_response(r),
         Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/devices/screen/scan", responses((status = 200, body = CommandResult)), tag = "Screen Capture")]
+#[utoipa::path(post, path = "/api/devices/screen/scan", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Screen Capture")]
 pub async fn scan_capture_targets(State(state): State<SharedState>) -> impl IntoResponse {
     match state
         .send_command(EngineCommand::RescanCaptureTargets)
@@ -277,7 +277,7 @@ pub async fn scan_capture_targets(State(state): State<SharedState>) -> impl Into
 /// On macOS the grant does **not** apply to the running process — the user must
 /// approve in System Settings and restart Varda. The response only reports that
 /// the request was issued, not that capture now works.
-#[utoipa::path(post, path = "/api/devices/screen/permission", responses((status = 200, body = CommandResult)), tag = "Screen Capture")]
+#[utoipa::path(post, path = "/api/devices/screen/permission", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Screen Capture")]
 pub async fn request_screen_capture_permission(
     State(state): State<SharedState>,
 ) -> impl IntoResponse {
@@ -289,7 +289,7 @@ pub async fn request_screen_capture_permission(
         Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/devices/midi/scan", responses((status = 200, body = CommandResult)), tag = "Devices")]
+#[utoipa::path(post, path = "/api/devices/midi/scan", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Devices")]
 pub async fn scan_midi(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::RescanMidi).await {
         Ok(r) => command_response(r),
@@ -297,7 +297,7 @@ pub async fn scan_midi(State(state): State<SharedState>) -> impl IntoResponse {
     }
 }
 
-#[utoipa::path(post, path = "/api/devices/audio/scan", responses((status = 200, body = CommandResult)), tag = "Devices")]
+#[utoipa::path(post, path = "/api/devices/audio/scan", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Devices")]
 pub async fn scan_audio(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::RescanAudio).await {
         Ok(r) => command_response(r),
@@ -312,7 +312,7 @@ pub struct AudioSourceEnabledBody {
     /// Whether the source should be enabled.
     pub enabled: bool,
 }
-#[utoipa::path(put, path = "/api/devices/audio/enabled", request_body = AudioSourceEnabledBody, responses((status = 200, body = CommandResult)), tag = "Devices")]
+#[utoipa::path(put, path = "/api/devices/audio/enabled", request_body = AudioSourceEnabledBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Devices")]
 pub async fn set_audio_source_enabled(
     State(state): State<SharedState>,
     Json(b): Json<AudioSourceEnabledBody>,
@@ -336,7 +336,7 @@ pub struct MidiDeviceEnabledBody {
     /// Whether the device should be enabled.
     pub enabled: bool,
 }
-#[utoipa::path(put, path = "/api/devices/midi/enabled", request_body = MidiDeviceEnabledBody, responses((status = 200, body = CommandResult)), tag = "Devices")]
+#[utoipa::path(put, path = "/api/devices/midi/enabled", request_body = MidiDeviceEnabledBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Devices")]
 pub async fn set_midi_device_enabled(
     State(state): State<SharedState>,
     Json(b): Json<MidiDeviceEnabledBody>,
@@ -352,7 +352,7 @@ pub async fn set_midi_device_enabled(
         Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(delete, path = "/api/midi/mappings", responses((status = 200, body = CommandResult)), tag = "Devices")]
+#[utoipa::path(delete, path = "/api/midi/mappings", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Devices")]
 pub async fn clear_midi_mappings(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::ClearMidiMappings).await {
         Ok(r) => command_response(r),
@@ -365,7 +365,7 @@ pub struct RemoveMidiMappingBody {
     /// MIDI key identifying the mapping to remove.
     pub key: crate::midi::MidiKey,
 }
-#[utoipa::path(post, path = "/api/midi/mappings/remove", request_body = RemoveMidiMappingBody, responses((status = 200, body = CommandResult)), tag = "Devices")]
+#[utoipa::path(post, path = "/api/midi/mappings/remove", request_body = RemoveMidiMappingBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Devices")]
 pub async fn remove_midi_mapping(
     State(state): State<SharedState>,
     Json(b): Json<RemoveMidiMappingBody>,
@@ -388,7 +388,7 @@ pub struct StreamLibraryBody {
     /// Stream connection mode (caller or listener for SRT).
     pub mode: crate::stream::SrtMode,
 }
-#[utoipa::path(post, path = "/api/streams/library", request_body = StreamLibraryBody, responses((status = 200, body = CommandResult)), tag = "Streams")]
+#[utoipa::path(post, path = "/api/streams/library", request_body = StreamLibraryBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Streams")]
 pub async fn add_stream_library_entry(
     State(state): State<SharedState>,
     Json(b): Json<StreamLibraryBody>,
@@ -410,7 +410,7 @@ pub struct RemoveStreamBody {
     /// SRT stream URL to remove.
     pub url: String,
 }
-#[utoipa::path(delete, path = "/api/streams/library", request_body = RemoveStreamBody, responses((status = 200, body = CommandResult)), tag = "Streams")]
+#[utoipa::path(delete, path = "/api/streams/library", request_body = RemoveStreamBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Streams")]
 pub async fn remove_stream_library_entry(
     State(state): State<SharedState>,
     Json(b): Json<RemoveStreamBody>,
@@ -431,7 +431,7 @@ pub struct HlsLibraryBody {
     /// HLS stream URL (.m3u8).
     pub url: String,
 }
-#[utoipa::path(post, path = "/api/streams/hls/library", request_body = HlsLibraryBody, responses((status = 200, body = CommandResult)), tag = "Streams")]
+#[utoipa::path(post, path = "/api/streams/hls/library", request_body = HlsLibraryBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Streams")]
 pub async fn add_hls_library_entry(
     State(state): State<SharedState>,
     Json(b): Json<HlsLibraryBody>,
@@ -450,7 +450,7 @@ pub struct RemoveHlsBody {
     /// HLS stream URL to remove.
     pub url: String,
 }
-#[utoipa::path(delete, path = "/api/streams/hls/library", request_body = RemoveHlsBody, responses((status = 200, body = CommandResult)), tag = "Streams")]
+#[utoipa::path(delete, path = "/api/streams/hls/library", request_body = RemoveHlsBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Streams")]
 pub async fn remove_hls_library_entry(
     State(state): State<SharedState>,
     Json(b): Json<RemoveHlsBody>,
@@ -471,7 +471,7 @@ pub struct DashLibraryBody {
     /// DASH stream URL (.mpd).
     pub url: String,
 }
-#[utoipa::path(post, path = "/api/streams/dash/library", request_body = DashLibraryBody, responses((status = 200, body = CommandResult)), tag = "Streams")]
+#[utoipa::path(post, path = "/api/streams/dash/library", request_body = DashLibraryBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Streams")]
 pub async fn add_dash_library_entry(
     State(state): State<SharedState>,
     Json(b): Json<DashLibraryBody>,
@@ -490,7 +490,7 @@ pub struct RemoveDashBody {
     /// DASH stream URL to remove.
     pub url: String,
 }
-#[utoipa::path(delete, path = "/api/streams/dash/library", request_body = RemoveDashBody, responses((status = 200, body = CommandResult)), tag = "Streams")]
+#[utoipa::path(delete, path = "/api/streams/dash/library", request_body = RemoveDashBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Streams")]
 pub async fn remove_dash_library_entry(
     State(state): State<SharedState>,
     Json(b): Json<RemoveDashBody>,
@@ -511,7 +511,7 @@ pub struct RtmpLibraryBody {
     /// Connection mode (Pull or Listen).
     pub mode: crate::stream::RtmpMode,
 }
-#[utoipa::path(post, path = "/api/streams/rtmp/library", request_body = RtmpLibraryBody, responses((status = 200, body = CommandResult)), tag = "Streams")]
+#[utoipa::path(post, path = "/api/streams/rtmp/library", request_body = RtmpLibraryBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Streams")]
 pub async fn add_rtmp_library_entry(
     State(state): State<SharedState>,
     Json(b): Json<RtmpLibraryBody>,
@@ -533,7 +533,7 @@ pub struct RemoveRtmpBody {
     /// RTMP stream URL to remove.
     pub url: String,
 }
-#[utoipa::path(delete, path = "/api/streams/rtmp/library", request_body = RemoveRtmpBody, responses((status = 200, body = CommandResult)), tag = "Streams")]
+#[utoipa::path(delete, path = "/api/streams/rtmp/library", request_body = RemoveRtmpBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Streams")]
 pub async fn remove_rtmp_library_entry(
     State(state): State<SharedState>,
     Json(b): Json<RemoveRtmpBody>,

@@ -28,7 +28,73 @@ Browse all routes interactively at:
 http://localhost:8080/api/docs
 ```
 
-Every parameter, path variable, and request body field is documented with descriptions and examples in the OpenAPI 3.0 spec.
+The OpenAPI 3.1 spec describes every typed route: its parameters, path variables and request bodies. `POST /api/command` takes any engine command; the recipes in this chapter show its JSON.
+
+The same spec is in the repository as [`docs/api/openapi.json`](api/openapi.json), for reading without Nida running. It is generated from the code, and a test (`tests/api_docs.rs`) fails when it falls behind.
+
+The routes that change something answer `200` with `{"status": "ok"}`, adding `"uuid"` when they made something and `"data"` when they report something. The routes that read (`GET /api/state` and the like) answer with what they read. When the engine refuses a command, the answer is `400`, `404`, `500` or `503` with `{"error": "invalid_input" | "not_found" | "internal" | "unavailable", "message": "…"}`. A request that cannot be read (bad JSON, a missing field, no JSON content type) gets a plain-text `400`, `415` or `422`, and a few routes answer some failures in plain text.
+
+## Running a show remotely
+
+The calls a control panel or a script makes during a show. The UUIDs come from `GET /api/state`: the inputs are `.mixer.channels[]` (`name`, `uuid`), their layers `.mixer.channels[].decks[]`, the rundown's steps `.rundown.steps[]`, the audio mixer's sources `.audio_mix.sources[]`.
+
+```sh
+H='Content-Type: application/json'
+
+# Main mode (Preview and Program), the transition (fade, merge, wipe, slide,
+# zoom or iris) and how long it takes
+curl -X PUT http://localhost:8080/api/main/mode -H "$H" -d '{"mode": "program"}'
+curl -X PUT http://localhost:8080/api/main/transition -H "$H" -d '{"transition": "merge"}'
+curl -X PUT http://localhost:8080/api/main/fade-time -H "$H" -d '{"secs": 1.0}'
+
+# Take an input to Main with the transition, or cut to it
+curl -X POST http://localhost:8080/api/main/take -H "$H" -d '{"source": {"Channel": "<input uuid>"}, "fade": true}'
+curl -X POST http://localhost:8080/api/main/take -H "$H" -d '{"source": {"Channel": "<input uuid>"}}'
+
+# An overlay: make the input one (once), then put it on ("on": false takes it off)
+curl -X PUT http://localhost:8080/api/channels/<input uuid>/overlay -H "$H" -d '{"overlay": true}'
+curl -X PUT http://localhost:8080/api/channels/<input uuid>/overlay-on -H "$H" -d '{"on": true}'
+
+# GO: the rundown's next step
+curl -X POST http://localhost:8080/api/rundown/go -H "$H" -d '{}'
+
+# STREAM and REC (…/stop to stop)
+curl -X POST http://localhost:8080/api/stream/start
+curl -X POST http://localhost:8080/api/record/start
+
+# A microphone off ("muted": false puts it back)
+curl -X PUT http://localhost:8080/api/audio-sources/<source uuid>/mute -H "$H" -d '{"muted": true}'
+
+# A count down or count up: start (or pause, reset), or a minute more (secs
+# below zero take time off). A clock and a count to a time run by the clock.
+curl -X POST http://localhost:8080/api/command -H "$H" \
+  -d '{"ControlTimer": {"deck_uuid": "<timer layer uuid>", "action": "start"}}'
+curl -X POST http://localhost:8080/api/command -H "$H" \
+  -d '{"ControlTimer": {"deck_uuid": "<timer layer uuid>", "action": {"adjust": {"secs": 60}}}}'
+```
+
+## Setting up a show with an AI agent
+
+Everything a show is made of can be built over this API, so an AI agent that can run commands (a coding agent, say) can set one up from a description. Give it:
+
+- where Nida is: `http://<the Mac's address>:8080`, or `localhost` on the Mac itself;
+- the API's description: [`docs/api/openapi.json`](api/openapi.json) here, or `/api/openapi.json` from the running Nida, and this chapter;
+- what the event needs, for example: *"Set up tomorrow's conference in Nida: the FaceTime camera and the capture card, the slides laptop over NDI, our logo in the corner as an overlay, a bus for the stage screen, the stream to YouTube (I'll give you the key), recording in HEVC, and a rundown: Opening, Keynote, Panel, Break. Save it as Conference day 1."*
+
+It builds the show the way the window does. `POST /api/channels` makes an input, a layer goes into it (`/api/channels/{uuid}/decks/camera`, or `…/decks/video`, `…/decks/image`, `…/decks/ndi`, `…/decks/srt` and so on) and `PUT /api/channels/{uuid}/name` names it. Then come the overlays, Main mode and the transition, `POST /api/buses`, `PUT /api/stream/destinations/{index}`, `PUT /api/record/options` and `POST /api/rundown/steps`. Last, it saves the show:
+
+```sh
+curl -X POST http://localhost:8080/api/command -H "Content-Type: application/json" \
+  -d '{"SaveShowAs": {"folder": "/Users/me/Documents/Nida Shows/Conference day 1"}}'
+```
+
+`GET /api/state` shows what it has made. Screens and LED walls have routes too (`/api/outputs`).
+
+It can use only what the Mac running Nida has: pictures and clips are files on that Mac, and cameras, capture cards, NDI sources and calls need the device, the runtime and macOS's permission there. The spec also lists the web-page and depth-sensor routes, which the DMG has no engine for.
+
+We tried it on a headless Nida. An agent made three named inputs (a camera's stand-in, slides and a logo overlay), switched on Main mode with Merge, and added a bus for the stage screen, a stream destination, HEVC recording and a rundown step. It saved the show, and the show opened again with all of it.
+
+The API has no password (see [Security](#security--network-trust-model)). Keep Nida on a network you trust, and give the agent a stream key only if you want it to set the stream up.
 
 ## Headless Mode
 
@@ -933,7 +999,7 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 |---|---|---|
 | `PUT` | `/api/clock/manual-bpm` |  |
 | `PUT` | `/api/clock/preference` |  |
-| `POST` | `/api/command` | Applies any `EngineCommand` sent as JSON and returns its `CommandResult`. |
+| `POST` | `/api/command` | Applies any `EngineCommand` sent as JSON, and answers as every route does |
 | `PUT` | `/api/domemaster/resolution` |  |
 | `GET` | `/api/health` |  |
 | `POST` | `/api/perf-profile` |  |

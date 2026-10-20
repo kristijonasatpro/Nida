@@ -10,7 +10,7 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
 async fn dispatch(state: &SharedState, cmd: EngineCommand) -> axum::response::Response {
@@ -111,7 +111,7 @@ pub struct OutputAudioBusBody {
     pub bus_uuid: Option<String>,
 }
 
-#[utoipa::path(post, path = "/api/audio-buses", request_body = AudioNameBody, responses((status = 200, body = CommandResult)), tag = "Audio Mixer")]
+#[utoipa::path(post, path = "/api/audio-buses", request_body = AudioNameBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Audio Mixer")]
 pub async fn create_bus(
     State(s): State<SharedState>,
     Json(b): Json<AudioNameBody>,
@@ -119,7 +119,7 @@ pub async fn create_bus(
     dispatch(&s, EngineCommand::AddAudioBus { name: b.name }).await
 }
 
-#[utoipa::path(delete, path = "/api/audio-buses/{bus_uuid}", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
+#[utoipa::path(delete, path = "/api/audio-buses/{bus_uuid}", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
 pub async fn delete_bus(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -127,7 +127,7 @@ pub async fn delete_bus(
     dispatch(&s, EngineCommand::RemoveAudioBus { uuid }).await
 }
 
-#[utoipa::path(put, path = "/api/audio-buses/{bus_uuid}/name", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = AudioNameBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-buses/{bus_uuid}/name", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = AudioNameBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
 pub async fn rename_bus(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -136,7 +136,7 @@ pub async fn rename_bus(
     dispatch(&s, EngineCommand::RenameAudioBus { uuid, name: b.name }).await
 }
 
-#[utoipa::path(put, path = "/api/audio-buses/{bus_uuid}/gain", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = AudioGainBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-buses/{bus_uuid}/gain", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = AudioGainBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
 pub async fn set_bus_gain(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -152,7 +152,7 @@ pub async fn set_bus_gain(
     .await
 }
 
-#[utoipa::path(put, path = "/api/audio-buses/{bus_uuid}/mute", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = AudioMuteBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-buses/{bus_uuid}/mute", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = AudioMuteBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
 pub async fn set_bus_mute(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -168,7 +168,7 @@ pub async fn set_bus_mute(
     .await
 }
 
-#[utoipa::path(put, path = "/api/audio-buses/{bus_uuid}/delay", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = AudioDelayBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-buses/{bus_uuid}/delay", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = AudioDelayBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
 pub async fn set_bus_delay(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -184,7 +184,7 @@ pub async fn set_bus_delay(
     .await
 }
 
-#[utoipa::path(put, path = "/api/audio-buses/{bus_uuid}/device", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = AudioDeviceBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-buses/{bus_uuid}/device", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = AudioDeviceBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
 pub async fn set_bus_device(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -201,7 +201,7 @@ pub async fn set_bus_device(
     .await
 }
 
-#[utoipa::path(post, path = "/api/audio-inputs", request_body = AudioInputBody, responses((status = 200, body = CommandResult)), tag = "Audio Mixer")]
+#[utoipa::path(post, path = "/api/audio-inputs", request_body = AudioInputBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Audio Mixer")]
 pub async fn create_input(
     State(s): State<SharedState>,
     Json(b): Json<AudioInputBody>,
@@ -220,7 +220,7 @@ pub async fn create_input(
 
 /// Take an app's sound — a Zoom or Teams call's — as a source, straight from
 /// the app while it runs (macOS 14.2 and later); replies with its UUID.
-#[utoipa::path(post, path = "/api/audio-inputs/app", request_body = AppSoundBody, responses((status = 200, body = CommandResult)), tag = "Audio Mixer")]
+#[utoipa::path(post, path = "/api/audio-inputs/app", request_body = AppSoundBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Audio Mixer")]
 pub async fn create_app_sound(
     State(s): State<SharedState>,
     Json(b): Json<AppSoundBody>,
@@ -235,7 +235,7 @@ pub async fn create_app_sound(
     .await
 }
 
-#[utoipa::path(delete, path = "/api/audio-inputs/{input_uuid}", params(("input_uuid" = String, Path, description = "Audio input UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "No such input")), tag = "Audio Mixer")]
+#[utoipa::path(delete, path = "/api/audio-inputs/{input_uuid}", params(("input_uuid" = String, Path, description = "Audio input UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such input")), tag = "Audio Mixer")]
 pub async fn delete_input(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -243,7 +243,7 @@ pub async fn delete_input(
     dispatch(&s, EngineCommand::RemoveAudioInput { uuid }).await
 }
 
-#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/gain", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioGainBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such source")), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/gain", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioGainBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such source")), tag = "Audio Mixer")]
 pub async fn set_source_gain(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -259,7 +259,7 @@ pub async fn set_source_gain(
     .await
 }
 
-#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/mute", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioMuteBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such source")), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/mute", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioMuteBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such source")), tag = "Audio Mixer")]
 pub async fn set_source_mute(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -275,7 +275,7 @@ pub async fn set_source_mute(
     .await
 }
 
-#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/sends/{bus_uuid}", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)"), ("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = AudioSendBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such source or bus")), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/sends/{bus_uuid}", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)"), ("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = AudioSendBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such source or bus")), tag = "Audio Mixer")]
 pub async fn set_send(
     State(s): State<SharedState>,
     Path((uuid, bus_uuid)): Path<(String, String)>,
@@ -292,7 +292,7 @@ pub async fn set_send(
     .await
 }
 
-#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/follow", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioFollowBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such source or video bus")), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/follow", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioFollowBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such source or video bus")), tag = "Audio Mixer")]
 pub async fn set_follow(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -308,7 +308,7 @@ pub async fn set_follow(
     .await
 }
 
-#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/auto", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioAutoBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such source")), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/auto", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioAutoBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such source")), tag = "Audio Mixer")]
 /// Audio Auto: the source's sound switches on as it goes on air and off as
 /// it leaves, fading with the picture.
 pub async fn set_auto(
@@ -319,7 +319,7 @@ pub async fn set_auto(
     dispatch(&s, EngineCommand::SetAudioAuto { uuid, auto: b.auto }).await
 }
 
-#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/balance", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioBalanceBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such source")), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/balance", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioBalanceBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such source")), tag = "Audio Mixer")]
 pub async fn set_balance(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -335,7 +335,7 @@ pub async fn set_balance(
     .await
 }
 
-#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/delay", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioDelayBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such source")), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/delay", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioDelayBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such source")), tag = "Audio Mixer")]
 pub async fn set_source_delay(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -351,7 +351,7 @@ pub async fn set_source_delay(
     .await
 }
 
-#[utoipa::path(put, path = "/api/outputs/{output_uuid}/audio-bus", params(("output_uuid" = String, Path, description = "Output UUID")), request_body = OutputAudioBusBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such output or bus")), tag = "Outputs")]
+#[utoipa::path(put, path = "/api/outputs/{output_uuid}/audio-bus", params(("output_uuid" = String, Path, description = "Output UUID")), request_body = OutputAudioBusBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such output or bus")), tag = "Outputs")]
 pub async fn set_output_audio_bus(
     State(s): State<SharedState>,
     Path(output_uuid): Path<String>,
@@ -367,7 +367,7 @@ pub async fn set_output_audio_bus(
     .await
 }
 
-#[utoipa::path(post, path = "/api/audio-devices/rescan", responses((status = 200, body = CommandResult)), tag = "Audio Mixer")]
+#[utoipa::path(post, path = "/api/audio-devices/rescan", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Audio Mixer")]
 pub async fn rescan_devices(State(s): State<SharedState>) -> impl IntoResponse {
     dispatch(&s, EngineCommand::RescanAudioDevices).await
 }
@@ -385,7 +385,7 @@ pub struct AudioListenBody {
     pub bus_uuid: Option<String>,
 }
 
-#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/solo", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioSoloBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such source")), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/solo", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioSoloBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such source")), tag = "Audio Mixer")]
 pub async fn set_solo(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -394,7 +394,7 @@ pub async fn set_solo(
     dispatch(&s, EngineCommand::SetAudioSolo { uuid, solo: b.solo }).await
 }
 
-#[utoipa::path(put, path = "/api/audio-monitor/device", request_body = AudioDeviceBody, responses((status = 200, body = CommandResult)), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-monitor/device", request_body = AudioDeviceBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Audio Mixer")]
 pub async fn set_monitor_device(
     State(s): State<SharedState>,
     Json(b): Json<AudioDeviceBody>,
@@ -409,7 +409,7 @@ pub async fn set_monitor_device(
     .await
 }
 
-#[utoipa::path(put, path = "/api/audio-monitor/gain", request_body = AudioGainBody, responses((status = 200, body = CommandResult)), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-monitor/gain", request_body = AudioGainBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Audio Mixer")]
 pub async fn set_monitor_gain(
     State(s): State<SharedState>,
     Json(b): Json<AudioGainBody>,
@@ -421,7 +421,7 @@ pub async fn set_monitor_gain(
     .await
 }
 
-#[utoipa::path(put, path = "/api/audio-monitor/listen", request_body = AudioListenBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
+#[utoipa::path(put, path = "/api/audio-monitor/listen", request_body = AudioListenBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
 pub async fn set_monitor_listen(
     State(s): State<SharedState>,
     Json(b): Json<AudioListenBody>,

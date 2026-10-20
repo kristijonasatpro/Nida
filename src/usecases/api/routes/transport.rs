@@ -9,7 +9,7 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
 #[derive(Deserialize, ToSchema)]
@@ -42,7 +42,7 @@ pub struct RateBody {
     pub rate: crate::transport::TimecodeRate,
 }
 
-#[utoipa::path(post, path = "/api/transport/play", responses((status = 200, body = CommandResult)), tag = "Transport")]
+#[utoipa::path(post, path = "/api/transport/play", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Transport")]
 pub async fn play(State(s): State<SharedState>) -> impl IntoResponse {
     match s.send_command(EngineCommand::TransportPlay).await {
         Ok(r) => command_response(r),
@@ -50,7 +50,7 @@ pub async fn play(State(s): State<SharedState>) -> impl IntoResponse {
     }
 }
 
-#[utoipa::path(post, path = "/api/transport/stop", responses((status = 200, body = CommandResult)), tag = "Transport")]
+#[utoipa::path(post, path = "/api/transport/stop", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Transport")]
 pub async fn stop(State(s): State<SharedState>) -> impl IntoResponse {
     match s.send_command(EngineCommand::TransportStop).await {
         Ok(r) => command_response(r),
@@ -58,7 +58,7 @@ pub async fn stop(State(s): State<SharedState>) -> impl IntoResponse {
     }
 }
 
-#[utoipa::path(post, path = "/api/transport/locate", request_body = PositionBody, responses((status = 200, body = CommandResult)), tag = "Transport")]
+#[utoipa::path(post, path = "/api/transport/locate", request_body = PositionBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Transport")]
 pub async fn locate(
     State(s): State<SharedState>,
     Json(b): Json<PositionBody>,
@@ -74,7 +74,7 @@ pub async fn locate(
     }
 }
 
-#[utoipa::path(post, path = "/api/transport/cue/prev", responses((status = 200, body = CommandResult)), tag = "Transport")]
+#[utoipa::path(post, path = "/api/transport/cue/prev", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Transport")]
 pub async fn prev_cue(State(s): State<SharedState>) -> impl IntoResponse {
     match s.send_command(EngineCommand::TransportPrevCue).await {
         Ok(r) => command_response(r),
@@ -82,7 +82,7 @@ pub async fn prev_cue(State(s): State<SharedState>) -> impl IntoResponse {
     }
 }
 
-#[utoipa::path(post, path = "/api/transport/cue/next", responses((status = 200, body = CommandResult)), tag = "Transport")]
+#[utoipa::path(post, path = "/api/transport/cue/next", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Transport")]
 pub async fn next_cue(State(s): State<SharedState>) -> impl IntoResponse {
     match s.send_command(EngineCommand::TransportNextCue).await {
         Ok(r) => command_response(r),
@@ -92,7 +92,7 @@ pub async fn next_cue(State(s): State<SharedState>) -> impl IntoResponse {
 
 /// Locate to one named cue, leaving the transport running or stopped as it was.
 /// What the Performance-mode cue pads and a mapped foot switch both do.
-#[utoipa::path(post, path = "/api/transport/cue/{uuid}", params(("uuid" = String, Path, description = "Cue UUID")), responses((status = 200, body = CommandResult)), tag = "Transport")]
+#[utoipa::path(post, path = "/api/transport/cue/{uuid}", params(("uuid" = String, Path, description = "Cue UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Transport")]
 pub async fn trigger_cue(
     State(s): State<SharedState>,
     axum::extract::Path(uuid): axum::extract::Path<String>,
@@ -103,7 +103,7 @@ pub async fn trigger_cue(
     }
 }
 
-#[utoipa::path(put, path = "/api/transport/source", request_body = SourceBody, responses((status = 200, body = CommandResult)), tag = "Transport")]
+#[utoipa::path(put, path = "/api/transport/source", request_body = SourceBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Transport")]
 pub async fn set_source(
     State(s): State<SharedState>,
     Json(b): Json<SourceBody>,
@@ -117,7 +117,7 @@ pub async fn set_source(
     }
 }
 
-#[utoipa::path(put, path = "/api/transport/loop", request_body = LoopBody, responses((status = 200, body = CommandResult)), tag = "Transport")]
+#[utoipa::path(put, path = "/api/transport/loop", request_body = LoopBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Transport")]
 pub async fn set_loop(State(s): State<SharedState>, Json(b): Json<LoopBody>) -> impl IntoResponse {
     match s
         .send_command(EngineCommand::SetTransportLoop { region: b.region })
@@ -130,7 +130,7 @@ pub async fn set_loop(State(s): State<SharedState>, Json(b): Json<LoopBody>) -> 
 
 /// Arm or disarm automation recording. Arming from a stop also rolls the show,
 /// the way the record button does. See `/spec/automation-recording.md`.
-#[utoipa::path(put, path = "/api/transport/record", request_body = RecordBody, responses((status = 200, body = CommandResult)), tag = "Transport")]
+#[utoipa::path(put, path = "/api/transport/record", request_body = RecordBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Transport")]
 pub async fn set_record(
     State(s): State<SharedState>,
     Json(b): Json<RecordBody>,
@@ -144,7 +144,7 @@ pub async fn set_record(
     }
 }
 
-#[utoipa::path(put, path = "/api/transport/rate", request_body = RateBody, responses((status = 200, body = CommandResult)), tag = "Transport")]
+#[utoipa::path(put, path = "/api/transport/rate", request_body = RateBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Transport")]
 pub async fn set_rate(State(s): State<SharedState>, Json(b): Json<RateBody>) -> impl IntoResponse {
     match s
         .send_command(EngineCommand::SetTimecodeRate { rate: b.rate })

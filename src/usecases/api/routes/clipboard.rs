@@ -11,7 +11,7 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{ClipboardSource, CommandResult, EngineCommand, PasteTarget};
+use crate::engine::{ClipboardSource, EngineCommand, PasteTarget};
 use crate::usecases::api::{command_response, SharedState};
 
 #[derive(Deserialize, ToSchema)]
@@ -35,7 +35,7 @@ pub struct DuplicateBody {
     pub source: ClipboardSource,
 }
 
-#[utoipa::path(post, path = "/api/clipboard/copy", request_body = CopyBody, responses((status = 200, body = CommandResult)), tag = "Clipboard")]
+#[utoipa::path(post, path = "/api/clipboard/copy", request_body = CopyBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Clipboard")]
 pub async fn copy(State(s): State<SharedState>, Json(b): Json<CopyBody>) -> impl IntoResponse {
     match s
         .send_command(EngineCommand::Copy {
@@ -49,7 +49,7 @@ pub async fn copy(State(s): State<SharedState>, Json(b): Json<CopyBody>) -> impl
     }
 }
 
-#[utoipa::path(post, path = "/api/clipboard/paste", request_body = PasteBody, responses((status = 200, body = CommandResult)), tag = "Clipboard")]
+#[utoipa::path(post, path = "/api/clipboard/paste", request_body = PasteBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Clipboard")]
 pub async fn paste(State(s): State<SharedState>, Json(b): Json<PasteBody>) -> impl IntoResponse {
     match s
         .send_command(EngineCommand::Paste { target: b.target })
@@ -60,7 +60,7 @@ pub async fn paste(State(s): State<SharedState>, Json(b): Json<PasteBody>) -> im
     }
 }
 
-#[utoipa::path(post, path = "/api/clipboard/duplicate", request_body = DuplicateBody, responses((status = 200, body = CommandResult)), tag = "Clipboard")]
+#[utoipa::path(post, path = "/api/clipboard/duplicate", request_body = DuplicateBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Clipboard")]
 pub async fn duplicate(
     State(s): State<SharedState>,
     Json(b): Json<DuplicateBody>,

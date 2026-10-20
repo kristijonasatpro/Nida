@@ -163,6 +163,8 @@ Parts III–VI are the engine underneath, from Varda, with Nida's additions.
   - [File Location](12-isf-authoring.md#file-location) — shader directory precedence hierarchy, `--shader-dir`
 - **13. [HTTP API & Headless Mode](13-api.md)**
   - [Swagger UI](13-api.md#swagger-ui)
+  - [Running a show remotely](13-api.md#running-a-show-remotely)
+  - [Setting up a show with an AI agent](13-api.md#setting-up-a-show-with-an-ai-agent)
   - [Headless Mode](13-api.md#headless-mode)
   - [WebSocket](13-api.md#websocket)
   - [Common Patterns](13-api.md#common-patterns)

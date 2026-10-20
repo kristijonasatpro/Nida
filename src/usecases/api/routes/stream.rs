@@ -11,7 +11,7 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
 async fn dispatch(state: &SharedState, cmd: EngineCommand) -> axum::response::Response {
@@ -36,7 +36,7 @@ pub async fn get_stream(State(state): State<SharedState>) -> impl IntoResponse {
     }
 }
 
-#[utoipa::path(put, path = "/api/stream/options", request_body = crate::streaming::StreamOptions, responses((status = 200, body = CommandResult), (status = 400, description = "While the stream is on only the source changes — and, for a stream encoded in Nida (`rate_live`), the video bit rate and `adaptive`")), tag = "Stream")]
+#[utoipa::path(put, path = "/api/stream/options", request_body = crate::streaming::StreamOptions, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "While the stream is on only the source changes — and, for a stream encoded in Nida (`rate_live`), the video bit rate and `adaptive`")), tag = "Stream")]
 pub async fn set_options(
     State(s): State<SharedState>,
     Json(options): Json<crate::streaming::StreamOptions>,
@@ -62,7 +62,7 @@ pub struct StreamDestinationBody {
     pub password: Option<String>,
 }
 
-#[utoipa::path(put, path = "/api/stream/destinations/{index}", params(("index" = usize, Path, description = "Destination 0–3")), request_body = StreamDestinationBody, responses((status = 200, body = CommandResult), (status = 400, description = "No such destination")), tag = "Stream")]
+#[utoipa::path(put, path = "/api/stream/destinations/{index}", params(("index" = usize, Path, description = "Destination 0–3")), request_body = StreamDestinationBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "No such destination")), tag = "Stream")]
 pub async fn set_destination(
     State(s): State<SharedState>,
     Path(index): Path<usize>,
@@ -83,12 +83,12 @@ pub async fn set_destination(
     .await
 }
 
-#[utoipa::path(post, path = "/api/stream/start", responses((status = 200, body = CommandResult), (status = 400, description = "No destination switched on, or none can be sent to")), tag = "Stream")]
+#[utoipa::path(post, path = "/api/stream/start", responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "No destination switched on, or none can be sent to")), tag = "Stream")]
 pub async fn start(State(s): State<SharedState>) -> impl IntoResponse {
     dispatch(&s, EngineCommand::StartStream).await
 }
 
-#[utoipa::path(post, path = "/api/stream/stop", responses((status = 200, body = CommandResult)), tag = "Stream")]
+#[utoipa::path(post, path = "/api/stream/stop", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Stream")]
 pub async fn stop(State(s): State<SharedState>) -> impl IntoResponse {
     dispatch(&s, EngineCommand::StopStream).await
 }

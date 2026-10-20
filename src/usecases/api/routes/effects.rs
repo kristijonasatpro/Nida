@@ -12,7 +12,7 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 
 use crate::engine::types::EffectTarget;
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
 #[derive(Deserialize, ToSchema)]
@@ -64,7 +64,7 @@ async fn move_effect(
     }
 }
 
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/effects", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddEffectBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Effects")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/effects", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddEffectBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Effects")]
 pub async fn add_channel_effect(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -73,7 +73,7 @@ pub async fn add_channel_effect(
     add_effect(state, EffectTarget::Channel(channel_uuid), body.shader_name).await
 }
 
-#[utoipa::path(post, path = "/api/decks/{deck_uuid}/effects", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = AddEffectBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Effects")]
+#[utoipa::path(post, path = "/api/decks/{deck_uuid}/effects", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = AddEffectBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Effects")]
 pub async fn add_deck_effect(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -82,7 +82,7 @@ pub async fn add_deck_effect(
     add_effect(state, EffectTarget::Deck(deck_uuid), body.shader_name).await
 }
 
-#[utoipa::path(post, path = "/api/master/effects", request_body = AddEffectBody, responses((status = 200, body = CommandResult)), tag = "Effects")]
+#[utoipa::path(post, path = "/api/master/effects", request_body = AddEffectBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Effects")]
 pub async fn add_master_effect(
     State(state): State<SharedState>,
     Json(body): Json<AddEffectBody>,
@@ -90,7 +90,7 @@ pub async fn add_master_effect(
     add_effect(state, EffectTarget::Master, body.shader_name).await
 }
 
-#[utoipa::path(delete, path = "/api/effects/{effect_uuid}", params(("effect_uuid" = String, Path, description = "Effect UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Effect not found")), tag = "Effects")]
+#[utoipa::path(delete, path = "/api/effects/{effect_uuid}", params(("effect_uuid" = String, Path, description = "Effect UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Effect not found")), tag = "Effects")]
 pub async fn remove_effect(
     State(state): State<SharedState>,
     Path(effect_uuid): Path<String>,
@@ -104,7 +104,7 @@ pub async fn remove_effect(
     }
 }
 
-#[utoipa::path(post, path = "/api/effects/{effect_uuid}/toggle", params(("effect_uuid" = String, Path, description = "Effect UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Effect not found")), tag = "Effects")]
+#[utoipa::path(post, path = "/api/effects/{effect_uuid}/toggle", params(("effect_uuid" = String, Path, description = "Effect UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Effect not found")), tag = "Effects")]
 pub async fn toggle_effect(
     State(state): State<SharedState>,
     Path(effect_uuid): Path<String>,
@@ -124,7 +124,7 @@ pub struct EffectMaskBody {
     pub mask: Option<crate::engine::value::mask::EffectMask>,
 }
 
-#[utoipa::path(put, path = "/api/effects/{effect_uuid}/mask", params(("effect_uuid" = String, Path, description = "Effect UUID")), request_body = EffectMaskBody, responses((status = 200, body = CommandResult), (status = 400, description = "The mask has no area"), (status = 404, description = "Effect not found")), tag = "Effects")]
+#[utoipa::path(put, path = "/api/effects/{effect_uuid}/mask", params(("effect_uuid" = String, Path, description = "Effect UUID")), request_body = EffectMaskBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "The mask has no area"), (status = 404, description = "Effect not found")), tag = "Effects")]
 pub async fn set_effect_mask(
     State(state): State<SharedState>,
     Path(effect_uuid): Path<String>,
@@ -149,7 +149,7 @@ pub struct ResetEffectBody {
     pub names: Vec<String>,
 }
 
-#[utoipa::path(post, path = "/api/effects/{effect_uuid}/reset", params(("effect_uuid" = String, Path, description = "Effect UUID")), request_body = ResetEffectBody, responses((status = 200, body = CommandResult), (status = 404, description = "Effect not found")), tag = "Effects")]
+#[utoipa::path(post, path = "/api/effects/{effect_uuid}/reset", params(("effect_uuid" = String, Path, description = "Effect UUID")), request_body = ResetEffectBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Effect not found")), tag = "Effects")]
 pub async fn reset_effect(
     State(state): State<SharedState>,
     Path(effect_uuid): Path<String>,
@@ -165,7 +165,7 @@ pub async fn reset_effect(
     }
 }
 
-#[utoipa::path(put, path = "/api/channels/{channel_uuid}/effects/reorder", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ReorderEffectBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Effects")]
+#[utoipa::path(put, path = "/api/channels/{channel_uuid}/effects/reorder", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ReorderEffectBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Effects")]
 pub async fn reorder_channel_effect(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -174,7 +174,7 @@ pub async fn reorder_channel_effect(
     move_effect(state, EffectTarget::Channel(channel_uuid), body).await
 }
 
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/effects/reorder", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = ReorderEffectBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Effects")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/effects/reorder", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = ReorderEffectBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Effects")]
 pub async fn reorder_deck_effect(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -183,7 +183,7 @@ pub async fn reorder_deck_effect(
     move_effect(state, EffectTarget::Deck(deck_uuid), body).await
 }
 
-#[utoipa::path(put, path = "/api/master/effects/reorder", request_body = ReorderEffectBody, responses((status = 200, body = CommandResult)), tag = "Effects")]
+#[utoipa::path(put, path = "/api/master/effects/reorder", request_body = ReorderEffectBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Effects")]
 pub async fn reorder_master_effect(
     State(state): State<SharedState>,
     Json(body): Json<ReorderEffectBody>,

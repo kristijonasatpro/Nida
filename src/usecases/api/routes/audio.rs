@@ -6,7 +6,7 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
 #[derive(Deserialize, ToSchema)]
@@ -15,7 +15,7 @@ pub struct AudioSourceBody {
     pub source_id: u32,
 }
 
-#[utoipa::path(post, path = "/api/audio/scan", responses((status = 200, body = CommandResult)), tag = "Audio")]
+#[utoipa::path(post, path = "/api/audio/scan", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Audio")]
 pub async fn scan_devices(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::ScanAudioDevices).await {
         Ok(result) => command_response(result),
@@ -23,7 +23,7 @@ pub async fn scan_devices(State(state): State<SharedState>) -> impl IntoResponse
     }
 }
 
-#[utoipa::path(post, path = "/api/audio/open", request_body = AudioSourceBody, responses((status = 200, body = CommandResult)), tag = "Audio")]
+#[utoipa::path(post, path = "/api/audio/open", request_body = AudioSourceBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Audio")]
 pub async fn open_source(
     State(state): State<SharedState>,
     Json(body): Json<AudioSourceBody>,
@@ -39,7 +39,7 @@ pub async fn open_source(
     }
 }
 
-#[utoipa::path(post, path = "/api/audio/close", request_body = AudioSourceBody, responses((status = 200, body = CommandResult)), tag = "Audio")]
+#[utoipa::path(post, path = "/api/audio/close", request_body = AudioSourceBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Audio")]
 pub async fn close_source(
     State(state): State<SharedState>,
     Json(body): Json<AudioSourceBody>,

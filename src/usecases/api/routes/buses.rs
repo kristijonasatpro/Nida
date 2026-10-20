@@ -11,7 +11,7 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 
 use crate::bus::BusInputRef;
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
 /// Body for creating a bus.
@@ -93,7 +93,7 @@ async fn dispatch(state: &SharedState, cmd: EngineCommand) -> axum::response::Re
     }
 }
 
-#[utoipa::path(post, path = "/api/buses", request_body = CreateBusBody, responses((status = 200, body = CommandResult)), tag = "Buses")]
+#[utoipa::path(post, path = "/api/buses", request_body = CreateBusBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Buses")]
 pub async fn create(
     State(s): State<SharedState>,
     Json(body): Json<CreateBusBody>,
@@ -109,12 +109,12 @@ pub async fn create(
     .await
 }
 
-#[utoipa::path(delete, path = "/api/buses/{bus_uuid}", params(("bus_uuid" = String, Path, description = "Bus UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Bus not found")), tag = "Buses")]
+#[utoipa::path(delete, path = "/api/buses/{bus_uuid}", params(("bus_uuid" = String, Path, description = "Bus UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Bus not found")), tag = "Buses")]
 pub async fn delete(State(s): State<SharedState>, Path(uuid): Path<String>) -> impl IntoResponse {
     dispatch(&s, EngineCommand::RemoveBus { uuid }).await
 }
 
-#[utoipa::path(put, path = "/api/buses/{bus_uuid}/name", params(("bus_uuid" = String, Path, description = "Bus UUID")), request_body = RenameBusBody, responses((status = 200, body = CommandResult), (status = 404, description = "Bus not found")), tag = "Buses")]
+#[utoipa::path(put, path = "/api/buses/{bus_uuid}/name", params(("bus_uuid" = String, Path, description = "Bus UUID")), request_body = RenameBusBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Bus not found")), tag = "Buses")]
 pub async fn rename(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -130,7 +130,7 @@ pub async fn rename(
     .await
 }
 
-#[utoipa::path(put, path = "/api/buses/{bus_uuid}/preview", params(("bus_uuid" = String, Path, description = "Bus UUID")), request_body = BusPreviewBody, responses((status = 200, body = CommandResult), (status = 404, description = "Bus not found")), tag = "Buses")]
+#[utoipa::path(put, path = "/api/buses/{bus_uuid}/preview", params(("bus_uuid" = String, Path, description = "Bus UUID")), request_body = BusPreviewBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Bus not found")), tag = "Buses")]
 pub async fn set_preview(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -146,7 +146,7 @@ pub async fn set_preview(
     .await
 }
 
-#[utoipa::path(put, path = "/api/buses/{bus_uuid}/canvas", params(("bus_uuid" = String, Path, description = "Bus UUID")), request_body = BusCanvasBody, responses((status = 200, body = CommandResult), (status = 404, description = "Bus not found")), tag = "Buses")]
+#[utoipa::path(put, path = "/api/buses/{bus_uuid}/canvas", params(("bus_uuid" = String, Path, description = "Bus UUID")), request_body = BusCanvasBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Bus not found")), tag = "Buses")]
 pub async fn set_canvas(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -163,7 +163,7 @@ pub async fn set_canvas(
     .await
 }
 
-#[utoipa::path(put, path = "/api/buses/{bus_uuid}/auto-duration", params(("bus_uuid" = String, Path, description = "Bus UUID")), request_body = BusAutoDurationBody, responses((status = 200, body = CommandResult), (status = 400, description = "Duration must be finite and positive"), (status = 404, description = "Bus not found")), tag = "Buses")]
+#[utoipa::path(put, path = "/api/buses/{bus_uuid}/auto-duration", params(("bus_uuid" = String, Path, description = "Bus UUID")), request_body = BusAutoDurationBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "Duration must be finite and positive"), (status = 404, description = "Bus not found")), tag = "Buses")]
 pub async fn set_auto_duration(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -179,12 +179,12 @@ pub async fn set_auto_duration(
     .await
 }
 
-#[utoipa::path(post, path = "/api/buses/{bus_uuid}/cut", params(("bus_uuid" = String, Path, description = "Bus UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Bus not found")), tag = "Buses")]
+#[utoipa::path(post, path = "/api/buses/{bus_uuid}/cut", params(("bus_uuid" = String, Path, description = "Bus UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Bus not found")), tag = "Buses")]
 pub async fn cut(State(s): State<SharedState>, Path(uuid): Path<String>) -> impl IntoResponse {
     dispatch(&s, EngineCommand::BusCut { uuid }).await
 }
 
-#[utoipa::path(post, path = "/api/buses/{bus_uuid}/auto", params(("bus_uuid" = String, Path, description = "Bus UUID")), request_body = BusAutoBody, responses((status = 200, body = CommandResult), (status = 404, description = "Bus not found")), tag = "Buses")]
+#[utoipa::path(post, path = "/api/buses/{bus_uuid}/auto", params(("bus_uuid" = String, Path, description = "Bus UUID")), request_body = BusAutoBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Bus not found")), tag = "Buses")]
 pub async fn auto(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -200,7 +200,7 @@ pub async fn auto(
     .await
 }
 
-#[utoipa::path(put, path = "/api/buses/{bus_uuid}/screen", params(("bus_uuid" = String, Path, description = "Bus UUID")), request_body = BusScreenBody, responses((status = 200, body = CommandResult), (status = 404, description = "Bus not found")), tag = "Buses")]
+#[utoipa::path(put, path = "/api/buses/{bus_uuid}/screen", params(("bus_uuid" = String, Path, description = "Bus UUID")), request_body = BusScreenBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Bus not found")), tag = "Buses")]
 pub async fn set_screen(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -216,7 +216,7 @@ pub async fn set_screen(
     .await
 }
 
-#[utoipa::path(put, path = "/api/buses/{bus_uuid}/blackmagic", params(("bus_uuid" = String, Path, description = "Bus UUID")), request_body = BusBlackmagicBody, responses((status = 200, body = CommandResult), (status = 404, description = "Bus or device not found")), tag = "Buses")]
+#[utoipa::path(put, path = "/api/buses/{bus_uuid}/blackmagic", params(("bus_uuid" = String, Path, description = "Bus UUID")), request_body = BusBlackmagicBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Bus or device not found")), tag = "Buses")]
 pub async fn set_blackmagic(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -240,7 +240,7 @@ pub async fn set_blackmagic(
         ("channel_uuid" = String, Path, description = "Channel (mixer layer) UUID")
     ),
     request_body = BusLayerBody,
-    responses((status = 200, body = CommandResult), (status = 404, description = "Bus or channel not found")),
+    responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Bus or channel not found")),
     tag = "Buses"
 )]
 pub async fn set_layer(

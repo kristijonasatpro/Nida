@@ -12,7 +12,7 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 
 use crate::channel::DeckRenderFps;
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
 /// Strip `..` components from a path to prevent directory traversal attacks.
@@ -108,7 +108,7 @@ pub struct DeckBoolBody {
     pub value: bool,
 }
 
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/shader", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddShaderDeckBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/shader", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddShaderDeckBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Decks")]
 pub async fn add_shader_deck(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -126,7 +126,7 @@ pub async fn add_shader_deck(
     }
 }
 
-#[utoipa::path(delete, path = "/api/decks/{deck_uuid}", params(("deck_uuid" = String, Path, description = "Deck UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
+#[utoipa::path(delete, path = "/api/decks/{deck_uuid}", params(("deck_uuid" = String, Path, description = "Deck UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn remove_deck(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -151,7 +151,7 @@ pub struct LayerMaskBody {
 /// Transparent inside the shape, so what is under the layer shows through;
 /// inverted, only the shape is kept. Answers with the UUID of the effect
 /// carrying it (empty once taken away).
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/mask", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = LayerMaskBody, responses((status = 200, body = CommandResult), (status = 400, description = "The mask has no area"), (status = 404, description = "Deck not found")), tag = "Decks")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/mask", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = LayerMaskBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "The mask has no area"), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn set_layer_mask(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -169,7 +169,7 @@ pub async fn set_layer_mask(
     }
 }
 
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/opacity", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckOpacityBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/opacity", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckOpacityBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn set_opacity(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -187,7 +187,7 @@ pub async fn set_opacity(
     }
 }
 
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/blend-mode", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckBlendModeBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/blend-mode", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckBlendModeBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn set_blend_mode(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -205,7 +205,7 @@ pub async fn set_blend_mode(
     }
 }
 
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/solo", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckBoolBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/solo", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckBoolBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn set_solo(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -223,7 +223,7 @@ pub async fn set_solo(
     }
 }
 
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/mute", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckBoolBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/mute", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckBoolBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn set_mute(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -391,7 +391,7 @@ pub struct SetParamBody {
     pub value: crate::internal::params::ParamValue,
 }
 
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/image", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddImageDeckBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/image", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddImageDeckBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Decks")]
 pub async fn add_image_deck(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -407,7 +407,7 @@ pub async fn add_image_deck(
     }
 }
 
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/video", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddVideoDeckBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/video", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddVideoDeckBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Decks")]
 pub async fn add_video_deck(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -423,7 +423,7 @@ pub async fn add_video_deck(
     }
 }
 
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/solid", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddSolidColorDeckBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/solid", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddSolidColorDeckBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Decks")]
 pub async fn add_solid_color_deck(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -441,7 +441,7 @@ pub async fn add_solid_color_deck(
     }
 }
 
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/camera", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddCameraDeckBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/camera", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddCameraDeckBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Decks")]
 pub async fn add_camera_deck(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -460,7 +460,7 @@ pub async fn add_camera_deck(
     }
 }
 
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/depth", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddDepthSensorDeckBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Depth Sensors")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/depth", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddDepthSensorDeckBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Depth Sensors")]
 pub async fn add_depth_sensor_deck(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -478,7 +478,7 @@ pub async fn add_depth_sensor_deck(
     }
 }
 
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/screen", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddScreenCaptureDeckBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel or capture target not found")), tag = "Screen Capture")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/screen", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = AddScreenCaptureDeckBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel or capture target not found")), tag = "Screen Capture")]
 pub async fn add_screen_capture_deck(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -505,7 +505,7 @@ pub async fn add_screen_capture_deck(
     }
 }
 
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/tap", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = TapSourceRequestBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/tap", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = TapSourceRequestBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Decks")]
 pub async fn add_tap_deck(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -523,7 +523,7 @@ pub async fn add_tap_deck(
     }
 }
 
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/tap/source", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = TapSourceRequestBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found or is not a tap")), tag = "Decks")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/tap/source", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = TapSourceRequestBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found or is not a tap")), tag = "Decks")]
 pub async fn set_tap_source(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -541,7 +541,7 @@ pub async fn set_tap_source(
     }
 }
 
-#[utoipa::path(post, path = "/api/decks/{deck_uuid}/move", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = MoveDeckBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck or destination channel not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/decks/{deck_uuid}/move", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = MoveDeckBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck or destination channel not found")), tag = "Decks")]
 pub async fn move_deck(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -560,7 +560,7 @@ pub async fn move_deck(
     }
 }
 
-#[utoipa::path(put, path = "/api/channels/{channel_uuid}/decks/reorder", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ReorderDeckBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Decks")]
+#[utoipa::path(put, path = "/api/channels/{channel_uuid}/decks/reorder", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ReorderDeckBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Decks")]
 pub async fn reorder_deck(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -584,7 +584,7 @@ pub struct DeckRenderFpsBody {
     pub render_fps: DeckRenderFps,
 }
 
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/render-fps", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckRenderFpsBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/render-fps", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckRenderFpsBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn set_render_fps(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -609,7 +609,7 @@ pub struct DeckRenderScaleBody {
     pub scale: crate::engine::types::DeckRenderScale,
 }
 
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/render-scale", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckRenderScaleBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/render-scale", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckRenderScaleBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn set_render_scale(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -627,7 +627,7 @@ pub async fn set_render_scale(
     }
 }
 
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/transparent", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckBoolBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/transparent", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckBoolBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn set_transparent(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -651,7 +651,7 @@ pub struct DeckColorBody {
     pub color: [f32; 4],
 }
 
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/color", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckColorBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/color", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckColorBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn set_color(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -669,7 +669,7 @@ pub async fn set_color(
     }
 }
 
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/scaling-mode", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckScalingModeBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/scaling-mode", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DeckScalingModeBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn set_scaling_mode(
     State(state): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -687,7 +687,7 @@ pub async fn set_scaling_mode(
     }
 }
 
-#[utoipa::path(put, path = "/api/mixer/transition", request_body = SetTransitionBody, responses((status = 200, body = CommandResult)), tag = "Mixer")]
+#[utoipa::path(put, path = "/api/mixer/transition", request_body = SetTransitionBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Mixer")]
 pub async fn set_transition(
     State(state): State<SharedState>,
     Json(body): Json<SetTransitionBody>,
@@ -713,7 +713,7 @@ pub async fn set_transition(
 /// To write a generator or effect parameter's value as `/api/state` shows
 /// it, send `SetEffectParam` or `SetGeneratorParam` to `POST /api/command`;
 /// a whole number for an integer parameter is kept an integer.
-#[utoipa::path(put, path = "/api/params", request_body = SetParamBody, responses((status = 200, body = CommandResult)), tag = "Params")]
+#[utoipa::path(put, path = "/api/params", request_body = SetParamBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Params")]
 pub async fn set_param(
     State(state): State<SharedState>,
     Json(body): Json<SetParamBody>,
@@ -730,7 +730,8 @@ pub async fn set_param(
     }
 }
 
-/// Applies any `EngineCommand` sent as JSON and returns its `CommandResult`.
+/// Applies any `EngineCommand` sent as JSON, and answers as every route does
+/// (see `ApiReply`).
 ///
 /// The body is an externally-tagged `EngineCommand`, documented as unconstrained
 /// JSON: the enum has no `ToSchema` derive, and a hand-written approximation of
@@ -738,7 +739,7 @@ pub async fn set_param(
 /// routes for a documented body.
 #[utoipa::path(post, path = "/api/command",
     request_body = serde_json::Value,
-    responses((status = 200, body = CommandResult)),
+    responses((status = 200, body = crate::usecases::api::ApiReply)),
     tag = "System")]
 pub async fn generic_command(
     State(state): State<SharedState>,
@@ -752,7 +753,7 @@ pub async fn generic_command(
 
 // ── Video Playback ─────────────────────────────────────────────────
 
-#[utoipa::path(post, path = "/api/decks/{deck_uuid}/video/toggle-play", params(("deck_uuid" = String, Path, description = "Deck UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Video")]
+#[utoipa::path(post, path = "/api/decks/{deck_uuid}/video/toggle-play", params(("deck_uuid" = String, Path, description = "Deck UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Video")]
 pub async fn video_toggle_play(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -771,7 +772,7 @@ pub struct VideoSeekBody {
     /// Seek position in seconds from the start of the video.
     pub position_secs: f64,
 }
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/video/seek", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = VideoSeekBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Video")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/video/seek", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = VideoSeekBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Video")]
 pub async fn video_seek(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -794,7 +795,7 @@ pub struct VideoSpeedBody {
     /// Playback speed multiplier (1.0 = normal speed).
     pub speed: f64,
 }
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/video/speed", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = VideoSpeedBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Video")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/video/speed", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = VideoSpeedBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Video")]
 pub async fn video_set_speed(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -817,7 +818,7 @@ pub struct VideoLoopModeBody {
     /// Loop behaviour for the video.
     pub mode: crate::video::LoopMode,
 }
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/video/loop-mode", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = VideoLoopModeBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Video")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/video/loop-mode", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = VideoLoopModeBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Video")]
 pub async fn video_set_loop_mode(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -840,7 +841,7 @@ pub struct VideoPointBody {
     /// Time position in seconds.
     pub secs: f64,
 }
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/video/in-point", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = VideoPointBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Video")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/video/in-point", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = VideoPointBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Video")]
 pub async fn video_set_in_point(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -857,7 +858,7 @@ pub async fn video_set_in_point(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/video/out-point", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = VideoPointBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Video")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/video/out-point", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = VideoPointBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Video")]
 pub async fn video_set_out_point(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -874,7 +875,7 @@ pub async fn video_set_out_point(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(delete, path = "/api/decks/{deck_uuid}/video/in-out-points", params(("deck_uuid" = String, Path, description = "Deck UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Video")]
+#[utoipa::path(delete, path = "/api/decks/{deck_uuid}/video/in-out-points", params(("deck_uuid" = String, Path, description = "Deck UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Video")]
 pub async fn video_clear_in_out(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -902,7 +903,7 @@ pub struct VideoTransportSyncBody {
     params(("deck_uuid" = String, Path, description = "Deck UUID")),
     request_body = VideoTransportSyncBody,
     responses(
-        (status = 200, body = CommandResult),
+        (status = 200, body = crate::usecases::api::ApiReply),
         (status = 400, description = "Not a video deck"),
         (status = 404, description = "Deck not found")
     ),
@@ -935,7 +936,7 @@ pub async fn video_set_transport_sync(
     params(("deck_uuid" = String, Path, description = "Deck UUID")),
     request_body = crate::engine::value::video::AutoPlayback,
     responses(
-        (status = 200, body = CommandResult),
+        (status = 200, body = crate::usecases::api::ApiReply),
         (status = 400, description = "Not a clip"),
         (status = 404, description = "Deck not found")
     ),
@@ -964,7 +965,7 @@ pub struct AutoTransBoolBody {
     /// Boolean toggle value.
     pub value: bool,
 }
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/auto-transition/enabled", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = AutoTransBoolBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Auto Transitions")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/auto-transition/enabled", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = AutoTransBoolBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Auto Transitions")]
 pub async fn set_auto_transition_enabled(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -981,7 +982,7 @@ pub async fn set_auto_transition_enabled(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/auto-transition/trigger", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = AutoTransBoolBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Auto Transitions")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/auto-transition/trigger", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = AutoTransBoolBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Auto Transitions")]
 pub async fn set_auto_transition_trigger(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -1006,7 +1007,7 @@ pub struct DurationBody {
     /// Unit of the duration (seconds or beats).
     pub unit: crate::channel::DurationUnit,
 }
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/auto-transition/play-duration", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DurationBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Auto Transitions")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/auto-transition/play-duration", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DurationBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Auto Transitions")]
 pub async fn set_auto_transition_play_duration(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -1024,7 +1025,7 @@ pub async fn set_auto_transition_play_duration(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/auto-transition/duration", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DurationBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Auto Transitions")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/auto-transition/duration", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = DurationBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Auto Transitions")]
 pub async fn set_auto_transition_duration(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -1048,7 +1049,7 @@ pub struct ShaderNameBody {
     /// Shader name, or null to clear.
     pub shader_name: Option<String>,
 }
-#[utoipa::path(put, path = "/api/decks/{deck_uuid}/auto-transition/shader", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = ShaderNameBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Auto Transitions")]
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/auto-transition/shader", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = ShaderNameBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Auto Transitions")]
 pub async fn set_auto_transition_shader(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -1073,7 +1074,7 @@ pub struct NdiSourceBody {
     /// Name of the NDI source to receive.
     pub source_name: String,
 }
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/ndi", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = NdiSourceBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/ndi", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = NdiSourceBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Decks")]
 pub async fn add_ndi_deck(
     State(s): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -1096,7 +1097,7 @@ pub struct SyphonSourceBody {
     /// Name of the Syphon server to receive.
     pub server_name: String,
 }
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/syphon", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = SyphonSourceBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/syphon", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = SyphonSourceBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Decks")]
 pub async fn add_syphon_deck(
     State(s): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -1121,7 +1122,7 @@ pub struct SrtSourceBody {
     /// SRT connection mode (caller or listener).
     pub mode: crate::stream::SrtMode,
 }
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/srt", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = SrtSourceBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/srt", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = SrtSourceBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Decks")]
 pub async fn add_srt_deck(
     State(s): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -1145,7 +1146,7 @@ pub struct HlsSourceBody {
     /// HLS stream URL (.m3u8).
     pub url: String,
 }
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/hls", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = HlsSourceBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/hls", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = HlsSourceBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Decks")]
 pub async fn add_hls_deck(
     State(s): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -1168,7 +1169,7 @@ pub struct DashSourceBody {
     /// DASH stream URL (.mpd).
     pub url: String,
 }
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/dash", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = DashSourceBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/dash", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = DashSourceBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Decks")]
 pub async fn add_dash_deck(
     State(s): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -1193,7 +1194,7 @@ pub struct RtmpSourceBody {
     /// Connection mode (Pull or Listen).
     pub mode: crate::stream::RtmpMode,
 }
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/rtmp", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = RtmpSourceBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/rtmp", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = RtmpSourceBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Decks")]
 pub async fn add_rtmp_deck(
     State(s): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -1217,7 +1218,7 @@ pub struct HtmlSourceBody {
     /// HTML content URL or local file path.
     pub url: String,
 }
-#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/html", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = HtmlSourceBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/channels/{channel_uuid}/decks/html", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = HtmlSourceBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Decks")]
 pub async fn add_html_deck(
     State(s): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -1235,7 +1236,7 @@ pub async fn add_html_deck(
     }
 }
 
-#[utoipa::path(post, path = "/api/decks/{deck_uuid}/html/reload", params(("deck_uuid" = String, Path, description = "Deck UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/decks/{deck_uuid}/html/reload", params(("deck_uuid" = String, Path, description = "Deck UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn reload_html_deck(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -1256,7 +1257,7 @@ pub struct HtmlInteractiveBody {
     pub open: bool,
 }
 
-#[utoipa::path(post, path = "/api/decks/{deck_uuid}/html/interactive", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = HtmlInteractiveBody, responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Decks")]
+#[utoipa::path(post, path = "/api/decks/{deck_uuid}/html/interactive", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = HtmlInteractiveBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Decks")]
 pub async fn set_html_interactive(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -1280,7 +1281,7 @@ pub async fn set_html_interactive(
 /// Only a generated layer's (a shader source's) own; its effects — Transform,
 /// Crop and the rest — are left as they are. Reset an effect with
 /// `ResetEffectParams` to `POST /api/command`.
-#[utoipa::path(post, path = "/api/decks/{deck_uuid}/params/reset", params(("deck_uuid" = String, Path, description = "Deck UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")), tag = "Params")]
+#[utoipa::path(post, path = "/api/decks/{deck_uuid}/params/reset", params(("deck_uuid" = String, Path, description = "Deck UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")), tag = "Params")]
 pub async fn reset_generator_params(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -1307,7 +1308,7 @@ pub struct RequestAnalyzerBody {
 #[utoipa::path(post, path = "/api/decks/{deck_uuid}/analyzers",
     params(("deck_uuid" = String, Path, description = "Deck UUID")),
     request_body = RequestAnalyzerBody,
-    responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")),
+    responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")),
     tag = "Analyzers")]
 pub async fn request_analyzer(
     State(state): State<SharedState>,
@@ -1333,7 +1334,7 @@ pub async fn request_analyzer(
         ("deck_uuid" = String, Path, description = "Deck UUID"),
         ("analyzer_type" = String, Path, description = "Analyzer type to release"),
     ),
-    responses((status = 200, body = CommandResult), (status = 404, description = "Deck not found")),
+    responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Deck not found")),
     tag = "Analyzers")]
 pub async fn release_analyzer(
     State(state): State<SharedState>,
