@@ -2,6 +2,11 @@
 
 ## Reading the meters
 
+The expanded gear inspector now also has an **Equalizer** category, before
+Dynamics. EQ is disabled by default: high-pass, low/high shelves, three parametric
+bands, output trim and a draggable response graph. It runs before compression
+and the fader, leaving raw PFL untouched. See [EQ behavior and measurements](audio-equalizer.md).
+
 Input and output strip meters use a **dBFS** scale, separate from fader gain.
 The numbered scale includes a highlighted **−6 dBFS** mark. Green indicates
 levels below −12 dBFS, yellow the remaining headroom; red is a **0 dBFS or
@@ -20,16 +25,17 @@ For a target such as −6 dBFS, watch the **output bus** peak readout. A fader a
 0 dB means unity gain, not a signal at 0 dBFS. Internal floating-point inputs
 can exceed full scale without necessarily clipping until delivery; the red
 warning shows lost headroom, not proof of where distortion occurred. The
-Dynamics panel uses the same scale, but its Pre/Post FX taps are before the fader.
+Dynamics panel uses the same scale, with Pre/Post comp taps around compression,
+after EQ and before the fader. EQ has its own Pre/Post EQ meters.
 
-Audio effects are being designed separately; they are not available yet. See
-the [audio-processing proposal and implementation stages](audio-processing-plan.md)
-for the planned gear-accessed inspector, signal flow and regression checks.
+Sources and buses have opt-in **Equalizer** and **Dynamics** processing. Both
+default off, including in older shows. See [compressor behavior](audio-compressor.md),
+[EQ behavior](audio-equalizer.md) and the [implementation plan](audio-processing-plan.md).
 
-The audio branch's layout prototype keeps these existing settings in compact
-and expanded views. Use the square beside **×** to expand, or the overlapping
-squares to restore compact view. Expanded view has a **General** category on
-the left; no compressor or other processing page is implemented yet. The view
+The gear inspector keeps existing settings in compact and expanded views.
+Use the square beside **×** to expand, or the overlapping squares to restore
+compact view. Expanded view has **General**, **Equalizer** and **Dynamics**
+categories on the left. The view
 choice is remembered per source/bus during the current run, not across restarts.
 
 The **Audio Mixer** panel (under the Switcher in the Classic layout, beside the

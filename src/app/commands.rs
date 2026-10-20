@@ -610,8 +610,14 @@ impl VardaApp {
             EngineCommand::SetAudioBusCompressor { uuid, config } => {
                 self.cmd_set_audio_compressor(&uuid, true, config)
             }
+            EngineCommand::SetAudioBusEqualizer { uuid, config } => {
+                self.cmd_set_audio_equalizer(&uuid, true, config)
+            }
+            EngineCommand::SetAudioSourceEqualizer { uuid, config } => {
+                self.cmd_set_audio_equalizer(&uuid, false, config)
+            }
             EngineCommand::ResetAudioMeter { uuid, bus } => {
-                self.audio_mix.reset_meter(&uuid,bus);
+                self.audio_mix.reset_meter(&uuid, bus);
                 CommandResult::Ok
             }
             EngineCommand::SetAudioSourceCompressor { uuid, config } => {
@@ -2260,6 +2266,8 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::RenameAudioBus { .. }
             | C::SetAudioBusGain { .. }
             | C::SetAudioBusCompressor { .. }
+            | C::SetAudioBusEqualizer { .. }
+            | C::SetAudioSourceEqualizer { .. }
             | C::ResetAudioMeter { .. }
             | C::SetAudioSourceCompressor { .. }
             | C::SetAudioBusMute { .. }

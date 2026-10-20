@@ -91,10 +91,17 @@ pub(super) fn render_audio_mixer_section(
 
 /// Whose settings are open, from a strip's ⚙ (or the headphones).
 #[derive(Clone, PartialEq)]
-enum Settings {
+pub(super) enum Settings {
     Bus(String),
     Source(String),
     Headphones,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsPage {
+    General,
+    Equalizer,
+    Dynamics,
 }
 
 fn settings_id() -> egui::Id {
@@ -148,8 +155,11 @@ fn render_settings_window(ctx: &egui::Context, data: &UIData, actions: &mut UIAc
     };
     let view_id = egui::Id::new(("audio_settings_expanded", &key));
     let expanded = ctx.data(|data| data.get_temp::<bool>(view_id).unwrap_or(false));
-    let category_id = egui::Id::new(("audio_settings_dynamics", &key));
-    let mut dynamics = ctx.data(|data| data.get_temp::<bool>(category_id).unwrap_or(false));
+    let category_id = egui::Id::new(("audio_settings_page", &key));
+    let mut page = ctx.data(|data| {
+        data.get_temp::<SettingsPage>(category_id)
+            .unwrap_or(SettingsPage::General)
+    });
     let bounds = ctx.content_rect();
     let width =
         (if expanded { 640.0_f32 } else { 280.0_f32 }).min((bounds.width() - 24.0).max(100.0));
@@ -178,6 +188,9 @@ fn render_settings_window(ctx: &egui::Context, data: &UIData, actions: &mut UIAc
         .title_bar(false)
         .movable(false)
         .resizable(expanded);
+    if expanded {
+        window = window.default_height((bounds.height() - 96.0).clamp(0.0, 760.0));
+    }
     if let Some(position) = pending_position {
         window = window.current_pos(position);
     }
@@ -226,19 +239,35 @@ fn render_settings_window(ctx: &egui::Context, data: &UIData, actions: &mut UIAc
                         ui.vertical(|ui| {
                             ui.set_width(112.0);
                             ui.set_min_height(230.0_f32.min((bounds.height() - 100.0).max(0.0)));
-                            if ui.selectable_label(!dynamics, "General").clicked() {
-                                dynamics = false;
+                            if ui
+                                .selectable_label(page == SettingsPage::General, "General")
+                                .clicked()
+                            {
+                                page = SettingsPage::General;
                             }
                             if which != Settings::Headphones
-                                && ui.selectable_label(dynamics, "Dynamics").clicked()
+                                && ui
+                                    .selectable_label(page == SettingsPage::Equalizer, "Equalizer")
+                                    .clicked()
                             {
-                                dynamics = true;
+                                page = SettingsPage::Equalizer;
+                            }
+                            if which != Settings::Headphones
+                                && ui
+                                    .selectable_label(page == SettingsPage::Dynamics, "Dynamics")
+                                    .clicked()
+                            {
+                                page = SettingsPage::Dynamics;
                             }
                         });
                         ui.separator();
                         ui.vertical(|ui| {
                             ui.set_width(ui.available_width());
-                            if dynamics && which != Settings::Headphones {
+                            if page == SettingsPage::Equalizer && which != Settings::Headphones {
+                                super::audio_equalizer::render(ui, &which, data, actions);
+                            } else if page == SettingsPage::Dynamics
+                                && which != Settings::Headphones
+                            {
                                 render_dynamics_settings(ui, &which, data, actions);
                             } else {
                                 ui.heading("General settings");
@@ -259,7 +288,7 @@ fn render_settings_window(ctx: &egui::Context, data: &UIData, actions: &mut UIAc
             ctx.request_repaint();
         }
     }
-    ctx.data_mut(|data| data.insert_temp(category_id, dynamics));
+    ctx.data_mut(|data| data.insert_temp(category_id, page));
     if !open {
         ctx.memory_mut(|m| m.data.remove::<(Settings, egui::Pos2)>(settings_id()));
     }
@@ -344,7 +373,7 @@ fn render_dynamics_settings(
     );
     ui.separator();
     ui.horizontal_top(|ui|{
-        for (label,levels) in [("Pre FX",snapshot.pre_db),("Post FX",snapshot.post_db)] {
+        for (label,levels) in [("Pre comp",snapshot.pre_db),("Post comp",snapshot.post_db)] {
             ui.vertical(|ui|{
                 ui.set_width(100.0);
                 ui.label(label);
@@ -359,7 +388,7 @@ fn render_dynamics_settings(
                 .desired_width(135.0).text(format!("{:.1} dB",snapshot.reduction_db)));
             ui.label(egui::RichText::new("Peak hold · excludes makeup").small().weak());
         });
-    }).response.on_hover_text("Pre/Post FX are stereo sample peaks in dBFS before the fader. Raw PFL remains unprocessed. Reduction measures applied attenuation on non-silent samples, with display decay.");
+    }).response.on_hover_text("Pre/Post comp are stereo sample peaks around the compressor, after EQ and before the fader. Raw PFL remains unprocessed. Reduction excludes makeup, with transition smoothing and display decay.");
     if let Some(error) = &snapshot.error {
         ui.colored_label(egui::Color32::YELLOW, format!("Dry fallback: {error}"));
         ui.label("Toggle compression off/on to retry.");
@@ -1754,7 +1783,7 @@ fn strip_meter(
     response.clicked()
 }
 
-fn meter(
+pub(super) fn meter(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     meter_db: [f32; 2],
@@ -1805,11 +1834,7 @@ fn meter(
                 egui::Align2::RIGHT_CENTER,
                 format!("{db}"),
                 egui::FontId::proportional(8.5),
-                if db == -6 {
-                    egui::Color32::WHITE
-                } else {
-                    TICK
-                },
+                if db == -6 { egui::Color32::WHITE } else { TICK },
             );
         }
         painter.line_segment(
@@ -1851,8 +1876,13 @@ fn meter(
             );
         }
     }
-    painter.text(egui::pos2(rect.center().x,rect.bottom()-19.0),egui::Align2::CENTER_CENTER,
-        if held.is_some(){"Peak"}else{"Now"},egui::FontId::proportional(8.0),TICK);
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - 19.0),
+        egui::Align2::CENTER_CENTER,
+        if held.is_some() { "Peak" } else { "Now" },
+        egui::FontId::proportional(8.0),
+        TICK,
+    );
     painter.text(
         egui::pos2(rect.center().x, rect.bottom() - 6.0),
         egui::Align2::CENTER_CENTER,
@@ -2015,9 +2045,11 @@ mod tests {
 
     fn bus(uuid: &str, name: &str) -> AudioBusSnapshot {
         AudioBusSnapshot {
+            equalizer: crate::audio_mix::EqualizerSnapshot::default(),
             peak_db: [-20.0; 2],
             dynamics: crate::audio_mix::DynamicsSnapshot::default(),
             config: crate::audio_mix::AudioBusConfig {
+                equalizer: crate::audio_mix::EqualizerConfig::default(),
                 compressor: crate::audio_mix::CompressorConfig::default(),
                 uuid: uuid.into(),
                 name: name.into(),
@@ -2034,6 +2066,7 @@ mod tests {
 
     fn clip(uuid: &str, name: &str) -> AudioSourceSnapshot {
         AudioSourceSnapshot {
+            equalizer: crate::audio_mix::EqualizerSnapshot::default(),
             peak_db: [-96.0; 2],
             dynamics: crate::audio_mix::DynamicsSnapshot::default(),
             uuid: uuid.into(),
@@ -2174,8 +2207,8 @@ mod tests {
                 harness.get_by_label("General").rect().top()
                     < harness.get_by_label("Dynamics").rect().top()
             );
-            harness.get_by_label("Pre FX");
-            harness.get_by_label("Post FX");
+            harness.get_by_label("Pre comp");
+            harness.get_by_label("Post comp");
             harness.get_by_label("Enable compressor").click();
             harness.run();
         }
@@ -2214,6 +2247,123 @@ mod tests {
             |command| matches!(command,EngineCommand::SetAudioSourceCompressor{uuid:target,config}
             if target==&uuid && *config==crate::audio_mix::CompressorConfig::default())
         ));
+    }
+
+    #[test]
+    fn equalizer_navigation_is_local_and_enable_targets_the_selected_bus() {
+        let data = mixer_data();
+        let mut actions = UIActions::new();
+        {
+            let mut harness = harness(&data, &mut actions);
+            harness.run();
+            for label in ["Settings Master", "Expand audio settings", "Equalizer"] {
+                harness.get_by_label(label).click();
+                harness.run();
+            }
+            harness.get_by_label("Equalizer settings");
+            harness.get_by_label("EQ 2 point");
+            harness.get_by_label("Enable EQ").click();
+            harness.run();
+        }
+        assert_eq!(actions.commands.len(), 1, "{:?}", actions.commands);
+        assert!(pushed(
+            &actions,
+            |command| matches!(command,EngineCommand::SetAudioBusEqualizer{uuid,config} if uuid=="amaster1" && config.enabled)
+        ));
+    }
+
+    #[test]
+    fn equalizer_reset_targets_only_the_selected_source_and_disables_eq() {
+        let mut data = mixer_data();
+        data.audio_mix.sources[0].equalizer.config.enabled = true;
+        data.audio_mix.sources[0].equalizer.config.bands[1].gain_db = 6.0;
+        let uuid = data.audio_mix.sources[0].uuid.clone();
+        let name = data.audio_mix.sources[0].name.clone();
+        let actions = run(
+            &data,
+            &[
+                &format!("Settings {name}"),
+                "Expand audio settings",
+                "Equalizer",
+                "Reset EQ",
+            ],
+        );
+        assert_eq!(actions.commands.len(), 1, "{:?}", actions.commands);
+        assert!(pushed(
+            &actions,
+            |command| matches!(command,EngineCommand::SetAudioSourceEqualizer{uuid:target,config} if target==&uuid && *config==crate::audio_mix::EqualizerConfig::default())
+        ));
+    }
+
+    #[test]
+    fn dragging_an_eq_point_changes_its_real_band_without_enabling_the_whole_eq() {
+        let data = mixer_data();
+        let mut actions = UIActions::new();
+        {
+            let mut harness = harness(&data, &mut actions);
+            harness.run();
+            for label in ["Settings Master", "Expand audio settings", "Equalizer"] {
+                harness.get_by_label(label).click();
+                harness.run();
+            }
+            let from = harness.get_by_label("EQ 2 point").rect().center();
+            harness.hover_at(from);
+            harness.run_steps(2);
+            harness.drag_at(from);
+            harness.run_steps(2);
+            harness.hover_at(from + egui::vec2(15.0, -12.0));
+            harness.run_steps(2);
+            harness.drop_at(from + egui::vec2(15.0, -12.0));
+            harness.run_steps(2);
+        }
+        assert!(pushed(
+            &actions,
+            |command| matches!(command,EngineCommand::SetAudioBusEqualizer{uuid,config}
+            if uuid=="amaster1" && !config.enabled && config.bands[1].frequency_hz>1000.0 && config.bands[1].gain_db>1.0)
+        ));
+        assert!(actions
+            .commands
+            .iter()
+            .all(|command| matches!(command, EngineCommand::SetAudioBusEqualizer { .. })));
+    }
+
+    #[test]
+    #[ignore = "manual screenshot of the actual egui EQ implementation"]
+    fn render_equalizer_preview_image() {
+        let path = std::env::var("NIDA_EQ_PREVIEW_IMAGE")
+            .expect("Set NIDA_EQ_PREVIEW_IMAGE to a PNG output path");
+        let mut data = mixer_data();
+        let config = &mut data.audio_mix.buses[0].equalizer.config;
+        config.enabled = true;
+        config.high_pass = true;
+        config.low_shelf.gain_db = -2.0;
+        config.high_shelf.gain_db = 3.0;
+        for (band, gain) in config.bands.iter_mut().zip([-3.0, 2.0, -1.0]) {
+            band.gain_db = gain;
+        }
+        config.output_db = -2.0;
+        data.audio_mix.buses[0].equalizer.pre_db = [-9.0, -12.0];
+        data.audio_mix.buses[0].equalizer.post_db = [-11.0, -14.0];
+        data.audio_mix.buses[0].equalizer.ready = true;
+        let mut actions = UIActions::new();
+        {
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(1100.0, 1000.0))
+                .build_ui(|ui| render_audio_mixer_section(ui, &data, &mut actions));
+            harness.run();
+            for label in ["Settings Master", "Expand audio settings", "Equalizer"] {
+                harness.get_by_label(label).click();
+                harness.run();
+            }
+            harness.hover_at(egui::pos2(2.0, 2.0));
+            harness.run();
+            harness
+                .render()
+                .expect("GPU rendered EQ")
+                .save(path)
+                .expect("saved EQ PNG");
+        }
+        assert!(actions.commands.is_empty());
     }
 
     #[test]

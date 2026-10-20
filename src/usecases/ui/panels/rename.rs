@@ -268,6 +268,7 @@ mod tests {
             device_ok: None,
             meter_db: [f32::NEG_INFINITY; 2],
             peak_db: [-96.0;2],
+            equalizer:crate::audio_mix::EqualizerSnapshot::default(),
         }];
         let data = std::rc::Rc::new(data);
         let mut opened = false;

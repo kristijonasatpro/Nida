@@ -1567,6 +1567,7 @@ mod tests {
             live: true,
             meter_db: [-96.0, -96.0],
             peak_db: [-96.0;2],
+            equalizer:crate::audio_mix::EqualizerSnapshot::default(),
             refused: None,
         };
         let mut data = show();

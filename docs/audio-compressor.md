@@ -1,6 +1,6 @@
 # First Dynamics section
 
-Implementation for draft PR #11, isolated on `codex/audio-settings-upstream`.
+Experimental implementation for upstream review in PR #11.
 Open a source or bus gear, expand using the icon immediately left of X, then
 choose **Dynamics**, below **General**. Compact settings remain unchanged.
 Headphones have no compressor category. Opening/navigating does not change sound.
@@ -16,14 +16,17 @@ and disables compression. There is no auto makeup, sidechain or lookahead.
 FFmpeg's attack/release numbers describe its own detector coefficients, not
 guaranteed standard 63% time constants. This is not a safety limiter.
 
-- Sources: raw PFL -> compressor -> sync delay -> fader/balance/mute/Audio Auto
+- Sources: raw PFL -> EQ -> compressor -> sync delay -> fader/balance/mute/Audio Auto
   -> existing strip meter -> bus sends. Process once, regardless of send count.
-- Buses: sum -> compressor -> fader/mute -> existing bus meter -> normal
+- Buses: sum -> EQ -> compressor -> fader/mute -> existing bus meter -> normal
   headphones monitor -> sync delay -> output consumers.
-- Pre FX and Post FX show stereo **sample peaks**, before the fader, in dBFS.
+- Pre comp and Post comp show stereo **sample peaks** around compression,
+  after EQ and before the fader, in dBFS.
   They are decaying displays, not LUFS, RMS or true-peak measurements.
-- Gain reduction measures the applied linked attenuation on non-silent samples,
-  excluding makeup, with peak/display decay. It is not FFmpeg's private detector
+- Gain reduction displays linked compression attenuation on non-silent samples,
+  excluding makeup, with transition smoothing and peak/display decay. During a
+  transition it is a separate display envelope, not output divided by makeup.
+  It is not FFmpeg's private detector
   state; silence cannot reveal that state from input/output ratios.
 - Raw solo/PFL remains unprocessed. Normal bus monitoring includes bus effects.
   Legacy direct-device recording passthrough does not traverse the mixer and
@@ -40,9 +43,17 @@ recreate the rack. Real transport/media listening checks remain necessary.
 Graphs are prepared on the control thread outside the mix-core mutex. Parameters
 are validated before commands mutate settings; corrupt persisted values revert
 to disabled defaults. Graph parameter updates occur at a block boundary under
-the existing mutex. Applied gain and makeup transition over 960 samples (20 ms)
+the existing mutex. The combined compression-times-makeup output gain transitions
+over 960 samples (20 ms)
 when enabling, bypassing, editing, or falling back. This does not add sample
 delay and is not sample-accurate automation. Parameter edits are last-write-wins.
+
+Compression and makeup are not ramped independently and multiplied: that old
+path could exceed both endpoint gains, causing a temporary boost even when
+both endpoints were unity or quieter. Four regressions reproduce that bug in
+the old implementation and pass with combined-gain interpolation: compensated
+bypass/re-enable, opposing ratio/makeup edits, midstream failure and interrupted
+transitions. Stereo uses one shared gain; reduction metering excludes makeup.
 
 Initialization or processing failure keeps the source audible using dry fallback,
 with an error in Dynamics. Toggle off/on to retry; unrelated edits do not repeatedly
@@ -83,20 +94,29 @@ failure, frame timestamps/PCM reuse, multi-send/PFL and bus monitor routing,
 old-show defaults, persistence, reconnect and inspector command targeting.
 Tests require the actual FFmpeg filter and fail if unavailable, not silently skip.
 
-Windows integration validation on 20 October 2026: 93 focused mixer/UI/bus tests
-pass, including 21 new regression tests. Production library/binary Clippy with
+Windows validation on 20 October 2026: 89 focused mixer/UI/bus tests pass,
+including 17 new regression tests. Production library/binary Clippy with
 warnings denied and the debug binary build pass. The vendored wgpu-hal build
 script still emits its existing macro warnings. Static-curve assertions verify
 0.5 input -> approximately 0.1767767 output at a 0.125 threshold and 4:1 ratio
 (9.03 dB reduction), with preserved stereo ratio. These are signal correctness
 checks, not listening or whole-app performance measurements.
 
-Isolated upstream-base validation was attempted separately. Its older
-`mozjs_sys 0.140.8-2` dependency could not obtain its prebuilt Windows archive
-and then required unavailable MozTools/MozillaBuild. Tests and Clippy therefore
-did not complete on that base; the 93-test/Clippy/debug-build results above are
-from the combined Windows integration branch, not the isolated PR branch.
-The draft remains pending isolated-base CI and packaged listening checks.
+Subsequent EQ/review follow-up: four new transition regressions fail before the
+combined-gain fix and pass after it. The combined Windows integration has 116
+passing focused audio/UI tests; the standalone harness reusing the production
+compressor/EQ/reader modules has 35 passing tests. See the
+[combined block-service measurements](audio-equalizer-measurements.md).
+
+The audio UI now changes the full broadcast snapshot deliberately. Its existing
+Metal golden must be reviewed and regenerated on macOS; it has not been replaced
+with a Windows image or made more tolerant. Packaged macOS/Linux builds, native
+listening under rendering/streaming load and FFmpeg C-allocation profiling remain
+release gates. A zero Rust allocation count does not establish C-allocation-free
+processing. A fresh isolated upstream Windows check on 21 October reaches app
+code but fails on existing Unix-only DeckLink timing calls (`clock_gettime` /
+`CLOCK_THREAD_CPUTIME_ID`); the mozjs blocker was from an earlier attempt.
+The combined fork results are not that isolated build.
 
 The earlier standalone reference/probe measurements are in
 [`tools/audio-compressor-probe`](../tools/audio-compressor-probe/README.md).

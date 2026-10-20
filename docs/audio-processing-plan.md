@@ -1,15 +1,16 @@
 # Audio processing: design and implementation plan
 
-Status: layout approved; the local branch now implements the first FFmpeg
-compressor in the second, Dynamics category. See [compressor behavior and
-validation](audio-compressor.md). Later processors below remain proposals.
+Status: layout approved; the local branch implements FFmpeg compression and a
+parametric EQ. See [compressor behavior](audio-compressor.md) and
+[EQ behavior and validation](audio-equalizer.md). Other processors remain proposals.
 Prepared on 20 October 2026 on `codex/audio-improvements`, based on fork main
 `82c668d`. The initial prototype reuses the existing settings on one page with
 compact/expanded controls. It remembers the view per target within the current
 run; restart persistence is deferred until the layout is approved. Expand/restore
 sits immediately left of the close button in a shared header. Expanded mode has
 a left-hand General category and the existing settings on the right. Dynamics
-now adds compression and pre/post FX meters; no EQ or other DSP. Keep this work separate
+now adds compression and pre/post FX meters. Equalizer adds a high-pass, shelves,
+three bell bands, output trim and a response graph. Keep this work separate
 from the Windows GPU and Properties-layout PRs.
 
 Scheduled layout pass: 21 mixer UI tests pass, including header-button ordering,

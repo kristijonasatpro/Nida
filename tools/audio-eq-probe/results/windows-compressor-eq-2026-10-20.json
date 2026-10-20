@@ -1,0 +1,200 @@
+[
+  {
+    "name": "combined-1",
+    "metadata": {
+      "exit_code": 0,
+      "mode": "sources-and-buses",
+      "process_cpu_seconds": 15.484375,
+      "sampled_peak_working_set_bytes": 25714688,
+      "binary": "E:\\Custom Apps\\Nida\\target\\debug\\deps\\varda-1847810f59885d2c.exe",
+      "processor_count": 32,
+      "sha256": "BCB41FA7F6C73104CBF0A40F28AD7A70FC80DF7581FD18978D2D9C8A24326B2D",
+      "note": "Busy-loop audio probe, no playback clock/rendering/devices; CPU includes fixture refill and setup. Memory is sampled, not an allocator count.",
+      "wall_seconds": 15.6593925,
+      "compressor": true,
+      "test": "mixer_block_budget_probe"
+    },
+    "measurements": [
+      {
+        "mode": "sources-and-buses",
+        "compressors": true,
+        "sources": 1,
+        "buses": 2,
+        "blocks": 2000,
+        "p50_us": 328.5,
+        "p95_us": 371.8,
+        "p99_us": 406.8,
+        "max_us": 533.4,
+        "service_overruns_10ms": 0
+      },
+      {
+        "mode": "sources-and-buses",
+        "compressors": true,
+        "sources": 8,
+        "buses": 2,
+        "blocks": 2000,
+        "p50_us": 1153.4,
+        "p95_us": 1164.6,
+        "p99_us": 1238.1,
+        "max_us": 1518.9,
+        "service_overruns_10ms": 0
+      },
+      {
+        "mode": "sources-and-buses",
+        "compressors": true,
+        "sources": 16,
+        "buses": 2,
+        "blocks": 2000,
+        "p50_us": 1965.3,
+        "p95_us": 2125.6,
+        "p99_us": 2285.8,
+        "max_us": 3165.7,
+        "service_overruns_10ms": 0
+      },
+      {
+        "mode": "sources-and-buses",
+        "compressors": true,
+        "sources": 32,
+        "buses": 2,
+        "blocks": 2000,
+        "p50_us": 3725.8,
+        "p95_us": 3865.3,
+        "p99_us": 4017.8,
+        "max_us": 5853.7,
+        "service_overruns_10ms": 0
+      }
+    ]
+  },
+  {
+    "name": "combined-2",
+    "metadata": {
+      "exit_code": 0,
+      "mode": "sources-and-buses",
+      "process_cpu_seconds": 15.4375,
+      "sampled_peak_working_set_bytes": 25690112,
+      "binary": "E:\\Custom Apps\\Nida\\target\\debug\\deps\\varda-1847810f59885d2c.exe",
+      "processor_count": 32,
+      "sha256": "BCB41FA7F6C73104CBF0A40F28AD7A70FC80DF7581FD18978D2D9C8A24326B2D",
+      "note": "Busy-loop audio probe, no playback clock/rendering/devices; CPU includes fixture refill and setup. Memory is sampled, not an allocator count.",
+      "wall_seconds": 15.5140772,
+      "compressor": true,
+      "test": "mixer_block_budget_probe"
+    },
+    "measurements": [
+      {
+        "mode": "sources-and-buses",
+        "compressors": true,
+        "sources": 1,
+        "buses": 2,
+        "blocks": 2000,
+        "p50_us": 328.2,
+        "p95_us": 336.7,
+        "p99_us": 360.9,
+        "max_us": 532.2,
+        "service_overruns_10ms": 0
+      },
+      {
+        "mode": "sources-and-buses",
+        "compressors": true,
+        "sources": 8,
+        "buses": 2,
+        "blocks": 2000,
+        "p50_us": 1091.8,
+        "p95_us": 1127.2,
+        "p99_us": 1243.2,
+        "max_us": 1848.6,
+        "service_overruns_10ms": 0
+      },
+      {
+        "mode": "sources-and-buses",
+        "compressors": true,
+        "sources": 16,
+        "buses": 2,
+        "blocks": 2000,
+        "p50_us": 1964.2,
+        "p95_us": 2052,
+        "p99_us": 2157,
+        "max_us": 2831.2,
+        "service_overruns_10ms": 0
+      },
+      {
+        "mode": "sources-and-buses",
+        "compressors": true,
+        "sources": 32,
+        "buses": 2,
+        "blocks": 2000,
+        "p50_us": 3719.1,
+        "p95_us": 3860.7,
+        "p99_us": 4057.8,
+        "max_us": 5195.3,
+        "service_overruns_10ms": 0
+      }
+    ]
+  },
+  {
+    "name": "combined-3",
+    "metadata": {
+      "exit_code": 0,
+      "mode": "sources-and-buses",
+      "process_cpu_seconds": 15.40625,
+      "sampled_peak_working_set_bytes": 25706496,
+      "binary": "E:\\Custom Apps\\Nida\\target\\debug\\deps\\varda-1847810f59885d2c.exe",
+      "processor_count": 32,
+      "sha256": "BCB41FA7F6C73104CBF0A40F28AD7A70FC80DF7581FD18978D2D9C8A24326B2D",
+      "note": "Busy-loop audio probe, no playback clock/rendering/devices; CPU includes fixture refill and setup. Memory is sampled, not an allocator count.",
+      "wall_seconds": 15.5143766,
+      "compressor": true,
+      "test": "mixer_block_budget_probe"
+    },
+    "measurements": [
+      {
+        "mode": "sources-and-buses",
+        "compressors": true,
+        "sources": 1,
+        "buses": 2,
+        "blocks": 2000,
+        "p50_us": 331.1,
+        "p95_us": 371.2,
+        "p99_us": 419.6,
+        "max_us": 564.6,
+        "service_overruns_10ms": 0
+      },
+      {
+        "mode": "sources-and-buses",
+        "compressors": true,
+        "sources": 8,
+        "buses": 2,
+        "blocks": 2000,
+        "p50_us": 1089.1,
+        "p95_us": 1123.7,
+        "p99_us": 1176.5,
+        "max_us": 1724.7,
+        "service_overruns_10ms": 0
+      },
+      {
+        "mode": "sources-and-buses",
+        "compressors": true,
+        "sources": 16,
+        "buses": 2,
+        "blocks": 2000,
+        "p50_us": 1965.3,
+        "p95_us": 2034.6,
+        "p99_us": 2067.3,
+        "max_us": 2936.5,
+        "service_overruns_10ms": 0
+      },
+      {
+        "mode": "sources-and-buses",
+        "compressors": true,
+        "sources": 32,
+        "buses": 2,
+        "blocks": 2000,
+        "p50_us": 3719.8,
+        "p95_us": 3861.8,
+        "p99_us": 3967,
+        "max_us": 6430.6,
+        "service_overruns_10ms": 0
+      }
+    ]
+  }
+]

@@ -235,7 +235,7 @@ pub(super) struct Dynamics {
     processor: Option<Processor>,
     error: Option<String>,
     compression_gain: f64,
-    makeup_gain: f64,
+    output_gain: f64,
     transition: usize,
     gains: [f64; BLOCK_FRAMES],
     pre: Frame,
@@ -250,7 +250,7 @@ impl Default for Dynamics {
             processor: None,
             error: None,
             compression_gain: 1.0,
-            makeup_gain: 1.0,
+            output_gain: 1.0,
             transition: 0,
             gains: [1.0; BLOCK_FRAMES],
             pre: [0.0; 2],
@@ -320,13 +320,14 @@ impl Dynamics {
                 .iter()
                 .any(|sample| sample.is_finite() && sample.abs() > 1e-20);
             let target = if active { self.gains[position] } else { 1.0 };
+            let output_target = target * makeup;
             if self.transition > 0 {
                 self.compression_gain += (target - self.compression_gain) / self.transition as f64;
-                self.makeup_gain += (makeup - self.makeup_gain) / self.transition as f64;
+                self.output_gain += (output_target - self.output_gain) / self.transition as f64;
                 self.transition -= 1;
             } else {
                 self.compression_gain = target;
-                self.makeup_gain = makeup;
+                self.output_gain = output_target;
             }
             for channel in 0..2 {
                 pre[channel] = pre[channel].max(frame[channel].abs());
@@ -336,7 +337,7 @@ impl Dynamics {
                     } else {
                         0.0
                     };
-                    frame[channel] = (sample * self.compression_gain * self.makeup_gain) as f32;
+                    frame[channel] = (sample * self.output_gain) as f32;
                 }
                 post[channel] = post[channel].max(frame[channel].abs());
             }
@@ -539,6 +540,133 @@ mod tests {
         assert!(dynamics.needs_prepare(config));
         dynamics.configure(config, Some(Processor::new(config)));
         assert!(dynamics.snapshot().ready);
+    }
+
+    #[test]
+    fn compensated_compression_never_overshoots_during_bypass_or_enable() {
+        let config = CompressorConfig {
+            threshold_db: -48.0,
+            ratio: 10.0,
+            makeup_db: 24.0,
+            ..settings()
+        };
+        let mut dynamics = enabled(config);
+        let wet = settle(&mut dynamics)[BLOCK_FRAMES - 1];
+        assert!(wet[0] < 0.5);
+        for active in [false, true, false, true] {
+            dynamics.configure(
+                CompressorConfig {
+                    enabled: active,
+                    ..config
+                },
+                None,
+            );
+            for _ in 0..2 {
+                let mut block = [[0.5, -0.25]; BLOCK_FRAMES];
+                dynamics.process(&mut block);
+                for frame in block {
+                    assert!(
+                        (wet[0] - 1e-5..=0.50001).contains(&frame[0]),
+                        "{active}: {frame:?}"
+                    );
+                    assert!(
+                        (-0.25001..=wet[1] + 1e-5).contains(&frame[1]),
+                        "{active}: {frame:?}"
+                    );
+                    assert!((frame[1] + frame[0] * 0.5).abs() < 1e-6);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn opposing_ratio_and_makeup_edits_do_not_create_a_gain_bump() {
+        let config = CompressorConfig {
+            makeup_db: 20.0 * (0.5_f32 / (0.125 * 4.0_f32.powf(0.25))).log10(),
+            ..settings()
+        };
+        let mut dynamics = enabled(config);
+        let before = settle(&mut dynamics)[BLOCK_FRAMES - 1][0];
+        assert!((before - 0.5).abs() < 1e-5);
+        dynamics.configure(
+            CompressorConfig {
+                ratio: 1.0,
+                makeup_db: 0.0,
+                ..config
+            },
+            None,
+        );
+        for _ in 0..2 {
+            let mut block = [[0.5, -0.25]; BLOCK_FRAMES];
+            dynamics.process(&mut block);
+            for frame in block {
+                assert!((frame[0] - 0.5).abs() < 1e-5, "{frame:?}");
+                assert!((frame[1] + 0.25).abs() < 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn compensated_compressor_failure_returns_to_dry_without_overshoot() {
+        let mut dynamics = enabled(CompressorConfig {
+            threshold_db: -48.0,
+            ratio: 10.0,
+            makeup_db: 24.0,
+            ..settings()
+        });
+        let wet = settle(&mut dynamics)[BLOCK_FRAMES - 1][0];
+        dynamics
+            .processor
+            .as_mut()
+            .unwrap()
+            .source
+            .source()
+            .flush()
+            .unwrap();
+        for _ in 0..2 {
+            let mut block = [[0.5, -0.25]; BLOCK_FRAMES];
+            dynamics.process(&mut block);
+            assert!(
+                block
+                    .iter()
+                    .all(|frame| (wet - 1e-5..=0.50001).contains(&frame[0])),
+                "{block:?}"
+            );
+        }
+        assert!(dynamics.snapshot().error.is_some());
+        assert!(!dynamics.snapshot().ready);
+        assert_eq!(dynamics.compression_gain, 1.0);
+    }
+
+    #[test]
+    fn interrupted_compensated_bypass_continues_from_the_current_gain() {
+        let config = CompressorConfig {
+            threshold_db: -48.0,
+            ratio: 10.0,
+            makeup_db: 24.0,
+            ..settings()
+        };
+        let mut dynamics = enabled(config);
+        let mut previous = settle(&mut dynamics)[BLOCK_FRAMES - 1][0];
+        for active in [false, true, false, true, false, true] {
+            dynamics.configure(
+                CompressorConfig {
+                    enabled: active,
+                    ..config
+                },
+                None,
+            );
+            let mut block = [[0.5, -0.25]; BLOCK_FRAMES];
+            dynamics.process(&mut block);
+            for frame in block {
+                assert!(
+                    (frame[0] - previous).abs() < 0.001,
+                    "{previous} -> {frame:?}"
+                );
+                assert!((0.0..=0.50001).contains(&frame[0]));
+                previous = frame[0];
+            }
+        }
     }
 
     #[test]

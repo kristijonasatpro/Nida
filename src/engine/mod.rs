@@ -1737,6 +1737,14 @@ pub enum EngineCommand {
         uuid: String,
         config: crate::audio_mix::CompressorConfig,
     },
+    SetAudioBusEqualizer {
+        uuid: String,
+        config: crate::audio_mix::EqualizerConfig,
+    },
+    SetAudioSourceEqualizer {
+        uuid: String,
+        config: crate::audio_mix::EqualizerConfig,
+    },
     ResetAudioMeter {
         uuid: String,
         bus: bool,
