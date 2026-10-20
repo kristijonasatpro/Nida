@@ -142,39 +142,178 @@ fn render_settings_window(ctx: &egui::Context, data: &UIData, actions: &mut UIAc
         return;
     };
     let key = match &which {
-        Settings::Bus(uuid) | Settings::Source(uuid) => uuid.clone(),
+        Settings::Bus(uuid) => format!("bus_{uuid}"),
+        Settings::Source(uuid) => format!("source_{uuid}"),
         Settings::Headphones => "headphones".to_string(),
     };
+    let view_id = egui::Id::new(("audio_settings_expanded", &key));
+    let expanded = ctx.data(|data| data.get_temp::<bool>(view_id).unwrap_or(false));
+    let bounds = ctx.content_rect();
+    let width =
+        (if expanded { 640.0_f32 } else { 280.0_f32 }).min((bounds.width() - 24.0).max(100.0));
+    let position_id = egui::Id::new(("audio_settings_drag_position", &key, expanded));
+    let pending_position = ctx.data_mut(|data| data.remove_temp::<egui::Pos2>(position_id));
     let mut open = true;
-    egui::Window::new(format!("{title} — Audio"))
-        .id(egui::Id::new(("audio_strip_settings_window", key)))
-        .default_pos(at + egui::vec2(6.0, 0.0))
+    let mut window = egui::Window::new(format!("{title} — Audio"))
+        .id(egui::Id::new((
+            "audio_strip_settings_window",
+            &key,
+            expanded,
+        )))
+        .default_pos(if expanded {
+            bounds.center() - egui::vec2(width / 2.0, 180.0)
+        } else {
+            at + egui::vec2(6.0, 0.0)
+        })
+        .constrain_to(bounds)
+        .default_width(width)
+        .min_height(if expanded {
+            300.0_f32.min(bounds.height() - 40.0).max(0.0)
+        } else {
+            0.0
+        })
         .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.set_min_width(250.0);
-            match &which {
-                Settings::Bus(uuid) => {
-                    if let Some((i, bus)) = mix
-                        .buses
-                        .iter()
-                        .enumerate()
-                        .find(|(_, b)| &b.config.uuid == uuid)
-                    {
-                        bus_settings(ui, bus, i == 0, data, actions);
-                    }
+        .title_bar(false)
+        .movable(false)
+        .resizable(expanded);
+    if let Some(position) = pending_position {
+        window = window.current_pos(position);
+    }
+    let shown = window.show(ctx, |ui| {
+        ui.set_min_width(width);
+        let header = ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let close = ui.add_sized([28.0, 24.0], egui::Button::new("×"));
+                close.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        true,
+                        "Close audio settings",
+                    )
+                });
+                if close.on_hover_text("Close audio settings").clicked() {
+                    open = false;
                 }
-                Settings::Source(uuid) => {
-                    if let Some(source) = mix.sources.iter().find(|s| &s.uuid == uuid) {
-                        source_settings(ui, source, data, actions);
-                    }
+                if settings_view_button(ui, expanded).clicked() {
+                    ctx.data_mut(|data| data.insert_temp(view_id, !expanded));
+                    ctx.request_repaint();
                 }
-                Settings::Headphones => monitor_settings(ui, data, actions),
-            }
+                ui.add_sized(
+                    [ui.available_width(), 24.0],
+                    egui::Label::new(egui::RichText::new(format!("{title} — Audio")).strong())
+                        .truncate()
+                        .sense(egui::Sense::drag()),
+                )
+                .on_hover_text(&title)
+                .on_hover_cursor(egui::CursorIcon::Grab)
+                .drag_delta()
+            })
+            .inner
         });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt(("audio_settings_content", &key, expanded))
+            .max_height(
+                ui.available_height()
+                    .min((bounds.height() - 96.0).max(40.0))
+                    .max(40.0),
+            )
+            .show(ui, |ui| {
+                if expanded {
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(112.0);
+                            ui.set_min_height(230.0_f32.min((bounds.height() - 100.0).max(0.0)));
+                            let _ = ui.selectable_label(true, "General");
+                        });
+                        ui.separator();
+                        ui.vertical(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.heading("General settings");
+                            ui.add_space(8.0);
+                            render_strip_settings(ui, &which, data, actions);
+                        });
+                    });
+                } else {
+                    render_strip_settings(ui, &which, data, actions);
+                }
+            });
+        header.inner
+    });
+    if let Some(shown) = shown {
+        if let Some(delta) = shown.inner.filter(|delta| *delta != egui::Vec2::ZERO) {
+            ctx.data_mut(|data| data.insert_temp(position_id, shown.response.rect.min + delta));
+            ctx.request_repaint();
+        }
+    }
     if !open {
         ctx.memory_mut(|m| m.data.remove::<(Settings, egui::Pos2)>(settings_id()));
+    }
+}
+
+fn settings_view_button(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
+    let label = if expanded {
+        "Compact audio settings"
+    } else {
+        "Expand audio settings"
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 24.0), egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, visuals.bg_fill);
+    let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(12.0, 10.0));
+    if expanded {
+        painter.rect_stroke(
+            icon.translate(egui::vec2(2.0, -2.0)),
+            0.0,
+            visuals.fg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_filled(icon.translate(egui::vec2(-2.0, 2.0)), 0.0, visuals.bg_fill);
+        painter.rect_stroke(
+            icon.translate(egui::vec2(-2.0, 2.0)),
+            0.0,
+            visuals.fg_stroke,
+            egui::StrokeKind::Inside,
+        );
+    } else {
+        painter.rect_stroke(icon, 0.0, visuals.fg_stroke, egui::StrokeKind::Inside);
+        painter.line_segment(
+            [
+                icon.left_top() + egui::vec2(1.0, 2.0),
+                icon.right_top() + egui::vec2(-1.0, 2.0),
+            ],
+            visuals.fg_stroke,
+        );
+    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    response.on_hover_text(label)
+}
+
+fn render_strip_settings(
+    ui: &mut egui::Ui,
+    which: &Settings,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
+    let mix = &data.audio_mix;
+    match which {
+        Settings::Bus(uuid) => {
+            if let Some((i, bus)) = mix
+                .buses
+                .iter()
+                .enumerate()
+                .find(|(_, b)| &b.config.uuid == uuid)
+            {
+                bus_settings(ui, bus, i == 0, data, actions);
+            }
+        }
+        Settings::Source(uuid) => {
+            if let Some(source) = mix.sources.iter().find(|s| &s.uuid == uuid) {
+                source_settings(ui, source, data, actions);
+            }
+        }
+        Settings::Headphones => monitor_settings(ui, data, actions),
     }
 }
 
@@ -1708,6 +1847,82 @@ mod tests {
     /// An audio bus's name offers Rename… on a right-click — Master's too —
     /// and asks for the new name; a double-click does the same.
     #[test]
+    fn settings_views_share_controls_and_remember_the_last_view_without_commands() {
+        let data = mixer_data();
+        let mut actions = UIActions::new();
+        {
+            let mut harness = harness(&data, &mut actions);
+            harness.run();
+            harness.get_by_label("Settings Master").click();
+            harness.run();
+            let expand = harness.get_by_label("Expand audio settings").rect();
+            let close = harness.get_by_label("Close audio settings").rect();
+            assert!(expand.right() <= close.left());
+            assert!((expand.center().y - close.center().y).abs() < 1.0);
+            harness.get_by_label("Expand audio settings").click();
+            harness.run();
+            let restore = harness.get_by_label("Compact audio settings").rect();
+            let close = harness.get_by_label("Close audio settings").rect();
+            assert!(restore.right() <= close.left());
+            let category = harness.get_by_label("General").rect();
+            let content = harness.get_by_label("General settings").rect();
+            assert!(category.right() < content.left());
+            harness.get_by_label("General").click();
+            harness.run();
+            harness.get_by_value("Out: none");
+            harness.get_by_value("0 ms");
+            harness.get_by_label("Close audio settings").click();
+            harness.run();
+            harness.get_by_label("Settings Master").click();
+            harness.run();
+            harness.get_by_label("Compact audio settings").click();
+            harness.run();
+            harness.get_by_label("Expand audio settings");
+            assert!(harness.query_by_label("General settings").is_none());
+            harness.get_by_value("Out: none");
+        }
+        assert!(actions.commands.is_empty());
+    }
+
+    #[test]
+    fn settings_can_be_moved_by_the_shared_header_and_closed_without_audio_commands() {
+        let data = mixer_data();
+        let mut actions = UIActions::new();
+        {
+            let mut harness = harness(&data, &mut actions);
+            harness.run();
+            harness.get_by_label("Settings Master").click();
+            harness.run();
+            let before = harness.get_by_label("Close audio settings").rect();
+            let start = before.center() - egui::vec2(130.0, 0.0);
+            let offset = egui::vec2(35.0, 25.0);
+            harness.event(egui::Event::PointerMoved(start));
+            harness.event(egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.run_steps(3);
+            harness.event(egui::Event::PointerMoved(start + offset));
+            harness.run_steps(3);
+            harness.event(egui::Event::PointerButton {
+                pos: start + offset,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.run_steps(3);
+            let after = harness.get_by_label("Close audio settings").rect();
+            assert!((after.center() - before.center() - offset).length() < 2.0);
+            harness.get_by_label("Close audio settings").click();
+            harness.run();
+            assert!(harness.query_by_label("Expand audio settings").is_none());
+        }
+        assert!(actions.commands.is_empty());
+    }
+
+    #[test]
     fn an_audio_bus_can_be_renamed_from_its_name() {
         let data = mixer_data();
         let mut actions = UIActions::new();
@@ -1717,12 +1932,18 @@ mod tests {
         harness.run_steps(3);
         harness.get_by_label("Rename bus…").click();
         harness.run_steps(3);
-        assert_eq!(super::super::rename::renaming(&harness.ctx).as_deref(), Some("astream1"));
+        assert_eq!(
+            super::super::rename::renaming(&harness.ctx).as_deref(),
+            Some("astream1")
+        );
         harness.get_by_label("Master").click_secondary();
         harness.run_steps(3);
         harness.get_by_label("Rename bus…").click();
         harness.run_steps(3);
-        assert_eq!(super::super::rename::renaming(&harness.ctx).as_deref(), Some("amaster1"));
+        assert_eq!(
+            super::super::rename::renaming(&harness.ctx).as_deref(),
+            Some("amaster1")
+        );
     }
 
     #[test]

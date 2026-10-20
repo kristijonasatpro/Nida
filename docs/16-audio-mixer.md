@@ -1,5 +1,15 @@
 # Audio Mixer
 
+Audio effects are being designed separately; they are not available yet. See
+the [audio-processing proposal and implementation stages](audio-processing-plan.md)
+for the planned gear-accessed inspector, signal flow and regression checks.
+
+The audio branch's layout prototype keeps these existing settings in compact
+and expanded views. Use the square beside **×** to expand, or the overlapping
+squares to restore compact view. Expanded view has a **General** category on
+the left; no compressor or other processing page is implemented yet. The view
+choice is remembered per source/bus during the current run, not across restarts.
+
 The **Audio Mixer** panel (under the Switcher in the Classic layout, beside the
 inputs in vMix's) is laid out as vMix's: **OUTPUTS** — Master and the other
 buses — then **INPUTS**, one upright strip each. Each bus has its own fader,
