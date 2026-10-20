@@ -586,6 +586,15 @@ impl UIRunner {
                 varda.command_sender(),
                 varda.state_reader(),
             );
+            // The log says why, but an app opened from the Finder logs to a
+            // file no one is watching: the window says it too, once.
+            if self.api_handle.is_none() && !self.config.headless {
+                varda.session.notifications.notify_once(
+                    "api-off",
+                    crate::notifications::NotificationLevel::Warning,
+                    api_off(self.config.api_port),
+                );
+            }
         }
 
         self.gpu = Some(varda.gpu_context().clone());
@@ -1752,6 +1761,14 @@ struct Shown {
 /// rather than by the app bundle's environment.
 fn workspace_on_command_line() -> bool {
     std::env::args().any(|a| a == "--workspace" || a.starts_with("--workspace="))
+}
+
+/// What the window says when the HTTP API could not start on `port`.
+fn api_off(port: u16) -> String {
+    format!(
+        "No HTTP API: port {port} is busy, most likely with another program. Nothing can \
+         control Nida over HTTP until Nida is opened again with the port free."
+    )
 }
 
 /// Show `file` selected in Finder — or open its folder in the file manager

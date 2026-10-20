@@ -1787,6 +1787,20 @@ pub fn start(
 mod tests {
     use super::*;
 
+    /// What the window's notice that the API is off goes by (see the UI
+    /// runner's `finish_init`).
+    #[test]
+    fn a_port_in_use_leaves_the_api_off() {
+        let taken = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let started = start(
+            port,
+            mpsc::unbounded_channel().0,
+            Arc::new(RwLock::new(None)),
+        );
+        assert!(started.is_none(), "port {port} is taken");
+    }
+
     #[test]
     fn test_build_router_creates_valid_router() {
         let shared = SharedState {

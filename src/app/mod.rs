@@ -17,6 +17,7 @@ mod inputs;
 #[cfg(feature = "html")]
 pub(crate) mod interactive;
 mod keep_awake;
+pub mod log_file;
 pub(crate) mod monitors;
 mod outputs;
 pub(crate) mod render;
