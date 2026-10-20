@@ -24,6 +24,15 @@ reduction. These meter taps describe processor input/output, not pre/post fader;
 the existing strip/output meters remain distinct. Compression stays disabled by
 default. Benchmark and test the candidate before selecting the production DSP.
 
+Initial evaluation is now available in
+[`tools/audio-compressor-probe`](../tools/audio-compressor-probe/README.md):
+11 signal/bridge tests and repeatable release measurements of 1/8/16/32 stereo
+strips. The embedded FFmpeg compressor is a viable candidate on the tested
+Windows CPU, not yet integrated or production-qualified. Direct f64 bridging
+reduces typical service cost compared with automatic format conversions;
+runtime makeup changes are abrupt and need host smoothing. No application
+meters or DSP controls have been added by the probe.
+
 ## Product direction
 
 Build a dependable live-production channel strip, not a miniature DAW. Start
