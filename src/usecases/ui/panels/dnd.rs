@@ -439,7 +439,16 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
                         log::info!("Library drop (deferred): effect {filter_idx} -> {target:?}");
                         match select {
                             FxSelect::Deck(ch, dk) => actions.session.select_deck = Some((ch, dk)),
-                            FxSelect::Channel(ch) => actions.session.select_channel = Some(ch),
+                            FxSelect::Channel(ch) => {
+                                actions.session.select_channel = Some(ch);
+                                if let Some(channel) = data.channels.get(ch) {
+                                    super::effects::reveal_added_channel_effect(
+                                        ctx,
+                                        &channel.uuid,
+                                        &channel.effects,
+                                    );
+                                }
+                            }
                             FxSelect::Master => actions.session.select_master = true,
                         }
                         actions.commands.push(EngineCommand::AddEffect {

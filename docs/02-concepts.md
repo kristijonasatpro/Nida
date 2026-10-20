@@ -103,6 +103,12 @@ as `load_state` in API effect snapshots. Saved shows keep the effect and its
 settings, including edits made while loading, rather than the loading job.
 Show restore, effect paste and transition loading retain their existing paths.
 
+In **Properties**, a channel's effects run top to bottom in a vertical list.
+Each card can be collapsed; its grip reorders it and its checkbox bypasses it.
+Newly added effects are brought into view and briefly highlighted. The compact
+channel preview can be clicked to enlarge, and **Routing** expands the Send to
+controls. In narrow panels, **Preview and routing** collapses above the effects.
+
 ---
 
 ## Tonemapping & Color Grading
