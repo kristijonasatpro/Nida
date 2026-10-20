@@ -22,6 +22,24 @@ fn done(result: Result<(), AudioMixError>) -> CommandResult {
 }
 
 impl VardaApp {
+    pub fn cmd_set_audio_equalizer(
+        &mut self,
+        uuid: &str,
+        bus: bool,
+        config: crate::audio_mix::EqualizerConfig,
+    ) -> CommandResult {
+        if let Err(message) = config.validate() {
+            return CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                message: message.into(),
+            };
+        }
+        if bus {
+            self.cmd_edit_audio_bus(uuid, |target| target.equalizer = config)
+        } else {
+            self.cmd_edit_audio_source(uuid, |target| target.equalizer = config)
+        }
+    }
     /// Bring the mixer in line with this frame: which decks have sound, what
     /// is on air (see `on_air`), input devices and sound devices. Called once
     /// per rendered frame.
@@ -109,6 +127,25 @@ impl VardaApp {
     }
 
     // ── Commands ────────────────────────────────────────────────────
+
+    pub fn cmd_set_audio_compressor(
+        &mut self,
+        uuid: &str,
+        bus: bool,
+        config: crate::audio_mix::CompressorConfig,
+    ) -> CommandResult {
+        if let Err(message) = config.validate() {
+            return CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                message: message.into(),
+            };
+        }
+        if bus {
+            self.cmd_edit_audio_bus(uuid, |target| target.compressor = config)
+        } else {
+            self.cmd_edit_audio_source(uuid, |target| target.compressor = config)
+        }
+    }
 
     pub fn cmd_add_audio_bus(&mut self, name: &str) -> CommandResult {
         CommandResult::OkWithId {

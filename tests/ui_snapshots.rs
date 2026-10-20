@@ -426,7 +426,10 @@ fn broadcast_audio_mix(data: &UIData) -> varda::audio_mix::AudioMixSnapshot {
         AudioBusConfig, AudioBusSnapshot, AudioMixSnapshot, AudioSourceKind, AudioSourceSnapshot,
     };
     let bus = |uuid: &str, name: &str, gain_db: f32, meter: f32| AudioBusSnapshot {
+        dynamics: varda::audio_mix::DynamicsSnapshot::default(),
         config: AudioBusConfig {
+            compressor: varda::audio_mix::CompressorConfig::default(),
+            equalizer:varda::audio_mix::EqualizerConfig::default(),
             uuid: uuid.into(),
             name: name.into(),
             gain_db,
@@ -437,9 +440,12 @@ fn broadcast_audio_mix(data: &UIData) -> varda::audio_mix::AudioMixSnapshot {
         },
         device_ok: Some(true),
         meter_db: [meter, meter - 2.0],
+        peak_db: [meter,meter-2.0],
+        equalizer:varda::audio_mix::EqualizerSnapshot::default(),
     };
     let clip =
         |deck: &str, name: &str, on_air: f32, gain_db: f32, meter: f32| AudioSourceSnapshot {
+            dynamics: varda::audio_mix::DynamicsSnapshot::default(),
             uuid: deck.into(),
             name: name.into(),
             kind: AudioSourceKind::Clip {
@@ -457,6 +463,8 @@ fn broadcast_audio_mix(data: &UIData) -> varda::audio_mix::AudioMixSnapshot {
             solo: false,
             live: true,
             meter_db: [meter, meter - 1.5],
+            peak_db: [meter,meter-1.5],
+            equalizer:varda::audio_mix::EqualizerSnapshot::default(),
             refused: None,
         };
     let deck = |ch: usize| data.channels[ch].decks[0].uuid.clone();

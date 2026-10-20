@@ -1,0 +1,32 @@
+libavutil version (packed): 3998054
++-----------+
+|    in     |default--[48000Hz flt:stereo]--auto_aresample_0:default
+| (abuffer) |
++-----------+
+
+                                                       +---------------+
+Parsed_aformat_1:default--[48000Hz flt:stereo]--default|      out      |
+                                                       | (abuffersink) |
+                                                       +---------------+
+
+                                                       +------------------+
+auto_aresample_0:default--[48000Hz dbl:stereo]--default| acompressor@comp |default--[48000Hz dbl:stereo]--auto_aresample_1:default
+                                                       |  (acompressor)   |
+                                                       +------------------+
+
+                                                       +------------------+
+auto_aresample_1:default--[48000Hz flt:stereo]--default| Parsed_aformat_1 |default--[48000Hz flt:stereo]--out:default
+                                                       |    (aformat)     |
+                                                       +------------------+
+
+                                         +------------------+
+in:default--[48000Hz flt:stereo]--default| auto_aresample_0 |default--[48000Hz dbl:stereo]--acompressor@comp:default
+                                         |   (aresample)    |
+                                         +------------------+
+
+                                                       +------------------+
+acompressor@comp:default--[48000Hz dbl:stereo]--default| auto_aresample_1 |default--[48000Hz flt:stereo]--Parsed_aformat_1:default
+                                                       |   (aresample)    |
+                                                       +------------------+
+
+

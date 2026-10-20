@@ -5,6 +5,7 @@
 
 mod add_input;
 mod arrangement;
+mod audio_equalizer;
 mod audio_mixer;
 mod bottom_bar;
 mod channel_settings;

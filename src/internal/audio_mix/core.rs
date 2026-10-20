@@ -147,6 +147,9 @@ impl InputFeed {
 
 /// One source strip: a feed with its fader, mute and bus sends.
 pub struct Source {
+    pub(super) equalizer: super::equalizer::Equalizer,
+    pub(super) held_peak: Frame,
+    pub(super) dynamics: super::dynamics::Dynamics,
     /// Deck UUID for a clip; the input's own UUID for a capture device.
     pub uuid: String,
     pub feed: Feed,
@@ -181,6 +184,9 @@ impl Source {
         Self {
             uuid: uuid.into(),
             feed,
+            dynamics: super::dynamics::Dynamics::default(),
+            equalizer: super::equalizer::Equalizer::default(),
+            held_peak: [0.0; 2],
             gain_db: 0.0,
             muted: false,
             sends: Vec::new(),
@@ -258,6 +264,9 @@ impl OutputRing {
 /// One bus: the sum of what is sent to it, with its own fader, mute and delay,
 /// going to sound devices and to recordings and streams.
 pub struct Bus {
+    pub(super) equalizer: super::equalizer::Equalizer,
+    pub(super) held_peak: Frame,
+    pub(super) dynamics: super::dynamics::Dynamics,
     pub uuid: String,
     pub gain_db: f32,
     pub muted: bool,
@@ -278,6 +287,9 @@ impl Bus {
         Self {
             uuid: uuid.into(),
             gain_db: 0.0,
+            dynamics: super::dynamics::Dynamics::default(),
+            equalizer: super::equalizer::Equalizer::default(),
+            held_peak: [0.0; 2],
             muted: false,
             delay_ms: 0.0,
             outputs: Vec::new(),
@@ -421,7 +433,8 @@ impl MixCore {
     /// there on; and the sound held back by delays ages through them, so what
     /// was held comes out no later than it would have.
     pub fn skipped(&mut self, blocks: u64, from: std::time::Instant) {
-        let block = std::time::Duration::from_secs_f64(BLOCK_FRAMES as f64 / f64::from(SAMPLE_RATE));
+        let block =
+            std::time::Duration::from_secs_f64(BLOCK_FRAMES as f64 / f64::from(SAMPLE_RATE));
         #[allow(clippy::cast_possible_truncation)] // A few seconds of frames at most.
         let frames = (blocks as usize) * BLOCK_FRAMES;
         for source in &mut self.sources {
@@ -439,7 +452,8 @@ impl MixCore {
                     .opened
                     .checked_duration_since(from)
                     .map_or(0.0, |since| since.as_secs_f64() / block.as_secs_f64());
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Positive, small.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                // Positive, small.
                 let owed = blocks.saturating_sub(before.ceil() as u64);
                 let samples = owed * BLOCK_FRAMES as u64 * 2;
                 tap.lost_samples.fetch_add(samples, Ordering::Relaxed);
@@ -467,11 +481,15 @@ impl MixCore {
             if source.solo {
                 add_into(&mut self.solo_sum, &self.scratch);
             }
+            source.equalizer.process(&mut self.scratch);
+            source.dynamics.process(&mut self.scratch);
             source.delay.run(&mut self.scratch, source.delay_ms);
             let target = source.target_gain();
             let peak = ramp_sides(&mut self.scratch, source.current, target);
             source.current = target;
             source.meter = fall(source.meter, peak);
+            source.held_peak =
+                std::array::from_fn(|channel| source.held_peak[channel].max(peak[channel]));
             for send in &source.sends {
                 if let Some(i) = self.buses.iter().position(|b| &b.uuid == send) {
                     for (acc, frame) in self.sums[i].iter_mut().zip(&self.scratch) {
@@ -498,6 +516,8 @@ impl MixCore {
         };
 
         for (bus, sum) in self.buses.iter_mut().zip(&mut self.sums) {
+            bus.equalizer.process(sum);
+            bus.dynamics.process(sum);
             let target = if bus.muted {
                 0.0
             } else {
@@ -506,6 +526,8 @@ impl MixCore {
             let peak = ramp(sum, bus.current, target);
             bus.current = target;
             bus.meter = fall(bus.meter, peak);
+            bus.held_peak =
+                std::array::from_fn(|channel| bus.held_peak[channel].max(peak[channel]));
             if !soloing && listen.as_deref() == Some(bus.uuid.as_str()) {
                 heard.copy_from_slice(sum);
             }
@@ -556,7 +578,8 @@ impl DelayLine {
         } else {
             0.0
         };
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // At most a second's frames.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // At most a second's frames.
         let frames = (f64::from(ms) / 1000.0 * f64::from(SAMPLE_RATE)).round() as usize;
         if frames == 0 {
             self.held.clear();
@@ -671,6 +694,160 @@ mod tests {
         [s[s.len() - 2], s[s.len() - 1]]
     }
 
+    #[test]
+    fn source_compression_is_once_before_sends_and_fader_but_not_raw_pfl() {
+        let (mut source, _) = fifo_source("mic", 0.5, 20);
+        source.sends = vec!["main".into(), "aux".into()];
+        source.solo = true;
+        source.gain_db = -6.0;
+        let config = super::super::CompressorConfig {
+            enabled: true,
+            threshold_db: -18.0618,
+            ratio: 4.0,
+            attack_ms: 0.1,
+            knee_db: 0.0,
+            ..super::super::CompressorConfig::default()
+        };
+        source
+            .dynamics
+            .configure(config, Some(super::super::dynamics::Processor::new(config)));
+        let mut core = core_with(vec![source], &["main", "aux"]);
+        let main = core.tap("main").unwrap();
+        let aux = core.tap("aux").unwrap();
+        let phones = core.tap_monitor();
+        for _ in 0..8 {
+            core.process_block();
+        }
+        let expected = 0.1767767 * db_to_gain(-6.0);
+        assert!((last_frame(&main)[0] - expected).abs() < 1e-4);
+        assert!((last_frame(&aux)[0] - expected).abs() < 1e-4);
+        assert!((last_frame(&phones)[0] - 0.5).abs() < 1e-5);
+        assert!((core.source("mic").unwrap().dynamics.snapshot().pre_db[0] + 6.0206).abs() < 1e-3);
+    }
+
+    #[test]
+    fn bus_compression_reaches_outputs_and_normal_monitor_before_delay() {
+        let (mut source, _) = fifo_source("mic", 0.5, 20);
+        source.sends = vec!["main".into()];
+        let mut core = core_with(vec![source], &["main"]);
+        let config = super::super::CompressorConfig {
+            enabled: true,
+            threshold_db: -18.0618,
+            ratio: 4.0,
+            attack_ms: 0.1,
+            knee_db: 0.0,
+            ..super::super::CompressorConfig::default()
+        };
+        let bus = core.bus_mut("main").unwrap();
+        bus.dynamics
+            .configure(config, Some(super::super::dynamics::Processor::new(config)));
+        bus.gain_db = -6.0;
+        bus.delay_ms = 100.0;
+        let main = core.tap("main").unwrap();
+        let phones = core.tap_monitor();
+        for _ in 0..8 {
+            core.process_block();
+        }
+        let expected = 0.1767767 * db_to_gain(-6.0);
+        assert!((last_frame(&phones)[0] - expected).abs() < 1e-4);
+        assert_eq!(last_frame(&main), [0.0, 0.0]);
+        for _ in 0..8 {
+            core.process_block();
+        }
+        assert!((last_frame(&main)[0] - expected).abs() < 1e-4);
+    }
+
+    #[test]
+    fn equalizer_precedes_compression_and_fader_once_for_all_sends_but_not_pfl() {
+        let fixture: Vec<Frame> = (0..BLOCK_FRAMES)
+            .map(|index| {
+                let sample = (std::f32::consts::TAU * index as f32 / 48.0).sin() * 0.5;
+                [sample, sample * 0.5]
+            })
+            .collect();
+        let (mut source, fifo) = fifo_source("mic", 0.0, 0);
+        source.sends = vec!["main".into(), "aux".into()];
+        source.solo = true;
+        source.gain_db = -6.0;
+        let mut eq = super::super::EqualizerConfig {
+            enabled: true,
+            ..super::super::EqualizerConfig::default()
+        };
+        eq.bands[1].gain_db = -6.0;
+        let comp = super::super::CompressorConfig {
+            enabled: true,
+            ..super::super::CompressorConfig::default()
+        };
+        drop(
+            source
+                .equalizer
+                .configure(eq, Some(super::super::equalizer::Processor::prepare(eq))),
+        );
+        source
+            .dynamics
+            .configure(comp, Some(super::super::dynamics::Processor::new(comp)));
+        let mut reference_eq = super::super::equalizer::Equalizer::default();
+        drop(reference_eq.configure(eq, Some(super::super::equalizer::Processor::prepare(eq))));
+        let mut reference_comp = super::super::dynamics::Dynamics::default();
+        reference_comp.configure(comp, Some(super::super::dynamics::Processor::new(comp)));
+        let mut core = core_with(vec![source], &["main", "aux"]);
+        let main = core.tap("main").unwrap();
+        let aux = core.tap("aux").unwrap();
+        let phones = core.tap_monitor();
+        let mut expected = fixture.clone();
+        for _ in 0..20 {
+            fifo.lock().unwrap().extend(fixture.iter().copied());
+            expected.clone_from(&fixture);
+            reference_eq.process(&mut expected);
+            reference_comp.process(&mut expected);
+            core.process_block();
+        }
+        let expected = expected[BLOCK_FRAMES - 1].map(|sample| sample * db_to_gain(-6.0));
+        for actual in [last_frame(&main), last_frame(&aux)] {
+            for channel in 0..2 {
+                assert!((actual[channel] - expected[channel]).abs() < 1e-6);
+            }
+        }
+        assert_eq!(last_frame(&phones), fixture[BLOCK_FRAMES - 1]);
+        assert!(core
+            .source("mic")
+            .unwrap()
+            .equalizer
+            .snapshot()
+            .error
+            .is_none());
+    }
+
+    #[test]
+    fn bus_equalizer_reaches_output_and_monitor_before_the_output_delay() {
+        let (mut source, _) = fifo_source("mic", 0.125, 30);
+        source.sends = vec!["main".into()];
+        let mut core = core_with(vec![source], &["main"]);
+        let mut eq = super::super::EqualizerConfig {
+            enabled: true,
+            ..super::super::EqualizerConfig::default()
+        };
+        eq.low_shelf.gain_db = 6.0;
+        let bus = core.bus_mut("main").unwrap();
+        bus.gain_db = -6.0;
+        bus.delay_ms = 100.0;
+        drop(
+            bus.equalizer
+                .configure(eq, Some(super::super::equalizer::Processor::prepare(eq))),
+        );
+        let main = core.tap("main").unwrap();
+        let phones = core.tap_monitor();
+        for _ in 0..8 {
+            core.process_block();
+        }
+        assert!((last_frame(&phones)[0] - 0.125).abs() < 0.002);
+        assert_eq!(last_frame(&main), [0.0; 2]);
+        for _ in 0..12 {
+            core.process_block();
+        }
+        assert!((last_frame(&main)[0] - 0.125).abs() < 0.002);
+    }
+
     /// A source held back by 100 ms reaches its bus 100 ms after one that is
     /// not, the same moment's sound; pre-fader listen hears it at once.
     #[test]
@@ -703,8 +880,14 @@ mod tests {
         }
         let out = first_loud(&master).expect("heard on Master");
         let heard = first_loud(&phones).expect("heard in the headphones");
-        assert!((heard - 4.0 * block_ms).abs() < 0.5, "PFL at once: {heard} ms");
-        assert!((out - heard - 100.0).abs() < 0.5, "Master {out} ms, PFL {heard} ms");
+        assert!(
+            (heard - 4.0 * block_ms).abs() < 0.5,
+            "PFL at once: {heard} ms"
+        );
+        assert!(
+            (out - heard - 100.0).abs() < 0.5,
+            "Master {out} ms, PFL {heard} ms"
+        );
     }
 
     /// Time the mixer jumped over is told to every tap open then, with the
@@ -923,6 +1106,130 @@ mod tests {
             core.source("mic").unwrap().meter()[0] < 0.1,
             "a second later it has fallen"
         );
+    }
+
+    #[test]
+    fn over_full_scale_peaks_survive_until_ui_reads_them() {
+        let (mut source, fifo) = fifo_source("mic", 1.25, 4);
+        source.sends = vec!["m".into()];
+        let mut core = core_with(vec![source], &["m"]);
+        core.process_block();
+        core.process_block();
+        fifo.lock().unwrap().clear();
+        for _ in 0..100 {
+            core.process_block();
+        }
+        assert!(core.bus("m").unwrap().meter()[0] < 1.0);
+        assert_eq!(core.bus("m").unwrap().held_peak, [1.25; 2]);
+        assert_eq!(core.source("mic").unwrap().held_peak, [1.25; 2]);
+    }
+
+    #[test]
+    #[ignore = "manual service-time probe; run alone with --nocapture"]
+    fn mixer_block_budget_probe() {
+        let blocks: usize = std::env::var("NIDA_AUDIO_PROBE_BLOCKS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2000);
+        assert!(blocks >= 100);
+        let mode = std::env::var("NIDA_AUDIO_PROBE_EQ").unwrap_or_else(|_| "disabled".into());
+        let compress = std::env::var_os("NIDA_AUDIO_PROBE_COMPRESSOR").is_some();
+        let compressor = super::super::CompressorConfig {
+            enabled: true,
+            threshold_db: -36.0,
+            ratio: 4.0,
+            attack_ms: 10.0,
+            release_ms: 100.0,
+            makeup_db: 3.0,
+            ..super::super::CompressorConfig::default()
+        };
+        assert!(["disabled", "sources", "sources-and-buses"].contains(&mode.as_str()));
+        for count in [1, 8, 16, 32] {
+            let mut sources = Vec::new();
+            let mut fifos = Vec::new();
+            for index in 0..count {
+                let (mut source, fifo) = fifo_source(&format!("probe-{index}"), 0.0, 0);
+                source.sends = vec!["main".into(), "aux".into()];
+                if compress {
+                    source.dynamics.configure(
+                        compressor,
+                        Some(super::super::dynamics::Processor::new(compressor)),
+                    );
+                }
+                if mode != "disabled" {
+                    let config = super::super::equalizer::fixture_config();
+                    drop(source.equalizer.configure(
+                        config,
+                        Some(super::super::equalizer::Processor::prepare(config)),
+                    ));
+                }
+                sources.push(source);
+                fifos.push(fifo);
+            }
+            let mut core = core_with(sources, &["main", "aux"]);
+            if compress {
+                for bus in &mut core.buses {
+                    bus.dynamics.configure(
+                        compressor,
+                        Some(super::super::dynamics::Processor::new(compressor)),
+                    );
+                }
+            }
+            if mode == "sources-and-buses" {
+                for bus in &mut core.buses {
+                    let config = super::super::equalizer::fixture_config();
+                    drop(bus.equalizer.configure(
+                        config,
+                        Some(super::super::equalizer::Processor::prepare(config)),
+                    ));
+                }
+            }
+            let fixture: Vec<Frame> = (0..BLOCK_FRAMES)
+                .map(|index| {
+                    let phase = std::f32::consts::TAU * index as f32 / 48.0;
+                    [0.02 * phase.sin(), 0.015 * (phase + 0.5).sin()]
+                })
+                .collect();
+            let mut times = Vec::with_capacity(blocks);
+            for index in 0..blocks + 100 {
+                for fifo in &fifos {
+                    fifo.lock().unwrap().extend(fixture.iter().copied());
+                }
+                let start = std::time::Instant::now();
+                core.process_block();
+                let elapsed = start.elapsed().as_secs_f64() * 1e6;
+                std::hint::black_box(&core);
+                if index >= 100 {
+                    times.push(elapsed);
+                }
+            }
+            if mode != "disabled" {
+                assert!(core
+                    .sources
+                    .iter()
+                    .all(|source| source.equalizer.snapshot().ready
+                        && source.equalizer.snapshot().error.is_none()));
+            }
+            if mode == "sources-and-buses" {
+                assert!(core.buses.iter().all(|bus| bus.equalizer.snapshot().ready
+                    && bus.equalizer.snapshot().error.is_none()));
+            }
+            if compress {
+                assert!(core
+                    .sources
+                    .iter()
+                    .all(|source| source.dynamics.snapshot().ready
+                        && source.dynamics.snapshot().error.is_none()));
+                assert!(core
+                    .buses
+                    .iter()
+                    .all(|bus| bus.dynamics.snapshot().ready
+                        && bus.dynamics.snapshot().error.is_none()));
+            }
+            times.sort_by(f64::total_cmp);
+            println!("{{\"mode\":\"{mode}\",\"compressors\":{compress},\"sources\":{count},\"buses\":2,\"blocks\":{blocks},\"p50_us\":{:.3},\"p95_us\":{:.3},\"p99_us\":{:.3},\"max_us\":{:.3},\"service_overruns_10ms\":{}}}",
+                times[blocks/2],times[blocks*95/100],times[blocks*99/100],times[blocks-1],times.iter().filter(|time|**time>10_000.0).count());
+        }
     }
 
     #[test]

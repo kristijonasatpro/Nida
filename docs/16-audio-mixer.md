@@ -1,5 +1,43 @@
 # Audio Mixer
 
+## Reading the meters
+
+The expanded gear inspector now also has an **Equalizer** category, before
+Dynamics. EQ is disabled by default: high-pass, low/high shelves, three parametric
+bands, output trim and a draggable response graph. It runs before compression
+and the fader, leaving raw PFL untouched. See [EQ behavior and measurements](audio-equalizer.md).
+
+Input and output strip meters use a **dBFS** scale, separate from fader gain.
+The numbered scale includes a highlighted **−6 dBFS** mark. Green indicates
+levels below −12 dBFS, yellow the remaining headroom; red is a **0 dBFS or
+higher** warning, not a −6 dBFS warning. These are sample peaks, not true peak
+or perceived loudness (LUFS).
+
+Stereo bars show decaying post-fader levels. White markers and the **Peak**
+number below each meter hold the highest level since reset (the number is the
+higher of L/R). Hover for separate L/R values; click the meter to reset its
+peak markers and full-scale warning without changing audio. Peaks are captured
+on the audio thread, so a transient between UI refreshes is not lost. They are
+session telemetry, not saved show settings. Source replacement/show load clears
+them; ordinary fader edits do not.
+
+For a target such as −6 dBFS, watch the **output bus** peak readout. A fader at
+0 dB means unity gain, not a signal at 0 dBFS. Internal floating-point inputs
+can exceed full scale without necessarily clipping until delivery; the red
+warning shows lost headroom, not proof of where distortion occurred. The
+Dynamics panel uses the same scale, with Pre/Post comp taps around compression,
+after EQ and before the fader. EQ has its own Pre/Post EQ meters.
+
+Sources and buses have opt-in **Equalizer** and **Dynamics** processing. Both
+default off, including in older shows. See [compressor behavior](audio-compressor.md),
+[EQ behavior](audio-equalizer.md) and the [implementation plan](audio-processing-plan.md).
+
+The gear inspector keeps existing settings in compact and expanded views.
+Use the square beside **×** to expand, or the overlapping squares to restore
+compact view. Expanded view has **General**, **Equalizer** and **Dynamics**
+categories on the left. The view
+choice is remembered per source/bus during the current run, not across restarts.
+
 The **Audio Mixer** panel (under the Switcher in the Classic layout, beside the
 inputs in vMix's) is laid out as vMix's: **OUTPUTS** — Master and the other
 buses — then **INPUTS**, one upright strip each. Each bus has its own fader,

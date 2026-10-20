@@ -1,0 +1,13 @@
+[package]
+name = "audio-eq-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ffmpeg-next = "=9.0.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+utoipa = "5"
+
+[workspace]

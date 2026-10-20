@@ -1,0 +1,11 @@
+[package]
+name = "audio-compressor-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ffmpeg-next = "=9.0.0"
+serde_json = "1.0"
+
+[workspace]
