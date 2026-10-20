@@ -351,7 +351,7 @@ const PLACEMENT: &[&str] = &["pos_x", "pos_y", "scale", "scale_mode", "scale_x",
 
 /// A deck's effects that are on, in order.
 fn enabled_effects(deck: &Deck) -> Vec<&crate::deck::Effect> {
-    deck.effects.iter().filter(|e| e.enabled).collect()
+    deck.effects.iter().filter(|e| e.is_active()).collect()
 }
 
 /// Whether anything modulates the settings under `prefix`.
@@ -392,7 +392,7 @@ type Fill<'a> = (&'a wgpu::TextureView, [f32; 4], Vec<Pixels>, u32);
 fn crisp_crops(deck: &Deck, modulation: &crate::modulation::ModulationEngine) -> bool {
     deck.effects
         .iter()
-        .filter(|e| e.enabled && e.shader.name() == "crop")
+        .filter(|e| e.is_active() && e.shader.name() == "crop")
         .all(|e| {
             e.plain_crop(modulation)
                 .is_some_and(|crop| crop.feather <= 0.0 && crop.border.is_none())
@@ -411,7 +411,7 @@ fn drawn_alike(a: &Deck, b: &Deck, modulation: &crate::modulation::ModulationEng
             && deck
                 .effects
                 .iter()
-                .all(|e| !e.enabled || !modulated(modulation, e.param_prefix()))
+                .all(|e| !e.is_active() || !modulated(modulation, e.param_prefix()))
     };
     if !still(a) || !still(b) || !crisp_crops(a, modulation) || !crisp_crops(b, modulation) {
         return false;
@@ -543,7 +543,7 @@ fn plain_tap(deck: &Deck, modulation: &crate::modulation::ModulationEngine) -> b
     let transforms = deck
         .effects
         .iter()
-        .filter(|e| e.enabled && e.shader.name() == "transform")
+        .filter(|e| e.is_active() && e.shader.name() == "transform")
         .count();
     deck.tap.is_some()
         && transforms <= 1
@@ -551,7 +551,7 @@ fn plain_tap(deck: &Deck, modulation: &crate::modulation::ModulationEngine) -> b
         && deck
             .effects
             .iter()
-            .filter(|e| e.enabled)
+            .filter(|e| e.is_active())
             .all(|e| match e.shader.name().as_str() {
                 "crop" => e.is_neutral_framing(modulation),
                 "transform" => e.plain_placement(modulation).is_some() && e.flips() == [false, false],
@@ -602,7 +602,7 @@ pub(super) fn merge_key(deck: &Deck) -> Option<String> {
 /// no rectangle here can say.
 pub(super) fn layer_rect(deck: &Deck, modulation: &crate::modulation::ModulationEngine) -> [f32; 4] {
     let mut rect = FRAME;
-    for effect in deck.effects.iter().filter(|e| e.enabled) {
+    for effect in deck.effects.iter().filter(|e| e.is_active()) {
         match effect.shader.name().as_str() {
             "crop" => {
                 let Some(crop) = effect.plain_crop(modulation) else {
@@ -886,7 +886,7 @@ impl Mixer {
             }
             Side::Channel(idx) => {
                 let channel = &self.channels[idx];
-                if let Some(effect) = channel.effects.iter().find(|e| e.enabled) {
+                if let Some(effect) = channel.effects.iter().find(|e| e.is_active()) {
                     return Err(format!(
                         "'{}' has an effect of its own ({})",
                         channel.name,

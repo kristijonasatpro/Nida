@@ -130,7 +130,8 @@ fn register_effect_drop_zone(ui: &egui::Ui, dz: &egui::Response, chain_key: &str
     // Store rect for deferred handler to find
     let key = egui::Id::new("eff_dz_rect").with((chain_key.to_string(), position));
     ui.ctx().memory_mut(|mem| {
-        mem.data.insert_temp(key, dz.rect);
+        // Scrolled-out rows cannot accept an effect over another panel.
+        mem.data.insert_temp(key, dz.rect.intersect(ui.clip_rect()));
     });
     // Visual highlight: check if pointer is actually over this zone
     if has_drag {

@@ -94,6 +94,21 @@ Effects are ISF filter shaders applied at three levels:
 
 Effects can be reordered via drag-and-drop and toggled on/off individually.
 
+Adding an effect from the library builds its shader and GPU resources in the
+background. **Loading** effects occupy their chosen place in the chain and
+remain editable, but are bypassed until ready. Removing one cancels its queued
+load. A failed effect stays bypassed and shows an error; hover for details, then
+remove and add it again after correcting the shader. The same status is exposed
+as `load_state` in API effect snapshots. Saved shows keep the effect and its
+settings, including edits made while loading, rather than the loading job.
+Show restore, effect paste and transition loading retain their existing paths.
+
+In **Properties**, a channel's effects run top to bottom in a vertical list.
+Each card can be collapsed; its grip reorders it and its checkbox bypasses it.
+Newly added effects are brought into view and briefly highlighted. The compact
+channel preview can be clicked to enlarge, and **Routing** expands the Send to
+controls. In narrow panels, **Preview and routing** collapses above the effects.
+
 ---
 
 ## Tonemapping & Color Grading
