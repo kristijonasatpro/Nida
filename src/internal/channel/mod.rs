@@ -1487,7 +1487,7 @@ impl Channel {
             let mut fx_cmd_buffers: Vec<wgpu::CommandBuffer> = Vec::new();
 
             for (eff_idx, effect) in self.effects.iter_mut().enumerate() {
-                if !effect.enabled {
+                if !effect.is_active() {
                     continue;
                 }
 

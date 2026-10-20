@@ -45,6 +45,7 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                             uuid: e.uuid().to_owned(),
                             name: e.shader.name(),
                             enabled: e.enabled,
+                            load_state: e.load_state(),
                             params: build_shader_params(&e.shader.name(), &e.params),
                             mask: e.mask.clone(),
                         })
@@ -267,6 +268,7 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                     uuid: e.uuid().to_owned(),
                     name: e.shader.name(),
                     enabled: e.enabled,
+                    load_state: e.load_state(),
                     params: build_shader_params(&e.shader.name(), &e.params),
                     mask: e.mask.clone(),
                 })
@@ -294,6 +296,7 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
             uuid: e.uuid().to_owned(),
             name: e.shader.name(),
             enabled: e.enabled,
+            load_state: e.load_state(),
             params: build_shader_params(&e.shader.name(), &e.params),
             mask: e.mask.clone(),
         })

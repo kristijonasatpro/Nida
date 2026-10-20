@@ -177,7 +177,8 @@ impl Effect {
             uuid,
             param_prefix,
             shader,
-            pipeline,
+            pipeline: Some(pipeline),
+            build: super::loading::EffectBuild::Ready,
             enabled: true,
             params,
             pass_buffers,
@@ -192,6 +193,35 @@ impl Effect {
             mask: None,
             mask_pass: None,
         })
+    }
+
+    /// Metadata and controls are ready immediately; no compiler or GPU work.
+    pub(super) fn pending(shader: ISFShader, target_format: wgpu::TextureFormat) -> Self {
+        let uuid = crate::deck::generate_short_uuid();
+        let params = ShaderParams::from_inputs(shader.metadata.inputs.as_deref().unwrap_or(&[]));
+        let passes = shader.metadata.passes.clone().unwrap_or_default();
+        let phase_inputs_config = shader.metadata.phase_inputs.clone();
+        let pointwise = shader.is_pointwise();
+        Self {
+            param_prefix: format!("fx_{uuid}"),
+            uuid,
+            shader,
+            pipeline: None,
+            build: super::loading::EffectBuild::Ready,
+            enabled: true,
+            params,
+            pass_buffers: HashMap::new(),
+            passes,
+            target_format,
+            imported_textures: Vec::new(),
+            preprocessor_textures: Vec::new(),
+            phase_accumulators: [0.0; 4],
+            phase_inputs_config,
+            runs: 0,
+            pointwise,
+            mask: None,
+            mask_pass: None,
+        }
     }
 
     /// Frames this effect has been run on a deck. Neutral crop and transform
@@ -591,7 +621,7 @@ impl Effect {
         cmd_buffers: &mut Vec<wgpu::CommandBuffer>,
         within: Option<&[crate::renderer::region::Pixels]>,
     ) -> Result<()> {
-        if !self.enabled {
+        if !self.is_active() {
             return Ok(());
         }
         let Some(mask) = self.mask.clone() else {
@@ -659,9 +689,13 @@ impl Effect {
         } else {
             wgpu::LoadOp::Clear(wgpu::Color::BLACK)
         };
-        if !self.enabled {
+        if !self.is_active() {
             return;
         }
+        let pipeline = self
+            .pipeline
+            .as_ref()
+            .expect("active effect has a pipeline");
 
         // Ensure user params buffer exists and update it (with modulation if available)
         self.params.ensure_buffer(&context.device);
@@ -704,8 +738,7 @@ impl Effect {
                 for _iter in 0..iterations {
                     let mut pass_uniforms = *uniforms;
                     pass_uniforms.pass_index = i32::try_from(pass_idx).unwrap_or(i32::MAX);
-                    self.pipeline
-                        .update_uniforms(&context.queue, &pass_uniforms);
+                    pipeline.update_uniforms(&context.queue, &pass_uniforms);
 
                     let pass_buffer_views: Vec<&wgpu::TextureView> = self
                         .passes
@@ -714,7 +747,7 @@ impl Effect {
                         .map(super::PassBuffer::read_view)
                         .collect();
 
-                    let bind_group = self.pipeline.create_bind_group(
+                    let bind_group = pipeline.create_bind_group(
                         &context.device,
                         Some(input_view),
                         &pass_buffer_views,
@@ -754,7 +787,7 @@ impl Effect {
                                 multiview_mask: None,
                             });
 
-                        render_pass.set_pipeline(&self.pipeline.pipeline);
+                        render_pass.set_pipeline(&pipeline.pipeline);
                         render_pass.set_bind_group(0, &bind_group, &[]);
                         render_pass.draw(0..3, 0..1);
                     }
@@ -773,8 +806,7 @@ impl Effect {
             // Final pass: render to output_view using pass buffer results + input
             let mut final_uniforms = *uniforms;
             final_uniforms.pass_index = i32::try_from(self.passes.len()).unwrap_or(i32::MAX);
-            self.pipeline
-                .update_uniforms(&context.queue, &final_uniforms);
+            pipeline.update_uniforms(&context.queue, &final_uniforms);
 
             let pass_buffer_views: Vec<&wgpu::TextureView> = self
                 .passes
@@ -783,7 +815,7 @@ impl Effect {
                 .map(super::PassBuffer::read_view)
                 .collect();
 
-            let bind_group = self.pipeline.create_bind_group(
+            let bind_group = pipeline.create_bind_group(
                 &context.device,
                 Some(input_view),
                 &pass_buffer_views,
@@ -817,7 +849,7 @@ impl Effect {
                     multiview_mask: None,
                 });
 
-                render_pass.set_pipeline(&self.pipeline.pipeline);
+                render_pass.set_pipeline(&pipeline.pipeline);
                 render_pass.set_bind_group(0, &bind_group, &[]);
                 crate::renderer::region::draw_within(&mut render_pass, within);
             }
@@ -825,9 +857,9 @@ impl Effect {
             cmd_buffers.push(encoder.finish());
         } else {
             // Simple single-pass effect
-            self.pipeline.update_uniforms(&context.queue, uniforms);
+            pipeline.update_uniforms(&context.queue, uniforms);
 
-            let bind_group = self.pipeline.create_bind_group(
+            let bind_group = pipeline.create_bind_group(
                 &context.device,
                 Some(input_view),
                 &[],
@@ -861,7 +893,7 @@ impl Effect {
                     multiview_mask: None,
                 });
 
-                render_pass.set_pipeline(&self.pipeline.pipeline);
+                render_pass.set_pipeline(&pipeline.pipeline);
                 render_pass.set_bind_group(0, &bind_group, &[]);
                 crate::renderer::region::draw_within(&mut render_pass, within);
             }

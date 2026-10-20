@@ -151,12 +151,13 @@ pub trait MixerCommands {
     /// Returns an error if `channel_uuid` names no channel, or if removing it
     /// would drop below the two-channel minimum the crossfader requires.
     fn remove_channel(&mut self, channel_uuid: &str) -> Result<()>;
+    /// Returns the reserved UUID immediately. Compilation finishes in the
+    /// background; snapshots expose building/ready/failed status. Parameters
+    /// and chain order can be edited while building; the picture bypasses it.
+    ///
     /// # Errors
-    /// Returns an error if `target` names no deck or channel, if no filter
-    /// shader called `shader_name` is registered, if the effect's GPU pipeline
-    /// cannot be built, if the shader needs a depth sensor that cannot be
-    /// acquired, or if a depth-sensor effect is targeted at a channel or master
-    /// chain (only deck chains can host one).
+    /// Returns an error for an unknown target or shader, a full loading queue,
+    /// or a depth sensor that cannot be acquired or is used outside a deck.
     fn add_effect(&mut self, target: EffectTarget, shader_name: &str) -> Result<String>;
     /// # Errors
     /// Returns an error if `effect_uuid` names no effect.

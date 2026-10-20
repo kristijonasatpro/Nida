@@ -421,6 +421,8 @@ pub struct UIData {
     pub shader_count: usize,
     pub channels: Vec<ChannelUIInfo>,
     pub master_effect_info: Vec<EffectInfo>,
+    pub effect_load_states:
+        std::collections::HashMap<String, crate::engine::types::EffectLoadState>,
     pub modulation_sources: Vec<ModSourceUIEntry>,
     /// Current computed values for each modulation source by UUID
     pub modulation_current_values: std::collections::HashMap<String, f32>,

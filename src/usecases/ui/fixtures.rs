@@ -267,6 +267,7 @@ impl UIData {
             ],
             shader_count: 7,
             channels: vec![channel_a, channel_b],
+            effect_load_states: std::collections::HashMap::new(),
             master_effect_info: vec![(
                 "mfx00001".to_string(),
                 "master_effect".to_string(),

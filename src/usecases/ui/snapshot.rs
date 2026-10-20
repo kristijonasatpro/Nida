@@ -567,6 +567,15 @@ pub(crate) fn build_ui_data(
         .chain(&engine.mixer.master_effects)
         .filter_map(|e| Some((e.uuid.clone(), e.mask.clone()?)))
         .collect();
+    let effect_load_states = engine
+        .mixer
+        .channels
+        .iter()
+        .flat_map(|ch| ch.decks.iter().flat_map(|d| &d.effects).chain(&ch.effects))
+        .chain(&engine.mixer.master_effects)
+        .filter(|e| e.load_state != crate::engine::types::EffectLoadState::Ready)
+        .map(|e| (e.uuid.clone(), e.load_state.clone()))
+        .collect();
     UIData {
         generators: engine.registry.generators,
         filters: engine.registry.filters,
@@ -574,6 +583,7 @@ pub(crate) fn build_ui_data(
         shader_count: engine.registry.shader_count,
         channels,
         master_effect_info,
+        effect_load_states,
         modulation_sources,
         modulation_current_values,
         modulation_assignments,

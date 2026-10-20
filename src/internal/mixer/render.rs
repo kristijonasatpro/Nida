@@ -1692,7 +1692,7 @@ impl Mixer {
         let mut read_from_composite = true;
 
         for effect in &mut self.master_effects {
-            if !effect.enabled {
+            if !effect.is_active() {
                 continue;
             }
 
