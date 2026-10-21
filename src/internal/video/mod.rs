@@ -13,6 +13,17 @@ pub mod modulation;
 pub mod sound_only;
 pub mod yuv;
 
+#[cfg(test)]
+mod diagnostics;
+
+#[cfg(test)]
+mod playback_diagnostics;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_VIDEO_CONVERSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -1534,7 +1545,7 @@ pub struct VideoPlayer {
     /// The last frame shown came off the media engine.
     on_engine: bool,
     /// A media-engine frame copied to memory for conversion.
-    engine_frame: Video,
+    engine_frame: hwdecode::Download,
     video_stream_index: usize,
     /// The picture as shown: its pixels' shape applied, and turned upright.
     width: u32,
@@ -1663,7 +1674,7 @@ impl VideoPlayer {
             yuv: yuv::YuvSetup::default(),
             hardware,
             on_engine: false,
-            engine_frame: Video::empty(),
+            engine_frame: hwdecode::Download::default(),
             video_stream_index,
             width,
             height,
@@ -1824,7 +1835,9 @@ impl VideoPlayer {
             converted = false;
             // Every frame passed, kept for ping-pong's way back.
             if self.caching_enabled && self.playback.loop_mode == LoopMode::PingPong {
-                self.convert_current()?;
+                if !self.convert_current()? {
+                    return self.next_frame();
+                }
                 converted = true;
                 if self.frame_cache.len() * self.frame_byte_size < MAX_CACHE_BYTES {
                     self.frame_cache.push(self.frame_data.clone());
@@ -1842,8 +1855,8 @@ impl VideoPlayer {
         }
         if current {
             self.retained_seek_frame = false;
-            if !converted {
-                self.convert_current()?;
+            if !converted && !self.convert_current()? {
+                return self.next_frame();
             }
             return Ok(Some(&self.frame_data));
         }
@@ -1938,14 +1951,14 @@ impl VideoPlayer {
     }
 
     /// Convert the frame being shown to RGBA in `frame_data`.
-    fn convert_current(&mut self) -> Result<()> {
+    fn convert_current(&mut self) -> Result<bool> {
         if let Err(e) = self.convert_decoded() {
             if !self.hardware {
                 return Err(e);
             }
-            // Its frame is lost with the engine; the next one comes in software.
             self.fall_back_to_software(&e.to_string())?;
-            return Ok(());
+            self.playback.show_frame = true;
+            return Ok(false);
         }
         let data = self.rgb_frame.data(0);
         let stride = self.rgb_frame.stride(0);
@@ -1973,19 +1986,23 @@ impl VideoPlayer {
         if self.interlaced_frame && self.quarter_turns.is_multiple_of(2) {
             blend_fields(&mut self.frame_data, self.width as usize * 4);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Convert the decoded frame to RGBA in `rgb_frame`, copying it off the
     /// media engine first if it is there, and making the scaler for its
     /// format the first time that format arrives.
     fn convert_decoded(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if FAIL_VIDEO_CONVERSION.with(|fail| fail.replace(false)) {
+            anyhow::bail!("injected frame conversion failure");
+        }
         self.on_engine = hwdecode::on_engine(&self.decoded);
         if self.on_engine {
             hwdecode::to_memory(&self.decoded, &mut self.engine_frame)?;
         }
         let source = if self.on_engine {
-            &self.engine_frame
+            &self.engine_frame.frame
         } else {
             &self.decoded
         };
@@ -2035,6 +2052,7 @@ impl VideoPlayer {
         log::warn!("Hardware decoding failed ({why}); decoding this clip in software");
         self.hardware = false;
         self.on_engine = false;
+        self.engine_frame = hwdecode::Download::default();
         let parameters = self
             .ictx
             .stream(self.video_stream_index)
@@ -2394,18 +2412,7 @@ mod tests {
             .filter_map(|_| {
                 step(player)?;
                 let source = &player.decoded;
-                let mut repacked = Video::empty();
-                let mut repacker = Scaler::get(
-                    source.format(),
-                    source.width(),
-                    source.height(),
-                    packing,
-                    source.width(),
-                    source.height(),
-                    yuv::rgba_flags(),
-                )
-                .unwrap();
-                repacker.run(source, &mut repacked).unwrap();
+                let mut repacked = repack_reference(source, packing);
                 // Repacking must preserve colour tags, range and frame timing.
                 unsafe {
                     ffmpeg::ffi::av_frame_copy_props(repacked.as_mut_ptr(), source.as_ptr());
@@ -2416,6 +2423,58 @@ mod tests {
                 Some(player.frame_data.clone())
             })
             .collect()
+    }
+
+    fn repack_reference(source: &Video, packing: Pixel) -> Video {
+        let bytes = match (source.format(), packing) {
+            (Pixel::YUV420P | Pixel::YUVJ420P, Pixel::NV12) => 1,
+            (Pixel::YUV420P10LE, Pixel::P010LE) => 2,
+            formats => panic!("unsupported reference packing: {formats:?}"),
+        };
+        let mut packed = Video::new(packing, source.width(), source.height());
+        for plane in 0..3 {
+            let (width, height) = if plane == 0 {
+                (source.width(), source.height())
+            } else {
+                (source.width().div_ceil(2), source.height().div_ceil(2))
+            };
+            let destination = usize::from(plane != 0);
+            let stride = packed.stride(destination);
+            for row in 0..height as usize {
+                for column in 0..width as usize {
+                    let from = row * source.stride(plane) + column * bytes;
+                    let to = row * stride
+                        + if plane == 0 {
+                            column * bytes
+                        } else {
+                            (column * 2 + plane - 1) * bytes
+                        };
+                    if bytes == 1 {
+                        packed.data_mut(destination)[to] = source.data(plane)[from];
+                    } else {
+                        let sample = u16::from_le_bytes(
+                            source.data(plane)[from..from + 2].try_into().unwrap(),
+                        ) << 6;
+                        packed.data_mut(destination)[to..to + 2]
+                            .copy_from_slice(&sample.to_le_bytes());
+                    }
+                }
+            }
+        }
+        packed
+    }
+
+    #[test]
+    fn reference_repacking_does_not_rescale_full_range_yuv_samples() {
+        let mut source = Video::new(Pixel::YUVJ420P, 64, 64);
+        for (plane, sample) in [(0, 0), (1, 128), (2, 255)] {
+            source.data_mut(plane).fill(sample);
+        }
+        let packed = repack_reference(&source, Pixel::NV12);
+        assert_eq!(&packed.data(0)[..64], &[0; 64]);
+        for pair in packed.data(1)[..64].chunks_exact(2) {
+            assert_eq!(pair, [128, 255]);
+        }
     }
 
     /// A clip of `seconds` from the ffmpeg tool's moving test picture, every
@@ -2815,6 +2874,161 @@ mod tests {
         assert!((at - 1.04).abs() < 1e-6);
     }
 
+    #[test]
+    fn conversion_failure_returns_the_recovered_picture_instead_of_stale_pixels() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = test_clip(dir.path(), "conversion-failure.mp4", 3, &[]) else {
+            return;
+        };
+        let mut reference = VideoPlayer::open(&path, false).unwrap();
+        reference.set_playing(false);
+        reference.seek_and_reset(1.05).unwrap();
+        let expected = reference.next_frame().unwrap().unwrap().to_vec();
+        let mut player = VideoPlayer::open(&path, false).unwrap();
+        player.set_playing(false);
+        player.seek_and_reset(1.01).unwrap();
+        let stale = player.next_frame().unwrap().unwrap().to_vec();
+        assert_ne!(expected, stale);
+        player.seek_and_reset(1.05).unwrap();
+        player.hardware = true;
+        FAIL_VIDEO_CONVERSION.with(|fail| fail.set(true));
+        assert_eq!(player.next_frame().unwrap().unwrap(), expected);
+        assert!(!player.hardware);
+        assert!(!player.hardware_decode());
+        assert!(player.next_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn scrub_boundaries_eof_and_restarts_match_fresh_seeks() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = test_clip(dir.path(), "scrub-boundaries.mp4", 3, &[]) else {
+            return;
+        };
+        let mut player = VideoPlayer::open(&path, false).unwrap();
+        player.set_playing(false);
+        for target in [2.92, 2.96, 0.0, 0.04, 0.02, 1.49, 1.53, 1.55, 0.9, 1.15] {
+            let mut reference = VideoPlayer::open(&path, false).unwrap();
+            reference.set_playing(false);
+            reference.seek_and_reset(target).unwrap();
+            let expected = reference.next_frame().unwrap().unwrap().to_vec();
+            player.seek_and_reset(target).unwrap();
+            assert_eq!(
+                player.next_frame().unwrap().unwrap(),
+                expected,
+                "seek {target}"
+            );
+            assert!(player.next_frame().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn hardware_download_reuses_storage_without_changing_samples_or_properties() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut download = hwdecode::Download::default();
+        for (name, codec) in CODECS {
+            let Some(path) = clip(dir.path(), name, codec) else {
+                assert!(
+                    std::env::var_os("VARDA_REQUIRE_HW_DECODE").is_none(),
+                    "missing encoder for {name}"
+                );
+                continue;
+            };
+            let mut player = VideoPlayer::open(&path, true).unwrap();
+            let mut previous = None;
+            let mut held: Option<(Video, Vec<u8>)> = None;
+            for index in 0..20 {
+                player.decode_ahead().unwrap().unwrap();
+                let source = &player.lookahead;
+                if !hwdecode::on_engine(source) {
+                    assert!(
+                        std::env::var_os("VARDA_REQUIRE_HW_DECODE").is_none(),
+                        "{name}: no hardware frames"
+                    );
+                    eprintln!("SKIP {name}: hardware download unavailable");
+                    break;
+                }
+                hwdecode::to_memory(source, &mut download).unwrap();
+                let pointer = download.frame.data(0).as_ptr();
+                if let Some((held, pixels)) = held.take() {
+                    assert_eq!(
+                        held.data(0),
+                        pixels,
+                        "shared download storage was overwritten"
+                    );
+                    assert_ne!(held.data(0).as_ptr(), pointer);
+                } else if let Some(previous) = previous.filter(|_| cfg!(target_os = "windows")) {
+                    assert_eq!(
+                        pointer, previous,
+                        "{name}: allocation changed without a layout change"
+                    );
+                }
+                previous = Some(pointer);
+                let mut fresh = Video::empty();
+                unsafe {
+                    assert_eq!(
+                        ffmpeg::ffi::av_hwframe_transfer_data(
+                            fresh.as_mut_ptr(),
+                            source.as_ptr(),
+                            0
+                        ),
+                        0
+                    );
+                }
+                let bytes = if fresh.format() == Pixel::P010LE {
+                    2
+                } else {
+                    1
+                };
+                assert!(matches!(fresh.format(), Pixel::NV12 | Pixel::P010LE));
+                for plane in 0..2 {
+                    let rows = if plane == 0 {
+                        fresh.height()
+                    } else {
+                        fresh.height().div_ceil(2)
+                    };
+                    for row in 0..rows as usize {
+                        let length = fresh.width() as usize * bytes;
+                        let actual = row * download.frame.stride(plane);
+                        let expected = row * fresh.stride(plane);
+                        assert_eq!(
+                            &download.frame.data(plane)[actual..actual + length],
+                            &fresh.data(plane)[expected..expected + length],
+                            "{name}: plane {plane}, row {row}"
+                        );
+                    }
+                }
+                assert_eq!(download.frame.timestamp(), source.timestamp());
+                assert_eq!(download.frame.pts(), source.pts());
+                assert_eq!(download.frame.color_space(), source.color_space());
+                assert_eq!(download.frame.color_range(), source.color_range());
+                assert_eq!(
+                    download.frame.color_transfer_characteristic(),
+                    source.color_transfer_characteristic()
+                );
+                assert_eq!(download.frame.color_primaries(), source.color_primaries());
+                unsafe {
+                    assert_eq!(
+                        (*download.frame.as_ptr()).nb_side_data,
+                        (*source.as_ptr()).nb_side_data
+                    );
+                }
+                if index == 10 {
+                    let mut retained = Video::empty();
+                    unsafe {
+                        assert_eq!(
+                            ffmpeg::ffi::av_frame_ref(
+                                retained.as_mut_ptr(),
+                                download.frame.as_ptr()
+                            ),
+                            0
+                        );
+                    }
+                    held = Some((retained, download.frame.data(0).to_vec()));
+                }
+            }
+        }
+    }
+
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn nearby_forward_scrubbing_preserves_the_existing_keyframe_seek() {
@@ -2926,13 +3140,47 @@ mod tests {
         mean
     }
 
-    const CODECS: [(&str, &[&str]); 4] = [
+    const CODECS: [(&str, &[&str]); 6] = [
         ("h264.mp4", &["-c:v", "libx264", "-preset", "veryfast"]),
         (
             "hevc.mp4",
             &["-c:v", "libx265", "-preset", "veryfast", "-tag:v", "hvc1"],
         ),
         ("av1.mp4", &["-c:v", "libsvtav1", "-preset", "12"]),
+        (
+            "full-range.mp4",
+            &[
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-colorspace",
+                "bt709",
+                "-color_range",
+                "pc",
+            ],
+        ),
+        (
+            "hdr10.mp4",
+            &[
+                "-vf",
+                "scale=320:180,setparams=range=limited:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+                "-c:v",
+                "libx265",
+                "-preset",
+                "veryfast",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-tag:v",
+                "hvc1",
+                "-colorspace",
+                "bt2020nc",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "smpte2084",
+            ],
+        ),
         (
             "hevc10.mp4",
             &[
@@ -2953,15 +3201,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for (name, codec) in CODECS {
             let Some(path) = clip(dir.path(), name, codec) else {
+                assert!(
+                    std::env::var_os("VARDA_REQUIRE_HW_DECODE").is_none(),
+                    "missing encoder for {name}"
+                );
                 eprintln!("skipping {name}: no ffmpeg or encoder");
                 continue;
             };
             let mut software = VideoPlayer::open(&path, false).unwrap();
             let mut hardware = VideoPlayer::open(&path, true).unwrap();
             let got = decode(&mut hardware, 12);
+            if name == "hdr10.mp4" {
+                assert!(hardware.hdr_frame, "HDR fixture must exercise tone mapping");
+                assert_eq!(hardware.rgb_frame.format(), Pixel::RGBA64LE);
+            }
             let packing = hardware
                 .hardware_decode()
-                .then(|| hardware.engine_frame.format());
+                .then(|| hardware.engine_frame.frame.format());
             let reference = decode_reference(&mut software, 40, packing);
             all_found(&reference, &got, name);
             assert!(

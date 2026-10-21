@@ -754,7 +754,7 @@ fn stream_receive_thread(
         let mut yuv = crate::video::yuv::YuvSetup::default();
         let mut pacer = Pacer::default();
         let mut decoded = ffmpeg_next::frame::Video::empty();
-        let mut engine_frame = ffmpeg_next::frame::Video::empty();
+        let mut engine_frame = crate::video::hwdecode::Download::default();
         let mut rgb_frame = ffmpeg_next::frame::Video::empty();
 
         let mut last_frame_time = Instant::now();
@@ -815,7 +815,11 @@ fn stream_receive_thread(
                 }
                 hardware.store(on_engine, Ordering::Relaxed);
                 let at = decoded.timestamp().map(|t| t as f64 * time_base);
-                let source = if on_engine { &engine_frame } else { &decoded };
+                let source = if on_engine {
+                    &engine_frame.frame
+                } else {
+                    &decoded
+                };
 
                 // Rebuild the scaler when the incoming frames change shape or
                 // format. The picture keeps its size, up to `MAX_SIZE`.

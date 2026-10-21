@@ -36,6 +36,10 @@ fn video_decode(c: &mut Criterion) {
                 let target = if alternate { other } else { at };
                 player.seek_and_reset(black_box(target)).expect("seek");
                 let bytes = player.next_frame().expect("decode").expect("frame").len();
+                assert!(
+                    !hardware || player.hardware_decode(),
+                    "hardware benchmark fell back"
+                );
                 black_box(bytes)
             });
         });
@@ -53,6 +57,7 @@ fn video_decode(c: &mut Criterion) {
         player.seek_and_reset(base).expect("seek");
         player.next_frame().expect("decode").expect("frame");
         if hardware && !player.hardware_decode() {
+            eprintln!("Hardware unavailable for this clip; skipping hardware scrub benchmark");
             continue;
         }
         let step = 1.0 / player.frame_rate();
@@ -65,7 +70,12 @@ fn video_decode(c: &mut Criterion) {
                 player
                     .seek_and_reset(black_box(base + f64::from(index) * step))
                     .expect("seek");
-                black_box(player.next_frame().expect("decode").expect("frame").len())
+                let bytes = player.next_frame().expect("decode").expect("frame").len();
+                assert!(
+                    !hardware || player.hardware_decode(),
+                    "hardware benchmark fell back"
+                );
+                black_box(bytes)
             });
         });
     }

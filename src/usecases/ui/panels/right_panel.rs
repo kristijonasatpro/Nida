@@ -183,7 +183,7 @@ fn render_performance(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions)
     let mut enabled = data.windows_hardware_decode;
     if ui.add_enabled(!data.software_decode_forced, egui::Checkbox::new(
         &mut enabled, "Use GPU video decoding (experimental)"))
-        .on_hover_text("Reduces CPU work when playing supported videos. Software decoding may be faster on some systems.")
+        .on_hover_text("Experimental: frames still pass through RAM and CPU colour conversion. This can be slower and use more CPU than software decoding.")
         .changed()
     {
         actions.session.windows_hardware_decode = Some(enabled);

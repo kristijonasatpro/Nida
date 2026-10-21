@@ -33,6 +33,9 @@ this Windows machine.
 This step does not add zero-copy textures or change recording/stream encoding.
 Downloaded NV12/P010 frames still go through CPU colour conversion and upload.
 
+The follow-up investigation, expanded measurement procedure, and remaining
+hardware checks are in [windows-gpu-decoding-investigation.md](windows-gpu-decoding-investigation.md).
+
 ## Initial prototype measurements
 
 Machine: NVIDIA GeForce RTX 3060 Ti, driver 32.0.16.1692. Synthetic 3840×2160,

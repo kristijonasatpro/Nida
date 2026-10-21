@@ -254,19 +254,89 @@ pub(crate) fn on_engine(frame: &Video) -> bool {
     frame.format() == engine_format()
 }
 
-/// Copy a media-engine frame into `into` in memory — NV12, or P010 for
-/// 10-bit — with its colour tags, ready for the usual YUV → RGBA conversion.
-pub(crate) fn to_memory(frame: &Video, into: &mut Video) -> Result<()> {
-    // Safety: both frames are valid; ffmpeg allocates `into`'s planes to the
-    // engine frame's software format and size.
+pub(crate) struct Download {
+    pub frame: Video,
+    layout: Option<(ffmpeg::ffi::AVPixelFormat, i32, i32)>,
+}
+
+impl Default for Download {
+    fn default() -> Self {
+        Self {
+            frame: Video::empty(),
+            layout: None,
+        }
+    }
+}
+
+pub(crate) fn to_memory(frame: &Video, download: &mut Download) -> Result<()> {
+    if !cfg!(target_os = "windows") {
+        unsafe {
+            ffmpeg::ffi::av_frame_unref(download.frame.as_mut_ptr());
+            let copied = ffmpeg::ffi::av_hwframe_transfer_data(
+                download.frame.as_mut_ptr(),
+                frame.as_ptr(),
+                0,
+            );
+            anyhow::ensure!(
+                copied >= 0,
+                "copying the decoded frame from the media engine failed ({copied})"
+            );
+        }
+        return replace_properties(frame, &mut download.frame);
+    }
     unsafe {
-        ffmpeg::ffi::av_frame_unref(into.as_mut_ptr());
+        let source = frame.as_ptr();
+        anyhow::ensure!(
+            !(*source).hw_frames_ctx.is_null(),
+            "No hardware frames context"
+        );
+        #[allow(
+            clippy::cast_ptr_alignment,
+            reason = "av_hwframe_ctx_alloc provides aligned AVHWFramesContext storage"
+        )]
+        let context = &*((*(*source).hw_frames_ctx)
+            .data
+            .cast::<ffmpeg::ffi::AVHWFramesContext>());
+        let layout = (context.sw_format, context.width, context.height);
+        let into = &mut download.frame;
+        let raw = into.as_mut_ptr();
+        if download.layout != Some(layout) || ffmpeg::ffi::av_frame_is_writable(raw) == 0 {
+            ffmpeg::ffi::av_frame_unref(raw);
+            (*raw).format = context.sw_format as i32;
+            (*raw).width = context.width;
+            (*raw).height = context.height;
+            let allocated = ffmpeg::ffi::av_frame_get_buffer(raw, 0);
+            anyhow::ensure!(
+                allocated >= 0,
+                "allocating download frame failed ({allocated})"
+            );
+            download.layout = Some(layout);
+        }
+        (*raw).width = context.width;
+        (*raw).height = context.height;
         let copied = ffmpeg::ffi::av_hwframe_transfer_data(into.as_mut_ptr(), frame.as_ptr(), 0);
         if copied < 0 {
             anyhow::bail!("copying the decoded frame from the media engine failed ({copied})");
         }
-        // Matrix, range and primaries, which the conversion reads.
-        ffmpeg::ffi::av_frame_copy_props(into.as_mut_ptr(), frame.as_ptr());
+        (*raw).width = (*source).width;
+        (*raw).height = (*source).height;
+    }
+    replace_properties(frame, &mut download.frame)
+}
+
+fn replace_properties(frame: &Video, into: &mut Video) -> Result<()> {
+    unsafe {
+        let raw = into.as_mut_ptr();
+        ffmpeg::ffi::av_frame_side_data_free(
+            &raw mut (*raw).side_data,
+            &raw mut (*raw).nb_side_data,
+        );
+        ffmpeg::ffi::av_dict_free(&raw mut (*raw).metadata);
+        let properties = ffmpeg::ffi::av_frame_copy_props(raw, frame.as_ptr());
+        anyhow::ensure!(
+            properties >= 0,
+            "copying download properties failed ({properties})"
+        );
     }
     Ok(())
 }
@@ -274,6 +344,54 @@ pub(crate) fn to_memory(frame: &Video, into: &mut Video) -> Result<()> {
 #[cfg(test)]
 mod preference_tests {
     use super::*;
+
+    #[test]
+    fn reused_download_properties_replace_hdr_side_data_and_clear_absent_tags() {
+        let mut source = Video::new(Pixel::P010LE, 64, 64);
+        source.set_color_space(ffmpeg::util::color::Space::BT2020NCL);
+        source.set_color_range(ffmpeg::util::color::Range::JPEG);
+        source.set_color_transfer_characteristic(
+            ffmpeg::util::color::TransferCharacteristic::SMPTE2084,
+        );
+        source.set_pts(Some(42));
+        unsafe {
+            let side = ffmpeg::ffi::av_frame_new_side_data(
+                source.as_mut_ptr(),
+                ffmpeg::ffi::AVFrameSideDataType::AV_FRAME_DATA_CONTENT_LIGHT_LEVEL,
+                4,
+            );
+            assert!(!side.is_null());
+            std::ptr::write_bytes((*side).data, 7, 4);
+        }
+        let mut into = Video::new(Pixel::P010LE, 64, 64);
+        let storage = into.data(0).as_ptr();
+        for _ in 0..100 {
+            replace_properties(&source, &mut into).unwrap();
+            assert_eq!(into.data(0).as_ptr(), storage);
+            assert_eq!(into.pts(), Some(42));
+            assert_eq!(into.color_space(), source.color_space());
+            assert_eq!(into.color_range(), source.color_range());
+            assert_eq!(
+                into.color_transfer_characteristic(),
+                source.color_transfer_characteristic()
+            );
+            unsafe {
+                assert_eq!((*into.as_ptr()).nb_side_data, 1);
+                let side = *(*into.as_ptr()).side_data;
+                assert_eq!(std::slice::from_raw_parts((*side).data, 4), &[7; 4]);
+            }
+        }
+        let sdr = Video::new(Pixel::NV12, 64, 64);
+        replace_properties(&sdr, &mut into).unwrap();
+        assert_eq!(into.pts(), None);
+        assert_eq!(
+            into.color_transfer_characteristic(),
+            sdr.color_transfer_characteristic()
+        );
+        unsafe {
+            assert_eq!((*into.as_ptr()).nb_side_data, 0);
+        }
+    }
 
     #[test]
     fn saved_decoding_choice_survives_restart_and_overrides_the_environment_default() {
