@@ -828,7 +828,7 @@ pub(super) fn render_selected_deck_detail(
             }
 
             // Column: Video playback controls (only for video decks)
-            if let Some(ref vp) = deck.video_playback {
+            if let Some(vp) = deck.video_playback.as_ref().filter(|_| deck.playlist.is_none()) {
                 egui::Frame::default()
                     .inner_margin(6.0)
                     .corner_radius(4.0)
@@ -851,7 +851,7 @@ pub(super) fn render_selected_deck_detail(
                     .fill(ui.visuals().faint_bg_color)
                     .show(ui, |ui| {
                         ui.set_min_width(160.0);
-                        ui.set_max_width(240.0);
+                        ui.set_max_width(if deck.video_playback.is_some() { 360.0 } else { 240.0 });
                         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                             super::playlist::render_deck_column(ui, deck, list, actions);
                         });
@@ -2015,8 +2015,15 @@ fn columns_after_preview(ui: &egui::Ui, deck: &DeckUIInfo, ch_idx: usize, deck_i
     };
     let mut width = 40.0; // frame margins
     width += super::switcher::TAKE_COLUMN_WIDTH + SEPARATOR;
-    if deck.video_playback.is_some() {
+    if deck.video_playback.is_some() && deck.playlist.is_none() {
         width += 280.0 + SEPARATOR;
+    }
+    if deck.playlist.is_some() {
+        width += if deck.video_playback.is_some() {
+            360.0
+        } else {
+            240.0
+        } + SEPARATOR;
     }
     if deck.is_html {
         width += 200.0 + SEPARATOR;

@@ -102,6 +102,8 @@ impl SlideFrom {
 }
 
 /// How a playlist plays.
+// Independent playback switches, each exposed as a checkbox.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct PlaylistSettings {
     #[serde(default)]
@@ -120,6 +122,13 @@ pub struct PlaylistSettings {
     /// counted. A clip plays to its end.
     #[serde(default = "default_picture_secs")]
     pub picture_secs: f64,
+    /// Continue to the next item automatically. Otherwise stop at the
+    /// current item's end, holding its last frame.
+    #[serde(default = "yes")]
+    pub auto_next: bool,
+    /// Start the selected item when the playlist becomes visible on Program.
+    #[serde(default)]
+    pub auto_play: bool,
     /// Start again from the first item after the last.
     #[serde(default = "yes", rename = "loop")]
     pub loop_list: bool,
@@ -150,6 +159,8 @@ impl Default for PlaylistSettings {
             speed_ramp: true,
             transition_secs: default_transition_secs(),
             picture_secs: default_picture_secs(),
+            auto_next: true,
+            auto_play: false,
             loop_list: true,
         }
     }
@@ -294,6 +305,20 @@ mod tests {
         let settings: PlaylistSettings = serde_json::from_str(r#"{"transition":"slide"}"#).unwrap();
         assert_eq!(settings.transition, PlaylistTransition::Slide);
         assert!(settings.loop_list && settings.speed_ramp);
+        assert!(settings.auto_next);
+        assert!(!settings.auto_play);
         assert_eq!(settings.picture_secs, 5.0);
+    }
+
+    #[test]
+    fn auto_next_off_survives_saving_and_loading() {
+        let settings = PlaylistSettings {
+            auto_next: false,
+            auto_play: true,
+            ..PlaylistSettings::default()
+        };
+        let saved = serde_json::to_string(&settings).unwrap();
+        let loaded: PlaylistSettings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded, settings);
     }
 }

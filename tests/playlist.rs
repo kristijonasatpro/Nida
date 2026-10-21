@@ -141,6 +141,81 @@ fn a_list_that_does_not_loop_stops_at_its_end_and_plays_again_from_the_top() {
 }
 
 #[test]
+fn auto_next_off_stops_on_the_selected_picture_and_replays_it() {
+    let Some(gpu) = common::headless_gpu() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    for loop_list in [false, true] {
+        let mut list = new_list(
+            &gpu,
+            three(dir.path()),
+            PlaylistSettings {
+                auto_next: false,
+                loop_list,
+                transition_secs: 0.2,
+                ..settings(PlaylistTransition::Fade, 0.5)
+            },
+        );
+        let mut clock = Clock::new();
+        clock.until(&mut list, |s| s.shown == Some(0));
+        list.show_item(1);
+        clock.until(&mut list, |s| s.shown == Some(1));
+        list.set_playing(true);
+        clock.until(&mut list, |s| s.next_ready == Some(2));
+        clock.run(&mut list, 0.6);
+        assert!(!list.is_playing());
+        assert_eq!(list.snapshot().shown, Some(1));
+        assert_eq!(list.snapshot().coming, None);
+        clock.run(&mut list, 2.0);
+        assert_eq!(list.snapshot().shown, Some(1), "the selected item stays up");
+
+        list.set_playing(true);
+        clock.run(&mut list, 0.2);
+        assert!(list.is_playing(), "Play restarts the selected item");
+        assert_eq!(list.snapshot().shown, Some(1));
+        clock.run(&mut list, 0.4);
+        assert!(!list.is_playing());
+
+        // Re-enabling automatic playback resumes normal advancement.
+        list.set_settings(PlaylistSettings {
+            auto_next: true,
+            ..list.settings()
+        });
+        list.set_playing(true);
+        clock.run(&mut list, 0.3);
+        assert_eq!(list.snapshot().shown, Some(2));
+    }
+}
+
+#[test]
+fn manual_selection_still_transitions_with_auto_next_off() {
+    let Some(gpu) = common::headless_gpu() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut list = new_list(
+        &gpu,
+        three(dir.path()),
+        PlaylistSettings {
+            auto_next: false,
+            transition_secs: 0.2,
+            ..settings(PlaylistTransition::Fade, 0.5)
+        },
+    );
+    let mut clock = Clock::new();
+    clock.until(&mut list, |s| s.shown == Some(0));
+    list.set_playing(true);
+    list.show_item(2);
+    clock.until(&mut list, |s| s.next_ready == Some(2));
+    clock.run(&mut list, 0.3);
+    assert_eq!(list.snapshot().shown, Some(2));
+    clock.run(&mut list, 0.6);
+    assert!(!list.is_playing());
+    assert_eq!(list.snapshot().shown, Some(2));
+}
+
+#[test]
 fn a_fade_runs_its_time_between_two_pictures() {
     let Some(gpu) = common::headless_gpu() else {
         return;
@@ -289,6 +364,54 @@ fn a_clip_plays_to_its_end_before_the_next_item() {
         played >= Duration::from_millis(800),
         "moved on after {played:?}, before the clip's end"
     );
+}
+
+#[test]
+fn auto_next_off_plays_a_clip_to_its_end_and_holds_it_even_with_loop_on() {
+    let Some(gpu) = common::headless_gpu() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let Some(green) = clip(dir.path(), 1.0) else {
+        return;
+    };
+    let red = picture(dir.path(), "red.png", [255, 0, 0]);
+    let mut list = new_list(
+        &gpu,
+        vec![green, red],
+        PlaylistSettings {
+            auto_next: false,
+            transition_secs: 0.5,
+            ..settings(PlaylistTransition::Fade, 5.0)
+        },
+    );
+    let clock = Clock::new();
+    clock.until(&mut list, |s| s.shown == Some(0));
+    for attempt in 0..2 {
+        list.set_playing(true);
+        let start = Instant::now();
+        while list.is_playing() {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(5));
+            list.step(Instant::now());
+            assert_eq!(list.snapshot().shown, Some(0));
+            assert_eq!(list.snapshot().coming, None);
+        }
+        assert!(
+            start.elapsed() >= Duration::from_millis(800),
+            "attempt {attempt} stopped after {:?}, before the clip's end",
+            start.elapsed()
+        );
+        assert!(list.snapshot().remaining.unwrap() < 0.1);
+        let mut held = Clock(Instant::now());
+        held.run(&mut list, 2.0);
+        assert!(!list.is_playing());
+        assert_eq!(list.snapshot().shown, Some(0));
+        // Let the decoder process Pause and publish a snapshot that no
+        // longer carries the transient reached_end flag before replaying.
+        std::thread::sleep(Duration::from_millis(100));
+        list.step(Instant::now());
+    }
 }
 
 // ── The picture ─────────────────────────────────────────────────────
@@ -483,6 +606,148 @@ fn last_playlist(app: &varda::app::VardaApp) -> (String, PlaylistSnapshot) {
     (deck.uuid, deck.playlist.expect("a playlist layer"))
 }
 
+#[test]
+fn the_input_transport_controls_the_current_playlist_clip_and_keeps_the_next_cued() {
+    use varda::engine::{CommandResult, EngineCommand, InputSource};
+    let Some(gpu) = common::headless_gpu() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let Some(green) = clip(dir.path(), 2.0) else {
+        return;
+    };
+    let mut app = app_in(gpu, dir.path());
+    assert!(matches!(
+        send_cmd(
+            &mut app,
+            EngineCommand::AddInput {
+                source: InputSource::Playlist {
+                    items: vec![green.clone(), green]
+                },
+                name: None,
+                audio: None,
+            }
+        ),
+        CommandResult::OkWithId { .. }
+    ));
+    let clock = Clock::new();
+    {
+        let deck = &mut app.mixer_mut().channels_mut().last_mut().unwrap().decks[0].deck;
+        let list = deck.playlist_mut().unwrap();
+        clock.until(list, |s| s.shown == Some(0));
+        list.set_settings(PlaylistSettings {
+            auto_next: false,
+            ..list.settings()
+        });
+    }
+    let (uuid, _) = last_playlist(&app);
+    let playback = |app: &varda::app::VardaApp| {
+        app.build_engine_state()
+            .mixer
+            .channels
+            .last()
+            .unwrap()
+            .decks[0]
+            .video_playback
+            .clone()
+            .expect("the current clip is exposed to the input transport")
+    };
+    assert!(!playback(&app).playing);
+    assert!((playback(&app).duration - 2.0).abs() < 0.1);
+    // Exposing transport metadata must not classify a playlist as a
+    // standalone video for on-air automation or scene persistence.
+    assert!(app.mixer_ref().channels().last().unwrap().decks[0]
+        .deck
+        .playback_snapshot()
+        .is_none());
+    assert!(matches!(
+        send_cmd(
+            &mut app,
+            EngineCommand::VideoTogglePlay {
+                deck_uuid: uuid.clone()
+            }
+        ),
+        CommandResult::Ok
+    ));
+    assert!(last_playlist(&app).1.playing && playback(&app).playing);
+    {
+        let list = app.mixer_mut().channels_mut().last_mut().unwrap().decks[0]
+            .deck
+            .playlist_mut()
+            .unwrap();
+        clock.until(list, |s| s.next_ready == Some(1));
+    }
+    assert!(matches!(
+        send_cmd(
+            &mut app,
+            EngineCommand::VideoTogglePlay {
+                deck_uuid: uuid.clone()
+            }
+        ),
+        CommandResult::Ok
+    ));
+    assert!(!last_playlist(&app).1.playing && !playback(&app).playing);
+    assert!(matches!(
+        send_cmd(
+            &mut app,
+            EngineCommand::VideoSeek {
+                deck_uuid: uuid.clone(),
+                position_secs: 0.8
+            }
+        ),
+        CommandResult::Ok
+    ));
+    let start = Instant::now();
+    while (playback(&app).position - 0.8).abs() > 0.1 {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the clip never sought"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!last_playlist(&app).1.playing, "scrubbing preserves pause");
+    assert_eq!(
+        last_playlist(&app).1.next_ready,
+        Some(1),
+        "scrubbing keeps the next clip preloaded"
+    );
+    send_cmd(
+        &mut app,
+        EngineCommand::VideoTogglePlay {
+            deck_uuid: uuid.clone(),
+        },
+    );
+    {
+        let list = app.mixer_mut().channels_mut().last_mut().unwrap().decks[0]
+            .deck
+            .playlist_mut()
+            .unwrap();
+        clock.until(list, |s| s.next_ready == Some(1));
+        let mut clips = Vec::new();
+        list.for_each_deck(|deck| clips.push(deck.playback_snapshot().unwrap()));
+        assert!(!clips[1].playing, "the next clip stays cued on resume");
+    }
+    send_cmd(
+        &mut app,
+        EngineCommand::VideoSeek {
+            deck_uuid: uuid.clone(),
+            position_secs: 0.2,
+        },
+    );
+    assert!(last_playlist(&app).1.playing, "scrubbing preserves play");
+    assert_eq!(last_playlist(&app).1.shown, Some(0));
+    assert!(matches!(
+        send_cmd(
+            &mut app,
+            EngineCommand::VideoSeek {
+                deck_uuid: uuid,
+                position_secs: f64::NAN
+            }
+        ),
+        CommandResult::Err { .. }
+    ));
+}
+
 /// A playlist input is a channel of its own holding the list, named after
 /// it; it plays on command, and its list and settings come back with the
 /// show.
@@ -499,6 +764,8 @@ fn a_playlist_input_plays_and_comes_back_with_the_show() {
     let slide = PlaylistSettings {
         transition: PlaylistTransition::Slide,
         picture_secs: 8.0,
+        auto_next: false,
+        auto_play: true,
         loop_list: false,
         ..PlaylistSettings::default()
     };

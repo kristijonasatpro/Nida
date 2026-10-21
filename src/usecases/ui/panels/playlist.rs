@@ -274,7 +274,7 @@ fn body(ui: &mut egui::Ui, deck_uuid: &str, list: &PlaylistSnapshot, actions: &m
     });
 }
 
-/// Transition, its time, the speed ramp, how long pictures stay, loop.
+/// Transition, its time, the speed ramp, picture time, Auto Next and loop.
 fn settings(
     ui: &mut egui::Ui,
     deck_uuid: &str,
@@ -339,6 +339,16 @@ fn settings(
                         .weak(),
                 );
             });
+            ui.end_row();
+
+            ui.label("");
+            ui.checkbox(&mut next.auto_next, "Auto Next")
+                .on_hover_text("Play the next item automatically. Off: stop after the current item and hold its last frame.");
+            ui.end_row();
+
+            ui.label("");
+            ui.checkbox(&mut next.auto_play, "Auto Play on Program")
+                .on_hover_text("Start the selected item when this playlist goes on Program, including during a cut or fade.");
             ui.end_row();
 
             ui.label("");
@@ -481,6 +491,9 @@ pub(super) fn render_deck_column(
 ) {
     ui.label(egui::RichText::new("Playlist").strong());
     ui.horizontal(|ui| transport(ui, &deck.uuid, list, actions));
+    if let Some(playback) = &deck.video_playback {
+        super::transport::render_transport(ui, Some((deck, playback)), false, 350.0, actions);
+    }
     let now = list
         .shown
         .and_then(|i| list.items.get(i))
@@ -739,6 +752,10 @@ mod tests {
     }
 
     fn window(data: &UIData, click: &str) -> UIActions {
+        window_control(data, click, egui::accesskit::Role::Button)
+    }
+
+    fn window_control(data: &UIData, click: &str, role: egui::accesskit::Role) -> UIActions {
         let mut actions = UIActions::new();
         {
             let mut harness = egui_kittest::Harness::builder()
@@ -749,9 +766,7 @@ mod tests {
                     render_playlist_window(ui.ctx(), data, &mut actions);
                 });
             harness.run_steps(2);
-            harness
-                .get_by_role_and_label(egui::accesskit::Role::Button, click)
-                .click();
+            harness.get_by_role_and_label(role, click).click();
             harness.run_steps(2);
         }
         actions
@@ -795,6 +810,37 @@ mod tests {
             c,
             EngineCommand::SetPlaylistSettings { settings, .. }
                 if settings.transition == PlaylistTransition::Slide
+        )));
+    }
+
+    #[test]
+    fn auto_next_can_be_disabled_independently_of_loop() {
+        let actions = window_control(&data(false), "Auto Next", egui::accesskit::Role::CheckBox);
+        assert!(actions.commands.iter().any(|c| matches!(
+            c,
+            EngineCommand::SetPlaylistSettings { settings, .. }
+                if !settings.auto_next && settings.loop_list
+        )));
+    }
+
+    #[test]
+    fn auto_play_can_be_enabled_without_auto_next() {
+        let mut data = data(false);
+        data.channels[0].decks[0]
+            .playlist
+            .as_mut()
+            .unwrap()
+            .settings
+            .auto_next = false;
+        let actions = window_control(
+            &data,
+            "Auto Play on Program",
+            egui::accesskit::Role::CheckBox,
+        );
+        assert!(actions.commands.iter().any(|c| matches!(
+            c,
+            EngineCommand::SetPlaylistSettings { settings, .. }
+                if settings.auto_play && !settings.auto_next
         )));
     }
 

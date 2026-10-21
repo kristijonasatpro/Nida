@@ -34,7 +34,8 @@ input, on the empty tile into a new one.
 
 ## Playlists
 
-A playlist input plays its clips, sound files and pictures one after another:
+A playlist input with **Auto Next** enabled plays its clips, sound files and
+pictures one after another:
 each picture stays up for **Pictures stay** (5 s to start with), each clip
 plays to its end, and each gives way to the next by the **Transition**:
 
@@ -49,6 +50,26 @@ one speed. A clip's transition starts that long before its end, so it ends as
 the clip does. **Loop** starts again from the first item after the last;
 without it the list stops on its last item, and **▶** plays it again from the
 top.
+
+**Auto Next** is on by default. Turn it off to play only the selected item,
+then stop and hold its last frame. **Loop** does not repeat it in this mode;
+press **▶** to replay it, or double-click another item while stopped and
+press **▶** to play that item. Manual **⏮ ⏭** and double-click selection still
+work while Auto Next is off.
+
+Enable **Auto Play on Program** to start the selected item when the input goes
+on Program through a cut, fade, or overlay. It starts as the input first becomes
+visible, during the fade. This is independent of Auto Next; with Auto Next off,
+the selected clip plays once and holds its last frame. Auto Play is off by
+default and is saved with the playlist.
+
+When the current item is a video or sound file, the transport under Preview
+controls that item: play/pause, click or drag its playhead, return to the start,
+or jump five seconds back or forward. The same controls appear in the playlist
+layer's Properties. Play/pause stays in sync with the playlist's buttons;
+scrubbing keeps the current play/pause state and cancels a pending transition.
+Auto Next and Loop remain in the playlist window. Pictures have no video
+playhead.
 
 **▶** on the input's picture — its tile, its column header, its Properties —
 starts it without opening anything, and turns to a green **■** to stop it.
@@ -74,7 +95,7 @@ Over the API: `{"source": {"kind": "playlist", "items": [{"path":
 `{"SetPlaylistPlaying": {"deck_uuid": …, "playing": true}}`,
 `{"ShowPlaylistItem": {"deck_uuid": …, "index": 2}}`, `SetPlaylistItems` and
 `SetPlaylistSettings` (`transition` `cut`/`fade`/`slide`, `slide_from`,
-`speed_ramp`, `transition_secs`, `picture_secs`, `loop`) to `POST
+`speed_ramp`, `transition_secs`, `picture_secs`, `auto_next`, `auto_play`, `loop`) to `POST
 /api/command`.
 
 ## Timers

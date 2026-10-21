@@ -129,6 +129,175 @@ fn set_auto(app: &mut VardaApp, deck: &str, auto: AutoPlayback) {
     ));
 }
 
+fn playlist_rig(path: &Path) -> Option<(VardaApp, String, String, String)> {
+    use varda::engine::value::playlist::{PlaylistItem, PlaylistSettings};
+    let (mut app, channel, clip, bus) = rig(path)?;
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::RemoveDeck { deck_uuid: clip },
+    ));
+    let item = PlaylistItem::new(path.to_string_lossy());
+    let deck = match send_cmd(
+        &mut app,
+        EngineCommand::AddPlaylistDeck {
+            channel_uuid: channel.clone(),
+            items: vec![item.clone(), item],
+            settings: Some(PlaylistSettings {
+                auto_next: false,
+                ..PlaylistSettings::default()
+            }),
+        },
+    ) {
+        CommandResult::OkWithId { uuid } => uuid,
+        other => panic!("the playlist did not load: {other:?}"),
+    };
+    app.set_preview_channels(vec![0]);
+    Some((app, channel, deck, bus))
+}
+
+fn playlist_state(app: &VardaApp, deck: &str) -> varda::engine::value::playlist::PlaylistSnapshot {
+    let (ch, d) = app.mixer_ref().find_deck_by_uuid(deck).unwrap();
+    app.mixer_ref().channels()[ch].decks[d]
+        .deck
+        .playlist()
+        .unwrap()
+        .snapshot()
+}
+
+#[test]
+fn playlist_auto_play_starts_the_selected_item_on_cut_and_during_a_fade() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(path) = red_clip(dir.path()) else {
+        return;
+    };
+    let Some((mut app, channel, deck, _)) = playlist_rig(&path) else {
+        return;
+    };
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::SetMainFadeTime { secs: 2.0 },
+    ));
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::ShowPlaylistItem {
+            deck_uuid: deck.clone(),
+            index: 1,
+        },
+    ));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while playlist_state(&app, &deck).shown != Some(1) {
+        assert!(Instant::now() < deadline, "selected clip did not load");
+        run(&mut app, 0.05);
+    }
+    for fade in [false, true] {
+        for enabled in [false, true] {
+            take(&mut app, MainSource::Black);
+            run(&mut app, 0.1);
+            ok(send_cmd(
+                &mut app,
+                EngineCommand::SetPlaylistPlaying {
+                    deck_uuid: deck.clone(),
+                    playing: false,
+                },
+            ));
+            ok(send_cmd(
+                &mut app,
+                EngineCommand::VideoSeek {
+                    deck_uuid: deck.clone(),
+                    position_secs: 0.0,
+                },
+            ));
+            let mut settings = playlist_state(&app, &deck).settings;
+            settings.auto_play = enabled;
+            ok(send_cmd(
+                &mut app,
+                EngineCommand::SetPlaylistSettings {
+                    deck_uuid: deck.clone(),
+                    settings,
+                },
+            ));
+            run(&mut app, 0.15);
+            assert!(
+                !playlist_state(&app, &deck).playing,
+                "Preview does not autoplay"
+            );
+            ok(send_cmd(
+                &mut app,
+                EngineCommand::TakeToMain {
+                    source: MainSource::Channel(channel.clone()),
+                    fade,
+                },
+            ));
+            run(&mut app, 0.3);
+            let list = playlist_state(&app, &deck);
+            assert_eq!(list.playing, enabled, "Auto Play {enabled}, fade {fade}");
+            assert_eq!(
+                list.shown,
+                Some(1),
+                "start the selected item, not the first"
+            );
+            if fade {
+                assert!(
+                    app.mixer_ref().main().fade.is_some(),
+                    "playback starts before the fade finishes"
+                );
+            }
+            if enabled {
+                let (ch, d) = app.mixer_ref().find_deck_by_uuid(&deck).unwrap();
+                let snapshot = app.mixer_ref().channels()[ch].decks[d]
+                    .deck
+                    .transport_playback_snapshot()
+                    .unwrap();
+                assert!(snapshot.position > 0.0, "the video actually advances");
+                ok(send_cmd(
+                    &mut app,
+                    EngineCommand::SetPlaylistPlaying {
+                        deck_uuid: deck.clone(),
+                        playing: false,
+                    },
+                ));
+                run(&mut app, 0.15);
+                assert!(
+                    !playlist_state(&app, &deck).playing,
+                    "a manual pause on Program stays paused"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn playlist_auto_play_starts_on_a_bus_program_but_not_its_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(path) = red_clip(dir.path()) else {
+        return;
+    };
+    let Some((mut app, channel, deck, bus)) = playlist_rig(&path) else {
+        return;
+    };
+    let mut settings = playlist_state(&app, &deck).settings;
+    settings.auto_play = true;
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::SetPlaylistSettings {
+            deck_uuid: deck.clone(),
+            settings,
+        },
+    ));
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::SetBusPreview {
+            uuid: bus.clone(),
+            input: BusInputRef::Channel(channel),
+        },
+    ));
+    run(&mut app, 0.2);
+    assert!(!playlist_state(&app, &deck).playing);
+    ok(send_cmd(&mut app, EngineCommand::BusCut { uuid: bus }));
+    run(&mut app, 0.3);
+    assert!(playlist_state(&app, &deck).playing);
+}
+
 /// The middle pixel of the master, linear RGBA.
 fn middle_of_main(app: &VardaApp) -> [f32; 4] {
     let ctx = app.gpu_context();

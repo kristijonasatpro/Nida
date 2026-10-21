@@ -129,6 +129,43 @@ impl Playlist {
         self.playing
     }
 
+    /// The clip on screen, for the input's transport. Pictures have no
+    /// playhead. The playlist owns play/pause, including at a clip's end.
+    pub fn playback_snapshot(&self) -> Option<crate::video::PlaybackSnapshot> {
+        let mut snapshot = self.shown.as_ref()?.deck.playback_snapshot()?;
+        snapshot.playing = self.playing;
+        Some(snapshot)
+    }
+
+    /// Scrub the clip on screen without starting or pausing the playlist.
+    /// A hand on its playhead cancels any pending change to another item.
+    pub fn seek(&mut self, position_secs: f64) -> bool {
+        if !position_secs.is_finite() {
+            return false;
+        }
+        let Some(open) = self.shown.as_mut().filter(|open| open.clip) else {
+            return false;
+        };
+        let Some(playback) = open.deck.playback_snapshot() else {
+            return false;
+        };
+        let position = position_secs.clamp(
+            playback.in_point,
+            playback.effective_out().max(playback.in_point),
+        );
+        open.deck.video_seek(position);
+        // Ignore the decoder's old end snapshot until the seek is processed.
+        open.held = 0.0;
+        self.last_step = None;
+        let changing_item = self.transition.is_some() || self.jump;
+        self.transition = None;
+        self.jump = false;
+        if changing_item {
+            self.drop_next();
+        }
+        true
+    }
+
     /// The renderer shows `fps` frames a second (0: as fast as it can).
     pub fn set_output_fps(&self, fps: u32) {
         self.output_fps
@@ -227,22 +264,35 @@ impl Playlist {
         }
     }
 
-    /// Play or stop. Played at the end of a list that does not loop, it
-    /// starts again from the first item.
+    /// Play or stop. With Auto Next off, replay the current item after it
+    /// ends. Otherwise restart a finished, non-looping list from the top.
     pub fn set_playing(&mut self, playing: bool) {
         if playing == self.playing {
             return;
         }
         self.playing = playing;
         self.last_step = None;
-        if playing && self.finished() {
+        if playing && !self.settings.auto_next {
+            if let Some(open) = self.shown.as_ref().filter(|open| self.done(open, 0.0)) {
+                if open.clip {
+                    open.deck.video_seek(0.0);
+                }
+                if let Some(open) = &mut self.shown {
+                    open.held = 0.0;
+                }
+            }
+        }
+        if playing && self.settings.auto_next && self.finished() {
             self.show_item(0);
             return;
         }
-        for open in self.shown.iter().chain(self.next.iter()) {
-            if open.clip {
-                open.deck.video_set_playing(playing);
-            }
+        if let Some(open) = &self.shown {
+            open.deck.video_set_playing(playing);
+        }
+        if let Some(next) = &self.next {
+            // Preloaded clips stay cued until their transition starts.
+            next.deck
+                .video_set_playing(playing && self.transition.is_some());
         }
     }
 
@@ -352,6 +402,15 @@ impl Playlist {
         let Some(open) = self.shown.as_ref() else {
             return;
         };
+        if !self.settings.auto_next {
+            // A manual pick above still works, but automatic playback ends
+            // on this item, without starting a transition early.
+            if self.done(open, 0.0) {
+                self.set_playing(false);
+            }
+            self.open_following();
+            return;
+        }
         let following = self.following(open);
         if self.done(open, lead) {
             match following {
@@ -392,10 +451,12 @@ impl Playlist {
         let Some(playback) = open.deck.playback_snapshot() else {
             return true;
         };
-        if playback.reached_end {
+        let end = playback.effective_out();
+        // Pausing clears the decoder's transient reached_end flag. Its
+        // stored position still identifies an ended clip when Play replays it.
+        if playback.reached_end || (end > 0.0 && playback.position >= end) {
             return true;
         }
-        let end = playback.effective_out();
         lead > 0.0 && end > lead && playback.position_now() >= end - lead
     }
 
