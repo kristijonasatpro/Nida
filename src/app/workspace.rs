@@ -3261,6 +3261,7 @@ mod tests {
                 device: "No Such Blackmagic Device".into(),
                 mode: "1080p60".into(),
                 full_range: false,
+                embedded_audio: false,
             },
             running,
             ..crate::scene::OutputConfig::default_windowed()
@@ -3335,6 +3336,7 @@ mod tests {
                 device: "No Such Blackmagic Device".into(),
                 mode: "1080p60".into(),
                 full_range: false,
+                embedded_audio: false,
             },
             running: true,
             ..crate::scene::OutputConfig::default_windowed()
