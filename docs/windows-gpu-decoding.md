@@ -141,3 +141,24 @@ backward/large seeks, variable-frame-rate clips, ping-pong, EOF, unsupported
 codecs, and reopening in software after a failure. Confirm Windows retains its
 nearby-seek improvement with decoding both enabled and disabled. These changes
 do not imply upstream has accepted Windows support.
+
+## FFmpeg build requirement
+
+FFmpeg 9+ is now the supported build baseline. Linux CI selects a verified
+FFmpeg 9 shared SDK instead of Ubuntu 24.04's FFmpeg 6.1 packages; Windows
+Clippy uses the same setup as the Windows package build. macOS checks require
+FFmpeg 9+ from Homebrew. The frame cleanup API and the Windows download-reuse
+optimization are retained. See [source build instructions](01-getting-started.md#build-from-source).
+
+The newer Windows download-reuse, software recovery and benchmark changes from
+fork main are included in this PR as well. Existing dated Windows measurements
+are historical results; changing the Linux build SDK does not validate Windows
+or macOS hardware playback.
+
+With the selected Linux FFmpeg 9 SDK, 221 production video/transport/timebase
+tests and 35 compressor/EQ/reader tests passed (one ignored in each suite).
+The isolated video harness excludes the two explicit GPU benchmark modules;
+these runs do not validate GPU playback. Installer checks also covered a bad
+checksum, preserving an unrelated directory, and reusing an installed SDK.
+Workflow actionlint, YAML parsing, shell syntax and focused Rust formatting pass.
+Full application and native Windows/macOS checks remain CI/hardware work.

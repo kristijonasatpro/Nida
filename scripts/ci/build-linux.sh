@@ -35,9 +35,8 @@ if [ "$SKIP_DEPS" = false ]; then
   echo "==> Installing system dependencies..."
   sudo apt-get update
   sudo apt-get install -y \
-    build-essential cmake pkg-config \
+    build-essential cmake pkg-config python3 \
     libvulkan-dev \
-    libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libavdevice-dev \
     libsrt-gnutls-dev \
     libasound2-dev \
     libv4l-dev \
@@ -46,6 +45,15 @@ if [ "$SKIP_DEPS" = false ]; then
     libwayland-dev libxkbcommon-dev libx11-dev libxrandr-dev libxi-dev \
     libgtk-3-dev
 fi
+
+# Match CI's commands, headers and shared libraries instead of Ubuntu's FFmpeg 6.
+FFMPEG_PREFIX="${FFMPEG_DIR:-${FFMPEG_PREFIX:-$HOME/.local/nida-ffmpeg-9}}"
+if [ "$SKIP_DEPS" = false ]; then
+  python3 scripts/ci/setup-linux-ffmpeg.py --prefix "$FFMPEG_PREFIX"
+  source "$FFMPEG_PREFIX/nida-env.sh"
+fi
+pkg-config --atleast-version=63 libavcodec \
+  || { echo "FFmpeg 9+ is required (including with --skip-deps)" >&2; exit 1; }
 
 # --- Build release binary ---
 if [ "$SKIP_BUILD" = false ]; then
@@ -61,6 +69,7 @@ echo "==> Preparing portable directory..."
 
 # Binary
 cp target/release/varda "$STAGE/bin/varda"
+cp "$(command -v ffmpeg)" "$(command -v ffprobe)" "$STAGE/bin/"
 
 # Shaders
 cp -r shaders/* "$STAGE/shaders/"
@@ -72,6 +81,7 @@ cat > "$STAGE/varda" << 'WRAPPER_EOF'
 SELF=$(readlink -f "$0")
 HERE=$(dirname "$SELF")
 export LD_LIBRARY_PATH="${HERE}/lib:${LD_LIBRARY_PATH:-}"
+export PATH="${HERE}/bin:${PATH}"
 exec "${HERE}/bin/varda" "$@"
 WRAPPER_EOF
 chmod +x "$STAGE/varda"
@@ -98,7 +108,11 @@ MEDIA_LIBS="
 
 echo "==> Bundling media shared libraries..."
 for lib_base in $MEDIA_LIBS; do
-  find /usr/lib -name "${lib_base}.so*" -print0 2>/dev/null | while IFS= read -r -d '' lib; do
+  case "$lib_base" in
+    libav*|libswscale|libswresample|libpostproc) media_dir="$(pkg-config --variable=libdir libavcodec)" ;;
+    *) media_dir=/usr/lib ;;
+  esac
+  find "$media_dir" -name "${lib_base}.so*" -print0 2>/dev/null | while IFS= read -r -d '' lib; do
     libname=$(basename "$lib")
     if [ ! -e "$STAGE/lib/$libname" ]; then
       echo "  bundling: $libname"
@@ -124,13 +138,9 @@ fi
 
 # --- Licenses ---
 cp LICENSE "$STAGE/LICENSE" 2>/dev/null || echo "MIT License" > "$STAGE/LICENSE"
-cat > "$STAGE/FFMPEG-LICENSE" << 'LIC_EOF'
-FFmpeg is licensed under the GNU Lesser General Public License (LGPL) version 2.1 or later.
-See https://ffmpeg.org/legal.html for details.
-
-The FFmpeg shared libraries bundled with Varda are dynamically linked,
-preserving LGPL compliance. Source code is available at https://ffmpeg.org.
-LIC_EOF
+# The selected SDK enables GPL codecs; ship its actual licence and provenance.
+cp "$FFMPEG_PREFIX/LICENSE.txt" "$STAGE/FFMPEG-LICENSE"
+cp "$FFMPEG_PREFIX/nida-build-inputs.json" "$STAGE/FFMPEG-build-inputs.json"
 
 # --- Create tarball ---
 echo "==> Creating tarball..."

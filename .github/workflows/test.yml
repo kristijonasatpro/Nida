@@ -15,6 +15,9 @@ on:
       - 'Cargo.lock'
       - 'build.rs'
       - '.github/workflows/test.yml'
+      - '.github/actions/linux-ffmpeg/**'
+      - 'scripts/ci/setup-linux-ffmpeg.py'
+      - 'scripts/ci/setup-windows-build.ps1'
 
 env:
   CARGO_TERM_COLOR: always
@@ -61,7 +64,6 @@ jobs:
           sudo apt-get install -y \
             build-essential cmake pkg-config \
             libvulkan-dev \
-            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libavdevice-dev \
             libsrt-gnutls-dev \
             libasound2-dev \
             libv4l-dev \
@@ -73,6 +75,9 @@ jobs:
           # the linker needs for -lfreenect is missing.
           test -e /usr/lib/x86_64-linux-gnu/libfreenect.so \
             || { echo "::error::libfreenect-dev did not provide libfreenect.so"; exit 1; }
+
+      - name: Select FFmpeg 9 SDK
+        uses: ./.github/actions/linux-ffmpeg
 
       # GitHub runners have no GPU. lavapipe (Mesa's software Vulkan
       # implementation) provides the headless adapter that the render, engine,
