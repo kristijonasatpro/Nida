@@ -24,6 +24,7 @@
 mod windows;
 
 /// Why the machine is held awake, as the OS lists it.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) const REASON: &str = "Nida: live outputs";
 
 /// Holds the machine awake while wanted, and lets go on drop.
