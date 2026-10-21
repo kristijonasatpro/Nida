@@ -52,7 +52,7 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
 
                     let video_playback =
                         slot.deck
-                            .playback_snapshot()
+                            .transport_playback_snapshot()
                             .map(|ps| VideoPlaybackSnapshot {
                                 playing: ps.playing,
                                 position: ps.position,

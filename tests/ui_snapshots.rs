@@ -200,6 +200,15 @@ fn snapshot_add_input_window() {
 /// A playlist on Ch B's tile, playing, and its window open.
 #[test]
 fn snapshot_playlist_window() {
+    playlist_window_snapshot(false);
+}
+
+#[test]
+fn snapshot_playlist_video_controls() {
+    playlist_window_snapshot(true);
+}
+
+fn playlist_window_snapshot(video: bool) {
     use varda::engine::value::playlist::{
         PlaylistItem, PlaylistSettings, PlaylistSnapshot, PlaylistTransition,
     };
@@ -232,6 +241,32 @@ fn snapshot_playlist_window() {
         failed: vec![4],
         remaining: Some(3.4),
     });
+    if video {
+        data.selected_channel = Some(1);
+        data.selected_deck = None;
+        let deck = &mut data.channels[1].decks[0];
+        let list = deck.playlist.as_mut().unwrap();
+        list.shown = Some(0);
+        list.settings.auto_next = false;
+        list.settings.auto_play = true;
+        list.remaining = Some(40.0);
+        deck.video_playback = Some(varda::usecases::ui::VideoPlaybackUI {
+            playing: true,
+            position: 20.0,
+            duration: 60.0,
+            speed: 1.0,
+            effective_speed: 1.0,
+            position_offset: 0.0,
+            loop_mode: varda::video::LoopMode::HoldLast,
+            in_point: 0.0,
+            out_point: 0.0,
+            frame_rate: 25.0,
+            transport_sync: varda::video::DeckTransportSync::default(),
+            hardware_decode: true,
+            auto: varda::engine::value::video::AutoPlayback::default(),
+            sound_only: false,
+        });
+    }
     let Some(mut harness) = snapshot_harness(data) else {
         return;
     };
@@ -243,7 +278,11 @@ fn snapshot_playlist_window() {
     harness.run();
     harness.hover_at(egui::pos2(5.0, 5.0));
     harness.run();
-    harness.snapshot("playlist_window");
+    harness.snapshot(if video {
+        "playlist_video_controls"
+    } else {
+        "playlist_window"
+    });
 }
 
 /// A count down on Ch B's tile, in its warning seconds and running, its

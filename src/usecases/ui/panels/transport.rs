@@ -6,6 +6,7 @@
 //! ◀◀ and ▶▶ jump [`JUMP_SECS`] back and forward.
 
 use super::super::{ChannelUIInfo, DeckUIInfo, UIActions, UIData, VideoPlaybackUI};
+use crate::engine::value::playlist::PlaylistItem;
 use crate::engine::EngineCommand;
 use crate::video::LoopMode;
 
@@ -121,6 +122,20 @@ pub(super) fn render_transport(
                         .weak(),
                 )
                 .on_hover_text("Left to play, to the out-point");
+                if let Some(list) = &deck.playlist {
+                    let name = list
+                        .shown
+                        .and_then(|index| list.items.get(index))
+                        .map_or("Playlist clip", PlaylistItem::name);
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(name).small().weak()).truncate(),
+                        )
+                        .on_hover_text(name);
+                    });
+                    return;
+                }
                 ui.add_space(6.0);
                 if ui
                     .small_button("[ In")

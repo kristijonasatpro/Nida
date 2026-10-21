@@ -89,8 +89,33 @@ impl VardaApp {
         let on_air = self.on_air();
         let mut now_on = HashMap::new();
         let mut arrived_held = Vec::new();
+        let mut playlist_starts = Vec::new();
         for slot in self.mixer.channels().iter().flat_map(|ch| &ch.decks) {
             let deck = &slot.deck;
+            if let Some(list) = deck.playlist() {
+                let uuid = deck.uuid();
+                // The playlist itself is the player: changing its selected
+                // item while on Program must not count as a fresh arrival.
+                let identity = deck.playback_identity().unwrap_or_default();
+                let on = on_air.anywhere(uuid) > 0.0;
+                let was = self
+                    .clips_on_air
+                    .get(uuid)
+                    .is_some_and(|&(was, id)| was && id == identity);
+                let held = self
+                    .clips_held
+                    .iter()
+                    .any(|(held, of, _)| held == uuid && *of == identity);
+                if on && !was {
+                    if held {
+                        arrived_held.push(uuid.to_string());
+                    } else if list.settings().auto_play {
+                        playlist_starts.push(uuid.to_string());
+                    }
+                }
+                now_on.insert(uuid.to_string(), (on, identity));
+                continue;
+            }
             let Some(playback) = deck.playback_snapshot() else {
                 continue;
             };
@@ -130,6 +155,9 @@ impl VardaApp {
                 }
             }
             now_on.insert(uuid.to_string(), (on, identity));
+        }
+        for uuid in playlist_starts {
+            let _ = self.edit_playlist(&uuid, |list| list.set_playing(true));
         }
         self.clips_on_air = now_on;
         // A held clip is held for the arrival its step brings about: until
@@ -349,5 +377,55 @@ mod tests {
         assert!((on_air.at(Some("led"), "b") - 1.0).abs() < 1e-6);
         assert!(on_air.at(Some("tv"), "b").abs() < 1e-6);
         assert!(on_air.at(Some("gone"), "b").abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_explicitly_held_playlist_suppresses_auto_play_for_only_that_arrival() {
+        use crate::engine::value::playlist::PlaylistSettings;
+        let Ok(gpu) = crate::renderer::context::GpuContext::new_headless() else {
+            return;
+        };
+        let mut app = VardaApp::new(gpu, &crate::testing::headless_config()).unwrap();
+        app.mixer.set_mix_mode(MixMode::Program);
+        let channel = app.mixer.channels()[0].uuid().to_string();
+        let deck = app
+            .add_playlist_deck(
+                &channel,
+                vec![],
+                Some(PlaylistSettings {
+                    auto_play: true,
+                    ..PlaylistSettings::default()
+                }),
+            )
+            .unwrap();
+        let (ch, dk) = app.resolve_deck(&deck).unwrap();
+        let identity = app.mixer.channels()[ch].decks[dk]
+            .deck
+            .playback_identity()
+            .unwrap();
+        app.clips_held.push((deck.clone(), identity, 6));
+        app.cmd_take_to_main(MainSource::Channel(channel.clone()), false);
+        app.update_on_air();
+        assert!(!app.mixer.channels()[ch].decks[dk]
+            .deck
+            .playlist()
+            .unwrap()
+            .is_playing());
+        assert!(
+            app.clips_held.is_empty(),
+            "the rundown's hold is consumed on arrival"
+        );
+        app.cmd_take_to_main(MainSource::Black, false);
+        app.update_on_air();
+        app.cmd_take_to_main(MainSource::Channel(channel), false);
+        app.update_on_air();
+        assert!(
+            app.mixer.channels()[ch].decks[dk]
+                .deck
+                .playlist()
+                .unwrap()
+                .is_playing(),
+            "the next arrival autoplays, even before a media item has opened"
+        );
     }
 }

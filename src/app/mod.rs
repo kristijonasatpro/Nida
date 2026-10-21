@@ -1208,7 +1208,7 @@ impl VardaApp {
         let (ch_idx, deck_idx) = self.mixer.find_deck_by_uuid(deck_uuid)?;
         self.mixer.channels()[ch_idx].decks[deck_idx]
             .deck
-            .playback_snapshot()
+            .transport_playback_snapshot()
     }
 
     /// Helper: update a modulation source by UUID.

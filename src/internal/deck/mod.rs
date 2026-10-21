@@ -889,14 +889,14 @@ impl Deck {
         }
     }
 
-    /// Which decode thread plays this clip, to tell a clip rebuilt under the
-    /// same UUID (a structural undo) from the one it replaced. `None` for
-    /// anything but a clip.
+    /// Which runtime player owns this clip or playlist, to tell one rebuilt
+    /// under the same UUID (a structural undo) from the one it replaced.
     pub fn playback_identity(&self) -> Option<usize> {
         match &self.source {
             DeckSource::Video { handle, .. } | DeckSource::HapVideo { handle, .. } => {
                 Some(std::sync::Arc::as_ptr(&handle.snapshot_cell()) as usize)
             }
+            DeckSource::Playlist(list) => Some(std::ptr::from_ref(list.as_ref()) as usize),
             _ => None,
         }
     }
@@ -934,6 +934,16 @@ impl Deck {
             }
             _ => None,
         }
+    }
+
+    /// The input transport's clip, including the current playlist item.
+    /// Keep this separate from the source snapshot used by residency,
+    /// on-air automation and persistence to identify standalone video decks.
+    pub fn transport_playback_snapshot(&self) -> Option<PlaybackSnapshot> {
+        self.playback_snapshot().or_else(|| {
+            self.playlist()
+                .and_then(playlist::Playlist::playback_snapshot)
+        })
     }
 
     /// Bound this deck's decode rate to what the renderer can present

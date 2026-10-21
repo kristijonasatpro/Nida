@@ -935,7 +935,17 @@ impl VardaApp {
                 let was_playing = self
                     .video_playback_snapshot(&deck_uuid)
                     .is_some_and(|s| s.playing);
-                let result = self.exec_on_deck(&deck_uuid, |d| d.video_toggle_play());
+                let result = self.exec_on_deck(&deck_uuid, |d| {
+                    if let Some(list) = d.playlist_mut() {
+                        if list.playback_snapshot().is_none() {
+                            return false;
+                        }
+                        list.set_playing(!list.is_playing());
+                        true
+                    } else {
+                        d.video_toggle_play()
+                    }
+                });
                 if matches!(result, CommandResult::Ok) {
                     self.note_live_video_write(
                         &deck_uuid,
@@ -952,7 +962,13 @@ impl VardaApp {
                 let duration = self
                     .video_playback_snapshot(&deck_uuid)
                     .map_or(0.0, |s| s.duration);
-                let result = self.exec_on_deck(&deck_uuid, |d| d.video_seek(position_secs));
+                let result = self.exec_on_deck(&deck_uuid, |d| {
+                    if let Some(list) = d.playlist_mut() {
+                        list.seek(position_secs)
+                    } else {
+                        d.video_seek(position_secs)
+                    }
+                });
                 if matches!(result, CommandResult::Ok) {
                     self.note_live_video_write(
                         &deck_uuid,

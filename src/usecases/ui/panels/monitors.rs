@@ -369,6 +369,51 @@ mod tests {
     }
 
     #[test]
+    fn a_playlists_current_clip_has_a_playhead_and_transport() {
+        use crate::engine::value::playlist::{PlaylistItem, PlaylistSettings, PlaylistSnapshot};
+        let (mut data, deck) = with_clip();
+        data.channels[1].decks.last_mut().unwrap().playlist = Some(PlaylistSnapshot {
+            items: vec![PlaylistItem::new("/show/lower-third.mov")],
+            settings: PlaylistSettings {
+                auto_next: false,
+                ..PlaylistSettings::default()
+            },
+            playing: false,
+            shown: Some(0),
+            coming: None,
+            next_ready: None,
+            failed: vec![],
+            remaining: Some(40.0),
+        });
+        let mut harness = harness(data);
+        assert!(harness
+            .query_by_label_contains("No video or sound")
+            .is_none());
+        assert!(harness.query_by_label("Playhead").is_some());
+        let filename = harness.get_by_label("lower-third.mov").rect();
+        let remaining = harness.get_by_label("-00:40.0").rect();
+        let playhead = harness.get_by_label("Playhead").rect();
+        assert!(
+            filename.left() >= remaining.right() + 10.0,
+            "filename stays clear of the time counters"
+        );
+        assert!(
+            (filename.right() - playhead.right()).abs() < 1.0,
+            "filename aligns to the right of the playback strip"
+        );
+        // Per-clip looping and trim controls are not playlist controls.
+        assert!(harness.query_by_label("[ In").is_none());
+        harness.get_by_label("Play").click();
+        harness.run();
+        assert!(harness.state().iter().any(|c| matches!(
+            c, EngineCommand::VideoTogglePlay { deck_uuid } if *deck_uuid == deck
+        )));
+        harness.get_by_label("Back 5 seconds").click();
+        harness.run();
+        assert_eq!(seeks(&harness), vec![15.0]);
+    }
+
+    #[test]
     fn clicking_the_bar_moves_the_playhead_there() {
         let (data, _) = with_clip();
         let mut harness = harness(data);
