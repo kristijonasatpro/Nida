@@ -65,12 +65,14 @@ build). The benchmark refuses to label a software fallback as hardware.
 
 ## Nearby forward scrubbing
 
-Short forward seeks (up to 0.25 seconds beyond the currently decoded picture)
+On Windows, short forward seeks (up to 0.25 seconds beyond the currently decoded picture)
 now retain the decoder's reference pictures, queued frame and GPU surfaces.
 They decode forward rather than flushing and starting again at a keyframe.
 Backward and larger jumps, ping-pong, EOF and unavailable timestamps keep the
 normal seek path. A decoder reopened in software always starts from a keyframe.
 A repeated paused seek to the same picture delivers it once and then holds.
+macOS (both software and VideoToolbox) and Linux retain the existing keyframe
+seek path. The Windows results below do not validate changing seeking on Macs.
 
 A separate Criterion baseline was recorded before this change. The same 4K
 clip was scrubbed forward one frame at a time, with a backward reset every
@@ -91,3 +93,48 @@ Four focused checks passed: forward/repeated seek and pause/resume correctness
 on both decoder requests, keyframe recovery after hardware fallback, the
 existing seek-to-frame pixel check, and forward-offset playback. Production
 library/binary and benchmark Clippy passes. GPU changes remain local.
+
+## Upstream review follow-up
+
+The forward-seek optimization is restricted to Windows because its measurements
+and playback validation were on Windows. This preserves keyframe seeking on
+macOS with software and VideoToolbox, and on Linux. Windows' optimization and
+opt-in decoding preference are unchanged. Fallback regression coverage remains
+active on every platform; only the retained-frame seek test is Windows-specific.
+
+Cloud validation used an isolated crate compiling the production video,
+transport, timebase and value modules with FFmpeg 7.1.5. It copies the production
+`ResolvedModulation` value type and uses `wgpu-types` for texture formats; it
+does not include application rendering or audio backends. The new non-Windows
+seek regression fails without the platform restriction and passes with it.
+The broader run passed 215 tests, with one ignored; after extending fallback
+coverage to non-Windows, both the seek and fallback tests passed again.
+This validates Linux software decoding and fallback, not D3D11VA or VideoToolbox.
+
+Focused rustfmt passes. Strict isolated Clippy is blocked by existing
+`doc_markdown`, `similar_names` and `assert_is_empty` findings in unchanged code.
+Full application validation remains pending: this container lacks application
+dependencies including ALSA development files and CMake; offline resolution also
+stops at the uncached `arc-swap` dependency.
+
+On configured native Windows and Mac build machines, with `ffmpeg` on PATH
+(use the minimal feature set to avoid unrelated optional capture/depth SDKs):
+
+```sh
+cargo test --no-default-features --lib nearby_forward_scrubbing -- --nocapture
+cargo test --no-default-features --lib hardware_fallback_restarts_at_a_keyframe_after_a_seek -- --nocapture
+cargo test --no-default-features --lib the_media_engine_decodes_the_same_picture_and_does_the_work -- --nocapture
+cargo test --no-default-features --lib
+cargo test --no-default-features --test ui_integration
+cargo clippy --no-default-features --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+On Windows, set `VARDA_REQUIRE_HW_DECODE=1` for the media-engine test when the
+GPU supports all its codecs. Check the reported backend rather than counting a
+software fallback as hardware success. On a Mac, check both forced software and
+actual VideoToolbox playback manually: paused and repeated scrubbing, resume,
+backward/large seeks, variable-frame-rate clips, ping-pong, EOF, unsupported
+codecs, and reopening in software after a failure. Confirm Windows retains its
+nearby-seek improvement with decoding both enabled and disabled. These changes
+do not imply upstream has accepted Windows support.

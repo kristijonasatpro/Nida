@@ -2073,6 +2073,12 @@ impl VideoPlayer {
     }
 
     fn can_decode_forward_to(&self, target: f64) -> bool {
+        // This optimization has only been measured and exercised on Windows.
+        // Keep the established keyframe seek on macOS (software/VideoToolbox)
+        // and Linux until forward scrubbing is validated there separately.
+        if !cfg!(target_os = "windows") {
+            return false;
+        }
         // Ping-pong can display a cached reverse picture while `decoded`
         // still holds the forward endpoint. It must use the normal seek.
         if self.playback.loop_mode == LoopMode::PingPong
@@ -2720,6 +2726,7 @@ mod tests {
         assert_eq!(which(&frames, &next), 38);
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn nearby_forward_scrubbing_reuses_the_decoder_and_keeps_the_right_picture() {
         let dir = tempfile::tempdir().unwrap();
@@ -2783,7 +2790,7 @@ mod tests {
     }
 
     #[test]
-    fn hardware_fallback_restarts_at_a_keyframe_after_a_retained_seek() {
+    fn hardware_fallback_restarts_at_a_keyframe_after_a_seek() {
         let dir = tempfile::tempdir().unwrap();
         let Some(path) = test_clip(dir.path(), "fallback.mp4", 3, &[]) else {
             return;
@@ -2793,7 +2800,7 @@ mod tests {
         player.seek_and_reset(1.01).unwrap();
         player.next_frame().unwrap().expect("initial frame");
         player.seek_and_reset(1.05).unwrap();
-        assert!(player.retained_seek_frame);
+        assert_eq!(player.retained_seek_frame, cfg!(target_os = "windows"));
         player
             .fall_back_to_software("test decoder replacement")
             .unwrap();
@@ -2806,6 +2813,35 @@ mod tests {
             .expect("software replacement frame");
         let at = player.decoded.timestamp().unwrap() as f64 * player.time_base - player.start;
         assert!((at - 1.04).abs() < 1e-6);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn nearby_forward_scrubbing_preserves_the_existing_keyframe_seek() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = test_clip(dir.path(), "forward-existing.mp4", 3, &[]) else {
+            return;
+        };
+        // On macOS these exercise software and the VideoToolbox request.
+        // A request may fall back; this test does not assert hardware use.
+        for hardware in [false, true] {
+            let mut player = VideoPlayer::open(&path, hardware).unwrap();
+            player.set_playing(false);
+            player.seek_and_reset(1.01).unwrap();
+            player.next_frame().unwrap().expect("initial frame");
+            assert!(player.lookahead_at.is_some(), "next picture queued");
+            player.seek_and_reset(1.05).unwrap();
+            assert!(!player.retained_seek_frame);
+            assert_eq!(player.lookahead_at, None, "flush the queued picture");
+            assert!(player.sought.is_some(), "decode again from a keyframe");
+            player.next_frame().unwrap().expect("frame at new position");
+            let at = player.decoded.timestamp().unwrap() as f64 * player.time_base - player.start;
+            assert!((at - 1.04).abs() < 1e-6, "frame 26 at 1.04 s, got {at}");
+            player.set_playing(true);
+            step(&mut player).expect("playing resumes");
+            let at = player.decoded.timestamp().unwrap() as f64 * player.time_base - player.start;
+            assert!((at - 1.08).abs() < 1e-6);
+        }
     }
 
     /// A clip whose frames come further apart after its first second (half
