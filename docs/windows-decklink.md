@@ -34,20 +34,40 @@ for output in Desktop Video first.
 
 ## Embedded audio
 
-While the output is stopped, choose its **Audio** mixer bus in the output panel.
-New headless outputs inherit the default bus; saved outputs with no bus stay
-video-only until a bus is selected. Microphones, capture audio and other sources
-reach the card through their mixer-bus routing. The tap includes bus gain, mute
-and delay, as mixed by Nida.
+While the output is stopped, explicitly choose its **Audio** mixer bus in the
+output panel. This sets `embedded_audio: true` in its saved DeckLink target.
+An absent or false flag keeps both Windows DeckLink and macOS UltraStudio on
+their existing synchronous video-only path, even when an old show already has
+`audio_bus` or `running: true`. New outputs also start video-only despite their
+inherited default bus. The legacy bus value is preserved on save; it is not
+consent to enable embedded audio. The existing Audio menu shows **None (silent)**
+until the operator explicitly selects a bus. Choosing None clears the opt-in.
+An explicit `SetOutputAudioBus` command does the same while stopped; changing
+it while running is rejected. Mode and level changes preserve the choice.
+
+Microphones, capture audio and other sources reach the card through their
+mixer-bus routing. The tap includes bus gain, mute and delay, as mixed by Nida.
 
 With a bus selected, the card embeds two interleaved channels at 48 kHz, using
 32-bit integer PCM. Video and audio use the same scheduled DeckLink playback
-clock. Three video frames and their corresponding audio duration are buffered
-before playback starts; fractional video rates keep exact rational timestamps
-instead of rounding to a whole number of audio samples per video frame. Initial
-preroll repeats the first picture and uses silence before the tap's start.
-The source audio offset matches the two frames ahead of a completed video
-frame in the three-frame queue (rounded once at 48 kHz).
+clock. The video queue has three frames. A completion occurs after one has
+played, so its replacement is scheduled two frame periods ahead of the current
+source picture. Audio uses this same delay and **at most two frame periods of
+buffered headroom**, derived from the video queue size minus the completed
+frame. Previously it filled three periods while delaying by two, requesting
+one period of source audio that had not been produced; the live tap correctly
+replaced those future samples with silence. Merely delaying audio by three
+periods would instead misalign it with the replacement picture.
+
+The headroom is rounded up once to 48 kHz sample frames (stereo pairs), with a
+24,000-frame memory/work bound for unusually slow modes. Audio scheduling uses
+absolute sample positions; video keeps the SDK's exact duration/time-scale
+ratio. It never accumulates a rounded samples-per-video-frame count at 23.976,
+29.97 or 59.94. The Rust tap retains the delay as an integer sample count rather
+than converting it to nanoseconds and back, which could lose one sample.
+Initial preroll repeats the first picture and uses silence before the tap's
+start; it must not pull future source sound. Only the existing 48 kHz, two-channel,
+32-bit integer SDK format is enabled; no other audio formats are added.
 
 The source receiver and native audio scratch storage are bounded. Underruns and
 reported source losses become silence; late source samples are discarded at
@@ -55,7 +75,7 @@ their original timeline positions. Partial or zero SDK writes retain pending
 samples, and callbacks that fall behind the hardware clock skip elapsed time.
 Stopping unregisters callbacks before their Rust audio context is freed.
 
-A missing selected bus or rejected audio setup fails the output rather than
+A missing explicitly selected bus or rejected audio setup fails the output rather than
 falling back to silent video. Choosing **None (silent)** explicitly retains the
 existing video-only path. Change the bus while stopped, then restart the output.
 Physical lip sync, connector routing and long-running clock behavior still need
@@ -74,6 +94,9 @@ This change does not import the integration fork's complete Windows core PR.
 Use that portability work when validating the complete Windows application.
 
 ## Checks without hardware
+
+For the local fixes following the two maintainer findings on PR #7, see
+[audio review fixes and remaining qualification](decklink-audio-review.md).
 
 The focused `DeckLink backend` workflow builds the actual module on Windows,
 Linux and macOS. Its isolated harness copies the module, tests, portable converter,
@@ -119,7 +142,7 @@ fractional rates. Measure sustained sync on the actual SDI/HDMI receiver.
 Do not use a successful SDK build or a fake-SDK test as evidence of a passing
 physical SDI/HDMI output, sustained frame rate, colour measurement or sync test.
 
-## Embedded audio validation
+## Historical embedded audio validation
 
 Checked code revision: `deb5056db4ad75684f2d9135edd96bcd0cb96cac`.
 All four jobs in [this audio CI run](https://github.com/pingvis/Nida-Windows/actions/runs/39319183811)

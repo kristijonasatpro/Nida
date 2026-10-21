@@ -1,12 +1,27 @@
 """Prepare an isolated build of the actual DeckLink sources, without the GPU app.
 
-Only scheduling priority and tracing are no-ops. The DeckLink module, its tests,
+Scheduling priority and tracing are no-ops. The DeckLink module, its tests,
 the NDI video-range conversion, build.rs and SDK files are copied verbatim.
+Output configuration tests also use the production value types, serde definitions
+and target conversion functions. Fixtures must supply UUIDs; their generator is
+unavailable here and deliberately panics rather than replacing production policy.
 """
 from pathlib import Path
 import shutil
 import sys
 import tomllib
+
+
+def block(text: str, signature: str) -> str:
+    """Copy one production Rust item, as for the existing conversion harness."""
+    start = text.index(signature)
+    opening = text.index("{", start)
+    depth = 1
+    end = opening + 1
+    while depth:
+        depth += (text[end] == "{") - (text[end] == "}")
+        end += 1
+    return text[start:end] + "\n"
 
 
 def prepare(destination: Path) -> None:
@@ -32,6 +47,23 @@ def prepare(destination: Path) -> None:
     chunk_start = audio.index("pub struct PcmChunk {")
     chunk_end = audio.index("\n}", chunk_start) + 2
     (destination / "src/pcm_chunk.rs").write_text(audio[chunk_start:chunk_end] + "\n", encoding="utf-8")
+    value_dir = destination / "src/engine/value"
+    value_dir.mkdir(parents=True, exist_ok=True)
+    for value in ("render", "led", "warp"):
+        shutil.copyfile(root / f"src/engine/value/{value}.rs", value_dir / f"{value}.rs")
+    scene = (root / "src/internal/scene/mod.rs").read_text(encoding="utf-8")
+    # Include the real OutputConfig, including defaults and nested serde types;
+    # no test-only model of legacy configuration or audio opt-in.
+    output = scene[scene.index("/// Serializable output target configuration."):scene.index("impl OutputConfig {")]
+    output += scene[scene.index("/// Membership of a surface in an output"):scene.index("// ── Blend mode")]
+    output += block(scene, "fn default_true()")
+    (destination / "src/output_config.rs").write_text(output, encoding="utf-8")
+    persistence = (root / "src/internal/persistence/mod.rs").read_text(encoding="utf-8")
+    conversions = block(persistence, "fn target_to_config(") + block(persistence, "fn config_to_target(")
+    (destination / "src/target_conversions.rs").write_text(conversions, encoding="utf-8")
+    tests_dir = destination / "src/persistence"
+    tests_dir.mkdir(exist_ok=True)
+    shutil.copyfile(root / "src/internal/persistence/decklink_audio_tests.rs", tests_dir / "decklink_audio_tests.rs")
     (destination / "Cargo.toml").write_text('''[package]
 name = "nida-decklink-check"
 version = "0.0.0"
@@ -45,6 +77,9 @@ serde = { version = "1", features = ["derive"] }
 utoipa = "5"
 libc = "0.2"
 crossbeam-channel = "0.5"
+
+[dev-dependencies]
+serde_json = "1"
 
 [build-dependencies]
 cc = "1"
@@ -60,7 +95,30 @@ cc = "1"
 pub mod decklink;
 mod audio { include!("pcm_chunk.rs"); }
 mod ndi { include!("ndi_conversion.rs"); }
+pub mod engine {
+    pub mod value {
+        pub mod render;
+        pub mod led;
+        pub mod warp;
+    }
+}
+mod scene {
+    use serde::{Deserialize, Serialize};
+    include!("output_config.rs");
+    fn generate_default_uuid() -> String {
+        panic!("configuration harness fixtures must provide an explicit UUID")
+    }
+}
+mod persistence {
+    use crate::engine::value::render::{OutputTarget, RecordingCodec};
+    use crate::scene::OutputTargetConfig;
+    include!("target_conversions.rs");
+    #[cfg(test)] mod decklink_audio_tests;
+}
 mod renderer {
+    pub mod context { pub use crate::engine::value::render::*; }
+    pub mod edge_blend { pub use crate::engine::value::render::{EdgeBlendMode, EdgeBlendConfig}; }
+    pub mod warp { pub use crate::engine::value::warp::WarpMode; }
     pub mod presenter {
         pub fn raise_priority(_: &str) {}
         pub fn run_in_real_time(_: &str, _: std::time::Duration,

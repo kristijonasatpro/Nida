@@ -13,6 +13,7 @@ pub struct AudioInput {
 pub(super) struct Pull {
     input: AudioInput,
     origin: Option<Instant>,
+    delay_frames: u32,
     position: u64,
     gap: u64,
     chunk: Vec<f32>,
@@ -25,6 +26,7 @@ impl Pull {
         Self {
             input,
             origin: None,
+            delay_frames: 0,
             position: 0,
             gap: 0,
             chunk: Vec::new(),
@@ -34,8 +36,8 @@ impl Pull {
 
     pub(super) fn begin(&mut self, now: Instant, delay_frames: u32) {
         if self.origin.is_none() {
-            let delay = std::time::Duration::from_secs_f64(f64::from(delay_frames) / 48_000.0);
-            self.origin = Some(now.checked_sub(delay).unwrap_or(now));
+            self.origin = Some(now);
+            self.delay_frames = delay_frames;
         }
     }
 
@@ -68,7 +70,8 @@ impl Pull {
         };
         // Convert time once at the read boundary; do not accumulate a rounded
         // "samples per video frame" at 29.97/59.94 Hz.
-        let start = difference.saturating_mul(48_000) / 1_000_000_000 + i128::from(frame);
+        let start = difference.saturating_mul(48_000) / 1_000_000_000 + i128::from(frame)
+            - i128::from(self.delay_frames);
         let start = start.saturating_mul(2);
         let mut reads = 0;
         for (index, dst) in out.iter_mut().enumerate() {
@@ -200,6 +203,45 @@ mod tests {
         assert_eq!(out, [0; 4]);
         pull.read(2400, &mut out);
         assert_eq!(out, [i32::MAX; 4]);
+    }
+    #[test]
+    fn sample_delays_are_exact_and_begin_does_not_move_a_running_timeline() {
+        // 4000/48000 seconds cannot be represented in whole nanoseconds.
+        // Converting the delay to an Instant and back used to lose one sample.
+        for delay in [1, 1600, 1602, 1920, 3200, 3204, 4000, 4004] {
+            let (tx, receiver) = crossbeam_channel::bounded(1);
+            let opened = Instant::now();
+            let mut pull = Pull::new(AudioInput { receiver, opened });
+            pull.begin(opened, delay);
+            pull.begin(opened + std::time::Duration::from_secs(1), 0);
+            tx.send(PcmChunk {
+                samples: vec![1.0, -1.0],
+                lost_before: 0,
+            })
+            .unwrap();
+            let mut out = [1; 4];
+            pull.read(i64::from(delay) - 1, &mut out);
+            assert_eq!(out, [0, 0, i32::MAX, i32::MIN], "delay {delay}");
+        }
+    }
+    #[test]
+    fn tap_open_time_is_preserved_when_the_first_picture_arrives_later() {
+        let (tx, receiver) = crossbeam_channel::bounded(1);
+        let opened = Instant::now();
+        let mut pull = Pull::new(AudioInput { receiver, opened });
+        // Tap opened 250ms before the first picture, with 50ms output latency:
+        // hardware time zero needs source frame 9600 (200ms into the tap).
+        pull.begin(opened + std::time::Duration::from_millis(250), 2400);
+        let mut samples = vec![0.0; 9600 * 2];
+        samples.extend([0.5, -0.5]);
+        tx.send(PcmChunk {
+            samples,
+            lost_before: 0,
+        })
+        .unwrap();
+        let mut out = [0; 2];
+        pull.read(0, &mut out);
+        assert_eq!(out, [1_073_741_824, -1_073_741_824]);
     }
     #[test]
     fn long_timestamp_gaps_are_bounded_and_do_not_allocate_silence() {

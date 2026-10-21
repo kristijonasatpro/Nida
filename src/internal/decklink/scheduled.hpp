@@ -12,7 +12,8 @@ class Scheduled final : public IDeckLinkVideoOutputCallback, public IDeckLinkAud
     std::atomic<ULONG> refs_{1};
     std::recursive_mutex lock_;
     IDeckLinkOutput* output_;
-    std::array<IDeckLinkMutableVideoFrame*, 3> frames_{};
+    static constexpr size_t video_queue_frames = 3;
+    std::array<IDeckLinkMutableVideoFrame*, video_queue_frames> frames_{};
     const int32_t width_, height_;
     const BMDTimeValue duration_;
     const BMDTimeScale scale_;
@@ -42,20 +43,21 @@ class Scheduled final : public IDeckLinkVideoOutputCallback, public IDeckLinkAud
     }
 
 public:
-    // Three display frames of headroom, rounded once at 48 kHz. Never round
-    // samples per video frame: 29.97 and 59.94 require fractional counts.
-    const uint32_t preroll;
-    // Completion is after a displayed frame: the three-frame queue has two
-    // frames ahead of the newly completed one. Match audio to that latency.
+    // At completion one frame period has elapsed. A fresh source picture is
+    // scheduled after the remaining queue: (queue size - 1) frame periods.
+    // Audio must use that same source delay AND no more buffered headroom:
+    // filling three frames while delaying by two asks a live tap for future
+    // sound, which it replaces with silence. Round this boundary once at 48 kHz,
+    // never a per-video-frame sample count (fractional rates would drift).
     const uint32_t source_delay;
+    const uint32_t preroll;
 
     Scheduled(IDeckLinkOutput* output, int32_t width, int32_t height,
               BMDTimeValue duration, BMDTimeScale scale, AudioRead read, void* context)
         : output_(output), width_(width), height_(height), duration_(duration), scale_(scale),
           read_(read), context_(context), latest_(static_cast<size_t>(width) * height * 2),
-          preroll(static_cast<uint32_t>(std::min<int64_t>(24000,
-              (48000 * duration * 3 + scale - 1) / scale))),
-          source_delay(static_cast<uint32_t>((48000 * duration * 2 + scale - 1) / scale)) {
+          source_delay(static_cast<uint32_t>((48000 * duration * (video_queue_frames - 1) + scale - 1) / scale)),
+          preroll(std::min<uint32_t>(24000, source_delay)) {
         output_->AddRef();
     }
 

@@ -933,6 +933,9 @@ pub enum OutputTargetConfig {
         mode: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         full_range: bool,
+        /// A legacy `audio_bus` does not enable the scheduled embedded path.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        embedded_audio: bool,
     },
 }
 
@@ -978,7 +981,8 @@ pub struct OutputConfig {
         skip_serializing_if = "is_master_output_source"
     )]
     pub source: crate::renderer::context::OutputSource,
-    /// The audio-mixer bus a recording or stream carries, by UUID.
+    /// The audio-mixer bus, by UUID. On DeckLink this is used only when the
+    /// target explicitly enables embedded audio; legacy shows already saved it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_bus: Option<String>,
     /// The LED screens this output's feed carries, when it is an LED feed.

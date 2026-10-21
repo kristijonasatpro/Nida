@@ -48,6 +48,7 @@ pub(super) fn render_output_section(ui: &mut egui::Ui, data: &UIData, actions: &
                         device: device.name.clone(),
                         mode: mode.name.clone(),
                         full_range: false,
+                        embedded_audio: false,
                     },
                 });
             }
@@ -529,13 +530,14 @@ fn render_headless_controls(
         device,
         mode,
         full_range,
+        embedded_audio,
     } = &output.target
     {
         render_blackmagic_config(
             ui,
             output_uuid,
             output.is_active,
-            (device, mode, *full_range),
+            (device, mode, *full_range, *embedded_audio),
             data,
             actions,
         );
@@ -630,10 +632,11 @@ fn render_headless_controls(
     }
 
     // NDI changes bus live; Blackmagic chooses its embedded stereo bus while
-    // stopped. No selection preserves existing video-only saved shows.
+    // stopped. A legacy saved bus is not an explicit audio selection.
     if matches!(output.target, OutputTarget::NdiSend { .. })
         || matches!(output.target, OutputTarget::DeckLink { .. }) && !output.is_active
     {
+        let selected_bus = output.target.mixer_audio_bus(output.audio_bus.as_deref());
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Audio:").small());
             let bus_name = |uuid: &str| {
@@ -646,10 +649,7 @@ fn render_headless_controls(
                         |b| format!("Bus: {}", b.config.name),
                     )
             };
-            let selected_text = output
-                .audio_bus
-                .as_deref()
-                .map_or_else(|| "None (silent)".to_string(), bus_name);
+            let selected_text = selected_bus.map_or_else(|| "None (silent)".to_string(), bus_name);
             egui::ComboBox::from_id_salt(format!("ndi_audio_{output_uuid}"))
                 .selected_text(egui::RichText::new(selected_text).small())
                 .width(160.0)
@@ -661,13 +661,13 @@ fn render_headless_controls(
                         });
                     };
                     if ui
-                        .selectable_label(output.audio_bus.is_none(), "None (silent)")
+                        .selectable_label(selected_bus.is_none(), "None (silent)")
                         .clicked()
                     {
                         choose(None);
                     }
                     for bus in &data.audio_mix.buses {
-                        let on = output.audio_bus.as_deref() == Some(bus.config.uuid.as_str());
+                        let on = selected_bus == Some(bus.config.uuid.as_str());
                         if ui
                             .selectable_label(on, format!("Bus: {}", bus.config.name))
                             .on_hover_text("Sent with the picture, as the audio mixer mixes it")
@@ -839,7 +839,7 @@ fn render_blackmagic_config(
     ui: &mut egui::Ui,
     output_uuid: &str,
     active: bool,
-    (device, mode, full_range): (&str, &str, bool),
+    (device, mode, full_range, embedded_audio): (&str, &str, bool, bool),
     data: &UIData,
     actions: &mut UIActions,
 ) {
@@ -847,6 +847,7 @@ fn render_blackmagic_config(
         device: device.to_string(),
         mode,
         full_range,
+        embedded_audio,
     };
     // Levels: chosen per output, running or not — taken up at once.
     ui.horizontal(|ui| {
@@ -1770,6 +1771,7 @@ mod tests {
             device: "UltraStudio Monitor 3G".into(),
             mode: "1080p60".into(),
             full_range: false,
+            embedded_audio: false,
         };
         output.source = Some(crate::renderer::context::OutputSource::Master);
         output
@@ -1781,6 +1783,9 @@ mod tests {
         let mut data = UIData::test_fixture();
         data.decklink_devices = vec![ultrastudio()];
         data.outputs = vec![blackmagic_output(false)];
+        if let OutputTarget::DeckLink { embedded_audio, .. } = &mut data.outputs[0].target {
+            *embedded_audio = true;
+        }
         let mut actions = UIActions::new();
         {
             let mut harness = egui_kittest::Harness::builder()
@@ -1796,7 +1801,7 @@ mod tests {
                 c,
                 EngineCommand::SetOutputTarget {
                     output_uuid,
-                    target: OutputTarget::DeckLink { device, mode, .. },
+                    target: OutputTarget::DeckLink { device, mode, embedded_audio: true, .. },
                 } if output_uuid == "out00001" && device == "UltraStudio Monitor 3G" && mode == "1080p50"
             )),
             "{:?}",
@@ -1812,6 +1817,9 @@ mod tests {
         let mut data = UIData::test_fixture();
         data.decklink_devices = vec![ultrastudio()];
         data.outputs = vec![blackmagic_output(true)];
+        if let OutputTarget::DeckLink { embedded_audio, .. } = &mut data.outputs[0].target {
+            *embedded_audio = true;
+        }
         let mut actions = UIActions::new();
         {
             let mut harness = egui_kittest::Harness::builder()
@@ -1829,7 +1837,7 @@ mod tests {
                 c,
                 EngineCommand::SetOutputTarget {
                     output_uuid,
-                    target: OutputTarget::DeckLink { mode, full_range: true, .. },
+                    target: OutputTarget::DeckLink { mode, full_range: true, embedded_audio: true, .. },
                 } if output_uuid == "out00001" && mode == "1080p60"
             )),
             "{:?}",

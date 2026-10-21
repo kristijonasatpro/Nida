@@ -469,6 +469,10 @@ pub enum OutputTarget {
         /// levels, black at 16 and white at 235, as video gear takes them.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         full_range: bool,
+        /// Explicit consent to scheduled embedded 48 kHz stereo audio.
+        /// Old outputs already saved an audio bus, so absence stays video-only.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        embedded_audio: bool,
     },
     /// The stream: one encode sent to up to four RTMP destinations. Its
     /// settings live with the stream (`crate::streaming`), and it never
@@ -480,6 +484,16 @@ pub enum OutputTarget {
 }
 
 impl OutputTarget {
+    /// The mixer bus used at startup. A saved bus alone never opts a legacy
+    /// Blackmagic output into scheduled playback (on Windows or macOS).
+    pub fn mixer_audio_bus<'a>(&self, bus: Option<&'a str>) -> Option<&'a str> {
+        if matches!(self, Self::DeckLink { embedded_audio: false, .. }) {
+            None
+        } else {
+            bus
+        }
+    }
+
     /// Whether this target requires an OS window.
     pub fn is_windowed(&self) -> bool {
         matches!(self, OutputTarget::Windowed | OutputTarget::Display { .. })
@@ -548,6 +562,7 @@ impl std::fmt::Display for OutputTarget {
                 device,
                 mode,
                 full_range,
+                ..
             } => {
                 let levels = if *full_range { ", full levels" } else { "" };
                 write!(f, "Blackmagic: {device} ({mode}{levels})")
@@ -976,12 +991,14 @@ mod tests {
             device: "UltraStudio Monitor 3G".into(),
             mode: "1080p60".into(),
             full_range: false,
+            embedded_audio: false,
         };
         assert_eq!(blackmagic.to_string(), "Blackmagic: UltraStudio Monitor 3G (1080p60)");
         let full = OutputTarget::DeckLink {
             device: "UltraStudio Monitor 3G".into(),
             mode: "1080p60".into(),
             full_range: true,
+            embedded_audio: false,
         };
         assert_eq!(
             full.to_string(),

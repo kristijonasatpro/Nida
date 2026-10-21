@@ -8,6 +8,11 @@ on:
       - 'src/internal/decklink/**'
       - 'src/internal/ndi/mod.rs'
       - 'src/internal/audio/mod.rs'
+      - 'src/engine/value/render.rs'
+      - 'src/engine/value/led.rs'
+      - 'src/engine/value/warp.rs'
+      - 'src/internal/scene/mod.rs'
+      - 'src/internal/persistence/**'
       - 'src/app/state/outputs.rs'
       - 'src/usecases/ui/panels/outputs.rs'
       - 'vendor/decklink-sdk/**'
@@ -22,6 +27,11 @@ on:
       - 'src/internal/decklink/**'
       - 'src/internal/ndi/mod.rs'
       - 'src/internal/audio/mod.rs'
+      - 'src/engine/value/render.rs'
+      - 'src/engine/value/led.rs'
+      - 'src/engine/value/warp.rs'
+      - 'src/internal/scene/mod.rs'
+      - 'src/internal/persistence/**'
       - 'src/app/state/outputs.rs'
       - 'src/usecases/ui/panels/outputs.rs'
       - 'vendor/decklink-sdk/**'
@@ -73,6 +83,7 @@ jobs:
         run: |
           rustfmt --edition 2021 --check build.rs src/internal/decklink/convert.rs
           rustfmt --edition 2021 --check src/internal/decklink/audio.rs
+          rustfmt --edition 2021 --check src/internal/persistence/decklink_audio_tests.rs
       - name: Compile shared shim against behavioral SDK double
         if: runner.os == 'Linux'
         run: |
