@@ -380,11 +380,115 @@ fn a_deck_hidden_under_one_covering_the_frame_is_not_rendered() {
     render_once(&mut ch, &gpu);
     assert_eq!(ch.active_deck_count, 1, "only the covering deck renders");
     assert_eq!(ch.composited_deck_count, 1);
+    assert_eq!(
+        ch.thumbnails_drawn, 1,
+        "but the covered one once, whole, for its thumbnail"
+    );
+    render_once(&mut ch, &gpu);
+    assert_eq!(ch.thumbnails_drawn, 0, "and not again at once");
 
     // Uncovered, it renders again.
     ch.decks[1].opacity = 0.5;
     render_once(&mut ch, &gpu);
     assert_eq!(ch.active_deck_count, 2);
+}
+
+/// A covered deck's thumbnail is drawn again now and then — a clip or a
+/// generator under a full-screen picture moves on — each covered deck on a
+/// frame of its own; a hidden (muted) one is not drawn for it.
+#[test]
+fn a_covered_decks_thumbnail_is_kept_up_now_and_then() {
+    let gpu = headless_gpu();
+    let mut ch = test_channel(&gpu, "Test");
+    for color in [
+        [1.0, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+    ] {
+        add_solid_deck(&mut ch, &gpu, color);
+    }
+    render_once(&mut ch, &gpu);
+    assert_eq!(ch.thumbnails_drawn, 1, "one covered one a frame");
+    render_once(&mut ch, &gpu);
+    assert_eq!(ch.thumbnails_drawn, 1, "then the other");
+    let mut most = 0;
+    let mut drawn = 0;
+    for _ in 0..super::THUMBNAIL_FRAMES {
+        render_once(&mut ch, &gpu);
+        most = most.max(ch.thumbnails_drawn);
+        drawn += ch.thumbnails_drawn;
+    }
+    assert_eq!(
+        drawn,
+        2,
+        "each once more in {} frames",
+        super::THUMBNAIL_FRAMES
+    );
+    assert_eq!(most, 1, "on frames of their own");
+
+    ch.decks[0].mute = true;
+    for _ in 0..super::THUMBNAIL_FRAMES {
+        render_once(&mut ch, &gpu);
+        drawn += ch.thumbnails_drawn;
+    }
+    assert_eq!(drawn, 3, "the hidden one is not drawn");
+}
+
+/// Covered decks take turns for their thumbnails, a deck never drawn first:
+/// each is drawn again within about `THUMBNAIL_FRAMES` frames — or as many
+/// frames as there are of them — none left out, however many.
+#[test]
+fn covered_thumbnails_take_turns() {
+    let mut turn = 0;
+    assert_eq!(
+        super::thumbnail_pick(&[1, 2, 3], Some(3), 7, &mut turn, true),
+        Some(3),
+        "an undrawn one first, whatever the budget"
+    );
+    for count in [1_usize, 2, 7, 120, 140] {
+        let covered: Vec<usize> = (0..count).collect();
+        let mut last = vec![0_u64; count];
+        let mut longest = 0;
+        for clock in 1..=20_000_u64 {
+            if let Some(i) = super::thumbnail_pick(&covered, None, clock, &mut turn, false) {
+                longest = longest.max(clock - last[i]);
+                last[i] = clock;
+            }
+        }
+        for &drawn in &last {
+            longest = longest.max(20_000 - drawn);
+        }
+        let bound = super::THUMBNAIL_FRAMES.max(count as u64) * 2;
+        assert!(longest <= bound, "{count}: {longest} frames between draws");
+    }
+}
+
+/// Many pictures dropped at once under a full-screen one are drawn for
+/// their thumbnails one a frame, not all in one; and again once a resize has
+/// made their textures anew, empty.
+#[test]
+fn covered_decks_are_drawn_for_their_thumbnails_one_a_frame() {
+    let gpu = headless_gpu();
+    let mut ch = test_channel(&gpu, "Test");
+    for _ in 0..5 {
+        add_solid_deck(&mut ch, &gpu, [1.0, 0.0, 0.0, 1.0]);
+    }
+    let undrawn = |ch: &Channel| {
+        ch.decks[..4]
+            .iter()
+            .filter(|s| s.drawn != Some(s.deck.texture_generation()))
+            .count()
+    };
+    for left in (0..4).rev() {
+        render_once(&mut ch, &gpu);
+        assert_eq!(ch.thumbnails_drawn, 1);
+        assert_eq!(undrawn(&ch), left);
+    }
+
+    ch.resize(&gpu, 32, 32);
+    assert_eq!(undrawn(&ch), 4, "the new textures are empty");
+    render_once(&mut ch, &gpu);
+    assert_eq!(undrawn(&ch), 3, "drawn again, one a frame");
 }
 
 #[test]

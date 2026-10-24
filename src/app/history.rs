@@ -114,6 +114,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,

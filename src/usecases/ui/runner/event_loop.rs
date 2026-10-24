@@ -223,6 +223,20 @@ impl ApplicationHandler for UIRunner {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The API's Shutdown or Ctrl-C: the windowed app saves and quits as
+        // on ⌘Q (headless does so in `render_headless`) — Ctrl-C while the
+        // GPU is still being set up included. Answered "ok", it went on
+        // running.
+        if !self.config.headless
+            && self
+                .shutdown_flag
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            log::info!("Shutdown requested: saving workspace and exiting...");
+            self.quit(event_loop);
+            return;
+        }
+
         // ── Phase 2 of deferred GPU init: poll the background thread ────
         if let Some(handle) = self.gpu_init_handle.as_ref() {
             if handle.is_finished() {
@@ -301,6 +315,12 @@ impl ApplicationHandler for UIRunner {
         if !self.config.headless && !self.shut_down {
             log::info!("Quit: saving workspace and exiting...");
             self.shut_down();
+        }
+        // Night Shift, if Nida holds it off, given back however it ends:
+        // headless too, whose Quit (⌘Q, the Dock) comes here without its
+        // shutdown flag (see `night_shift`).
+        if let Some(kept) = self.night_shift.give_back_now() {
+            log::info!("Quit: {kept:?}");
         }
     }
 }
@@ -381,6 +401,10 @@ impl UIRunner {
         }
         if let Some(api) = self.api_handle.take() {
             api.shutdown();
+        }
+        // Night Shift, if Nida holds it off, given back (see `night_shift`).
+        if let Some(kept) = self.night_shift.give_back_now() {
+            log::info!("Quit: {kept:?}");
         }
     }
 }

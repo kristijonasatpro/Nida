@@ -873,6 +873,28 @@ pub(super) fn render_target_fps_popover(ui: &mut egui::Ui, data: &UIData, action
     render_latency(ui, data, actions);
     #[cfg(target_os = "macos")]
     render_control_screen_rate(ui, data, actions);
+    #[cfg(target_os = "macos")]
+    render_night_shift_off(ui, data, actions);
+}
+
+/// Whether Nida keeps Night Shift off while an output is on a screen (see
+/// `crate::night_shift`).
+#[cfg(target_os = "macos")]
+fn render_night_shift_off(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
+    let mut on = data.night_shift_off;
+    let changed = ui
+        .checkbox(&mut on, "Keep Night Shift off for the outputs")
+        .on_hover_text(
+            "macOS warms every screen with Night Shift, the outputs too, and lets no app \
+             leave one out. While an output is on a screen Nida turns it off (this screen too) \
+             and turns it back on afterwards, if it is due on then.",
+        )
+        .changed();
+    if changed {
+        actions
+            .commands
+            .push(EngineCommand::SetNightShiftOff { on });
+    }
 }
 
 /// Whether Nida sets the control window's screen to the show's rate while it

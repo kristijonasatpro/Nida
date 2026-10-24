@@ -371,10 +371,15 @@ fn render_capture_controls(
             .size(12.0),
     );
     if !capture.bound {
-        ui.colored_label(
-            egui::Color32::from_rgb(220, 160, 60),
-            "Target not found — showing black. Reopen the target and rescan.",
-        );
+        // A PowerPoint input's window is found by its show: what holds it up
+        // is the show's to say, not a target to reopen and rescan.
+        let why = match &deck.presentation {
+            Some(p) => p.message.clone().unwrap_or_else(|| {
+                "Black until PowerPoint plays the show and its window is found.".into()
+            }),
+            None => "Target not found — showing black. Reopen the target and rescan.".into(),
+        };
+        ui.colored_label(egui::Color32::from_rgb(220, 160, 60), why);
     } else if !capture.connected {
         ui.colored_label(egui::Color32::GRAY, "Waiting for frames…");
     }
@@ -827,6 +832,22 @@ pub(super) fn render_selected_deck_detail(
                 ui.separator();
             }
 
+            // Column: an input that could not be opened, kept as saved
+            if let Some(ref why) = deck.offline {
+                egui::Frame::default()
+                    .inner_margin(6.0)
+                    .corner_radius(4.0)
+                    .fill(ui.visuals().faint_bg_color)
+                    .show(ui, |ui| {
+                        ui.set_min_width(200.0);
+                        ui.set_max_width(280.0);
+                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            render_offline_column(ui, why);
+                        });
+                    });
+                ui.separator();
+            }
+
             // Column: Video playback controls (only for video decks)
             if let Some(ref vp) = deck.video_playback {
                 egui::Frame::default()
@@ -854,6 +875,40 @@ pub(super) fn render_selected_deck_detail(
                         ui.set_max_width(240.0);
                         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                             super::playlist::render_deck_column(ui, deck, list, actions);
+                        });
+                    });
+                ui.separator();
+            }
+
+            // Column: a PowerPoint show's steps, screen, notes and what comes next
+            if let Some(ref p) = deck.presentation {
+                egui::Frame::default()
+                    .inner_margin(6.0)
+                    .corner_radius(4.0)
+                    .fill(ui.visuals().faint_bg_color)
+                    .show(ui, |ui| {
+                        ui.set_min_width(180.0);
+                        ui.set_max_width(280.0);
+                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            super::presentation::render_deck_column(ui, data, deck, p, actions);
+                        });
+                    });
+                ui.separator();
+            }
+
+            // Column: a presenter view's show and its talk clock
+            if let Some(ref follows) = deck.presenter_of {
+                egui::Frame::default()
+                    .inner_margin(6.0)
+                    .corner_radius(4.0)
+                    .fill(ui.visuals().faint_bg_color)
+                    .show(ui, |ui| {
+                        ui.set_min_width(160.0);
+                        ui.set_max_width(240.0);
+                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            super::presentation::render_presenter_column(
+                                ui, data, deck, follows, actions,
+                            );
                         });
                     });
                 ui.separator();
@@ -1510,6 +1565,25 @@ pub(super) fn render_generator_params(
 /// A video deck's playback: play/pause, the scrub bar, speed, loop, in and
 /// out points, and what decodes it — the Properties panel's Playback column
 /// and the input settings window's.
+/// An offline input: why, and that the show keeps it as saved until it can
+/// be opened again.
+fn render_offline_column(ui: &mut egui::Ui, why: &str) {
+    ui.label(
+        egui::RichText::new("⚠ Offline")
+            .strong()
+            .color(ui.visuals().warn_fg_color),
+    );
+    ui.label(egui::RichText::new(why).small());
+    ui.label(
+        egui::RichText::new(
+            "Kept in the show as saved. Put the file back, or connect the device, \
+             then open the show again.",
+        )
+        .small()
+        .weak(),
+    );
+}
+
 pub(super) fn render_playback_controls(
     ui: &mut egui::Ui,
     deck: &DeckUIInfo,

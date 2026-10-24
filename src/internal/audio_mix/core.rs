@@ -147,6 +147,8 @@ impl InputFeed {
 
 /// One source strip: a feed with its fader, mute and bus sends.
 pub struct Source {
+    pub(super) held_peak: Frame,
+    pub(super) dynamics: super::dynamics::SourceChain,
     /// Deck UUID for a clip; the input's own UUID for a capture device.
     pub uuid: String,
     pub feed: Feed,
@@ -181,6 +183,8 @@ impl Source {
         Self {
             uuid: uuid.into(),
             feed,
+            dynamics: super::dynamics::SourceChain::default(),
+            held_peak: [0.0; 2],
             gain_db: 0.0,
             muted: false,
             sends: Vec::new(),
@@ -258,6 +262,8 @@ impl OutputRing {
 /// One bus: the sum of what is sent to it, with its own fader, mute and delay,
 /// going to sound devices and to recordings and streams.
 pub struct Bus {
+    pub(super) held_peak: Frame,
+    pub(super) dynamics: super::dynamics::BusChain,
     pub uuid: String,
     pub gain_db: f32,
     pub muted: bool,
@@ -278,6 +284,8 @@ impl Bus {
         Self {
             uuid: uuid.into(),
             gain_db: 0.0,
+            dynamics: super::dynamics::BusChain::default(),
+            held_peak: [0.0; 2],
             muted: false,
             delay_ms: 0.0,
             outputs: Vec::new(),
@@ -421,11 +429,13 @@ impl MixCore {
     /// there on; and the sound held back by delays ages through them, so what
     /// was held comes out no later than it would have.
     pub fn skipped(&mut self, blocks: u64, from: std::time::Instant) {
-        let block = std::time::Duration::from_secs_f64(BLOCK_FRAMES as f64 / f64::from(SAMPLE_RATE));
+        let block =
+            std::time::Duration::from_secs_f64(BLOCK_FRAMES as f64 / f64::from(SAMPLE_RATE));
         #[allow(clippy::cast_possible_truncation)] // A few seconds of frames at most.
         let frames = (blocks as usize) * BLOCK_FRAMES;
         for source in &mut self.sources {
             source.delay.advance(frames);
+            source.dynamics.skip();
         }
         for bus in self
             .buses
@@ -433,13 +443,15 @@ impl MixCore {
             .chain(std::iter::once(&mut self.monitor))
         {
             bus.delay.advance(frames);
+            bus.dynamics.skip(blocks as usize);
             for tap in &mut bus.taps {
                 // Blocks due before the tap was opened are not its to owe.
                 let before = tap
                     .opened
                     .checked_duration_since(from)
                     .map_or(0.0, |since| since.as_secs_f64() / block.as_secs_f64());
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Positive, small.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                // Positive, small.
                 let owed = blocks.saturating_sub(before.ceil() as u64);
                 let samples = owed * BLOCK_FRAMES as u64 * 2;
                 tap.lost_samples.fetch_add(samples, Ordering::Relaxed);
@@ -464,6 +476,9 @@ impl MixCore {
         for source in &mut self.sources {
             self.scratch.fill([0.0; 2]);
             source.feed.pull(&mut self.scratch);
+            // Its processing first, so pre-fader listen hears what goes out,
+            // as a console's does.
+            source.dynamics.process(&mut self.scratch);
             if source.solo {
                 add_into(&mut self.solo_sum, &self.scratch);
             }
@@ -472,6 +487,8 @@ impl MixCore {
             let peak = ramp_sides(&mut self.scratch, source.current, target);
             source.current = target;
             source.meter = fall(source.meter, peak);
+            source.held_peak =
+                std::array::from_fn(|channel| source.held_peak[channel].max(peak[channel]));
             for send in &source.sends {
                 if let Some(i) = self.buses.iter().position(|b| &b.uuid == send) {
                     for (acc, frame) in self.sums[i].iter_mut().zip(&self.scratch) {
@@ -498,14 +515,21 @@ impl MixCore {
         };
 
         for (bus, sum) in self.buses.iter_mut().zip(&mut self.sums) {
+            bus.dynamics.process_pre(sum);
             let target = if bus.muted {
                 0.0
             } else {
                 db_to_gain(bus.gain_db)
             };
-            let peak = ramp(sum, bus.current, target);
+            ramp(sum, bus.current, target);
             bus.current = target;
+            // The limiter and loudness meter after the fader: the bus's meter
+            // shows what actually goes out.
+            bus.dynamics.process_post(sum);
+            let peak = peak_of(sum);
             bus.meter = fall(bus.meter, peak);
+            bus.held_peak =
+                std::array::from_fn(|channel| bus.held_peak[channel].max(peak[channel]));
             if !soloing && listen.as_deref() == Some(bus.uuid.as_str()) {
                 heard.copy_from_slice(sum);
             }
@@ -556,7 +580,8 @@ impl DelayLine {
         } else {
             0.0
         };
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // At most a second's frames.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // At most a second's frames.
         let frames = (f64::from(ms) / 1000.0 * f64::from(SAMPLE_RATE)).round() as usize;
         if frames == 0 {
             self.held.clear();
@@ -636,6 +661,13 @@ fn ramp(block: &mut [Frame], from: f32, to: f32) -> Frame {
 }
 
 /// A peak meter: jumps up to a new peak, falls back at [`METER_DECAY`].
+/// The block's peak per channel.
+fn peak_of(block: &[Frame]) -> Frame {
+    block.iter().fold([0.0; 2], |peak, frame| {
+        [peak[0].max(frame[0].abs()), peak[1].max(frame[1].abs())]
+    })
+}
+
 fn fall(meter: Frame, peak: Frame) -> Frame {
     [
         peak[0].max(meter[0] * METER_DECAY),
@@ -671,6 +703,72 @@ mod tests {
         [s[s.len() - 2], s[s.len() - 1]]
     }
 
+    #[test]
+    fn source_processing_is_once_before_sends_and_fader_and_heard_on_pfl() {
+        let (mut source, _) = fifo_source("mic", 0.5, 20);
+        source.sends = vec!["main".into(), "aux".into()];
+        source.solo = true;
+        source.gain_db = -6.0;
+        let config = super::super::CompressorConfig {
+            enabled: true,
+            threshold_db: -18.0618,
+            ratio: 4.0,
+            attack_ms: 0.1,
+            knee_db: 0.0,
+            ..super::super::CompressorConfig::default()
+        };
+        source.dynamics.configure(
+            super::super::LowCutConfig::default(),
+            super::super::LevelerConfig::default(),
+            config,
+        );
+        let mut core = core_with(vec![source], &["main", "aux"]);
+        let main = core.tap("main").unwrap();
+        let aux = core.tap("aux").unwrap();
+        let phones = core.tap_monitor();
+        for _ in 0..8 {
+            core.process_block();
+        }
+        let expected = 0.176_776_7 * db_to_gain(-6.0);
+        assert!((last_frame(&main)[0] - expected).abs() < 1e-4);
+        assert!((last_frame(&aux)[0] - expected).abs() < 1e-4);
+        // Pre-fader listen hears the processed sound, before the fader.
+        assert!((last_frame(&phones)[0] - 0.176_776_7).abs() < 1e-4);
+        assert!((core.source("mic").unwrap().dynamics.snapshot().pre_db[0] + 6.0206).abs() < 1e-3);
+    }
+
+    #[test]
+    fn bus_compression_reaches_outputs_and_normal_monitor_before_delay() {
+        let (mut source, _) = fifo_source("mic", 0.5, 20);
+        source.sends = vec!["main".into()];
+        let mut core = core_with(vec![source], &["main"]);
+        let config = super::super::CompressorConfig {
+            enabled: true,
+            threshold_db: -18.0618,
+            ratio: 4.0,
+            attack_ms: 0.1,
+            knee_db: 0.0,
+            ..super::super::CompressorConfig::default()
+        };
+        let bus = core.bus_mut("main").unwrap();
+        bus.dynamics
+            .configure(config, super::super::LimiterConfig::default());
+        bus.gain_db = -6.0;
+        bus.delay_ms = 100.0;
+        let main = core.tap("main").unwrap();
+        let phones = core.tap_monitor();
+        for _ in 0..8 {
+            core.process_block();
+        }
+        let expected = 0.176_776_7 * db_to_gain(-6.0);
+        assert!((last_frame(&phones)[0] - expected).abs() < 1e-4);
+        assert_eq!(last_frame(&main), [0.0, 0.0]);
+        for _ in 0..8 {
+            core.process_block();
+        }
+        assert!((last_frame(&main)[0] - expected).abs() < 1e-4);
+    }
+
     /// A source held back by 100 ms reaches its bus 100 ms after one that is
     /// not, the same moment's sound; pre-fader listen hears it at once.
     #[test]
@@ -703,8 +801,17 @@ mod tests {
         }
         let out = first_loud(&master).expect("heard on Master");
         let heard = first_loud(&phones).expect("heard in the headphones");
-        assert!((heard - 4.0 * block_ms).abs() < 0.5, "PFL at once: {heard} ms");
-        assert!((out - heard - 100.0).abs() < 0.5, "Master {out} ms, PFL {heard} ms");
+        assert!(
+            (heard - 4.0 * block_ms).abs() < 0.5,
+            "PFL at once: {heard} ms"
+        );
+        // The source's 100 ms, and the bus limiter's look-ahead.
+        let lookahead_ms =
+            super::super::dsp::LIMITER_LOOKAHEAD as f64 * 1000.0 / f64::from(SAMPLE_RATE);
+        assert!(
+            (out - heard - 100.0 - lookahead_ms).abs() < 0.1,
+            "Master {out} ms, PFL {heard} ms"
+        );
     }
 
     /// Time the mixer jumped over is told to every tap open then, with the
@@ -926,6 +1033,29 @@ mod tests {
     }
 
     #[test]
+    fn over_full_scale_peaks_survive_until_ui_reads_them() {
+        let (mut source, fifo) = fifo_source("mic", 1.25, 4);
+        source.sends = vec!["m".into()];
+        let mut core = core_with(vec![source], &["m"]);
+        core.process_block();
+        core.process_block();
+        fifo.lock().unwrap().clear();
+        for _ in 0..100 {
+            core.process_block();
+        }
+        assert!(core.bus("m").unwrap().meter()[0] < 1.0);
+        // The source's own peak, over full scale, is held; the bus's limiter
+        // kept what went out at its −1 dBFS ceiling.
+        assert_eq!(core.source("mic").unwrap().held_peak, [1.25; 2]);
+        let ceiling = db_to_gain(-1.0);
+        let bus_peak = core.bus("m").unwrap().held_peak;
+        assert!(
+            bus_peak.iter().all(|p| (p - ceiling).abs() < 1e-3),
+            "{bus_peak:?}"
+        );
+    }
+
+    #[test]
     fn an_abandoned_tap_is_dropped() {
         let mut core = core_with(vec![], &["m"]);
         let tap = core.tap("m").unwrap();
@@ -979,7 +1109,8 @@ mod tests {
 
     #[test]
     fn the_monitor_hears_its_bus_before_the_bus_delay() {
-        let (mut src, _) = fifo_source("clip", 1.0, 8);
+        // Under the bus limiter's ceiling, so only the timing is in question.
+        let (mut src, _) = fifo_source("clip", 0.5, 8);
         src.sends = vec!["m".into()];
         let mut core = core_with(vec![src], &["m"]);
         core.bus_mut("m").unwrap().delay_ms = 100.0;
@@ -987,7 +1118,7 @@ mod tests {
         core.process_block();
         core.process_block();
         assert!(
-            (last_frame(&phones)[0] - 1.0).abs() < 1e-6,
+            (last_frame(&phones)[0] - 0.5).abs() < 1e-6,
             "no delay in the headphones"
         );
     }

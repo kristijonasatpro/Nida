@@ -11973,6 +11973,7 @@ dependencies = [
  "resvg 0.47.0",
  "rfd",
  "rosc",
+ "roxmltree 0.21.1",
  "rustfft",
  "serde",
  "serde_json",
@@ -11997,6 +11998,7 @@ dependencies = [
  "winit",
  "x11rb 0.14.0",
  "yuvutils-rs",
+ "zip",
 ]
 
 [[package]]

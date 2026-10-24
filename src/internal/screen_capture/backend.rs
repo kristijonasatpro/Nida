@@ -355,10 +355,24 @@ impl MockBackend {
     }
 
     /// Output size after `scale_to`, which is what a real backend would deliver.
+    /// As the real captures size it: the target bounded by `scale_to` (a
+    /// bound, not an exact size: see `platform::macos::output_size`), then
+    /// the crop's part of that.
     fn output_size(&self) -> (u32, u32) {
-        self.config
+        let (w, h) = self
+            .config
             .scale_to
-            .map_or((self.width, self.height), |(w, h)| (w.max(1), h.max(1)))
+            .map_or((self.width, self.height), |(bw, bh)| {
+                super::resample::fit_within(self.width, self.height, bw, bh)
+            });
+        let crop = self.config.crop.clamped();
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let part = |v: u32, share: f32| ((v as f32 * share).round() as u32).max(1);
+        (part(w, crop.w), part(h, crop.h))
     }
 
     pub fn marker(&self) -> [u8; 3] {
@@ -603,9 +617,24 @@ mod tests {
         )
         .next_frame()
         .expect("frame");
-        assert_eq!(full.data.len(), cropped.data.len());
-        // Skip the marker texel (identical by construction) and compare content.
-        assert_ne!(&full.data[4..], &cropped.data[4..]);
+        // As the real captures: the crop's part, at the crop's size — and
+        // its content is that part of the whole (the marker texel aside).
+        assert_eq!((cropped.width, cropped.height), (32, 32));
+        let texel = |f: &CaptureFrame, x: u32, y: u32| {
+            let at = ((y * f.width + x) * 4) as usize;
+            f.data[at..at + 4].to_vec()
+        };
+        for y in 0..32 {
+            for x in 0..32 {
+                if (x, y) != (0, 0) {
+                    assert_eq!(
+                        texel(&cropped, x, y),
+                        texel(&full, x + 32, y + 32),
+                        "({x}, {y})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

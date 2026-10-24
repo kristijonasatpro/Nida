@@ -15,6 +15,7 @@ pub mod dome;
 pub mod led;
 pub mod mask;
 pub mod playlist;
+pub mod presentation;
 pub mod render;
 pub mod surface;
 pub mod timer;

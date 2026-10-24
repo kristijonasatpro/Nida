@@ -124,6 +124,10 @@ pub(crate) fn build_ui_data(
                         tap,
                         playlist: d.playlist.clone(),
                         timer: d.timer.clone(),
+                        presentation: d.presentation.clone(),
+                        presenter_of: d.presenter_of.clone(),
+                        presenter_layout: d.presenter_layout,
+                        offline: d.offline.clone(),
                         camera_colour: d.camera_colour,
                         camera_profile: d.camera_profile.clone(),
                         camera_lowest_latency: d.camera_lowest_latency,
@@ -159,6 +163,17 @@ pub(crate) fn build_ui_data(
                 decks,
                 effects,
                 overlay: ch.overlay,
+                on_air: ch.on_air.as_deref().map(|at| {
+                    if at == "main" {
+                        "Main".to_string()
+                    } else {
+                        engine
+                            .buses
+                            .iter()
+                            .find(|bus| bus.uuid == at)
+                            .map_or_else(|| at.to_string(), |bus| bus.name.clone())
+                    }
+                }),
             }
         })
         .collect();
@@ -460,6 +475,8 @@ pub(crate) fn build_ui_data(
             label: m.label.clone(),
             model: m.model.clone(),
             given_name: m.given_name.clone(),
+            identity: m.identity.clone(),
+            main: m.main,
         })
         .collect();
 
@@ -806,6 +823,7 @@ pub(crate) fn build_ui_data(
         target_fps: app.target_fps(),
         frames_in_flight: app.frames_in_flight(),
         control_screen_rate: app.control_screen_rate(),
+        night_shift_off: app.night_shift_off(),
         // Populated by UIRunner after build (history/pending loads live on runner, not app)
         can_undo: false,
         can_redo: false,
@@ -863,7 +881,10 @@ fn params_snapshot_to_ui(snap: &ShaderParamsSnapshot) -> ShaderParamsUI {
 fn effect_snapshot_to_ui(snap: &EffectSnapshot) -> EffectInfo {
     (
         snap.uuid.clone(),
-        snap.name.clone(),
+        match snap.offline {
+            Some(_) => format!("⚠ {} — offline", snap.name),
+            None => snap.name.clone(),
+        },
         snap.enabled,
         params_snapshot_to_ui(&snap.params),
     )

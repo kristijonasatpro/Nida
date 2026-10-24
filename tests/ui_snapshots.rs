@@ -305,7 +305,10 @@ fn snapshot_rundown_panel_and_step_window() {
     data.screen = ScreenLayout::builtin(Builtin::Broadcast);
     // The Rundown is a tab behind the Audio Mixer: brought to the front.
     let tab = data.screen.dock.find_tab(&Pane::Rundown).expect("the tab");
-    data.screen.dock.set_active_tab(tab).expect("brought to the front");
+    data.screen
+        .dock
+        .set_active_tab(tab)
+        .expect("brought to the front");
     data.main.mode = varda::mixer::MixMode::Program;
     data.channels[0].name = "Camera".into();
     data.channels[1].name = "Slides".into();
@@ -426,7 +429,10 @@ fn broadcast_audio_mix(data: &UIData) -> varda::audio_mix::AudioMixSnapshot {
         AudioBusConfig, AudioBusSnapshot, AudioMixSnapshot, AudioSourceKind, AudioSourceSnapshot,
     };
     let bus = |uuid: &str, name: &str, gain_db: f32, meter: f32| AudioBusSnapshot {
+        dynamics: varda::audio_mix::DynamicsSnapshot::default(),
         config: AudioBusConfig {
+            compressor: varda::audio_mix::CompressorConfig::default(),
+            limiter: varda::audio_mix::LimiterConfig::default(),
             uuid: uuid.into(),
             name: name.into(),
             gain_db,
@@ -437,9 +443,11 @@ fn broadcast_audio_mix(data: &UIData) -> varda::audio_mix::AudioMixSnapshot {
         },
         device_ok: Some(true),
         meter_db: [meter, meter - 2.0],
+        peak_db: [meter, meter - 2.0],
     };
     let clip =
         |deck: &str, name: &str, on_air: f32, gain_db: f32, meter: f32| AudioSourceSnapshot {
+            dynamics: varda::audio_mix::DynamicsSnapshot::default(),
             uuid: deck.into(),
             name: name.into(),
             kind: AudioSourceKind::Clip {
@@ -457,6 +465,7 @@ fn broadcast_audio_mix(data: &UIData) -> varda::audio_mix::AudioMixSnapshot {
             solo: false,
             live: true,
             meter_db: [meter, meter - 1.5],
+            peak_db: [meter, meter - 1.5],
             refused: None,
         };
     let deck = |ch: usize| data.channels[ch].decks[0].uuid.clone();
@@ -896,4 +905,70 @@ fn snapshot_led_screens_window() {
     harness.hover_at(egui::pos2(5.0, 5.0));
     harness.run();
     harness.snapshot("led_screens_window");
+}
+
+/// An input's Processing page: the Speech preset on, the leveler turning a
+/// soft speaker up and the compressor at work.
+#[test]
+fn snapshot_audio_processing_input() {
+    use varda::audio_mix::{CompressorConfig, LevelerConfig, LowCutConfig};
+    let mut data = UIData::test_fixture();
+    data.screen = varda::usecases::ui::screen_layout::ScreenLayout::builtin(
+        varda::usecases::ui::screen_layout::Builtin::Broadcast,
+    );
+    data.audio_mix = broadcast_audio_mix(&data);
+    let source = &mut data.audio_mix.sources[0];
+    source.dynamics.config = CompressorConfig::speech();
+    source.dynamics.low_cut = Some(LowCutConfig::speech());
+    source.dynamics.leveler = Some(LevelerConfig::speech());
+    source.dynamics.leveler_gain_db = 6.5;
+    source.dynamics.reduction_db = 4.2;
+    source.dynamics.pre_db = [-27.0, -27.5];
+    source.dynamics.post_db = [-14.0, -14.5];
+    let name = source.name.clone();
+    let Some(mut harness) = snapshot_harness(data) else {
+        return;
+    };
+    for label in [
+        format!("Settings {name}"),
+        "Expand audio settings".to_string(),
+        "Processing".to_string(),
+    ] {
+        harness.get_by_label(&label).click();
+        harness.run();
+    }
+    harness.snapshot("audio_processing_input");
+}
+
+/// A bus's Processing page: its limiter catching a peak and its loudness.
+#[test]
+fn snapshot_audio_processing_bus() {
+    let mut data = UIData::test_fixture();
+    data.screen = varda::usecases::ui::screen_layout::ScreenLayout::builtin(
+        varda::usecases::ui::screen_layout::Builtin::Broadcast,
+    );
+    data.audio_mix = broadcast_audio_mix(&data);
+    let bus = &mut data.audio_mix.buses[0];
+    bus.dynamics.limiter = Some(bus.config.limiter);
+    bus.dynamics.limiter_reduction_db = 2.3;
+    bus.dynamics.pre_db = [-8.0, -8.5];
+    bus.dynamics.post_db = [-1.0, -1.2];
+    bus.dynamics.loudness = Some(varda::audio_mix::LoudnessSnapshot {
+        momentary_lufs: -15.2,
+        short_term_lufs: -16.4,
+        integrated_lufs: Some(-16.9),
+    });
+    let name = bus.config.name.clone();
+    let Some(mut harness) = snapshot_harness(data) else {
+        return;
+    };
+    for label in [
+        format!("Settings {name}"),
+        "Expand audio settings".to_string(),
+        "Processing".to_string(),
+    ] {
+        harness.get_by_label(&label).click();
+        harness.run();
+    }
+    harness.snapshot("audio_processing_bus");
 }

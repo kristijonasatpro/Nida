@@ -5,6 +5,10 @@
 
 use super::VardaApp;
 
+/// How often the LTC input's device is looked for once it went (see
+/// `VardaApp::tick_ltc`).
+const LTC_LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The cue a control-surface write asks for, if it asks for one.
 ///
 /// `cue/<uuid>/fire` is taken on the rising edge like `deck/<uuid>/trigger`, so
@@ -419,12 +423,39 @@ impl VardaApp {
             .then(|| self.input.timecode.ltc_input())
             .flatten();
 
-        if self.input.ltc_tap.as_ref().map(|tap| tap.source_id) != wanted.map(|i| i.source_id) {
+        // Its device gone (unplugged), the tap is let go and taken again
+        // once the device is back — looked for every two seconds, the patch
+        // kept: subscribed still, it heard nothing for the rest of the show.
+        let gone = self
+            .input
+            .ltc_tap
+            .as_ref()
+            .is_some_and(|tap| !self.audio_manager.serves(tap.source_id, tap.token));
+        if let Some(tap) = self.input.ltc_tap.take_if(|_| gone) {
+            log::warn!("LTC input's device went: listening again once it is back");
+            self.input.ltc_lost = Some((tap.source_id, now));
+        }
+        // Lost is the source's that went: another patched, or none, starts
+        // afresh — one that will not open is said, and its patch forgotten.
+        if self
+            .input
+            .ltc_lost
+            .is_some_and(|(id, _)| wanted.map(|w| w.source_id) != Some(id))
+        {
+            self.input.ltc_lost = None;
+        }
+        let lost = self.input.ltc_lost;
+        let looked_lately =
+            lost.is_some_and(|(_, at)| now.saturating_duration_since(at) < LTC_LOOK_EVERY);
+        if self.input.ltc_tap.as_ref().map(|tap| tap.source_id) != wanted.map(|i| i.source_id)
+            && !(self.input.ltc_tap.is_none() && looked_lately)
+        {
             if let Some(tap) = self.input.ltc_tap.take() {
                 self.audio_manager.unsubscribe_pcm(tap.source_id, tap.token);
             }
             if let Some(input) = wanted {
                 if let Some(sub) = self.audio_manager.subscribe_pcm(input.source_id) {
+                    self.input.ltc_lost = None;
                     log::info!(
                         "Listening for LTC on audio source {} channel {}",
                         input.source_id,
@@ -437,6 +468,9 @@ impl VardaApp {
                         sample_rate: sub.format.sample_rate,
                         channels: sub.format.channels,
                     });
+                } else if let Some((id, _)) = lost {
+                    // Not back yet: looked for again in a while.
+                    self.input.ltc_lost = Some((id, now));
                 } else {
                     self.session.notifications.warn(format!(
                         "Could not open audio source {} to listen for timecode",
@@ -507,6 +541,81 @@ mod tests {
     use crate::engine::{EngineCommand as C, MixerQueries};
     use crate::midi::{MidiDeviceManager, MidiKey, MidiMessage};
     use crate::osc::{OscInput, OscReceiver};
+
+    /// LTC on a sound device unplugged mid-show: the tap is taken again once
+    /// the device is back, the patch kept — subscribed still, it heard
+    /// nothing for the rest of the show; looked for and failing, it forgot
+    /// the patch.
+    #[test]
+    fn ltc_comes_back_with_its_device_and_keeps_its_patch() {
+        let Some(gpu) = crate::renderer::context::GpuContext::new_headless().ok() else {
+            return;
+        };
+        let Ok(mut app) = VardaApp::new(gpu, &crate::testing::headless_config()) else {
+            return;
+        };
+        app.audio_manager = crate::audio::AudioManager::listing(&["LTC box"]);
+        let _first = app.audio_manager.open_for_test(0, "LTC box");
+        let patch = crate::timecode::LtcInput {
+            source_id: 0,
+            channel: 0,
+            rate: None,
+        };
+        app.input.timecode.set_ltc_input(Some(patch));
+        let t0 = std::time::Instant::now();
+        app.tick_ltc(t0);
+        assert!(app.input.ltc_tap.is_some(), "listening");
+
+        app.audio_manager.lose_for_test(0);
+        assert_eq!(app.audio_manager.forget_lost(), ["LTC box"]);
+        app.tick_ltc(t0);
+        assert!(app.input.ltc_tap.is_none(), "its device went");
+        // Looked for, not there yet: waits on, the patch kept.
+        app.tick_ltc(t0 + std::time::Duration::from_secs(3));
+        assert!(app.input.ltc_tap.is_none());
+        assert_eq!(app.input.timecode.ltc_input(), Some(patch), "patch kept");
+
+        // The device back (opened again, as the mixer does).
+        let _again = app.audio_manager.open_for_test(0, "LTC box");
+        app.tick_ltc(t0 + std::time::Duration::from_secs(4));
+        assert!(app.input.ltc_tap.is_none(), "not looked for within 2 s");
+        app.tick_ltc(t0 + std::time::Duration::from_secs(6));
+        let tap = app.input.ltc_tap.as_ref().expect("listening again");
+        assert!(app.audio_manager.serves(0, tap.token));
+        assert_eq!(app.input.timecode.ltc_input(), Some(patch));
+    }
+
+    /// Lost belongs to the source that went: LTC patched to another device
+    /// meanwhile, one that will not open, is said and its patch forgotten —
+    /// as for any device that never opened — not looked for for ever.
+    #[test]
+    fn another_ltc_patch_does_not_inherit_a_lost_device() {
+        let Some(gpu) = crate::renderer::context::GpuContext::new_headless().ok() else {
+            return;
+        };
+        let Ok(mut app) = VardaApp::new(gpu, &crate::testing::headless_config()) else {
+            return;
+        };
+        app.audio_manager = crate::audio::AudioManager::listing(&["LTC box", "Not here"]);
+        let _first = app.audio_manager.open_for_test(0, "LTC box");
+        let patch = |source_id| crate::timecode::LtcInput {
+            source_id,
+            channel: 0,
+            rate: None,
+        };
+        app.input.timecode.set_ltc_input(Some(patch(0)));
+        let t0 = std::time::Instant::now();
+        app.tick_ltc(t0);
+        app.audio_manager.lose_for_test(0);
+        app.audio_manager.forget_lost();
+        app.tick_ltc(t0);
+        assert!(app.input.ltc_lost.is_some(), "the first went");
+
+        app.input.timecode.set_ltc_input(Some(patch(1)));
+        app.tick_ltc(t0);
+        assert_eq!(app.input.timecode.ltc_input(), None, "said and forgotten");
+        assert!(app.input.ltc_lost.is_none());
+    }
 
     /// An app with one white deck in channel 0, returning the deck's UUID.
     ///

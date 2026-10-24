@@ -952,7 +952,8 @@ fn edit_plays(ui: &mut egui::Ui, step: &Step, data: &UIData, actions: &mut UIAct
     let runnable: Vec<(&str, &str, &str, bool)> = data
         .channels
         .iter()
-        .flat_map(|ch| ch.decks.iter().map(move |d| (ch, d)))
+        // Front first, as the lists of a channel's layers.
+        .flat_map(|ch| ch.decks.iter().rev().map(move |d| (ch, d)))
         .filter(|(_, d)| {
             d.video_playback.is_some()
                 || d.playlist.is_some()
@@ -1550,6 +1551,7 @@ mod tests {
     fn a_clip_that_would_not_be_heard_says_so() {
         use crate::audio_mix::{AudioSourceKind, AudioSourceSnapshot};
         let strip = |muted: bool, auto: bool| AudioSourceSnapshot {
+            dynamics: crate::audio_mix::DynamicsSnapshot::default(),
             uuid: "strip001".into(),
             name: "Sting".into(),
             kind: AudioSourceKind::Clip { deck_uuid: "a0000001".into() },
@@ -1565,6 +1567,7 @@ mod tests {
             solo: false,
             live: true,
             meter_db: [-96.0, -96.0],
+            peak_db: [-96.0;2],
             refused: None,
         };
         let mut data = show();

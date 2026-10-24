@@ -61,12 +61,14 @@ pub enum ClipboardSource {
 
 /// Where a paste lands.
 ///
-/// The `After*` forms are what a right-click uses, so a copy arrives directly
-/// below the thing the menu was opened on; the `Into*` forms append, which is
-/// what the container's own menu and an API caller mean.
+/// The `After*` forms are what a right-click uses, so a copy arrives next to
+/// the thing the menu was opened on — a deck's just after it in its
+/// channel's stack, in front of it, which the lists of layers show above
+/// it; the `Into*` forms append, which is what the container's own menu and
+/// an API caller mean.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum PasteTarget {
-    /// This deck's channel, directly below it.
+    /// This deck's channel, just after it in the stack: in front of it.
     AfterDeck(String),
     /// The end of this channel.
     IntoChannel(String),
@@ -707,6 +709,11 @@ pub struct ChannelSnapshot {
     pub active_deck_count: u32,
     /// An overlay in Main mode.
     pub overlay: bool,
+    /// Where it is on air: `"main"`, or the UUID of the first bus whose
+    /// Program shows it — a layer of it, on its own or inside another input
+    /// shown there, fading or not. Absent off air.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_air: Option<String>,
 }
 
 // Serialized DTO: the flags mirror independent deck toggles, not a state enum.
@@ -738,6 +745,20 @@ pub struct DeckSnapshot {
     /// A timer's settings and what it reads (None = not a timer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timer: Option<crate::engine::value::timer::TimerSnapshot>,
+    /// A PowerPoint input's show (None = not a PowerPoint input).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<crate::engine::value::presentation::PresentationSnapshot>,
+    /// A presenter view: the PowerPoint input's layer (deck UUID) it shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presenter_of: Option<String>,
+    /// A presenter view's layout (see `SetPresenterLayout`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presenter_layout: Option<crate::engine::value::presentation::PresenterLayout>,
+    /// An input that could not be opened as its show loaded — a file moved,
+    /// a camera unplugged — kept as saved and drawn clear: why (None = not
+    /// offline). Opening the show again tries it anew.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offline: Option<String>,
     /// How a camera's picture is read into colours (None = not a camera).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camera_colour: Option<crate::engine::value::camera::CameraColour>,
@@ -835,6 +856,10 @@ pub struct EffectSnapshot {
     /// Where the effect shows; everywhere when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mask: Option<crate::engine::value::mask::EffectMask>,
+    /// An effect whose shader could not be loaded, kept as saved and drawing
+    /// nothing: why (None = not offline).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offline: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1125,6 +1150,11 @@ pub struct MonitorSnapshot {
     /// The name given to it on this computer.
     pub given_name: Option<String>,
     pub refresh_hz: Option<f64>,
+    /// What a name given to it, or a PowerPoint input's screen, is kept by:
+    /// its lasting identity (see `app::screens`).
+    pub identity: String,
+    /// This Mac's screen: the one with the menu bar.
+    pub main: bool,
 }
 
 // ── MIDI Snapshot ───────────────────────────────────────────────────
@@ -1601,6 +1631,7 @@ mod tests {
     fn channel_snapshot_fields() {
         let ch = ChannelSnapshot {
             overlay: false,
+            on_air: None,
             idx: 0,
             uuid: "test0001".into(),
             name: "Ch 0".into(),
@@ -1654,6 +1685,10 @@ mod tests {
             tap: None,
             playlist: None,
             timer: None,
+            presentation: None,
+            presenter_of: None,
+            presenter_layout: None,
+            offline: None,
             camera_colour: None,
             camera_profile: None,
             camera_lowest_latency: None,

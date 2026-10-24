@@ -78,6 +78,12 @@ pub struct SceneConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub free_control_screen: bool,
 
+    /// Night Shift left alone while an output is on a screen: Nida does not
+    /// keep it off (see `crate::night_shift`). Absent — the default — when
+    /// it does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub free_night_shift: bool,
+
     /// Tonemap mode (defaults to Bypass if absent)
     #[serde(default)]
     pub tonemap_mode: crate::renderer::tonemap::TonemapMode,
@@ -623,6 +629,10 @@ pub enum SourceConfig {
         exclude_varda: Option<bool>,
         #[serde(default)]
         scaling_mode: crate::deck::ScalingMode,
+        /// A PowerPoint input's deck file: the window is PowerPoint's show of
+        /// it, found again when the show is opened (see `crate::presentation`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation: Option<crate::presentation::PresentationConfig>,
     },
     /// Varda's own program or a channel composite, re-entered as a source.
     /// See spec/program-tap.md.
@@ -649,6 +659,16 @@ pub enum SourceConfig {
         /// comes back paused there.
         #[serde(default)]
         elapsed: f64,
+    },
+    /// A presenter view of the PowerPoint input whose layer (deck UUID) it
+    /// follows, laid out as `layout` has it (left out when as a new one).
+    Presenter {
+        follows: String,
+        #[serde(
+            default,
+            skip_serializing_if = "crate::engine::value::presentation::PresenterLayout::is_default"
+        )]
+        layout: crate::engine::value::presentation::PresenterLayout,
     },
 }
 
@@ -853,7 +873,7 @@ impl EffectConfig {
     pub fn of(effect: &crate::deck::Effect) -> Self {
         Self {
             uuid: effect.uuid().to_owned(),
-            path: effect.shader.file_path.clone().unwrap_or_default(),
+            path: effect.saved_path().to_owned(),
             enabled: effect.enabled,
             params: effect.params.values.clone(),
             mask: effect.mask.clone(),
@@ -1182,8 +1202,15 @@ impl SourceConfig {
                 }
             }
             SourceConfig::ScreenCapture {
-                target, rate, crop, ..
+                target,
+                rate,
+                crop,
+                presentation,
+                ..
             } => {
+                if presentation.as_ref().is_some_and(|p| p.path.trim().is_empty()) {
+                    errors.push(format!("{prefix}: PowerPoint input has no file"));
+                }
                 match target {
                     CaptureTargetConfig::Display { name } if name.trim().is_empty() => {
                         errors.push(format!("{prefix}: capture display name is empty"));
@@ -1228,6 +1255,13 @@ impl SourceConfig {
             // A missing file is skipped as the list plays, not refused here;
             // a timer's settings out of range are brought into it.
             SourceConfig::Playlist { .. } | SourceConfig::Timer { .. } => {}
+            SourceConfig::Presenter { follows, .. } => {
+                if follows.trim().is_empty() {
+                    errors.push(format!(
+                        "{prefix}: presenter view follows no PowerPoint input"
+                    ));
+                }
+            }
         }
         errors
     }
@@ -1509,6 +1543,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -1566,6 +1601,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -1608,6 +1644,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -1892,6 +1929,23 @@ mod tests {
         assert!(scene.active_transition.is_none());
     }
 
+    /// Night Shift kept off for the outputs is the default, left out of the
+    /// file; a show that lets it be says so, and opens that way.
+    #[test]
+    fn night_shift_left_alone_is_kept_with_the_show() {
+        let scene: SceneConfig = serde_json::from_str(r#"{"version": 2}"#).unwrap();
+        assert!(!scene.free_night_shift, "an older show keeps it off");
+        let json = serde_json::to_string(&scene).unwrap();
+        assert!(!json.contains("free_night_shift"), "the default unwritten");
+        let free = SceneConfig {
+            free_night_shift: true,
+            ..scene
+        };
+        let json = serde_json::to_string(&free).unwrap();
+        let restored: SceneConfig = serde_json::from_str(&json).unwrap();
+        assert!(restored.free_night_shift);
+    }
+
     #[test]
     fn deck_config_defaults() {
         let json = r#"{"source": {"type": "SolidColor", "color": [1,0,0,1]}}"#;
@@ -2062,6 +2116,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -2125,6 +2180,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -2150,6 +2206,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -2178,6 +2235,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,

@@ -90,6 +90,7 @@ pub struct UIRunner {
     /// The control window's screen held at the show's rate (see
     /// `crate::screen_rate`).
     screen_rate: crate::screen_rate::ScreenRate,
+    night_shift: crate::night_shift::NightShift,
     /// Shows opened lately, for the Show menu.
     recent_shows: std::sync::Arc<Vec<std::path::PathBuf>>,
     /// The show folder the window is named after (see `show_changed`).
@@ -115,6 +116,12 @@ pub struct UIRunner {
 
     // ── UI-consumer-owned layout/selection state ─────────────────────
     layout: super::UILayoutState,
+    /// What the selection was on, by UUID, as the last frame ended: found
+    /// again as the next starts, wherever the API has moved it meanwhile.
+    selection_anchor: super::state::SelectionAnchor,
+    /// The channels this frame's UI was drawn from: what its clicks'
+    /// positions name (see [`settle_selection`]).
+    frame_order: super::state::ChannelOrder,
     /// The operator's saved screen layouts, kept for the user.
     saved_layouts: crate::usecases::ui::screen_layout::SavedLayoutStore,
     /// Choices made in windows, kept for the user across shows and runs.
@@ -198,7 +205,12 @@ impl UIRunner {
             window: None,
             window_surface: None,
             blit_pipeline: None,
-            egui_ctx: egui::Context::default(),
+            egui_ctx: {
+                let ctx = egui::Context::default();
+                ui::one_pass_a_frame(&ctx);
+                ui::always_dark(&ctx);
+                ctx
+            },
             egui_state: None,
             egui_renderer: None,
             preview_encoder: None,
@@ -221,9 +233,18 @@ impl UIRunner {
             ui_queue: crate::renderer::on_screen::Waiting::default(),
             ui_waiting_most: 0,
             screen_rate: crate::screen_rate::ScreenRate::default(),
+            night_shift: crate::night_shift::NightShift::default(),
             recent_shows: std::sync::Arc::default(),
             named_after: std::path::PathBuf::new(),
-            recent_file: crate::app::shows::recent_file(),
+            // A test's runner never reads or writes this computer's Recent
+            // list, saved layouts or window choices: a first frame names the
+            // window after its scratch show, which put that show at the head
+            // of the operator's list for Nida to reopen.
+            recent_file: if cfg!(test) {
+                None
+            } else {
+                crate::app::shows::recent_file()
+            },
             layout_writes: LayoutWrites::default(),
             channel_preview_textures: std::collections::HashMap::new(),
             output_preview_textures: std::collections::HashMap::new(),
@@ -238,8 +259,18 @@ impl UIRunner {
             detect_in_flight: false,
             main_window_id: None,
             layout: super::UILayoutState::default(),
-            saved_layouts: crate::usecases::ui::screen_layout::SavedLayoutStore::open_default(),
-            window_choices: crate::usecases::ui::window_choices::WindowChoiceStore::open_default(),
+            selection_anchor: super::state::SelectionAnchor::default(),
+            frame_order: super::state::ChannelOrder::default(),
+            saved_layouts: if cfg!(test) {
+                crate::usecases::ui::screen_layout::SavedLayoutStore::default()
+            } else {
+                crate::usecases::ui::screen_layout::SavedLayoutStore::open_default()
+            },
+            window_choices: if cfg!(test) {
+                crate::usecases::ui::window_choices::WindowChoiceStore::default()
+            } else {
+                crate::usecases::ui::window_choices::WindowChoiceStore::open_default()
+            },
             file_dialog_tx,
             file_dialog_rx,
             deck_load_tx,
@@ -467,6 +498,23 @@ fn channel_moves(
     moves
 }
 
+/// The selection kept on what the operator had selected — `selected`, by
+/// UUID from the channels the frame was drawn from — wherever that is in
+/// the show now. Held by position, an undo or redo, a layer moved into
+/// another input, or the API reordering channels while the frame was drawn
+/// left it on whichever channel took that place, and the next take sent
+/// that one.
+fn settle_selection(
+    layout: &mut super::UILayoutState,
+    selected: &super::state::SelectionAnchor,
+    varda: &VardaApp,
+) {
+    layout.reanchor(
+        selected,
+        &super::state::ChannelOrder::of(varda.mixer_ref().channels()),
+    );
+}
+
 /// Whether this frame's mutations deserve their own undo entry.
 ///
 /// A held drag reports a mutation on every frame it moves, so only the frame
@@ -537,7 +585,10 @@ impl UIRunner {
         // Create engine now that GPU is ready
         log::info!("[STARTUP] Creating engine (audio, MIDI, shaders, mixer)...");
         let mut varda = match VardaApp::new(gpu, &self.config) {
-            Ok(v) => Box::new(v),
+            Ok(mut v) => {
+                self.share_shutdown(&mut v);
+                Box::new(v)
+            }
             Err(e) => {
                 log::error!("Failed to initialize engine: {e}");
                 event_loop.exit();
@@ -650,6 +701,12 @@ impl UIRunner {
         );
     }
 
+    /// The API's Shutdown and Ctrl-C raise the one flag the loop reads,
+    /// windowed or headless (see `about_to_wait`).
+    fn share_shutdown(&self, varda: &mut VardaApp) {
+        varda.shutdown_requested = std::sync::Arc::clone(&self.shutdown_flag);
+    }
+
     /// Headless render loop — engine processing without UI/egui.
     fn render_headless(&mut self, host: &dyn WindowHost) {
         // The frame's slot on the even cadence the loop sleeps to.
@@ -659,7 +716,9 @@ impl UIRunner {
         };
 
         // Check for shutdown request (from API or SIGINT/SIGTERM)
-        if varda.shutdown_requested
+        if varda
+            .shutdown_requested
+            .load(std::sync::atomic::Ordering::Relaxed)
             || self
                 .shutdown_flag
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -671,6 +730,9 @@ impl UIRunner {
             varda.refuse_commands();
             if let Some(api) = self.api_handle.take() {
                 api.shutdown();
+            }
+            if let Some(kept) = self.night_shift.give_back_now() {
+                log::info!("Shutdown: {kept:?}");
             }
             host.exit();
             return;
@@ -688,6 +750,13 @@ impl UIRunner {
         // Create pending output windows (API-driven in headless)
         host.create_pending_outputs(varda);
         host.refresh_monitors(varda);
+        // Night Shift off while an output is on a screen (see `night_shift`).
+        if let Some(kept) = self
+            .night_shift
+            .keep(varda.outputs_on_screens(), varda.night_shift_off())
+        {
+            varda.note_night_shift(kept);
+        }
         #[cfg(feature = "html")]
         host.create_pending_interactive(varda);
 
@@ -976,6 +1045,14 @@ impl UIRunner {
             if let Some(kept) = kept {
                 varda.note_screen_rate(&kept);
             }
+            // Night Shift off while an output is on a screen (see
+            // `night_shift`).
+            if let Some(kept) = self
+                .night_shift
+                .keep(varda.outputs_on_screens(), varda.night_shift_off())
+            {
+                varda.note_night_shift(kept);
+            }
             #[cfg(feature = "html")]
             varda.create_pending_interactive(event_loop);
         }
@@ -1021,6 +1098,12 @@ impl UIRunner {
         // 4. Collect UI data snapshot (engine → UI, with UI-owned layout state)
         let t_part = std::time::Instant::now();
         let varda_ref = self.varda.as_ref()?;
+        // The selection on what it was on as the last frame ended, wherever
+        // that is now: the API may have moved channels since. The channels
+        // as they are now are what this frame is drawn from.
+        self.frame_order = super::state::ChannelOrder::of(varda_ref.mixer_ref().channels());
+        self.layout
+            .reanchor(&self.selection_anchor, &self.frame_order);
         let mut ui_data = crate::usecases::ui::build_ui_data(
             varda_ref,
             &self.layout,
@@ -1114,6 +1197,9 @@ impl UIRunner {
         // 6. Apply all UI actions
         // 6a. UI-consumer-owned selection/layout state
         self.layout.apply_selections(&ui_actions);
+        // What the operator has selected, as drawn: settled where it is once
+        // this frame's changes are in (see `settle_selection`).
+        let selected = self.layout.anchor(&self.frame_order);
         self.apply_screen_layout_actions(&mut ui_actions);
 
         // 6a2. Dome camera actions — apply to renderer (not layout state)
@@ -1346,6 +1432,18 @@ impl UIRunner {
                     paths,
                 );
             }
+            // Dropped where no channel is: an input each.
+            let as_inputs = std::mem::take(&mut ui_actions.session.files_as_inputs);
+            if !as_inputs.is_empty() {
+                deck_load::add_dropped_files_as_inputs(
+                    varda,
+                    &mut self.deck_load_targets,
+                    &mut self.inputs_awaiting_files,
+                    &self.deck_load_tx,
+                    &self.pending_deck_loads,
+                    as_inputs,
+                );
+            }
 
             // Poll completed file dialog results → spawn background deck loads.
             // The dialog carries a channel UUID rather than an index: the user
@@ -1378,7 +1476,10 @@ impl UIRunner {
                 };
                 // One loader thread, in the order picked: with a thread per
                 // file, several slides picked together landed shuffled.
-                let files = result
+                // Stacked in one input, last first: the first picked is in
+                // front, at the top of the lists of layers.
+                let stacked = result.channel_uuid.is_some();
+                let mut files: Vec<_> = result
                     .paths
                     .into_iter()
                     .zip(targets)
@@ -1391,6 +1492,9 @@ impl UIRunner {
                         (token, file)
                     })
                     .collect();
+                if stacked {
+                    files.reverse();
+                }
                 VardaApp::spawn_ordered_deck_loads(
                     &self.deck_load_tx,
                     varda.gpu_context(),
@@ -1431,9 +1535,14 @@ impl UIRunner {
                         // dropped from the Library renders against blank
                         // preprocessor textures with no error shown.
                         let mut deck = deck;
+                        // A deck that cannot be finalized is not added (the
+                        // notice is logged too); an input made for its file
+                        // goes with it.
                         if let Err(e) = varda.finalize_new_deck(&mut deck) {
-                            log::error!("Failed to add deck: {e}");
                             varda.notify_error(format!("Failed to add deck: {e}"));
+                            if self.inputs_awaiting_files.remove(&channel_uuid) {
+                                deck_load::remove_if_empty(varda, &channel_uuid);
+                            }
                             continue;
                         }
                         let deck_uuid = deck.uuid().to_string();
@@ -1485,8 +1594,12 @@ impl UIRunner {
         // dome's content rotation (real-time, MIDI-mappable).
         {
             let varda = self.varda.as_mut()?;
+            settle_selection(&mut self.layout, &selected, varda);
             varda.set_preview_channels(self.layout.preview_channels());
             varda.set_ui_selected_deck(self.layout.selected_deck);
+            self.selection_anchor = self.layout.anchor(&super::state::ChannelOrder::of(
+                varda.mixer_ref().channels(),
+            ));
             let dome = &self.layout.dome_geometry;
             varda.set_domemaster_content_rotation(
                 dome.content_azimuth_degrees.to_radians(),
@@ -1802,6 +1915,102 @@ mod tests {
         UIRunner::new(AppConfig::parse_from(["varda", "--headless"]))
     }
 
+    fn headless_app_with(channels: usize) -> Option<VardaApp> {
+        let gpu = GpuContext::new_headless().ok()?;
+        let mut app = VardaApp::new(gpu, &crate::testing::headless_config()).ok()?;
+        while app.mixer_ref().channels().len() < channels {
+            app.execute_command(crate::engine::EngineCommand::AddChannel);
+        }
+        Some(app)
+    }
+
+    fn channel_order(app: &VardaApp) -> Vec<String> {
+        let channels = app.mixer_ref().channels();
+        channels.iter().map(|c| c.uuid().to_string()).collect()
+    }
+
+    /// Undo puts a moved input back; the selection stays on that input, so
+    /// the next take sends it — held by position, it stayed where the input
+    /// had been, on another one.
+    #[test]
+    fn undoing_a_move_keeps_the_selection_on_its_input() {
+        use crate::engine::{CommandOutcome, EngineCommand};
+        let Some(mut app) = headless_app_with(3) else {
+            return;
+        };
+        let before = channel_order(&app);
+        let b = before[1].clone();
+        let mut layout = super::super::UILayoutState {
+            selected_channel: Some(1),
+            ..Default::default()
+        };
+        // As a frame does: the snapshot, the move, the selection along.
+        let snapshot = app.history_snapshot(&layout);
+        app.push_history(snapshot);
+        app.execute_command(EngineCommand::MoveChannel {
+            channel_uuid: b.clone(),
+            before_channel_uuid: None,
+        });
+        layout.fixup_channel_move(1, 2);
+        assert_eq!(channel_order(&app)[2], b);
+
+        // The next frames, drawn from the channels as they are: Undo, Redo.
+        for (undo, at) in [(true, 1), (false, 2)] {
+            let drawn = super::super::state::ChannelOrder::of(app.mixer_ref().channels());
+            let selected = layout.anchor(&drawn);
+            let restored = app.history_gui(&layout, undo);
+            assert!(matches!(restored, CommandOutcome::HistoryRestored { .. }));
+            settle_selection(&mut layout, &selected, &app);
+            assert_eq!(channel_order(&app)[at], b, "undo {undo}");
+            assert_eq!(
+                layout.selected_channel,
+                Some(at),
+                "still on it, undo {undo}"
+            );
+        }
+    }
+
+    /// A layer selected and dragged into another input while the API moves
+    /// that input, both in one frame: the selection stays on the layer,
+    /// so the next take sends the input it is in now.
+    #[test]
+    fn the_selection_follows_its_layer_into_another_input_mid_frame() {
+        use crate::engine::{CommandResult, EngineCommand};
+        let Some(mut app) = headless_app_with(3) else {
+            return;
+        };
+        let order = channel_order(&app);
+        let layer =
+            |app: &mut VardaApp| match app.execute_command(EngineCommand::AddSolidColorDeck {
+                channel_uuid: order[0].clone(),
+                color: [1.0, 0.0, 0.0, 1.0],
+            }) {
+                CommandResult::OkWithId { uuid } => uuid,
+                other => panic!("{other:?}"),
+            };
+        let (d, _e) = (layer(&mut app), layer(&mut app));
+        let mut layout = super::super::UILayoutState {
+            selected_deck: Some((0, 0)),
+            ..Default::default()
+        };
+        let drawn = super::super::state::ChannelOrder::of(app.mixer_ref().channels());
+        let selected = layout.anchor(&drawn);
+        app.execute_command(EngineCommand::MoveDeck {
+            deck_uuid: d.clone(),
+            dst_channel_uuid: order[2].clone(),
+            before_deck_uuid: None,
+        });
+        app.execute_command(EngineCommand::MoveChannel {
+            channel_uuid: order[2].clone(),
+            before_channel_uuid: Some(order[1].clone()),
+        });
+        settle_selection(&mut layout, &selected, &app);
+        let (ch, dk) = layout.selected_deck.expect("still selected");
+        let channel = &app.mixer_ref().channels()[ch];
+        assert_eq!(channel.decks[dk].deck.uuid(), d, "the layer it was on");
+        assert_eq!(channel.uuid(), order[2], "in the input it went to");
+    }
+
     #[test]
     fn cadence_anchor_is_cleared_when_fps_is_uncapped() {
         let mut runner = runner();
@@ -2059,6 +2268,27 @@ mod tests {
 
     /// A flagged shutdown exits and skips the frame's work entirely, so nothing
     /// is rendered or reconciled after the signal.
+    /// The API's Shutdown raises the flag the window loop reads: answered
+    /// "ok", the windowed app went on running.
+    #[test]
+    fn the_apis_shutdown_raises_the_flag_the_loop_quits_on() {
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        let mut varda = runner.varda.take().unwrap();
+        runner.share_shutdown(&mut varda);
+        assert!(!runner
+            .shutdown_flag
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            varda.execute_command(crate::engine::EngineCommand::Shutdown),
+            crate::engine::CommandResult::Ok
+        ));
+        assert!(runner
+            .shutdown_flag
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     #[test]
     fn render_headless_exits_and_skips_work_when_shutdown_flagged() {
         let Some(mut runner) = headless_runner() else {
@@ -2450,5 +2680,18 @@ mod tests {
         runner.shut_down();
         assert_eq!(recent_in(&recent).first(), Some(&target));
         assert!(target.join(".varda/scene.json").is_file());
+    }
+
+    /// A test's runner keeps no Recent list of this computer's: its first
+    /// frame names the window after its scratch show, which once put that
+    /// show at the head of the operator's list, for Nida to reopen.
+    #[test]
+    fn a_test_runner_keeps_no_recent_list_of_this_computers() {
+        assert_eq!(runner().recent_file, None);
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        runner.show_moved();
+        assert_eq!(runner.recent_file, None, "nowhere to write it");
     }
 }

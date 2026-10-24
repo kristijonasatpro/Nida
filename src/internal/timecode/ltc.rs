@@ -67,6 +67,11 @@ pub struct LtcDecoder {
 }
 
 impl LtcDecoder {
+    /// The sample rate it reads at.
+    pub fn sample_rate(&self) -> f64 {
+        self.sample_rate
+    }
+
     pub fn new(sample_rate: f64) -> Self {
         Self {
             sample_rate,

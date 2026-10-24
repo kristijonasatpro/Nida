@@ -268,6 +268,12 @@ impl VardaApp {
         for opened in self.camera_manager.poll_opening(&self.context.device) {
             match opened.result {
                 Ok(size) => self.show_opened_camera(opened.id, &opened.decks, size),
+                // Its input waits for it, tried again every two seconds; the
+                // operator who just added it is told once.
+                Err(e) if opened.asked => {
+                    log::warn!("{e:#}");
+                    self.notify_error(format!("{e:#} — its input waits for it"));
+                }
                 Err(e) => log::warn!("{e:#}"),
             }
         }
@@ -323,7 +329,10 @@ impl VardaApp {
             }
         }
         for (id, mode, decks) in starting {
-            if let Err(e) = self.camera_manager.open_in_background(id, mode, decks) {
+            if let Err(e) = self
+                .camera_manager
+                .open_in_background(id, mode, decks, false)
+            {
                 log::warn!("{e:#}");
             }
         }

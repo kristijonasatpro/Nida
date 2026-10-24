@@ -549,9 +549,13 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 |---|---|---|
 | `POST` | `/api/audio-buses` |  |
 | `DELETE` | `/api/audio-buses/{bus_uuid}` |  |
+| `PUT` | `/api/audio-buses/{bus_uuid}/compressor` | A bus's compressor, before its fader. |
 | `PUT` | `/api/audio-buses/{bus_uuid}/delay` |  |
 | `PUT` | `/api/audio-buses/{bus_uuid}/device` |  |
 | `PUT` | `/api/audio-buses/{bus_uuid}/gain` |  |
+| `PUT` | `/api/audio-buses/{bus_uuid}/limiter` | A bus's limiter, after its fader: no sample past its ceiling. |
+| `POST` | `/api/audio-buses/{bus_uuid}/loudness/reset` | Start a bus's loudness readings again — integrated, short-term and |
+| `POST` | `/api/audio-buses/{bus_uuid}/meters/reset` | Reset a bus's held peak (its loudness readings stay). |
 | `PUT` | `/api/audio-buses/{bus_uuid}/mute` |  |
 | `PUT` | `/api/audio-buses/{bus_uuid}/name` |  |
 | `POST` | `/api/audio-devices/rescan` |  |
@@ -563,12 +567,17 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `PUT` | `/api/audio-monitor/listen` |  |
 | `PUT` | `/api/audio-sources/{source_uuid}/auto` | Audio Auto: the source's sound switches on as it goes on air and off as |
 | `PUT` | `/api/audio-sources/{source_uuid}/balance` |  |
+| `PUT` | `/api/audio-sources/{source_uuid}/compressor` | A source's compressor, after its leveler. |
 | `PUT` | `/api/audio-sources/{source_uuid}/delay` |  |
 | `PUT` | `/api/audio-sources/{source_uuid}/follow` |  |
 | `PUT` | `/api/audio-sources/{source_uuid}/gain` |  |
+| `PUT` | `/api/audio-sources/{source_uuid}/leveler` | A source's leveler: each speaker brought slowly to the same loudness. |
+| `PUT` | `/api/audio-sources/{source_uuid}/low-cut` | A source's low cut: rumble and hum under a voice. |
+| `POST` | `/api/audio-sources/{source_uuid}/meters/reset` | Reset a source's held peak. |
 | `PUT` | `/api/audio-sources/{source_uuid}/mute` |  |
 | `PUT` | `/api/audio-sources/{source_uuid}/sends/{bus_uuid}` |  |
 | `PUT` | `/api/audio-sources/{source_uuid}/solo` |  |
+| `POST` | `/api/audio-sources/{source_uuid}/speech-preset` | The Speech preset on a source: low cut at 100 Hz, the leveler to −20 dB, |
 
 ### Auto Transitions
 

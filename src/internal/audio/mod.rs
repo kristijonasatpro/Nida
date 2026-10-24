@@ -9,9 +9,9 @@ use cpal::Sample;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rustfft::{num_complex::Complex, FftPlanner};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Opaque audio source identifier.
 pub type AudioSourceId = u32;
@@ -160,6 +160,56 @@ pub struct AudioDeviceInfo {
     pub name: String,
 }
 
+/// How long a device that would not open is left before it is looked for
+/// again by a modulator, which asks every frame.
+const OPEN_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// An input device's name as listed: its description's, or a stand-in by
+/// its place when it has none.
+fn input_name(i: usize, device: &cpal::Device) -> String {
+    device.description().map_or_else(
+        |_| format!("Audio Input {i}"),
+        |desc| desc.name().to_string(),
+    )
+}
+
+/// Whether `device` was listed under a stand-in name, its description
+/// unreadable then: it is known only by its place.
+fn is_stand_in(device: &AudioDeviceInfo) -> bool {
+    device.name == format!("Audio Input {}", device.id)
+}
+
+/// Where the listed input `id` is in `now`, the inputs' names as the OS
+/// lists them at this moment: the device of its name — of two with one
+/// name, the one in the same place among them — or, listed under a
+/// stand-in name, the one in its place. `None` when it is gone.
+///
+/// By name, because the OS's order changes when a device is plugged in: a
+/// USB capture box puts its sound first, and by place an input listed
+/// before it would open that instead of its own device.
+fn now_at(listed: &[AudioDeviceInfo], id: AudioSourceId, now: &[String]) -> Option<usize> {
+    let device = listed.iter().find(|d| d.id == id)?;
+    if is_stand_in(device) {
+        return Some(id as usize).filter(|&at| at < now.len());
+    }
+    let twin = listed
+        .iter()
+        .filter(|d| d.name == device.name && d.id < id)
+        .count();
+    now.iter()
+        .enumerate()
+        .filter(|(_, name)| **name == device.name)
+        .nth(twin)
+        .map(|(at, _)| at)
+}
+
+/// Whether opening `id` failed within [`OPEN_RETRY`] before `now`.
+fn tried_lately(failed: &HashMap<AudioSourceId, Instant>, id: AudioSourceId, now: Instant) -> bool {
+    failed
+        .get(&id)
+        .is_some_and(|t| now.saturating_duration_since(*t) < OPEN_RETRY)
+}
+
 /// Audio analysis data sent to the rendering thread
 #[derive(Clone)]
 pub struct AudioData {
@@ -305,9 +355,63 @@ pub fn estimate_bpm(beat_intervals: &[f32]) -> Option<f32> {
     None
 }
 
+/// How long a capture that has called back may go without a callback
+/// before it is taken for lost: an unplugged device's stream stops calling,
+/// said or not.
+const LOST_AFTER: Duration = Duration::from_secs(2);
+
+/// How long a capture may take to call back at all: a Bluetooth microphone
+/// can take seconds to start, and taken for lost sooner it would be opened
+/// again and again, never heard.
+const START_GRACE: Duration = Duration::from_secs(10);
+
+/// Whether a capture's stream still runs: macOS said its device went (the
+/// stream's error), or it has stopped calling back (see [`LOST_AFTER`],
+/// [`START_GRACE`]).
+struct Liveness {
+    gone: AtomicBool,
+    since: Instant,
+    /// When it last called back, in milliseconds from `since`, plus one: 0
+    /// while it never has.
+    heard_ms: AtomicU64,
+}
+
+impl Liveness {
+    fn new() -> Self {
+        Self {
+            gone: AtomicBool::new(false),
+            since: Instant::now(),
+            heard_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// The stream called back: on the real-time thread, so an atomic store.
+    fn heard(&self) {
+        let ms = u64::try_from(self.since.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+        self.heard_ms.store(ms + 1, Ordering::Relaxed);
+    }
+
+    fn lost(&self, now: Instant) -> bool {
+        if self.gone.load(Ordering::Relaxed) {
+            return true;
+        }
+        match self.heard_ms.load(Ordering::Relaxed) {
+            0 => now.saturating_duration_since(self.since) > START_GRACE,
+            ms => {
+                let heard = self.since + Duration::from_millis(ms - 1);
+                now.saturating_duration_since(heard) > LOST_AFTER
+            }
+        }
+    }
+}
+
 /// An active audio source with its own capture stream.
 struct ActiveAudioSource {
-    _stream: cpal::Stream,
+    /// The stream (none in tests, which have no device).
+    _stream: Option<cpal::Stream>,
+    /// The device's name, to say which went.
+    name: String,
+    liveness: Arc<Liveness>,
     receiver: Receiver<AudioData>,
     /// Latest polled data (cached between polls)
     pub latest: AudioData,
@@ -342,6 +446,8 @@ pub struct AudioManager {
     manual_pins: HashSet<AudioSourceId>,
     /// Devices referenced by `AudioBand` modulators (last reconciled set).
     mod_refs: HashSet<AudioSourceId>,
+    /// When opening each device last failed (see [`OPEN_RETRY`]).
+    failed: HashMap<AudioSourceId, Instant>,
 }
 
 impl Default for AudioManager {
@@ -358,6 +464,7 @@ impl AudioManager {
             default_source_id: None,
             manual_pins: HashSet::new(),
             mod_refs: HashSet::new(),
+            failed: HashMap::new(),
         };
         // Enumerate devices and cache the default input, but open nothing —
         // capture starts only when a holder appears (issue #76).
@@ -381,6 +488,19 @@ impl AudioManager {
         devices.first().map(|d| d.id)
     }
 
+    /// A manager listing `names` and asking the OS nothing, for a test.
+    #[cfg(test)]
+    pub(crate) fn listing(names: &[&str]) -> Self {
+        Self {
+            devices: tests::info(names),
+            active: HashMap::new(),
+            default_source_id: None,
+            manual_pins: HashSet::new(),
+            mod_refs: HashSet::new(),
+            failed: HashMap::new(),
+        }
+    }
+
     /// A manager with the input devices listed — or, when listing takes
     /// longer than `wait`, none yet and the listing still going: the
     /// receiver gets it when it is done (hand it to [`Self::adopt`]).
@@ -396,6 +516,7 @@ impl AudioManager {
             default_source_id: None,
             manual_pins: HashSet::new(),
             mod_refs: HashSet::new(),
+            failed: HashMap::new(),
         };
         match within(wait, Self::list_inputs) {
             Ok(listing) => {
@@ -435,15 +556,9 @@ impl AudioManager {
             .input_devices()
             .map(|devs| {
                 devs.enumerate()
-                    .map(|(i, d)| {
-                        let name = d.description().map_or_else(
-                            |_| format!("Audio Input {i}"),
-                            |desc| desc.name().to_string(),
-                        );
-                        AudioDeviceInfo {
-                            id: i as AudioSourceId,
-                            name,
-                        }
+                    .map(|(i, d)| AudioDeviceInfo {
+                        id: i as AudioSourceId,
+                        name: input_name(i, &d),
                     })
                     .collect()
             })
@@ -477,8 +592,8 @@ impl AudioManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if the host cannot enumerate input devices, if no device
-    /// exists at index `id`, if the device has no usable default input config, if
+    /// Returns an error if the host cannot enumerate input devices, if the device
+    /// listed as `id` is not connected, if it has no usable default input config, if
     /// its sample format is not `f32`/`i16`/`u16`, or if building or starting the
     /// cpal input stream fails.
     pub fn open_source(&mut self, id: AudioSourceId) -> Result<()> {
@@ -488,21 +603,50 @@ impl AudioManager {
 
     /// Start capture for a source if it isn't already active. Idempotent.
     /// Does not register any holder — callers manage holder sets themselves.
+    /// A failure is noted (see [`OPEN_RETRY`]).
     fn ensure_open(&mut self, id: AudioSourceId) -> Result<()> {
         if self.active.contains_key(&id) {
             return Ok(()); // Already open
         }
+        match self.open_listed(id) {
+            Ok(source) => {
+                self.failed.remove(&id);
+                self.active.insert(id, source);
+                Ok(())
+            }
+            Err(e) => {
+                self.failed.insert(id, Instant::now());
+                Err(e)
+            }
+        }
+    }
 
+    /// Capture from the device listed as `id`, found among the OS's by its
+    /// name (see [`now_at`]).
+    fn open_listed(&self, id: AudioSourceId) -> Result<ActiveAudioSource> {
+        // An id never listed — a show's modulator from another Mac — is not
+        // looked for: listing the OS's devices is slow.
+        anyhow::ensure!(
+            self.devices.iter().any(|d| d.id == id),
+            "Audio device not found"
+        );
         let host = cpal::default_host();
-        let device = host
+        let devices: Vec<cpal::Device> = host
             .input_devices()
             .context("Failed to enumerate audio devices")?
-            .nth(id as usize)
+            .collect();
+        let now: Vec<String> = devices
+            .iter()
+            .enumerate()
+            .map(|(i, d)| input_name(i, d))
+            .collect();
+        let at = now_at(&self.devices, id, &now).context("Audio device not found")?;
+        let device = devices
+            .into_iter()
+            .nth(at)
             .context("Audio device not found")?;
 
-        let dev_name = device
-            .description()
-            .map_or_else(|_| format!("Audio {id}"), |desc| desc.name().to_string());
+        let dev_name = &now[at];
         log::info!("Opening audio source {id}: {dev_name}");
 
         let config = device
@@ -515,6 +659,7 @@ impl AudioManager {
 
         let (sender, receiver) = bounded::<AudioData>(16);
         let pcm_subs = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        let liveness = Arc::new(Liveness::new());
 
         let stream = match config.sample_format() {
             cpal::SampleFormat::F32 => Self::build_stream::<f32>(
@@ -523,6 +668,7 @@ impl AudioManager {
                 sender,
                 sample_rate,
                 pcm_subs.clone(),
+                Arc::clone(&liveness),
             )?,
             cpal::SampleFormat::I16 => Self::build_stream::<i16>(
                 &device,
@@ -530,6 +676,7 @@ impl AudioManager {
                 sender,
                 sample_rate,
                 pcm_subs.clone(),
+                Arc::clone(&liveness),
             )?,
             cpal::SampleFormat::U16 => Self::build_stream::<u16>(
                 &device,
@@ -537,28 +684,26 @@ impl AudioManager {
                 sender,
                 sample_rate,
                 pcm_subs.clone(),
+                Arc::clone(&liveness),
             )?,
             _ => anyhow::bail!("Unsupported sample format"),
         };
 
         stream.play().context("Failed to start audio stream")?;
 
-        self.active.insert(
-            id,
-            ActiveAudioSource {
-                _stream: stream,
-                receiver,
-                latest: AudioData {
-                    sample_rate,
-                    ..AudioData::default()
-                },
-                sample_rate_hz,
-                channels,
-                pcm_subs,
+        Ok(ActiveAudioSource {
+            _stream: Some(stream),
+            name: dev_name.clone(),
+            liveness,
+            receiver,
+            latest: AudioData {
+                sample_rate,
+                ..AudioData::default()
             },
-        );
-
-        Ok(())
+            sample_rate_hz,
+            channels,
+            pcm_subs,
+        })
     }
 
     /// Subscribe to raw PCM passthrough for a source, opening it if needed.
@@ -671,8 +816,14 @@ impl AudioManager {
             self.mod_refs.remove(&id);
             self.close_if_orphaned(id);
         }
-        // Devices entering the modulation set: register the ref, then ensure open.
+        // Devices entering the modulation set: register the ref, then ensure
+        // open — one that would not open only every OPEN_RETRY, as this runs
+        // every frame.
+        let now = Instant::now();
         for &id in needed {
+            if tried_lately(&self.failed, id, now) {
+                continue;
+            }
             if self.mod_refs.insert(id) || !self.active.contains_key(&id) {
                 if let Err(e) = self.ensure_open(id) {
                     log::warn!("set_modulation_refs: failed to open audio source {id}: {e}");
@@ -728,12 +879,108 @@ impl AudioManager {
         !self.active.is_empty()
     }
 
+    /// Let go of the captures whose stream has stopped — the device
+    /// unplugged, said by macOS or gone quiet (see [`Liveness`]). Kept, a
+    /// dead stream held its subscribers silent for good while the mixer's
+    /// input looked connected. Their subscribers' channels close; the mixer
+    /// subscribes again once the device is back (`connect_inputs`), opened
+    /// by its name. The names of those let go.
+    pub fn forget_lost(&mut self) -> Vec<String> {
+        let now = Instant::now();
+        let lost: Vec<AudioSourceId> = self
+            .active
+            .iter()
+            .filter(|(_, source)| source.liveness.lost(now))
+            .map(|(id, _)| *id)
+            .collect();
+        lost.into_iter()
+            .filter_map(|id| {
+                let source = self.active.remove(&id)?;
+                self.failed.insert(id, now);
+                log::warn!(
+                    "Audio source {id} ('{}') stopped: let go, opened again once it is back",
+                    source.name
+                );
+                Some(source.name)
+            })
+            .collect()
+    }
+
+    /// Open again, every [`OPEN_RETRY`], the sources pinned open (see
+    /// [`Self::open_source`]) that are not: let go when their device went
+    /// (see [`Self::forget_lost`]), they had no other way back.
+    pub fn reopen_pins(&mut self) {
+        let now = Instant::now();
+        let closed: Vec<AudioSourceId> = self
+            .manual_pins
+            .iter()
+            .filter(|id| !self.active.contains_key(id) && !tried_lately(&self.failed, **id, now))
+            .copied()
+            .collect();
+        for id in closed {
+            if let Err(e) = self.ensure_open(id) {
+                log::debug!("Audio source {id} pinned open, not back yet: {e}");
+            }
+        }
+    }
+
+    /// Whether subscription `token` to source `id` still runs.
+    pub fn serves(&self, id: AudioSourceId, token: PcmToken) -> bool {
+        self.active
+            .get(&id)
+            .is_some_and(|s| s.pcm_subs.load().iter().any(|p| p.token == token))
+    }
+
+    /// Source `id` open as `name` with no device behind it, and a
+    /// subscription to it — for tests.
+    #[cfg(test)]
+    pub(crate) fn open_for_test(&mut self, id: AudioSourceId, name: &str) -> PcmSubscription {
+        self.active.insert(
+            id,
+            ActiveAudioSource {
+                _stream: None,
+                name: name.into(),
+                liveness: Arc::new(Liveness::new()),
+                receiver: bounded(1).1,
+                latest: AudioData::default(),
+                sample_rate_hz: 48_000,
+                channels: 2,
+                pcm_subs: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            },
+        );
+        self.subscribe_pcm(id).expect("open")
+    }
+
+    /// Source `id`'s stream as macOS says when its device goes — for tests.
+    #[cfg(test)]
+    pub(crate) fn lose_for_test(&self, id: AudioSourceId) {
+        if let Some(source) = self.active.get(&id) {
+            source.liveness.gone.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Source `id`'s stream as one started `ago`, called back as it started
+    /// (`heard`) or never — for tests.
+    #[cfg(test)]
+    pub(crate) fn quiet_for_test(&mut self, id: AudioSourceId, ago: Duration, heard: bool) {
+        if let Some(source) = self.active.get_mut(&id) {
+            source.liveness = Arc::new(Liveness {
+                gone: AtomicBool::new(false),
+                since: Instant::now()
+                    .checked_sub(ago)
+                    .expect("a time that far back"),
+                heard_ms: AtomicU64::new(u64::from(heard)),
+            });
+        }
+    }
+
     fn build_stream<T>(
         device: &cpal::Device,
         config: &cpal::StreamConfig,
         sender: Sender<AudioData>,
         sample_rate: f32,
         pcm_subs: Arc<ArcSwap<Vec<PcmSubscriber>>>,
+        liveness: Arc<Liveness>,
     ) -> Result<cpal::Stream>
     where
         T: cpal::Sample + cpal::SizedSample,
@@ -767,9 +1014,11 @@ impl AudioManager {
         let mut beat_intervals: Vec<f32> = Vec::with_capacity(BPM_HISTORY_SIZE);
         let mut current_bpm: Option<f32> = None;
 
+        let callback_liveness = Arc::clone(&liveness);
         let stream = device.build_input_stream(
             config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
+                callback_liveness.heard();
                 // Passthrough tee: forward raw interleaved PCM, untouched by the
                 // FFT pipeline, to every subscriber. Skipped entirely when there
                 // are no subscribers so the video-only path pays nothing.
@@ -876,7 +1125,12 @@ impl AudioManager {
                     let _ = sender.try_send(data);
                 }
             },
-            |err| log::error!("Audio stream error: {err}"),
+            move |err| {
+                log::error!("Audio stream error: {err}");
+                if matches!(err, cpal::StreamError::DeviceNotAvailable) {
+                    liveness.gone.store(true, Ordering::Relaxed);
+                }
+            },
             None,
         )?;
 
@@ -988,6 +1242,64 @@ impl AudioTextures {
 
 #[cfg(test)]
 mod tests {
+
+    /// A capture whose device went — macOS said so, or its stream stopped
+    /// calling back — is let go, its subscribers told; one still running is
+    /// kept. Kept, a dead stream held its listeners silent for good.
+    #[test]
+    fn a_capture_whose_device_went_is_let_go() {
+        use super::AudioManager;
+        use std::time::Duration;
+        let mut mgr = AudioManager::listing(&["Scarlett", "BlackHole", "USB Mixer", "AirPods"]);
+        let said = mgr.open_for_test(0, "Scarlett");
+        let quiet = mgr.open_for_test(1, "BlackHole");
+        let fine = mgr.open_for_test(2, "USB Mixer");
+        let starting = mgr.open_for_test(3, "AirPods");
+        assert!(mgr.forget_lost().is_empty(), "all running");
+        mgr.lose_for_test(0);
+        mgr.quiet_for_test(1, Duration::from_secs(3), true);
+        // A Bluetooth microphone slow to start is given its time.
+        mgr.quiet_for_test(3, Duration::from_secs(3), false);
+        let mut lost = mgr.forget_lost();
+        lost.sort();
+        assert_eq!(lost, ["BlackHole", "Scarlett"]);
+        assert!(!mgr.serves(0, said.token) && !mgr.serves(1, quiet.token));
+        assert!(mgr.serves(2, fine.token), "the one still running stays");
+        assert!(mgr.serves(3, starting.token), "and the one starting");
+        mgr.quiet_for_test(3, Duration::from_secs(11), false);
+        assert_eq!(mgr.forget_lost(), ["AirPods"], "but not for ever");
+        assert!(
+            matches!(
+                said.receiver.try_recv(),
+                Err(crossbeam_channel::TryRecvError::Disconnected)
+            ),
+            "its listeners hear it went"
+        );
+    }
+
+    /// A source pinned open whose device went is looked for again — every
+    /// two seconds, not every frame: let go, it had no other way back.
+    #[test]
+    fn a_pinned_source_whose_device_went_is_looked_for_again() {
+        use super::AudioManager;
+        use std::time::{Duration, Instant};
+        let mut mgr = AudioManager::listing(&["Scarlett"]);
+        mgr.manual_pins.insert(0);
+        let _sub = mgr.open_for_test(0, "Scarlett");
+        mgr.lose_for_test(0);
+        assert_eq!(mgr.forget_lost(), ["Scarlett"]);
+        let lost_at = mgr.failed[&0];
+        mgr.reopen_pins();
+        assert_eq!(mgr.failed[&0], lost_at, "not looked for again at once");
+        let long_ago = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .expect("a time that far back");
+        mgr.failed.insert(0, long_ago);
+        mgr.reopen_pins();
+        // No Scarlett here, so the look fails — and is noted, to be tried
+        // again later.
+        assert!(mgr.failed[&0] > long_ago, "looked for again");
+    }
 
     /// Listing sound inputs that takes longer than the startup will wait —
     /// macOS asking for the microphone — does not hold the startup up: the
@@ -1454,6 +1766,75 @@ mod tests {
             None
         );
         assert_eq!(AudioManager::pick_default_input(None, &[]), None);
+    }
+
+    fn names(of: &[&str]) -> Vec<String> {
+        of.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    /// A listing as the OS makes it: ids by place.
+    pub(super) fn info(of: &[&str]) -> Vec<AudioDeviceInfo> {
+        of.iter()
+            .enumerate()
+            .map(|(i, n)| AudioDeviceInfo {
+                id: i as AudioSourceId,
+                name: (*n).to_string(),
+            })
+            .collect()
+    }
+
+    /// A device plugged in comes first in the OS's list — a USB capture
+    /// box's sound — and an input listed before it still opens its own
+    /// device, not the one now in its place.
+    #[test]
+    fn a_device_plugged_in_in_front_takes_no_inputs_place() {
+        let listed = info(&["Scarlett Solo 4th Gen", "ZoomAudioDevice"]);
+        let now = names(&[
+            "Blackmagic Design",
+            "Scarlett Solo 4th Gen",
+            "ZoomAudioDevice",
+        ]);
+        assert_eq!(
+            now_at(&listed, 0, &now),
+            Some(1),
+            "the Scarlett, not the Blackmagic"
+        );
+        assert_eq!(now_at(&listed, 1, &now), Some(2));
+        assert_eq!(now_at(&listed, 2, &now), None, "never listed");
+    }
+
+    /// Of two inputs with one name, each opens the one in its place among
+    /// them; one no longer there opens nothing; one listed under a stand-in
+    /// name, its description unreadable then, opens the device in its place.
+    #[test]
+    fn twins_keep_their_places_and_a_stand_in_its_place() {
+        let listed = info(&["USB Audio", "USB Audio"]);
+        let now = names(&["Mic", "USB Audio", "USB Audio"]);
+        assert_eq!(now_at(&listed, 0, &now), Some(1));
+        assert_eq!(now_at(&listed, 1, &now), Some(2));
+        assert_eq!(now_at(&listed, 1, &names(&["Mic", "USB Audio"])), None);
+        let stand_in = info(&["Mic", "Audio Input 1"]);
+        assert_eq!(
+            now_at(&stand_in, 1, &names(&["Mic", "Readable Now"])),
+            Some(1)
+        );
+    }
+
+    /// A modulator's device that would not open is not looked for again
+    /// every frame — listing the OS's devices is slow — but after a while;
+    /// one never listed is not looked for at all.
+    #[test]
+    fn a_device_that_would_not_open_is_tried_again_after_a_while() {
+        let mut mgr = AudioManager::listing(&["Scarlett Solo 4th Gen"]);
+        let at = Instant::now();
+        mgr.failed.insert(0, at);
+        mgr.set_modulation_refs(&BTreeSet::from([0]));
+        assert_eq!(mgr.failed.get(&0), Some(&at), "not tried this frame");
+        assert!(mgr.mod_refs.is_empty());
+        assert!(tried_lately(&mgr.failed, 0, at + OPEN_RETRY / 2));
+        assert!(!tried_lately(&mgr.failed, 0, at + OPEN_RETRY));
+        assert!(!tried_lately(&mgr.failed, 1, at), "another device");
+        assert!(mgr.open_listed(5).is_err(), "never listed");
     }
 
     #[test]

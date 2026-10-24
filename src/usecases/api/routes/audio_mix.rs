@@ -76,6 +76,10 @@ pub struct AppSoundBody {
     /// The strip's name; the app's when empty.
     #[serde(default)]
     pub name: String,
+    /// The input whose sound it is, by deck UUID (PowerPoint's, of a
+    /// PowerPoint input): heard with its picture on air, removed with it.
+    #[serde(default)]
+    pub deck_uuid: Option<String>,
 }
 
 /// A send switch.
@@ -230,6 +234,7 @@ pub async fn create_app_sound(
         EngineCommand::AddAppSound {
             app: b.app,
             name: b.name,
+            deck_uuid: b.deck_uuid,
         },
     )
     .await
@@ -433,4 +438,124 @@ pub async fn set_monitor_listen(
         },
     )
     .await
+}
+
+// ── Processing ─────────────────────────────────────────────────────────
+//
+// Each takes the whole setting: fields left out take their defaults (`enabled`
+// false among them), so send every field you mean to keep.
+
+const SOURCE: &str = "Source UUID (the deck's, for a clip)";
+
+/// A source's low cut: rumble and hum under a voice.
+#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/low-cut", params(("source_uuid" = String, Path, description = SOURCE)), request_body = crate::audio_mix::LowCutConfig, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "Frequency out of 20–400 Hz, or a slope other than 12 or 24"), (status = 404, description = "No such source")), tag = "Audio Mixer")]
+pub async fn set_source_low_cut(
+    State(s): State<SharedState>,
+    Path(uuid): Path<String>,
+    Json(config): Json<crate::audio_mix::LowCutConfig>,
+) -> impl IntoResponse {
+    dispatch(&s, EngineCommand::SetAudioSourceLowCut { uuid, config }).await
+}
+
+/// A source's leveler: each speaker brought slowly to the same loudness.
+#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/leveler", params(("source_uuid" = String, Path, description = SOURCE)), request_body = crate::audio_mix::LevelerConfig, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "A value out of its range"), (status = 404, description = "No such source")), tag = "Audio Mixer")]
+pub async fn set_source_leveler(
+    State(s): State<SharedState>,
+    Path(uuid): Path<String>,
+    Json(config): Json<crate::audio_mix::LevelerConfig>,
+) -> impl IntoResponse {
+    dispatch(&s, EngineCommand::SetAudioSourceLeveler { uuid, config }).await
+}
+
+/// A source's compressor, after its leveler.
+#[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/compressor", params(("source_uuid" = String, Path, description = SOURCE)), request_body = crate::audio_mix::CompressorConfig, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "A value out of its range"), (status = 404, description = "No such source")), tag = "Audio Mixer")]
+pub async fn set_source_compressor(
+    State(s): State<SharedState>,
+    Path(uuid): Path<String>,
+    Json(config): Json<crate::audio_mix::CompressorConfig>,
+) -> impl IntoResponse {
+    dispatch(&s, EngineCommand::SetAudioSourceCompressor { uuid, config }).await
+}
+
+/// The Speech preset on a source: low cut at 100 Hz, the leveler to −20 dB,
+/// gentle compression — what a talk's microphone needs, in one call.
+#[utoipa::path(post, path = "/api/audio-sources/{source_uuid}/speech-preset", params(("source_uuid" = String, Path, description = SOURCE)), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such source")), tag = "Audio Mixer")]
+pub async fn apply_speech_preset(
+    State(s): State<SharedState>,
+    Path(uuid): Path<String>,
+) -> axum::response::Response {
+    use crate::audio_mix::{CompressorConfig, LevelerConfig, LowCutConfig};
+    let commands = [
+        EngineCommand::SetAudioSourceLowCut {
+            uuid: uuid.clone(),
+            config: LowCutConfig::speech(),
+        },
+        EngineCommand::SetAudioSourceLeveler {
+            uuid: uuid.clone(),
+            config: LevelerConfig::speech(),
+        },
+        EngineCommand::SetAudioSourceCompressor {
+            uuid,
+            config: CompressorConfig::speech(),
+        },
+    ];
+    let mut last = crate::engine::CommandResult::Ok;
+    for command in commands {
+        match s.send_command(command).await {
+            Ok(result @ crate::engine::CommandResult::Err { .. }) => {
+                return command_response(result)
+            }
+            Ok(result) => last = result,
+            Err(m) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+        }
+    }
+    command_response(last)
+}
+
+/// A bus's compressor, before its fader.
+#[utoipa::path(put, path = "/api/audio-buses/{bus_uuid}/compressor", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = crate::audio_mix::CompressorConfig, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "A value out of its range"), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
+pub async fn set_bus_compressor(
+    State(s): State<SharedState>,
+    Path(uuid): Path<String>,
+    Json(config): Json<crate::audio_mix::CompressorConfig>,
+) -> impl IntoResponse {
+    dispatch(&s, EngineCommand::SetAudioBusCompressor { uuid, config }).await
+}
+
+/// A bus's limiter, after its fader: no sample past its ceiling.
+#[utoipa::path(put, path = "/api/audio-buses/{bus_uuid}/limiter", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = crate::audio_mix::LimiterConfig, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "Ceiling out of −12–0 dBFS or release out of 10–1000 ms"), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
+pub async fn set_bus_limiter(
+    State(s): State<SharedState>,
+    Path(uuid): Path<String>,
+    Json(config): Json<crate::audio_mix::LimiterConfig>,
+) -> impl IntoResponse {
+    dispatch(&s, EngineCommand::SetAudioBusLimiter { uuid, config }).await
+}
+
+/// Reset a bus's held peak (its loudness readings stay).
+#[utoipa::path(post, path = "/api/audio-buses/{bus_uuid}/meters/reset", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Audio Mixer")]
+pub async fn reset_bus_meters(
+    State(s): State<SharedState>,
+    Path(uuid): Path<String>,
+) -> impl IntoResponse {
+    dispatch(&s, EngineCommand::ResetAudioMeter { uuid, bus: true }).await
+}
+
+/// Start a bus's loudness readings again — integrated, short-term and
+/// momentary — as a show starts.
+#[utoipa::path(post, path = "/api/audio-buses/{bus_uuid}/loudness/reset", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Audio Mixer")]
+pub async fn reset_bus_loudness(
+    State(s): State<SharedState>,
+    Path(uuid): Path<String>,
+) -> impl IntoResponse {
+    dispatch(&s, EngineCommand::ResetAudioLoudness { uuid }).await
+}
+
+/// Reset a source's held peak.
+#[utoipa::path(post, path = "/api/audio-sources/{source_uuid}/meters/reset", params(("source_uuid" = String, Path, description = SOURCE)), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Audio Mixer")]
+pub async fn reset_source_meters(
+    State(s): State<SharedState>,
+    Path(uuid): Path<String>,
+) -> impl IntoResponse {
+    dispatch(&s, EngineCommand::ResetAudioMeter { uuid, bus: false }).await
 }

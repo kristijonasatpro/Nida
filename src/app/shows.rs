@@ -261,7 +261,8 @@ impl VardaApp {
                 // copy: kept, not read again.
                 let moves =
                     self.camera_lut_moves(&self.session.workspace.luts_dir(), &to.luts_dir());
-                self.session.workspace = to;
+                // Its shaders the copy's, as an opened show's.
+                self.enter_show(to);
                 self.camera_manager.relocate_luts(&moves);
             }
             // The engine names the new folder itself from now.
@@ -317,6 +318,7 @@ impl VardaApp {
         can_hold_a_show(folder)?;
         let mut empty = self.empty_scene();
         empty.free_control_screen = !self.control_screen_rate();
+        empty.free_night_shift = !self.night_shift_off();
         // The new show is written first, the desk's setup copied beside a
         // fresh stage and an empty scene; only then is it opened, as any show
         // is, so a show that cannot be written leaves the one open as it is.
@@ -330,7 +332,7 @@ impl VardaApp {
         .and_then(|()| crate::persistence::StagePrefs::default().save(target.stage_path()))
         .and_then(|()| empty.save(target.scene_path()))
         .with_context(|| format!("Cannot write {}", folder.display()))?;
-        self.session.workspace = target;
+        self.enter_show(target);
         let opened = self.load_workspace();
         if let Some(why) = opened.error_message() {
             log::warn!("New show opened in part: {why}");
@@ -375,17 +377,30 @@ impl VardaApp {
         if !is_show(folder) {
             anyhow::bail!("{} holds no Nida show", folder.display());
         }
+        let workspace = Workspace::new(folder.to_path_buf());
+        // A show whose scene or stage cannot be read is not opened: the show
+        // open now stays. Opened, its folder became the show's while Nida
+        // still held the show before, and the next save — Quit saves — wrote
+        // that over the files that would not load (a show saved by a later
+        // Nida, a damaged file).
+        let scene = if workspace.has_scene() {
+            let scene = crate::scene::SceneConfig::load(workspace.scene_path());
+            Some(scene.context("its scene cannot be read")?)
+        } else {
+            None
+        };
+        if workspace.has_stage() {
+            crate::persistence::StagePrefs::load(workspace.stage_path())
+                .context("its stage cannot be read")?;
+        }
         self.save_workspace(layout)
             .context("the open show could not be saved first")?;
-        let workspace = Workspace::new(folder.to_path_buf());
         // A show made at another size: everything is resized to it first,
         // as a size picked by hand would be.
-        if workspace.has_scene() {
-            if let Ok(scene) = crate::scene::SceneConfig::load(workspace.scene_path()) {
-                if let (Some(w), Some(h)) = (scene.render_width, scene.render_height) {
-                    if w > 0 && h > 0 && (w, h) != (self.render_width, self.render_height) {
-                        self.set_render_resolution(w, h);
-                    }
+        if let Some(scene) = &scene {
+            if let (Some(w), Some(h)) = (scene.render_width, scene.render_height) {
+                if w > 0 && h > 0 && (w, h) != (self.render_width, self.render_height) {
+                    self.set_render_resolution(w, h);
                 }
             }
         }
@@ -401,17 +416,16 @@ impl VardaApp {
         self.enter_show(Workspace::new(folder.to_path_buf()));
     }
 
-    /// Make `workspace` the show's folder, its own shaders in the library.
+    /// Make `workspace` the show's folder, its own shaders in the library
+    /// in place of the show's before (see `ShaderRegistry::set_show_library`):
+    /// left there, a shader of the show before stood in for this one's of the
+    /// same name — added to it, or for a file gone (see
+    /// `persistence::saved_shader`).
     fn enter_show(&mut self, workspace: Workspace) {
         let shaders = workspace.shaders_dir();
-        if shaders.is_dir() {
-            match self.registry.add_library_path(&shaders) {
-                Ok(()) => {
-                    if let Err(e) = self.registry.scan() {
-                        log::warn!("Show shaders not read: {e}");
-                    }
-                }
-                Err(e) => log::warn!("Show shaders not added: {e}"),
+        if self.registry.set_show_library(&shaders) || shaders.is_dir() {
+            if let Err(e) = self.registry.scan() {
+                log::warn!("Show shaders not read: {e}");
             }
         }
         self.session.workspace = workspace;

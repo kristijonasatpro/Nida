@@ -225,6 +225,11 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::audio_mix::rescan_devices, routes::audio_mix::set_solo,
         routes::audio_mix::set_monitor_device, routes::audio_mix::set_monitor_gain,
         routes::audio_mix::set_monitor_listen,
+        routes::audio_mix::set_source_low_cut, routes::audio_mix::set_source_leveler,
+        routes::audio_mix::set_source_compressor, routes::audio_mix::apply_speech_preset,
+        routes::audio_mix::set_bus_compressor, routes::audio_mix::set_bus_limiter,
+        routes::audio_mix::reset_bus_meters, routes::audio_mix::reset_source_meters,
+        routes::audio_mix::reset_bus_loudness,
         // Main
         routes::main_program::set_mode, routes::main_program::take,
         routes::main_program::set_fade_time, routes::main_program::set_transition,
@@ -1341,6 +1346,42 @@ pub fn build_router(shared: SharedState) -> Router {
         .route(
             "/api/audio-sources/{source_uuid}/delay",
             axum::routing::put(routes::audio_mix::set_source_delay),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/low-cut",
+            axum::routing::put(routes::audio_mix::set_source_low_cut),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/leveler",
+            axum::routing::put(routes::audio_mix::set_source_leveler),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/compressor",
+            axum::routing::put(routes::audio_mix::set_source_compressor),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/speech-preset",
+            axum::routing::post(routes::audio_mix::apply_speech_preset),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/meters/reset",
+            axum::routing::post(routes::audio_mix::reset_source_meters),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/compressor",
+            axum::routing::put(routes::audio_mix::set_bus_compressor),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/limiter",
+            axum::routing::put(routes::audio_mix::set_bus_limiter),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/meters/reset",
+            axum::routing::post(routes::audio_mix::reset_bus_meters),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/loudness/reset",
+            axum::routing::post(routes::audio_mix::reset_bus_loudness),
         )
         .route(
             "/api/outputs/{output_uuid}/audio-bus",

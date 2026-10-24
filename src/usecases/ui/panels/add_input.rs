@@ -36,6 +36,7 @@ enum Kind {
     Colour,
     Generator,
     Timer,
+    PowerPoint,
     Input,
     Audio,
 }
@@ -54,6 +55,7 @@ impl Kind {
             Self::Colour => "Colour",
             Self::Generator => "Generator",
             Self::Timer => "Timer / Clock",
+            Self::PowerPoint => "PowerPoint",
             Self::Input => "Another input",
             Self::Audio => "Audio Input",
         }
@@ -74,7 +76,12 @@ impl Kind {
         if cfg!(feature = "html") {
             kinds.push(Self::Web);
         }
-        kinds.extend([Self::Colour, Self::Generator, Self::Timer, Self::Input]);
+        kinds.extend([Self::Colour, Self::Generator, Self::Timer]);
+        // PowerPoint for Mac plays the deck: macOS only.
+        if cfg!(target_os = "macos") {
+            kinds.push(Self::PowerPoint);
+        }
+        kinds.push(Self::Input);
         if !layer {
             kinds.push(Self::Audio);
         }
@@ -380,6 +387,10 @@ fn kind_body(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions, state: &
             timer_body(ui, state);
             false
         }
+        Kind::PowerPoint => {
+            powerpoint_body(ui, state);
+            false
+        }
         Kind::Input => input_body(ui, data, state),
         Kind::Audio => audio_body(ui, data, actions, state),
     }
@@ -540,6 +551,43 @@ fn playlist_body(ui: &mut egui::Ui, state: &mut State) {
     ui.label(
         egui::RichText::new(
             "Or OK for an empty list, filled in its window. Its tile gets ▶ to start it.",
+        )
+        .small()
+        .weak(),
+    );
+}
+
+/// A PowerPoint deck: chosen, it opens in PowerPoint, which plays it.
+fn powerpoint_body(ui: &mut egui::Ui, state: &mut State) {
+    ui.label(match &state.layer_of {
+        None => {
+            "A PowerPoint deck, played by PowerPoint on this Mac in a window Nida shows — \
+             its transitions, animations and videos as PowerPoint plays them. ◀ ▶ on its \
+             tile, PageDown and PageUp (a presentation clicker) move it on."
+        }
+        Some(_) => "A PowerPoint deck, played by PowerPoint, as a layer of this input.",
+    });
+    ui.add_space(8.0);
+    if ui
+        .add(egui::Button::new(
+            egui::RichText::new("Choose a deck…").size(15.0),
+        ))
+        .clicked()
+    {
+        let into = match &state.layer_of {
+            Some(ch) => super::presentation::DeckFor::Layer(ch.clone()),
+            None => super::presentation::DeckFor::NewInput(
+                Some(state.name.trim().to_string()).filter(|n| !n.is_empty()),
+            ),
+        };
+        super::presentation::choose_deck(ui.ctx(), into);
+        state.open = false;
+    }
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(
+            "Needs Microsoft PowerPoint on this Mac. The first time, macOS asks whether \
+             Nida may control PowerPoint: allow it.",
         )
         .small()
         .weak(),
@@ -1009,7 +1057,7 @@ fn source(data: &UIData, state: &State) -> Option<InputSource> {
         Kind::Timer => Some(InputSource::Timer {
             settings: Some(state.timer.clone()),
         }),
-        Kind::Video | Kind::Image | Kind::Audio => None,
+        Kind::Video | Kind::Image | Kind::Audio | Kind::PowerPoint => None,
     }
 }
 
@@ -1202,7 +1250,10 @@ mod tests {
         click(&mut harness, "OK");
         match added(&harness).as_slice() {
             [EngineCommand::AddInput {
-                source: InputSource::Timer { settings: Some(settings) },
+                source:
+                    InputSource::Timer {
+                        settings: Some(settings),
+                    },
                 ..
             }] => assert_eq!(settings.mode, crate::engine::value::timer::TimerMode::Clock),
             other => panic!("{other:?}"),

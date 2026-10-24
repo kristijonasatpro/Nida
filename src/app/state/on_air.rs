@@ -141,15 +141,15 @@ impl VardaApp {
             *updates > 0 && !arrived_held.contains(held)
         });
 
-        let levels = self
-            .audio_mix
-            .auto_sources()
-            .into_iter()
-            .map(|(strip, deck, follow)| {
-                let level = on_air.at(follow.as_deref(), &deck);
-                (strip, level)
-            })
-            .collect();
+        let powerpoint = self.powerpoint_decks();
+        let shared = self.powerpoint_sound_strip(&powerpoint);
+        let levels = auto_levels(
+            self.audio_mix.auto_sources(),
+            &powerpoint,
+            shared.as_deref(),
+            |strip, deck| self.shares_powerpoint_sound(strip, deck, &powerpoint),
+            |follow, deck| on_air.at(follow, deck),
+        );
         self.audio_mix.set_on_air(levels);
     }
 
@@ -349,5 +349,74 @@ mod tests {
         assert!((on_air.at(Some("led"), "b") - 1.0).abs() < 1e-6);
         assert!(on_air.at(Some("tv"), "b").abs() < 1e-6);
         assert!(on_air.at(Some("gone"), "b").abs() < 1e-6);
+    }
+}
+
+/// Each Audio Auto strip's level, from its `sources` (strip, the deck it
+/// follows, the bus it follows) and `at`, how much of a deck a bus shows.
+/// PowerPoint's sound is one, whichever PowerPoint input shows it: its strip,
+/// `shared`, is on air while any of the `powerpoint` inputs is, and another
+/// strip of it (`of_powerpoint`) stays quiet — two would add the one sound twice.
+fn auto_levels(
+    sources: Vec<(String, String, Option<String>)>,
+    powerpoint: &[String],
+    shared: Option<&str>,
+    of_powerpoint: impl Fn(&str, &str) -> bool,
+    at: impl Fn(Option<&str>, &str) -> f32,
+) -> HashMap<String, f32> {
+    sources
+        .into_iter()
+        .map(|(strip, deck, follow)| {
+            let shows = |deck: &str| at(follow.as_deref(), deck);
+            let level = if shared == Some(strip.as_str()) {
+                powerpoint.iter().map(|d| shows(d)).fold(0.0, f32::max)
+            } else if of_powerpoint(&strip, &deck) {
+                0.0
+            } else {
+                shows(&deck)
+            };
+            (strip, level)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod powerpoint_sound {
+    use super::auto_levels;
+
+    /// PowerPoint's sound is one: its strip is heard while any PowerPoint
+    /// input is on air, and a second strip of it — as a show saved by an
+    /// older Nida can hold — stays quiet rather than add it twice. Other
+    /// strips follow their own input.
+    #[test]
+    fn powerpoints_one_sound_is_heard_once() {
+        let source = |strip: &str, deck: &str| (strip.to_string(), deck.to_string(), None);
+        let powerpoint = ["pptA".to_string(), "pptB".to_string()];
+        let levels = auto_levels(
+            vec![
+                source("s1", "pptA"),
+                source("s2", "pptB"),
+                source("cam", "cam"),
+            ],
+            &powerpoint,
+            Some("s1"),
+            |strip, _| strip.starts_with('s'),
+            |_, deck| {
+                if deck == "pptB" || deck == "cam" {
+                    1.0
+                } else {
+                    0.0
+                }
+            },
+        );
+        assert!(
+            (levels["s1"] - 1.0).abs() < f32::EPSILON,
+            "heard with the other PowerPoint input on air"
+        );
+        assert!(
+            levels["s2"].abs() < f32::EPSILON,
+            "a second strip of it stays quiet"
+        );
+        assert!((levels["cam"] - 1.0).abs() < f32::EPSILON);
     }
 }

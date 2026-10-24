@@ -180,6 +180,7 @@ pub(crate) mod tests {
                 main: crate::mixer::MainSnapshot::default(),
                 channels: vec![ChannelSnapshot {
                     overlay: false,
+                    on_air: None,
                     idx: 0,
                     uuid: "ch-001".into(),
                     name: "Channel A".into(),
@@ -199,6 +200,10 @@ pub(crate) mod tests {
                         tap: None,
                         playlist: None,
                         timer: None,
+                        presentation: None,
+                        presenter_of: None,
+                        presenter_layout: None,
+                        offline: None,
                         camera_colour: None,
                         camera_lowest_latency: None,
                         camera_profile: None,
@@ -308,6 +313,8 @@ pub(crate) mod tests {
                     model: None,
                     given_name: None,
                     refresh_hz: None,
+                    identity: "HDMI-1".into(),
+                    main: true,
                 }],
             },
             registry: RegistrySnapshot {

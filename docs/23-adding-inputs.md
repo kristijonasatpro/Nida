@@ -26,6 +26,7 @@ lower third over it, say. It offers the same kinds, all but **Audio Input**.
 | **Colour** | A solid colour. **Pick** beside it, then a click anywhere on the screen — a picture in Nida too — takes that colour (Esc cancels; macOS). A colour layer's colour can be changed later in its **Source** tab |
 | **Generator** | A generator from the shader library, found by typing part of its name |
 | **Timer / Clock** | A count down, a count to a time of day, a count up or the time of day, over a see-through background — below |
+| **PowerPoint** | A PowerPoint deck played by PowerPoint on this Mac, in a window Nida shows, moved on from Nida or a clicker (macOS, with PowerPoint installed) — see [PowerPoint](26-presentations.md) |
 | **Another input** | As a layer: that input's picture inside this one, sized and placed like any layer (see [Another input as a layer](21-input-settings.md#another-input-as-a-layer)). As a new input: a copy of it, called "*name* (copy)", that can be sized and placed on its own — vMix's virtual input. Either way it is drawn once for both. An input that shows the one being added to is greyed out |
 | **Audio Input** | A sound device on its own — a microphone, a mixer's output — as a strip in the [Audio Mixer](16-audio-mixer.md), with the pair of channels (or one channel, mono) it takes |
 
@@ -163,6 +164,12 @@ camera that is unplugged, or stops sending pictures, is started again by
 itself as soon as it is back — at the format chosen, or at its best when its
 format was changed on the device meanwhile. Removing an input never waits on
 a device that has stopped answering.
+
+A camera added during a show starts in the background: its input is black
+for the moment macOS takes to start it — about a second, longer for a device
+that hangs — and the outputs carry on meanwhile. One that does not start is
+said once; its input waits for it, tried every two seconds. A camera another
+input already shows is there at once.
 
 On a Mac cameras are read straight from macOS (AVFoundation), in the
 device's own colour matrix: SD at BT.601, HD at BT.709. The app asks for

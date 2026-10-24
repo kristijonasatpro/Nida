@@ -510,8 +510,21 @@ fn relocate_lut(profile: &mut CameraProfile, from: &CameraProfile, to: &CameraPr
     }
 }
 
+/// What a camera's thread runs: opens the device, says so (or why not)
+/// through `opened`, and captures into the sink until told to stop.
+type RunCamera = fn(
+    &CameraDeviceInfo,
+    Option<CameraMode>,
+    &Arc<Sink>,
+    &AtomicBool,
+    &mpsc::Sender<Result<CameraMode>>,
+);
+
 /// Manages camera device enumeration, capture sessions, and shared textures.
 pub struct CameraManager {
+    /// What each camera's thread runs: [`Self::run_camera`], or a test's
+    /// stand-in for a device.
+    run: RunCamera,
     /// Detected camera devices (refreshed periodically).
     devices: Vec<CameraDeviceInfo>,
     /// Active camera sessions keyed by `CameraId`.
@@ -616,6 +629,9 @@ struct Opening {
     since: Instant,
     /// The decks waiting for it, by UUID.
     decks: Vec<String>,
+    /// Started for an input just added, whose operator is told if it fails
+    /// — not for one waiting since its show opened, tried every two seconds.
+    asked: bool,
 }
 
 /// A camera started in the background that has run, or failed to: the
@@ -624,6 +640,8 @@ pub struct Opened {
     pub id: CameraId,
     pub decks: Vec<String>,
     pub result: Result<(u32, u32)>,
+    /// Started for an input just added (see [`CameraManager::open_in_background`]).
+    pub asked: bool,
 }
 
 /// A device as a scan finds it.
@@ -644,6 +662,7 @@ impl Default for CameraManager {
 impl CameraManager {
     pub fn new() -> Self {
         let mut mgr = Self {
+            run: Self::run_camera,
             devices: Vec::new(),
             active: HashMap::new(),
             opening: HashMap::new(),
@@ -673,6 +692,7 @@ impl CameraManager {
     pub fn disabled() -> Self {
         log::info!("Camera sources disabled via --no-camera; not enumerating devices");
         Self {
+            run: Self::run_camera,
             devices: Vec::new(),
             active: HashMap::new(),
             opening: HashMap::new(),
@@ -685,6 +705,27 @@ impl CameraManager {
             effects_due: None,
             profile_passes: None,
         }
+    }
+
+    /// A manager listing `devices` (unique ID, name), whose cameras' threads
+    /// run `run` in place of a device's — for tests.
+    #[cfg(test)]
+    pub(crate) fn with_devices(devices: &[(&str, &str)], run: RunCamera) -> Self {
+        let mut mgr = Self::disabled();
+        mgr.run = run;
+        mgr.list(
+            devices
+                .iter()
+                .map(|(unique_id, name)| Found {
+                    unique_id: (*unique_id).into(),
+                    name: (*name).into(),
+                    index: CameraIndex::String((*unique_id).into()),
+                    formats: Vec::new(),
+                    rates: Vec::new(),
+                })
+                .collect(),
+        );
+        mgr
     }
 
     fn initialize(&mut self) {
@@ -969,8 +1010,17 @@ impl CameraManager {
             return Ok((active.width, active.height));
         }
 
-        let opening = self.start(id, mode, Vec::new())?;
-        match opening.opened.recv_timeout(OPEN_WAIT) {
+        // Starting already, in the background (an input just added): waited
+        // for here, not started twice — the second start was overwritten as
+        // the first ran, its capture left running unseen and its input
+        // black. The decks waiting for the first are bound as cameras that
+        // are open are (see `reconcile_cameras`).
+        let opening = match self.opening.remove(&id) {
+            Some(opening) => opening,
+            None => self.start(id, mode, Vec::new())?,
+        };
+        let wait = OPEN_WAIT.saturating_sub(opening.since.elapsed());
+        match opening.opened.recv_timeout(wait) {
             Ok(Ok(opened)) => Ok(self.finish(id, opening, opened, device)),
             Ok(Err(e)) => {
                 let _ = opening.thread.join();
@@ -991,7 +1041,9 @@ impl CameraManager {
     /// Start a camera for decks waiting for it, without waiting for it to
     /// run: it can take the OS half a second, and the render loop must not
     /// stand still for that. [`Self::poll_opening`] says when it has. A
-    /// camera already open or starting is left as it is.
+    /// camera already open is left as it is; one starting takes these
+    /// decks too. `asked`: for an input just added, whose operator is told
+    /// if it fails.
     ///
     /// # Errors
     ///
@@ -1001,11 +1053,18 @@ impl CameraManager {
         id: CameraId,
         mode: Option<CameraMode>,
         decks: Vec<String>,
+        asked: bool,
     ) -> Result<()> {
-        if self.active.contains_key(&id) || self.opening.contains_key(&id) {
+        if self.active.contains_key(&id) {
             return Ok(());
         }
-        let opening = self.start(id, mode, decks)?;
+        if let Some(opening) = self.opening.get_mut(&id) {
+            opening.decks.extend(decks);
+            opening.asked |= asked;
+            return Ok(());
+        }
+        let mut opening = self.start(id, mode, decks)?;
+        opening.asked = asked;
         self.opening.insert(id, opening);
         Ok(())
     }
@@ -1042,7 +1101,7 @@ impl CameraManager {
             let Some(opening) = self.opening.remove(&id) else {
                 continue;
             };
-            let decks = opening.decks.clone();
+            let (decks, asked) = (opening.decks.clone(), opening.asked);
             let result = match answer {
                 Ok(opened) => Ok(self.finish(id, opening, opened, device)),
                 Err(e) => {
@@ -1050,7 +1109,12 @@ impl CameraManager {
                     Err(e.context(format!("Failed to open camera '{}'", opening.name)))
                 }
             };
-            done.push(Opened { id, decks, result });
+            done.push(Opened {
+                id,
+                decks,
+                result,
+                asked,
+            });
         }
         done
     }
@@ -1081,12 +1145,13 @@ impl CameraManager {
         let thread = {
             let sink = Arc::clone(&sink);
             let stop = Arc::clone(&stop_flag);
+            let run = self.run;
             std::thread::Builder::new()
                 .name(format!("camera-{id}"))
                 .spawn(move || {
                     // Dropped as the thread ends, which is what `done` hears.
                     let _done = done_tx;
-                    Self::run_camera(&dev_info, mode, &sink, &stop, &opened_tx);
+                    run(&dev_info, mode, &sink, &stop, &opened_tx);
                 })
                 .map_err(|e| anyhow::anyhow!("Failed to spawn camera thread: {e}"))?
         };
@@ -1099,6 +1164,7 @@ impl CameraManager {
             opened,
             since: Instant::now(),
             decks,
+            asked: false,
         })
     }
 
@@ -1385,8 +1451,10 @@ impl CameraManager {
     }
 
     /// Release a camera reference. Stops capture thread when `ref_count` hits 0.
-    /// A capture thread that does not stop in [`STOP_WAIT`] — a device stalled
-    /// in the OS — is left to end on its own rather than hang Nida.
+    /// Its thread is waited for away from the show: stopping takes the OS a
+    /// moment — a device stalled in it, up to never — and the outputs drew
+    /// nothing while the show waited. One that does not stop in
+    /// [`STOP_WAIT`] is left to end on its own.
     pub fn release_camera(&mut self, id: CameraId) {
         if let Some(active) = self.active.get_mut(&id) {
             active.ref_count = active.ref_count.saturating_sub(1);
@@ -1397,18 +1465,22 @@ impl CameraManager {
                     return;
                 };
                 removed.stop_flag.store(true, Ordering::Relaxed);
-                match removed.done.recv_timeout(STOP_WAIT) {
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        log::warn!(
+                let (thread, done) = (removed.thread.take(), removed.done);
+                let waited = std::thread::Builder::new()
+                    .name(format!("camera-{id}-stop"))
+                    .spawn(move || match done.recv_timeout(STOP_WAIT) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => log::warn!(
                             "Camera {id} did not stop within {} s: left to stop on its own",
                             STOP_WAIT.as_secs()
-                        );
-                    }
-                    _ => {
-                        if let Some(t) = removed.thread.take() {
-                            let _ = t.join();
+                        ),
+                        _ => {
+                            if let Some(t) = thread {
+                                let _ = t.join();
+                            }
                         }
-                    }
+                    });
+                if let Err(e) = waited {
+                    log::warn!("Camera {id} left to stop on its own: {e}");
                 }
             }
         }
@@ -2088,6 +2160,7 @@ mod tests {
                 opened,
                 since: Instant::now(),
                 decks: vec!["deck-1".into()],
+                asked: false,
             },
         );
         assert!(mgr.is_opening(7));
@@ -2112,6 +2185,77 @@ mod tests {
         assert_eq!(mgr.resolution(7), Some((64, 36)));
         mgr.release_camera(7);
         assert!(!mgr.is_active(7));
+    }
+
+    /// A camera opened while it is still starting in the background — an
+    /// input added, then undone and redone, or a show opened that uses it —
+    /// is waited for, not started twice: the second start was overwritten as
+    /// the first ran, its capture left running unseen and its input black.
+    #[test]
+    fn a_camera_opened_while_it_starts_is_started_once() {
+        static STARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn counted(
+            _: &CameraDeviceInfo,
+            _: Option<CameraMode>,
+            _: &Arc<Sink>,
+            stop: &AtomicBool,
+            opened: &mpsc::Sender<Result<CameraMode>>,
+        ) {
+            STARTS.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = opened.send(Ok(CameraMode {
+                width: 64,
+                height: 36,
+                fps: 60,
+            }));
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let gpu = crate::renderer::context::GpuContext::new_headless().expect("GPU");
+        let mut mgr = CameraManager::with_devices(&[("a", "ATEM")], counted);
+        let id = mgr.devices()[0].id;
+        mgr.open_in_background(id, None, vec!["deck-1".into()], true)
+            .unwrap();
+        assert_eq!(mgr.open_camera(id, &gpu.device, None).unwrap(), (64, 36));
+        assert_eq!(STARTS.load(Ordering::Relaxed), 1, "started once");
+        assert!(mgr.is_active(id) && !mgr.is_opening(id));
+        assert!(
+            mgr.poll_opening(&gpu.device).is_empty(),
+            "nothing to bind over it"
+        );
+        mgr.release_camera(id);
+        assert!(!mgr.is_active(id), "its one reference let go");
+    }
+
+    /// Letting a camera go never waits for its thread: one stalled in the
+    /// OS held every output still for up to two seconds as its input was
+    /// removed.
+    #[test]
+    fn letting_a_camera_go_never_waits_for_its_thread() {
+        fn deaf_to_stop(
+            _: &CameraDeviceInfo,
+            _: Option<CameraMode>,
+            _: &Arc<Sink>,
+            _: &AtomicBool,
+            opened: &mpsc::Sender<Result<CameraMode>>,
+        ) {
+            let _ = opened.send(Ok(CameraMode {
+                width: 64,
+                height: 36,
+                fps: 60,
+            }));
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        let gpu = crate::renderer::context::GpuContext::new_headless().expect("GPU");
+        let mut mgr = CameraManager::with_devices(&[("a", "ATEM")], deaf_to_stop);
+        let id = mgr.devices()[0].id;
+        assert_eq!(mgr.open_camera(id, &gpu.device, None).unwrap(), (64, 36));
+        let asked = Instant::now();
+        mgr.release_camera(id);
+        let took = asked.elapsed();
+        assert!(took < Duration::from_millis(100), "waited {took:?}");
+        assert!(!mgr.is_active(id));
     }
 
     /// A camera's colour reaches its capture while it is still starting and
@@ -2141,6 +2285,7 @@ mod tests {
                 opened,
                 since: Instant::now(),
                 decks: vec!["deck-1".into()],
+                asked: false,
             },
         );
         let full = CameraColour {
@@ -2193,6 +2338,7 @@ mod tests {
                 opened,
                 since: Instant::now(),
                 decks: vec!["deck-1".into()],
+                asked: false,
             },
         );
         let start = Instant::now();

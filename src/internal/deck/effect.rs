@@ -191,7 +191,47 @@ impl Effect {
             pointwise,
             mask: None,
             mask_pass: None,
+            show_path: None,
+            offline: None,
         })
+    }
+
+    /// Why its shader could not be loaded, when the effect is kept offline.
+    pub fn offline(&self) -> Option<&str> {
+        self.offline.as_deref()
+    }
+
+    /// Kept offline, as saved, for `why`.
+    pub(crate) fn set_offline(&mut self, why: String) {
+        self.offline = Some(why);
+    }
+
+    /// The effect's name: its shader's, or — kept offline — the missing
+    /// shader file's.
+    pub fn name(&self) -> String {
+        match (&self.offline, &self.show_path) {
+            (Some(_), Some(path)) => std::path::Path::new(path).file_stem().map_or_else(
+                || self.shader.name(),
+                |stem| stem.to_string_lossy().into_owned(),
+            ),
+            _ => self.shader.name(),
+        }
+    }
+
+    /// The shader's path as a save writes it: the file this effect was made
+    /// from, or the show's own when this copy's shader of the same name
+    /// stood in for a file gone — written back as it was, so the Nida that
+    /// has the file there still finds it.
+    pub fn saved_path(&self) -> &str {
+        self.show_path
+            .as_deref()
+            .or(self.shader.file_path.as_deref())
+            .unwrap_or_default()
+    }
+
+    /// Keep `path`, the show's, as the one [`Effect::saved_path`] gives.
+    pub(crate) fn keep_show_path(&mut self, path: String) {
+        self.show_path = Some(path);
     }
 
     /// Frames this effect has been run on a deck. Neutral crop and transform

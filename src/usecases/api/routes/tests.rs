@@ -36,6 +36,31 @@ mod tests {
         crate::usecases::api::runner::build_router(shared)
     }
 
+    /// A router whose engine records every command it is sent, answering Ok.
+    fn router_recording_commands() -> (
+        axum::Router,
+        std::sync::Arc<std::sync::Mutex<Vec<crate::engine::EngineCommand>>>,
+    ) {
+        let state = make_test_state();
+        let (cmd_tx, mut cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = sent.clone();
+        tokio::spawn(async move {
+            while let Some((cmd, reply_tx)) = cmd_rx.recv().await {
+                log.lock().unwrap().push(cmd);
+                if let Some(tx) = reply_tx {
+                    let _ = tx.send(CommandResult::Ok);
+                }
+            }
+        });
+        let shared = SharedState {
+            command_tx: cmd_tx,
+            engine_state: std::sync::Arc::new(std::sync::RwLock::new(Some(state))),
+        };
+        (crate::usecases::api::runner::build_router(shared), sent)
+    }
+
     fn router_with_state() -> axum::Router {
         let state = make_test_state();
         let shared = SharedState {
@@ -4071,5 +4096,92 @@ mod tests {
             .unwrap();
         let status = resp.status().as_u16();
         assert!((400..500).contains(&status), "Expected 4xx, got {status}");
+    }
+
+    // ── Audio processing routes ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_sources_low_cut_is_set_whole_from_the_body() {
+        use crate::audio_mix::LowCutConfig;
+        use crate::engine::EngineCommand as C;
+        let (app, sent) = router_recording_commands();
+        let (status, json) = put_json(
+            app,
+            "/api/audio-sources/mic1/low-cut",
+            serde_json::json!({"enabled": true, "hz": 120.0, "slope_db": 12}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let sent = sent.lock().unwrap();
+        assert!(
+            matches!(&sent[..], [C::SetAudioSourceLowCut { uuid, config }]
+                if uuid == "mic1" && *config == LowCutConfig { enabled: true, hz: 120.0, slope_db: 12 }),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_speech_preset_sets_low_cut_leveler_and_compressor_in_that_order() {
+        use crate::audio_mix::{CompressorConfig, LevelerConfig, LowCutConfig};
+        use crate::engine::EngineCommand as C;
+        let (app, sent) = router_recording_commands();
+        let (status, json) = post_json(
+            app,
+            "/api/audio-sources/mic1/speech-preset",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let sent = sent.lock().unwrap();
+        assert!(
+            matches!(&sent[..], [
+                C::SetAudioSourceLowCut { config: low_cut, .. },
+                C::SetAudioSourceLeveler { config: leveler, .. },
+                C::SetAudioSourceCompressor { uuid, config: compressor },
+            ] if uuid == "mic1"
+                && *low_cut == LowCutConfig::speech()
+                && *leveler == LevelerConfig::speech()
+                && *compressor == CompressorConfig::speech()),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_buses_limiter_and_loudness_reset_have_routes() {
+        use crate::audio_mix::LimiterConfig;
+        use crate::engine::EngineCommand as C;
+        let (app, sent) = router_recording_commands();
+        let (status, _) = put_json(
+            app.clone(),
+            "/api/audio-buses/b1/limiter",
+            serde_json::json!({"enabled": false, "ceiling_db": -2.0, "release_ms": 200.0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_json(
+            app.clone(),
+            "/api/audio-buses/b1/loudness/reset",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_json(
+            app,
+            "/api/audio-buses/b1/meters/reset",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let sent = sent.lock().unwrap();
+        // Two resets apart: the loudness, and the held peak.
+        assert!(
+            matches!(&sent[..], [
+                C::SetAudioBusLimiter { uuid, config },
+                C::ResetAudioLoudness { uuid: loudness },
+                C::ResetAudioMeter { uuid: reset, bus: true },
+            ] if uuid == "b1" && loudness == "b1" && reset == "b1"
+                && *config == LimiterConfig { enabled: false, ceiling_db: -2.0, release_ms: 200.0 }),
+            "{sent:?}"
+        );
     }
 }

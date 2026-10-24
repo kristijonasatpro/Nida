@@ -266,7 +266,8 @@ fn build_rows(data: &UIData) -> Vec<Row<'_>> {
             ch_idx: ch.ch_idx,
             name: &ch.name,
         });
-        for deck in &ch.decks {
+        // Front first, as the other lists of a channel's layers.
+        for deck in ch.decks.iter().rev() {
             let lane = arrangement.and_then(|a| a.config.lane(&deck.uuid));
             let key = crate::arrangement::opacity_param_key(&deck.uuid);
             let curves = deck_automation_rows(data, ch.ch_idx, deck);
@@ -611,7 +612,8 @@ fn render_idle_picker(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions)
             {
                 chosen = Some(IdleBehaviour::HoldPerformance);
             }
-            for deck in data.channels.iter().flat_map(|c| &c.decks) {
+            // Front first, as the lanes.
+            for deck in data.channels.iter().flat_map(|c| c.decks.iter().rev()) {
                 let this = IdleBehaviour::ShowDeck {
                     deck_uuid: deck.uuid.clone(),
                 };
@@ -1279,12 +1281,7 @@ fn handle_lane_reorder(
     }
 
     let above = pointer.y < geom.header.center().y;
-    let gap = if above {
-        lane.deck_idx
-    } else {
-        lane.deck_idx + 1
-    };
-    let to = reorder_target(from, gap);
+    let to = reorder_target(from, lane_gap(lane.deck_idx, above));
     if to == from {
         return;
     }
@@ -1308,6 +1305,17 @@ fn handle_lane_reorder(
             from_idx: from,
             to_idx: to,
         });
+    }
+}
+
+/// The gap in the stack a drop on lane `deck_idx`'s header aims at. Lanes
+/// are listed front first, so above a lane is in front of it — the gap after
+/// it — and below it the gap before it.
+fn lane_gap(deck_idx: usize, above: bool) -> usize {
+    if above {
+        deck_idx + 1
+    } else {
+        deck_idx
     }
 }
 
@@ -2966,8 +2974,10 @@ mod tests {
         let (_, (top, height)) = rows
             .iter()
             .zip(&spans)
-            .find(|(row, _)| matches!(row, Row::Lane(_)))
-            .expect("a deck lane");
+            .find(
+                |(row, _)| matches!(row, Row::Lane(l) if l.uuid == data.channels[0].decks[0].uuid),
+            )
+            .expect("the selected deck's lane");
         let armed = selection::Selection {
             start: 4.0,
             end: 12.0,
@@ -3002,6 +3012,37 @@ mod tests {
         );
     }
 
+    /// A channel's lanes are listed front first, as its other lists.
+    #[test]
+    fn lanes_are_listed_front_first() {
+        let data = fixture_with_arrangement();
+        let rows = build_rows(&data);
+        let listed: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Lane(lane) if lane.ch_idx == 0 => Some(lane.uuid),
+                _ => None,
+            })
+            .collect();
+        let front_first: Vec<&str> = data.channels[0]
+            .decks
+            .iter()
+            .rev()
+            .map(|d| d.uuid.as_str())
+            .collect();
+        assert_eq!(listed, front_first);
+    }
+
+    /// Listed front first: dropped above a lane, a deck goes in front of it;
+    /// below it, behind it.
+    #[test]
+    fn a_lane_dropped_above_another_goes_in_front_of_it() {
+        // Three decks, 0 at the back: deck 0 dropped above deck 2's lane goes
+        // to the front, deck 2 dropped below deck 0's to the back.
+        assert_eq!(reorder_target(0, lane_gap(2, true)), 2);
+        assert_eq!(reorder_target(2, lane_gap(0, false)), 0);
+    }
+
     /// The whole gesture through the real event path: an armed selection dragged
     /// sideways moves its region in one batch, and the lane it was dragged
     /// across does not also author a region or move the region by itself.
@@ -3030,7 +3071,19 @@ mod tests {
             scroll: data.arrangement_scroll,
             pps: data.arrangement_pixels_per_second,
         };
-        let y = group.bottom() + LANE_HEIGHT / 2.0;
+        // Its deck's lane, wherever the front-first listing puts it.
+        let rows = build_rows(&data);
+        let spans = row_spans(
+            &rows,
+            egui::Rect::from_min_size(group.left_top(), egui::vec2(group.width(), 4_000.0)),
+            0.0,
+        );
+        let (_, (top, height)) = rows
+            .iter()
+            .zip(&spans)
+            .find(|(row, _)| matches!(row, Row::Lane(l) if l.uuid == deck.as_str()))
+            .expect("the deck's lane");
+        let y = top + height / 2.0;
 
         selection::store(
             &harness.ctx,

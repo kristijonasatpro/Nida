@@ -1,8 +1,90 @@
 # Audio Mixer
 
+## Reading the meters
+
+Input and output strip meters use a **dBFS** scale, separate from fader gain.
+The numbered scale includes a highlighted **−6 dBFS** mark. Green indicates
+levels below −12 dBFS, yellow the remaining headroom; red is a **0 dBFS or
+higher** warning, not a −6 dBFS warning. These are sample peaks, not true peak
+or perceived loudness (LUFS).
+
+Stereo bars show decaying post-fader levels. White markers and the **Peak**
+number below each meter hold the highest level since reset (the number is the
+higher of L/R). Hover for separate L/R values; click the meter to reset its
+peak markers and full-scale warning without changing audio. Peaks are captured
+on the audio thread, so a transient between UI refreshes is not lost. They are
+session telemetry, not saved show settings. Source replacement/show load clears
+them; ordinary fader edits do not.
+
+For a target such as −6 dBFS, watch the **output bus** peak readout. A fader at
+0 dB means unity gain, not a signal at 0 dBFS. Internal floating-point inputs
+can exceed full scale without necessarily clipping until delivery; the red
+warning shows lost headroom, not proof of where distortion occurred. The
+Processing page uses the same scale. On an input its Pre and Post FX are both
+before the fader; on a bus, Pre FX is before its compressor and Post FX after
+its limiter, past the fader. A bus's own meter shows what goes out: after its
+limiter. Clicking a meter resets only its held peak.
+
+## Processing
+
+Conference sound goes wrong in the same few ways: rumble and hum under a lapel
+or lectern microphone, speakers far louder or softer than one another, and a
+voice whose peaks jump out of the stream. Each strip's gear opens its settings;
+the square beside **×** expands them, and **Processing** on the left holds:
+
+**On an input**, in this order, before its fader:
+
+1. **Low cut**: takes out what is below the voice: rumble, handling noise,
+   hum. 100 Hz suits speech; 12 or 24 dB an octave below it. A new frequency
+   or slope glides in over about 10 ms, so it can be moved on air without a
+   click.
+2. **Leveler**: rides each speaker slowly to the same average level (the
+   **Target**, −20 dB by default), up to **Most boost** and **Most cut**, as a
+   radio station's processor does, so a soft speaker after a loud one needs no
+   hand on the fader. It turns down three times as fast as it turns up
+   (**Speed**). Below **Hold below** it takes the sound for a pause or the room
+   and holds still, so it never pumps the room's noise up between sentences.
+   The panel shows the gain it applies now.
+3. **Compressor**: above its threshold the voice rises only 1/ratio as much,
+   evening out what the leveler leaves. Stereo linked, from the louder
+   channel's peak.
+
+**Speech preset** sets all three for a talk's microphone: low cut at 100 Hz,
+the leveler to −20 dB, gentle compression (3:1 from −18 dB, 3 dB made up).
+Pre-fader listen hears the processed sound, as on a console.
+
+**On a bus**: its compressor before the fader; after it, the **limiter** and
+the **loudness meter**.
+
+- **Limiter**: no sample past its **Ceiling** (−1 dBFS), whatever arrives: a
+  shout, a dropped microphone, a loud clip. (Switched on, it fades in over
+  10 ms rather than cutting a loud sound down at once, and a lower ceiling
+  glides down over 10 ms; it holds the ceiling from then on.) It is on for every bus, shows saved
+  before it included; it only acts on what would come within 1 dB of clipping.
+  It looks 1.5 ms ahead to turn down before a peak arrives, so a bus's sound
+  is 1.5 ms later — on or off, so switching it never shifts the timing, and far
+  inside anything heard as out of step with the picture.
+- **Loudness**: momentary (400 ms) and short-term (3 s) LUFS, updated every
+  10 ms, and integrated LUFS, gated as ITU-R BS.1770 and EBU R 128 say, of
+  what goes out. The integrated reading keeps every 400 ms block, each gated
+  by its own loudness exactly as the standard says (about 3.5 MB for a
+  12-hour day).
+  Streams usually aim at about −16 LUFS, broadcast at −23. **Reset loudness**
+  starts the readings again, as a show starts; the held peak stays.
+
+Switching any of these on or off, and every change of setting, is smoothed so
+nothing clicks. The processing runs on the mixing thread with no allocation
+and nothing that can fail mid-show; if the mixer stalls, it starts afresh
+rather than playing what it held. The settings are saved with the show; the
+readings are not.
+
 The **Audio Mixer** panel (under the Switcher in the Classic layout, beside the
 inputs in vMix's) is laid out as vMix's: **OUTPUTS** — Master and the other
-buses — then **INPUTS**, one upright strip each. Each bus has its own fader,
+buses — then **INPUTS**, one upright strip each. Strips keep their own
+size, as vMix's do, whatever the panel's: as many go across as fit, row after
+row, and the panel scrolls up and down. A clip's strip has **▶ / ⏸** at the
+left of its name (green while it plays): what is playing is seen, and paused,
+in the mixer. Each bus has its own fader,
 On button and delay, and plays on a sound device and/or feeds recordings and
 streams.
 
@@ -20,8 +102,14 @@ streams.
   **+ Input**, pick the device, then **Stereo 1-2** or **Mono N** (a lectern
   mic on input 2 of a USB interface is **Mono 2**), or use **Add Input →
   Audio Input**. An input whose device is unplugged shows **not connected**
-  and comes back by itself when it is plugged in again. Right-click an input's
-  name to remove it.
+  and comes back by itself when it is plugged in again — unplugged mid-show
+  too: Nida says the sound stopped, and takes it again within a couple of
+  seconds of the device coming back. An output that takes a device's sound
+  straight, not through a bus, stays without it until it is started again.
+  Plugging a device in
+  never moves an input onto it, unless the two have the same name; one
+  plugged in while Nida runs is listed after **Rescan** and gives sound once
+  Nida is reopened. Right-click an input's name to remove it.
 - **A camera's sound** — chosen under **Audio** when adding a camera or
   capture card ([Adding Inputs](23-adding-inputs.md)): an input like the one
   above, named after the camera's input, with Audio Auto on so it switches
@@ -168,4 +256,14 @@ PUT  /api/outputs/{output}/audio-bus                 {"bus_uuid": "<bus>"}
 PUT  /api/audio-sources/{deck-or-input}/solo         {"solo": true}
 PUT  /api/audio-monitor/device                       {"device": "Scarlett Solo 4th Gen"}
 PUT  /api/audio-monitor/listen                       {"bus_uuid": "<bus>"}
+POST /api/audio-sources/{deck-or-input}/speech-preset
+PUT  /api/audio-sources/{deck-or-input}/low-cut      {"enabled": true, "hz": 100, "slope_db": 24}
+PUT  /api/audio-sources/{deck-or-input}/leveler      {"enabled": true, "target_db": -20, "max_boost_db": 12, "max_cut_db": 12, "speed_secs": 3, "hold_below_db": -50}
+PUT  /api/audio-sources/{deck-or-input}/compressor   {"enabled": true, "threshold_db": -18, "ratio": 3, "attack_ms": 5, "release_ms": 150, "knee_db": 6, "makeup_db": 3}
+PUT  /api/audio-buses/{bus}/limiter                  {"enabled": true, "ceiling_db": -1, "release_ms": 100}
+POST /api/audio-buses/{bus}/loudness/reset           (its loudness readings)
+POST /api/audio-buses/{bus}/meters/reset             (its held peak)
 ```
+
+A processing route takes the whole setting: fields left out take their
+defaults — `enabled` false, except the limiter's, which is on.

@@ -1,5 +1,6 @@
 //! The audio mixer, laid out as vMix's: **OUTPUTS** — Master and the other
-//! buses — then **INPUTS**, one upright strip each.
+//! buses — then **INPUTS**, one upright strip each, of a size of its own:
+//! as many across as the panel fits, row after row.
 //!
 //! An input strip, top to bottom: its name (red while it is on air), the
 //! balance, then beside its fader ⚙ settings, **S** solo (heard on the
@@ -15,20 +16,25 @@ use super::super::{UIActions, UIData};
 use crate::audio_mix::{AudioBusSnapshot, AudioSourceKind, AudioSourceSnapshot, FOLLOW_MAIN};
 use crate::engine::EngineCommand;
 
-const STRIP_WIDTH: f32 = 104.0;
+const STRIP_WIDTH: f32 = 128.0;
 const STRIP_GAP: f32 = 4.0;
 const SECTION_WIDTH: f32 = 22.0;
 const HEADER: f32 = 22.0;
 const BALANCE: f32 = 18.0;
 const BUTTON: f32 = 28.0;
 const BUTTON_GAP: f32 = 5.0;
-const METER_WIDTH: f32 = 14.0;
+const METER_WIDTH: f32 = 38.0;
 /// One row of bus buttons under an input strip.
 const SEND_ROW: f32 = 24.0;
 const SENDS_PER_ROW: usize = 3;
 /// Master's headphones level under its fader.
 const KNOB_ROW: f32 = 40.0;
 const MIN_HEIGHT: f32 = 240.0;
+/// A strip's own height, as vMix keeps one whatever the panel's: a taller
+/// panel fits more rows of strips rather than longer faders.
+const STRIP_HEIGHT: f32 = 260.0;
+/// The column of + Input and + Bus after the strips.
+const ADD_WIDTH: f32 = 96.0;
 
 /// Fader travel: the level at each point of the track, bottom to top — as a
 /// desk's fader, with most of the travel round 0 dB. The bottom stop is off.
@@ -68,25 +74,76 @@ pub(super) fn render_audio_mixer_section(
     actions: &mut UIActions,
 ) {
     let mix = &data.audio_mix;
-    let height = (ui.available_height() - 4.0).max(MIN_HEIGHT);
-    egui::ScrollArea::both()
+    // Their own size — less only to fit a short panel, never less than an
+    // input strip's buttons and rows of sends need — and as many across as
+    // fit, row after row, scrolled up and down.
+    let rows = mix.buses.len().div_ceil(SENDS_PER_ROW).max(1);
+    let height = STRIP_HEIGHT
+        .min((ui.available_height() - 4.0).max(MIN_HEIGHT))
+        .max(input_strip_needs(rows));
+    egui::ScrollArea::vertical()
         .id_salt("audio_mixer_strips")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = STRIP_GAP;
-                section_label(ui, "OUTPUTS", height);
-                for (i, bus) in mix.buses.iter().enumerate() {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(STRIP_GAP, STRIP_GAP);
+                // A section's spine goes with its first strip, never left at
+                // the end of the row before.
+                let mut buses = mix.buses.iter().enumerate();
+                together(ui, STRIP_WIDTH, height, |ui| {
+                    section_label(ui, "OUTPUTS", height);
+                    if let Some((i, bus)) = buses.next() {
+                        bus_strip(ui, bus, i == 0, height, data, actions);
+                    }
+                });
+                for (i, bus) in buses {
                     bus_strip(ui, bus, i == 0, height, data, actions);
                 }
-                section_label(ui, "INPUTS", height);
-                for source in &mix.sources {
+                let mut sources = mix.sources.iter();
+                let first = if mix.sources.is_empty() {
+                    ADD_WIDTH
+                } else {
+                    STRIP_WIDTH
+                };
+                together(ui, first, height, |ui| {
+                    section_label(ui, "INPUTS", height);
+                    match sources.next() {
+                        Some(source) => input_strip(ui, source, height, data, actions),
+                        None => add_column(ui, height, data, actions),
+                    }
+                });
+                for source in sources {
                     input_strip(ui, source, height, data, actions);
                 }
-                add_column(ui, data, actions);
+                if !mix.sources.is_empty() {
+                    add_column(ui, height, data, actions);
+                }
             });
         });
     render_settings_window(ui.ctx(), data, actions);
+}
+
+/// The height an input strip needs: its four buttons beside the fader, and
+/// `rows` of sends under it.
+fn input_strip_needs(rows: usize) -> f32 {
+    let buttons_top = HEADER + 4.0 + BALANCE + 4.0;
+    let buttons = 3.0 * (BUTTON + BUTTON_GAP) + (BUTTON - 2.0);
+    #[allow(clippy::cast_precision_loss)]
+    let sends = SEND_ROW * rows as f32;
+    buttons_top + buttons + 6.0 + sends + 4.0
+}
+
+/// A section's spine and the `first` wide item after it, wrapped onto a row
+/// together.
+fn together(ui: &mut egui::Ui, first: f32, height: f32, add: impl FnOnce(&mut egui::Ui)) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(SECTION_WIDTH + STRIP_GAP + first, height),
+        egui::Layout::left_to_right(egui::Align::Min),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = STRIP_GAP;
+            add(ui);
+        },
+    );
 }
 
 /// Whose settings are open, from a strip's ⚙ (or the headphones).
@@ -142,39 +199,513 @@ fn render_settings_window(ctx: &egui::Context, data: &UIData, actions: &mut UIAc
         return;
     };
     let key = match &which {
-        Settings::Bus(uuid) | Settings::Source(uuid) => uuid.clone(),
+        Settings::Bus(uuid) => format!("bus_{uuid}"),
+        Settings::Source(uuid) => format!("source_{uuid}"),
         Settings::Headphones => "headphones".to_string(),
     };
+    let view_id = egui::Id::new(("audio_settings_expanded", &key));
+    let expanded = ctx.data(|data| data.get_temp::<bool>(view_id).unwrap_or(false));
+    let category_id = egui::Id::new(("audio_settings_dynamics", &key));
+    let mut dynamics = ctx.data(|data| data.get_temp::<bool>(category_id).unwrap_or(false));
+    let bounds = ctx.content_rect();
+    let width =
+        (if expanded { 640.0_f32 } else { 280.0_f32 }).min((bounds.width() - 24.0).max(100.0));
+    let position_id = egui::Id::new(("audio_settings_drag_position", &key, expanded));
+    let pending_position = ctx.data_mut(|data| data.remove_temp::<egui::Pos2>(position_id));
     let mut open = true;
-    egui::Window::new(format!("{title} — Audio"))
-        .id(egui::Id::new(("audio_strip_settings_window", key)))
-        .default_pos(at + egui::vec2(6.0, 0.0))
+    let mut window = egui::Window::new(format!("{title} — Audio"))
+        .id(egui::Id::new((
+            "audio_strip_settings_window",
+            &key,
+            expanded,
+        )))
+        .default_pos(if expanded {
+            bounds.center() - egui::vec2(width / 2.0, 180.0)
+        } else {
+            at + egui::vec2(6.0, 0.0)
+        })
+        .constrain_to(bounds)
+        .default_width(width)
+        .min_height(if expanded {
+            300.0_f32.min(bounds.height() - 40.0).max(0.0)
+        } else {
+            0.0
+        })
         .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.set_min_width(250.0);
-            match &which {
-                Settings::Bus(uuid) => {
-                    if let Some((i, bus)) = mix
-                        .buses
-                        .iter()
-                        .enumerate()
-                        .find(|(_, b)| &b.config.uuid == uuid)
-                    {
-                        bus_settings(ui, bus, i == 0, data, actions);
-                    }
+        .title_bar(false)
+        .movable(false)
+        .resizable(expanded);
+    if let Some(position) = pending_position {
+        window = window.current_pos(position);
+    }
+    let shown = window.show(ctx, |ui| {
+        ui.set_min_width(width);
+        let header = ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let close = ui.add_sized([28.0, 24.0], egui::Button::new("×"));
+                close.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        true,
+                        "Close audio settings",
+                    )
+                });
+                if close.on_hover_text("Close audio settings").clicked() {
+                    open = false;
                 }
-                Settings::Source(uuid) => {
-                    if let Some(source) = mix.sources.iter().find(|s| &s.uuid == uuid) {
-                        source_settings(ui, source, data, actions);
-                    }
+                if settings_view_button(ui, expanded).clicked() {
+                    ctx.data_mut(|data| data.insert_temp(view_id, !expanded));
+                    ctx.request_repaint();
                 }
-                Settings::Headphones => monitor_settings(ui, data, actions),
-            }
+                ui.add_sized(
+                    [ui.available_width(), 24.0],
+                    egui::Label::new(egui::RichText::new(format!("{title} — Audio")).strong())
+                        .truncate()
+                        .sense(egui::Sense::drag()),
+                )
+                .on_hover_text(&title)
+                .on_hover_cursor(egui::CursorIcon::Grab)
+                .drag_delta()
+            })
+            .inner
         });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt(("audio_settings_content", &key, expanded))
+            .max_height(
+                ui.available_height()
+                    .min((bounds.height() - 96.0).max(40.0))
+                    .max(40.0),
+            )
+            .show(ui, |ui| {
+                if expanded {
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(112.0);
+                            ui.set_min_height(230.0_f32.min((bounds.height() - 100.0).max(0.0)));
+                            if ui.selectable_label(!dynamics, "General").clicked() {
+                                dynamics = false;
+                            }
+                            if which != Settings::Headphones
+                                && ui.selectable_label(dynamics, "Processing").clicked()
+                            {
+                                dynamics = true;
+                            }
+                        });
+                        ui.separator();
+                        ui.vertical(|ui| {
+                            ui.set_width(ui.available_width());
+                            if dynamics && which != Settings::Headphones {
+                                render_processing_settings(ui, &which, data, actions);
+                            } else {
+                                ui.heading("General settings");
+                                ui.add_space(8.0);
+                                render_strip_settings(ui, &which, data, actions);
+                            }
+                        });
+                    });
+                } else {
+                    render_strip_settings(ui, &which, data, actions);
+                }
+            });
+        header.inner
+    });
+    if let Some(shown) = shown {
+        if let Some(delta) = shown.inner.filter(|delta| *delta != egui::Vec2::ZERO) {
+            ctx.data_mut(|data| data.insert_temp(position_id, shown.response.rect.min + delta));
+            ctx.request_repaint();
+        }
+    }
+    ctx.data_mut(|data| data.insert_temp(category_id, dynamics));
     if !open {
         ctx.memory_mut(|m| m.data.remove::<(Settings, egui::Pos2)>(settings_id()));
+    }
+}
+
+fn render_processing_settings(
+    ui: &mut egui::Ui,
+    which: &Settings,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
+    match which {
+        Settings::Source(uuid) => {
+            if let Some(source) = data.audio_mix.sources.iter().find(|s| s.uuid == *uuid) {
+                source_processing(ui, uuid, &source.dynamics, actions);
+            }
+        }
+        Settings::Bus(uuid) => {
+            if let Some(bus) = data.audio_mix.buses.iter().find(|b| b.config.uuid == *uuid) {
+                bus_processing(ui, uuid, bus, actions);
+            }
+        }
+        Settings::Headphones => {}
+    }
+}
+
+/// A source's processing: low cut → leveler → compressor, before its fader.
+fn source_processing(
+    ui: &mut egui::Ui,
+    uuid: &str,
+    snapshot: &crate::audio_mix::DynamicsSnapshot,
+    actions: &mut UIActions,
+) {
+    use crate::audio_mix::{CompressorConfig, LevelerConfig, LowCutConfig};
+    ui.heading("Processing settings");
+    ui.label(
+        egui::RichText::new(
+            "Low cut → leveler → compressor, before the fader. Pre-fader listen hears it.",
+        )
+        .small()
+        .weak(),
+    );
+    let speech = ui.button("Speech preset").on_hover_text(
+        "Low cut at 100 Hz, the leveler to −20 dB, gentle compression: a talk's microphone",
+    );
+    if speech.clicked() {
+        actions.commands.push(EngineCommand::SetAudioSourceLowCut {
+            uuid: uuid.to_string(),
+            config: LowCutConfig::speech(),
+        });
+        actions.commands.push(EngineCommand::SetAudioSourceLeveler {
+            uuid: uuid.to_string(),
+            config: LevelerConfig::speech(),
+        });
+        actions
+            .commands
+            .push(EngineCommand::SetAudioSourceCompressor {
+                uuid: uuid.to_string(),
+                config: CompressorConfig::speech(),
+            });
+    }
+    ui.separator();
+
+    let mut low_cut = snapshot.low_cut.unwrap_or_default();
+    let before = low_cut;
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut low_cut.enabled, "Low cut");
+        ui.add(
+            egui::Slider::new(&mut low_cut.hz, 20.0..=400.0)
+                .logarithmic(true)
+                .suffix(" Hz"),
+        );
+        egui::ComboBox::from_id_salt(("low_cut_slope", uuid))
+            .selected_text(format!("{} dB/oct", low_cut.slope_db))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut low_cut.slope_db, 12, "12 dB/oct");
+                ui.selectable_value(&mut low_cut.slope_db, 24, "24 dB/oct");
+            });
+    });
+    if low_cut != before {
+        actions.commands.push(EngineCommand::SetAudioSourceLowCut {
+            uuid: uuid.to_string(),
+            config: low_cut,
+        });
+    }
+    ui.separator();
+
+    let mut leveler = snapshot.leveler.unwrap_or_default();
+    let before = leveler;
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut leveler.enabled, "Leveler");
+        ui.label(
+            egui::RichText::new(format!("now {:+.1} dB", snapshot.leveler_gain_db))
+                .small()
+                .weak(),
+        );
+    });
+    ui.add(
+        egui::Slider::new(&mut leveler.target_db, -40.0..=-6.0)
+            .text("Target")
+            .suffix(" dB"),
+    );
+    ui.add(
+        egui::Slider::new(&mut leveler.max_boost_db, 0.0..=24.0)
+            .text("Most boost")
+            .suffix(" dB"),
+    );
+    ui.add(
+        egui::Slider::new(&mut leveler.max_cut_db, 0.0..=24.0)
+            .text("Most cut")
+            .suffix(" dB"),
+    );
+    ui.add(
+        egui::Slider::new(&mut leveler.speed_secs, 0.5..=20.0)
+            .logarithmic(true)
+            .text("Speed")
+            .suffix(" s"),
+    );
+    ui.add(
+        egui::Slider::new(&mut leveler.hold_below_db, -80.0..=-20.0)
+            .text("Hold below")
+            .suffix(" dB"),
+    )
+    .on_hover_text("Quieter than this is a pause or the room: the leveler holds still");
+    if leveler != before {
+        actions.commands.push(EngineCommand::SetAudioSourceLeveler {
+            uuid: uuid.to_string(),
+            config: leveler,
+        });
+    }
+    ui.separator();
+
+    let mut compressor = snapshot.config;
+    if compressor_controls(ui, &mut compressor) {
+        actions
+            .commands
+            .push(EngineCommand::SetAudioSourceCompressor {
+                uuid: uuid.to_string(),
+                config: compressor,
+            });
+    }
+    ui.separator();
+    processing_meters(ui, snapshot, None);
+}
+
+/// A bus's processing: compressor before its fader; limiter and loudness
+/// meter after it.
+fn bus_processing(
+    ui: &mut egui::Ui,
+    uuid: &str,
+    bus: &crate::audio_mix::AudioBusSnapshot,
+    actions: &mut UIActions,
+) {
+    let snapshot = &bus.dynamics;
+    ui.heading("Processing settings");
+    ui.label(
+        egui::RichText::new("Compressor before the fader; the limiter and loudness after it.")
+            .small()
+            .weak(),
+    );
+    ui.separator();
+    let mut compressor = bus.config.compressor;
+    if compressor_controls(ui, &mut compressor) {
+        actions.commands.push(EngineCommand::SetAudioBusCompressor {
+            uuid: uuid.to_string(),
+            config: compressor,
+        });
+    }
+    ui.separator();
+
+    let mut limiter = bus.config.limiter;
+    let before = limiter;
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut limiter.enabled, "Limiter");
+        ui.label(
+            egui::RichText::new(format!("{:.1} dB", snapshot.limiter_reduction_db))
+                .small()
+                .weak(),
+        )
+        .on_hover_text("How far it is turning down now");
+    });
+    ui.add(
+        egui::Slider::new(&mut limiter.ceiling_db, -12.0..=0.0)
+            .text("Ceiling")
+            .suffix(" dBFS"),
+    );
+    ui.add(
+        egui::Slider::new(&mut limiter.release_ms, 10.0..=1000.0)
+            .logarithmic(true)
+            .text("Release")
+            .suffix(" ms"),
+    );
+    if limiter != before {
+        actions.commands.push(EngineCommand::SetAudioBusLimiter {
+            uuid: uuid.to_string(),
+            config: limiter,
+        });
+    }
+    ui.separator();
+
+    if let Some(loudness) = snapshot.loudness {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Loudness").strong());
+            if ui
+                .button("Reset loudness")
+                .on_hover_text("Start the integrated reading again, as a show starts")
+                .clicked()
+            {
+                actions.commands.push(EngineCommand::ResetAudioLoudness {
+                    uuid: uuid.to_string(),
+                });
+            }
+        });
+        let lufs = |v: f32| {
+            if v <= -70.0 {
+                "−∞".to_string()
+            } else {
+                format!("{v:.1}")
+            }
+        };
+        egui::Grid::new(("loudness", uuid)).num_columns(2).show(ui, |ui| {
+            ui.label("Momentary");
+            ui.label(format!("{} LUFS", lufs(loudness.momentary_lufs)));
+            ui.end_row();
+            ui.label("Short-term");
+            ui.label(format!("{} LUFS", lufs(loudness.short_term_lufs)));
+            ui.end_row();
+            ui.label("Integrated");
+            ui.label(
+                loudness
+                    .integrated_lufs
+                    .map_or_else(|| "—".to_string(), |v| format!("{} LUFS", lufs(v))),
+            );
+            ui.end_row();
+        })
+        .response
+        .on_hover_text("ITU-R BS.1770 / EBU R 128. Streams usually aim at about −16 LUFS, broadcast at −23");
+        ui.separator();
+    }
+    processing_meters(ui, snapshot, Some(snapshot.limiter_reduction_db));
+}
+
+/// A compressor's controls; whether anything changed.
+fn compressor_controls(ui: &mut egui::Ui, config: &mut crate::audio_mix::CompressorConfig) -> bool {
+    let before = *config;
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut config.enabled, "Enable compressor");
+        if ui.button("Reset compressor").clicked() {
+            *config = crate::audio_mix::CompressorConfig::default();
+        }
+    });
+    ui.add(
+        egui::Slider::new(&mut config.threshold_db, -60.0..=0.0)
+            .text("Threshold")
+            .suffix(" dB"),
+    );
+    ui.add(
+        egui::Slider::new(&mut config.ratio, 1.0..=20.0)
+            .text("Ratio")
+            .suffix(":1"),
+    );
+    ui.add(
+        egui::Slider::new(&mut config.attack_ms, 0.1..=2000.0)
+            .logarithmic(true)
+            .text("Attack")
+            .suffix(" ms"),
+    );
+    ui.add(
+        egui::Slider::new(&mut config.release_ms, 1.0..=9000.0)
+            .logarithmic(true)
+            .text("Release")
+            .suffix(" ms"),
+    );
+    ui.add(
+        egui::Slider::new(&mut config.knee_db, 0.0..=18.0)
+            .text("Knee")
+            .suffix(" dB"),
+    );
+    ui.add(
+        egui::Slider::new(&mut config.makeup_db, -12.0..=24.0)
+            .text("Makeup")
+            .suffix(" dB"),
+    );
+    *config != before
+}
+
+/// Pre and post FX peaks, the compressor's reduction and — on a bus — the
+/// limiter's.
+fn processing_meters(
+    ui: &mut egui::Ui,
+    snapshot: &crate::audio_mix::DynamicsSnapshot,
+    limiter_db: Option<f32>,
+) {
+    ui.horizontal_top(|ui| {
+        for (label, levels) in [("Pre FX", snapshot.pre_db), ("Post FX", snapshot.post_db)] {
+            ui.vertical(|ui| {
+                ui.set_width(100.0);
+                ui.label(label);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(54.0, 160.0), egui::Sense::hover());
+                let _ = meter(ui, rect, levels, None);
+                ui.label(
+                    egui::RichText::new(format!("L {:+.1}  R {:+.1}", levels[0], levels[1])).small(),
+                );
+            });
+        }
+        ui.vertical(|ui| {
+            ui.label("Compressor");
+            ui.add(
+                egui::ProgressBar::new((snapshot.reduction_db / 24.0).clamp(0.0, 1.0))
+                    .desired_width(135.0)
+                    .text(format!("{:.1} dB", snapshot.reduction_db)),
+            );
+            if let Some(limiter_db) = limiter_db {
+                ui.label("Limiter");
+                ui.add(
+                    egui::ProgressBar::new((limiter_db / 12.0).clamp(0.0, 1.0))
+                        .desired_width(135.0)
+                        .text(format!("{limiter_db:.1} dB")),
+                );
+            }
+        });
+    })
+    .response
+    .on_hover_text("Pre/Post FX: stereo sample peaks, dBFS, before and after the processing. Reductions: how far each is turning down now.");
+}
+
+fn settings_view_button(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
+    let label = if expanded {
+        "Compact audio settings"
+    } else {
+        "Expand audio settings"
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 24.0), egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, visuals.bg_fill);
+    let icon = egui::Rect::from_center_size(rect.center(), egui::vec2(12.0, 10.0));
+    if expanded {
+        painter.rect_stroke(
+            icon.translate(egui::vec2(2.0, -2.0)),
+            0.0,
+            visuals.fg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_filled(icon.translate(egui::vec2(-2.0, 2.0)), 0.0, visuals.bg_fill);
+        painter.rect_stroke(
+            icon.translate(egui::vec2(-2.0, 2.0)),
+            0.0,
+            visuals.fg_stroke,
+            egui::StrokeKind::Inside,
+        );
+    } else {
+        painter.rect_stroke(icon, 0.0, visuals.fg_stroke, egui::StrokeKind::Inside);
+        painter.line_segment(
+            [
+                icon.left_top() + egui::vec2(1.0, 2.0),
+                icon.right_top() + egui::vec2(-1.0, 2.0),
+            ],
+            visuals.fg_stroke,
+        );
+    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    response.on_hover_text(label)
+}
+
+fn render_strip_settings(
+    ui: &mut egui::Ui,
+    which: &Settings,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
+    let mix = &data.audio_mix;
+    match which {
+        Settings::Bus(uuid) => {
+            if let Some((i, bus)) = mix
+                .buses
+                .iter()
+                .enumerate()
+                .find(|(_, b)| &b.config.uuid == uuid)
+            {
+                bus_settings(ui, bus, i == 0, data, actions);
+            }
+        }
+        Settings::Source(uuid) => {
+            if let Some(source) = mix.sources.iter().find(|s| &s.uuid == uuid) {
+                source_settings(ui, source, data, actions);
+            }
+        }
+        Settings::Headphones => monitor_settings(ui, data, actions),
     }
 }
 
@@ -385,7 +916,12 @@ fn bus_strip(
             gain_db: db,
         });
     }
-    meter(ui, layout.meter, bus.meter_db);
+    if strip_meter(ui, layout.meter, bus.meter_db, bus.peak_db, &cfg.name) {
+        actions.commands.push(EngineCommand::ResetAudioMeter {
+            uuid: cfg.uuid.clone(),
+            bus: true,
+        });
+    }
 
     if master {
         headphones(ui, layout.footer, data, actions);
@@ -601,12 +1137,55 @@ fn input_strip(
     } else {
         HEADER_BG
     };
-    let title = header(ui, layout.header, name, fill, id.with("header"))
-        .on_hover_text(describe(source, data));
     let clip_deck = match &source.kind {
         AudioSourceKind::Clip { deck_uuid } => Some(deck_uuid.as_str()),
         AudioSourceKind::Live { .. } | AudioSourceKind::Input { .. } => None,
     };
+    // A clip plays and pauses from the left of its name: what plays is seen,
+    // and stopped, in the mixer.
+    let playing = clip_deck.and_then(|deck| {
+        data.channels
+            .iter()
+            .flat_map(|c| &c.decks)
+            .find(|d| d.uuid == deck)?
+            .video_playback
+            .as_ref()
+            .map(|vp| vp.playing)
+    });
+    let mut name_rect = layout.header;
+    if let (Some(playing), Some(deck)) = (playing, clip_deck) {
+        let play = egui::Rect::from_min_size(layout.header.min, egui::vec2(HEADER, HEADER));
+        name_rect.set_left(play.right());
+        let (glyph, hover) = if playing {
+            ("⏸", "Pause the clip")
+        } else {
+            ("▶", "Play the clip")
+        };
+        let response = ui.interact(play, id.with("play"), egui::Sense::click());
+        let back = if playing {
+            super::transport::PLAYING_GREEN
+        } else if response.hovered() {
+            egui::Color32::from_gray(60)
+        } else {
+            egui::Color32::from_gray(40)
+        };
+        ui.painter().rect_filled(play.shrink(1.0), 2.0, back);
+        ui.painter().text(
+            play.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            egui::FontId::proportional(12.0),
+            egui::Color32::WHITE,
+        );
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, hover));
+        if response.on_hover_text(hover).clicked() {
+            actions.commands.push(EngineCommand::VideoTogglePlay {
+                deck_uuid: deck.to_string(),
+            });
+        }
+    }
+    let title =
+        header(ui, name_rect, name, fill, id.with("header")).on_hover_text(describe(source, data));
     // A clip, an NDI source's sound or a camera's: switched with its picture.
     let follows_a_picture = clip_deck.is_some()
         || matches!(
@@ -748,7 +1327,12 @@ fn input_strip(
             gain_db: db,
         });
     }
-    meter(ui, layout.meter, source.meter_db);
+    if strip_meter(ui, layout.meter, source.meter_db, source.peak_db, name) {
+        actions.commands.push(EngineCommand::ResetAudioMeter {
+            uuid: source.uuid.clone(),
+            bus: false,
+        });
+    }
     sends(ui, layout.footer, source, data, actions);
 }
 
@@ -1008,36 +1592,43 @@ pub(super) fn audio_auto_settings(
 
 // ── The last column: adding things ──────────────────────────────────
 
-fn add_column(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
-    ui.vertical(|ui| {
-        ui.set_width(96.0);
-        render_add_input(ui, data, actions);
-        if ui
-            .button("+ Bus")
-            .on_hover_text(
-                "Add an audio bus: a mix of its own for a device, a stream or a recording",
-            )
-            .clicked()
-        {
-            actions.commands.push(EngineCommand::AddAudioBus {
-                name: next_bus_name(data.audio_mix.buses.len()),
-            });
-        }
-        if ui
-            .button("Rescan")
-            .on_hover_text("Look for sound devices again, after plugging one in")
-            .clicked()
-        {
-            actions.commands.push(EngineCommand::RescanAudioDevices);
-        }
-        if data.audio_mix.sources.is_empty() {
-            ui.label(
-                egui::RichText::new("Clips with sound appear here; add a microphone with + Input.")
+fn add_column(ui: &mut egui::Ui, height: f32, data: &UIData, actions: &mut UIActions) {
+    // Its room asked for whole, so it wraps onto the next row like a strip.
+    ui.allocate_ui_with_layout(
+        egui::vec2(ADD_WIDTH, height),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_width(ADD_WIDTH);
+            render_add_input(ui, data, actions);
+            if ui
+                .button("+ Bus")
+                .on_hover_text(
+                    "Add an audio bus: a mix of its own for a device, a stream or a recording",
+                )
+                .clicked()
+            {
+                actions.commands.push(EngineCommand::AddAudioBus {
+                    name: next_bus_name(data.audio_mix.buses.len()),
+                });
+            }
+            if ui
+                .button("Rescan")
+                .on_hover_text("Look for sound devices again, after plugging one in")
+                .clicked()
+            {
+                actions.commands.push(EngineCommand::RescanAudioDevices);
+            }
+            if data.audio_mix.sources.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "Clips with sound appear here; add a microphone with + Input.",
+                    )
                     .small()
                     .weak(),
-            );
-        }
-    });
+                );
+            }
+        },
+    );
 }
 
 fn render_add_input(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
@@ -1092,6 +1683,7 @@ fn render_add_input(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
                     actions.commands.push(EngineCommand::AddAppSound {
                         app: app.bundle_id.clone(),
                         name: app.name.clone(),
+                        deck_uuid: None,
                     });
                     ui.close();
                 }
@@ -1427,14 +2019,105 @@ fn knob(
     new
 }
 
-/// Two upright level bars, left and right, on the fader's scale: green, then
-/// yellow from -18 dB, red from -6.
-fn meter(ui: &mut egui::Ui, rect: egui::Rect, meter_db: [f32; 2]) {
+/// Stereo sample peaks use a dBFS scale independent of fader gain.
+fn meter_travel(db: f32) -> f32 {
+    ((db + 60.0) / 60.0).clamp(0.0, 1.0)
+}
+
+fn meter_color(db: f32) -> egui::Color32 {
+    if db >= 0.0 {
+        egui::Color32::from_rgb(230, 60, 50)
+    } else if db >= -12.0 {
+        egui::Color32::from_rgb(225, 200, 60)
+    } else {
+        egui::Color32::from_rgb(70, 215, 90)
+    }
+}
+
+fn peak_text(db: f32) -> String {
+    if db <= -96.0 {
+        "−∞".into()
+    } else {
+        format!("{db:.1}")
+    }
+}
+
+fn strip_meter(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    levels: [f32; 2],
+    peaks: [f32; 2],
+    name: &str,
+) -> bool {
+    let response = meter(ui, rect, levels, Some(peaks));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Reset peak {name}"))
+    });
+    response.clicked()
+}
+
+fn meter(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    meter_db: [f32; 2],
+    held: Option<[f32; 2]>,
+) -> egui::Response {
+    let response = ui.interact(
+        rect,
+        ui.id()
+            .with(("audio_meter", rect.left().to_bits(), rect.top().to_bits())),
+        if held.is_some() {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let peaks = held.unwrap_or(meter_db);
+    let maximum = peaks[0].max(peaks[1]);
     let track = egui::Rect::from_min_max(
-        rect.min + egui::vec2(0.0, 8.0),
-        egui::pos2(rect.right(), rect.bottom() - 19.0),
+        rect.min + egui::vec2(24.0, 20.0),
+        egui::pos2(rect.right(), rect.bottom() - 30.0),
     );
     let painter = ui.painter();
+    painter.text(
+        egui::pos2(rect.left(), rect.top() + 6.0),
+        egui::Align2::LEFT_CENTER,
+        "dBFS",
+        egui::FontId::proportional(8.0),
+        TICK,
+    );
+    let clip = egui::Rect::from_min_max(
+        egui::pos2(track.left(), rect.top() + 2.0),
+        egui::pos2(track.right(), rect.top() + 11.0),
+    );
+    painter.rect_filled(
+        clip,
+        1.0,
+        if maximum >= 0.0 {
+            meter_color(0.0)
+        } else {
+            egui::Color32::from_rgb(45, 30, 30)
+        },
+    );
+    for db in [0_i16, -3, -6, -12, -18, -24, -36, -48] {
+        let y = track.bottom() - meter_travel(f32::from(db)) * track.height();
+        if db != -3 || track.height() >= 200.0 {
+            painter.text(
+                egui::pos2(track.left() - 3.0, y),
+                egui::Align2::RIGHT_CENTER,
+                format!("{db}"),
+                egui::FontId::proportional(8.5),
+                if db == -6 { egui::Color32::WHITE } else { TICK },
+            );
+        }
+        painter.line_segment(
+            [
+                egui::pos2(track.left() - 2.0, y),
+                egui::pos2(track.right(), y),
+            ],
+            egui::Stroke::new(0.5, TICK.gamma_multiply(0.35)),
+        );
+    }
     let half = track.width() / 2.0;
     for (i, db) in meter_db.iter().enumerate() {
         let bar = egui::Rect::from_min_size(
@@ -1442,22 +2125,51 @@ fn meter(ui: &mut egui::Ui, rect: egui::Rect, meter_db: [f32; 2]) {
             egui::vec2(half - 1.5, track.height()),
         );
         painter.rect_filled(bar, 1.0, egui::Color32::from_rgb(8, 30, 12));
-        let lit = db_to_travel(*db) * bar.height();
-        let color = if *db > -6.0 {
-            egui::Color32::from_rgb(230, 60, 50)
-        } else if *db > -18.0 {
-            egui::Color32::from_rgb(225, 200, 60)
-        } else {
-            egui::Color32::from_rgb(70, 215, 90)
-        };
-        if lit > 0.5 {
-            painter.rect_filled(
-                egui::Rect::from_min_max(egui::pos2(bar.left(), bar.bottom() - lit), bar.max),
-                1.0,
-                color,
+        for (low, high, color) in [
+            (-60.0, -12.0, meter_color(-24.0)),
+            (-12.0, 0.0, meter_color(-6.0)),
+        ] {
+            let top = (*db).min(high);
+            if top > low {
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(bar.left(), bar.bottom() - meter_travel(top) * bar.height()),
+                        egui::pos2(bar.right(), bar.bottom() - meter_travel(low) * bar.height()),
+                    ),
+                    1.0,
+                    color,
+                );
+            }
+        }
+        if held.is_some() && peaks[i] > -60.0 {
+            let y = bar.bottom() - meter_travel(peaks[i]) * bar.height();
+            painter.line_segment(
+                [egui::pos2(bar.left(), y), egui::pos2(bar.right(), y)],
+                egui::Stroke::new(1.5, egui::Color32::WHITE),
             );
         }
     }
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - 19.0),
+        egui::Align2::CENTER_CENTER,
+        if held.is_some() { "Peak" } else { "Now" },
+        egui::FontId::proportional(8.0),
+        TICK,
+    );
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - 6.0),
+        egui::Align2::CENTER_CENTER,
+        peak_text(maximum),
+        egui::FontId::proportional(9.0),
+        if maximum >= 0.0 {
+            meter_color(0.0)
+        } else {
+            egui::Color32::WHITE
+        },
+    );
+    response.on_hover_text(format!("Stereo sample peaks, dBFS (not fader gain or true peak).\nNow L {} / R {}\nPeak L {} / R {}{}",
+        peak_text(meter_db[0]),peak_text(meter_db[1]),peak_text(peaks[0]),peak_text(peaks[1]),
+        if held.is_some(){"\nPeaks and 0 dBFS warning latch on the audio thread. Click to reset; sound is unchanged."}else{""}))
 }
 
 #[derive(Clone, Copy)]
@@ -1606,7 +2318,11 @@ mod tests {
 
     fn bus(uuid: &str, name: &str) -> AudioBusSnapshot {
         AudioBusSnapshot {
+            peak_db: [-20.0; 2],
+            dynamics: crate::audio_mix::DynamicsSnapshot::default(),
             config: crate::audio_mix::AudioBusConfig {
+                compressor: crate::audio_mix::CompressorConfig::default(),
+                limiter: crate::audio_mix::LimiterConfig::default(),
                 uuid: uuid.into(),
                 name: name.into(),
                 gain_db: 0.0,
@@ -1622,6 +2338,8 @@ mod tests {
 
     fn clip(uuid: &str, name: &str) -> AudioSourceSnapshot {
         AudioSourceSnapshot {
+            peak_db: [-96.0; 2],
+            dynamics: crate::audio_mix::DynamicsSnapshot::default(),
             uuid: uuid.into(),
             name: name.into(),
             kind: AudioSourceKind::Clip {
@@ -1688,6 +2406,127 @@ mod tests {
             .build_ui(move |ui| render_audio_mixer_section(ui, data, actions))
     }
 
+    /// A clip plays and pauses from its strip, green while it plays: what
+    /// plays is seen, and stopped, in the mixer.
+    #[test]
+    fn a_clip_plays_and_pauses_from_its_strip() {
+        let mut data = mixer_data();
+        let deck = data.channels[0].decks[0].uuid.clone();
+        data.audio_mix.sources[0].kind = AudioSourceKind::Clip {
+            deck_uuid: deck.clone(),
+        };
+        data.channels[0].decks[0].video_playback = Some(crate::usecases::ui::VideoPlaybackUI {
+            playing: true,
+            position: 20.0,
+            duration: 60.0,
+            speed: 1.0,
+            effective_speed: 1.0,
+            position_offset: 0.0,
+            loop_mode: crate::video::LoopMode::Loop,
+            in_point: 0.0,
+            out_point: 0.0,
+            frame_rate: 25.0,
+            transport_sync: crate::video::DeckTransportSync::default(),
+            hardware_decode: false,
+            auto: crate::engine::value::video::AutoPlayback::default(),
+            sound_only: true,
+        });
+        let actions = run(&data, &["Pause the clip"]);
+        assert!(
+            actions.commands.iter().any(
+                |c| matches!(c, EngineCommand::VideoTogglePlay { deck_uuid } if *deck_uuid == deck)
+            ),
+            "{:?}",
+            actions.commands
+        );
+        // A microphone has none.
+        let mut actions = UIActions::new();
+        let mut harness = harness(&data, &mut actions);
+        harness.run();
+        assert_eq!(harness.query_all_by_label("Pause the clip").count(), 1);
+        assert_eq!(harness.query_all_by_label("Play the clip").count(), 0);
+    }
+
+    /// The mixer in a panel `size`, drawn.
+    fn rect_of(data: &UIData, size: egui::Vec2, label: &str) -> Vec<egui::Rect> {
+        let mut actions = UIActions::new();
+        let (data_ref, actions_ref) = (data, &mut actions);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(size)
+            .build_ui(move |ui| render_audio_mixer_section(ui, data_ref, actions_ref));
+        harness.run();
+        harness.get_all_by_label(label).map(|n| n.rect()).collect()
+    }
+
+    /// However many buses, a strip is tall enough for its buttons and its
+    /// rows of sends: the first send never lies on its On button.
+    #[test]
+    fn many_buses_leave_the_on_button_clear_of_the_sends() {
+        let mut data = mixer_data();
+        for i in 0..8 {
+            data.audio_mix
+                .buses
+                .push(bus(&format!("abus000{i}"), &format!("Bus {i}")));
+        }
+        let size = egui::vec2(1400.0, 600.0);
+        let on = rect_of(&data, size, "On Lectern mic")[0];
+        let send = rect_of(&data, size, "Send Lectern mic to Master")[0];
+        assert!(on.bottom() <= send.top(), "{on:?} over {send:?}");
+    }
+
+    /// The column of **+ Input** and **+ Bus** wraps onto the next row like a
+    /// strip, and a section's name goes with its first strip.
+    #[test]
+    fn the_add_column_and_section_names_wrap_with_the_strips() {
+        let data = mixer_data();
+        // Two strips a row, and room after the outputs for INPUTS but not
+        // its first strip; none after the last input for + Bus.
+        let size = egui::vec2(340.0, 900.0);
+        let bus = rect_of(&data, size, "+ Bus")[0];
+        let last = rect_of(&data, size, "On Lectern mic")[0];
+        assert!(bus.right() <= 340.0, "+ Bus inside the panel: {bus:?}");
+        assert!(
+            bus.top() > last.bottom(),
+            "+ Bus under the last strip: {bus:?}"
+        );
+        let inputs = rect_of(&data, size, "INPUTS")[0];
+        let first = rect_of(&data, size, "intro.mp4")[0];
+        assert!(
+            (inputs.top() - first.top()).abs() < 1.0,
+            "INPUTS on its first strip's row: {inputs:?}, {first:?}"
+        );
+        assert!(
+            first.right() <= 340.0,
+            "the first input inside the panel: {first:?}"
+        );
+    }
+
+    /// Strips keep their own size however tall the panel is, and as many go
+    /// across as fit, row after row — scrolled up and down, not sideways.
+    #[test]
+    fn strips_keep_their_size_and_wrap_into_rows() {
+        let data = mixer_data();
+        let mut actions = UIActions::new();
+        let (data_ref, actions_ref) = (&data, &mut actions);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 900.0))
+            .build_ui(move |ui| render_audio_mixer_section(ui, data_ref, actions_ref));
+        harness.run();
+        let strip = harness.get_by_label("OUTPUTS").rect();
+        assert!(
+            (strip.height() - STRIP_HEIGHT).abs() < 1.0,
+            "{} tall in a 900 panel",
+            strip.height()
+        );
+        let master = harness.get_by_label("Master").rect();
+        let mic = harness.get_by_label("Lectern mic").rect();
+        assert!(
+            mic.top() > master.bottom() + STRIP_HEIGHT / 2.0,
+            "the inputs a row below: {mic:?} against {master:?}"
+        );
+        assert!(mic.right() <= 420.0, "none off to the side");
+    }
+
     fn run(data: &UIData, clicks: &[&str]) -> UIActions {
         let mut actions = UIActions::new();
         {
@@ -1708,6 +2547,172 @@ mod tests {
     /// An audio bus's name offers Rename… on a right-click — Master's too —
     /// and asks for the new name; a double-click does the same.
     #[test]
+    fn settings_views_share_controls_and_remember_the_last_view_without_commands() {
+        let data = mixer_data();
+        let mut actions = UIActions::new();
+        {
+            let mut harness = harness(&data, &mut actions);
+            harness.run();
+            harness.get_by_label("Settings Master").click();
+            harness.run();
+            let expand = harness.get_by_label("Expand audio settings").rect();
+            let close = harness.get_by_label("Close audio settings").rect();
+            assert!(expand.right() <= close.left());
+            assert!((expand.center().y - close.center().y).abs() < 1.0);
+            harness.get_by_label("Expand audio settings").click();
+            harness.run();
+            let restore = harness.get_by_label("Compact audio settings").rect();
+            let close = harness.get_by_label("Close audio settings").rect();
+            assert!(restore.right() <= close.left());
+            let category = harness.get_by_label("General").rect();
+            let content = harness.get_by_label("General settings").rect();
+            assert!(category.right() < content.left());
+            harness.get_by_label("General").click();
+            harness.run();
+            harness.get_by_value("Out: none");
+            harness.get_by_value("0 ms");
+            harness.get_by_label("Close audio settings").click();
+            harness.run();
+            harness.get_by_label("Settings Master").click();
+            harness.run();
+            harness.get_by_label("Compact audio settings").click();
+            harness.run();
+            harness.get_by_label("Expand audio settings");
+            assert!(harness.query_by_label("General settings").is_none());
+            harness.get_by_value("Out: none");
+        }
+        assert!(actions.commands.is_empty());
+    }
+
+    #[test]
+    fn dynamics_navigation_is_local_and_enable_targets_only_the_selected_bus() {
+        let data = mixer_data();
+        let mut actions = UIActions::new();
+        {
+            let mut harness = harness(&data, &mut actions);
+            harness.run();
+            for label in ["Settings Master", "Expand audio settings", "Processing"] {
+                harness.get_by_label(label).click();
+                harness.run();
+            }
+            assert!(
+                harness.get_by_label("General").rect().top()
+                    < harness.get_by_label("Processing").rect().top()
+            );
+            harness.get_by_label("Pre FX");
+            harness.get_by_label("Post FX");
+            harness.get_by_label("Enable compressor").click();
+            harness.run();
+        }
+        assert_eq!(actions.commands.len(), 1, "{:?}", actions.commands);
+        assert!(pushed(
+            &actions,
+            |command| matches!(command,EngineCommand::SetAudioBusCompressor{uuid,config}
+            if uuid=="amaster1" && config.enabled)
+        ));
+    }
+
+    #[test]
+    fn dynamics_reset_targets_the_source_and_disables_compression() {
+        let mut data = mixer_data();
+        data.audio_mix.sources[0].dynamics.config.enabled = true;
+        data.audio_mix.sources[0].dynamics.config.ratio = 9.0;
+        let uuid = data.audio_mix.sources[0].uuid.clone();
+        let name = data.audio_mix.sources[0].name.clone();
+        let mut actions = UIActions::new();
+        {
+            let mut harness = harness(&data, &mut actions);
+            harness.run();
+            for label in [
+                format!("Settings {name}"),
+                "Expand audio settings".into(),
+                "Processing".into(),
+                "Reset compressor".into(),
+            ] {
+                harness.get_by_label(&label).click();
+                harness.run();
+            }
+        }
+        assert_eq!(actions.commands.len(), 1, "{:?}", actions.commands);
+        assert!(pushed(
+            &actions,
+            |command| matches!(command,EngineCommand::SetAudioSourceCompressor{uuid:target,config}
+            if target==&uuid && *config==crate::audio_mix::CompressorConfig::default())
+        ));
+    }
+
+    #[test]
+    fn meter_scale_and_colours_distinguish_headroom_from_full_scale() {
+        assert_eq!(meter_travel(0.0), 1.0);
+        assert!((meter_travel(-6.0) - 0.9).abs() < 1e-6);
+        assert_eq!(meter_travel(-96.0), 0.0);
+        assert_eq!(meter_travel(12.0), 1.0);
+        assert_ne!(meter_color(-6.0), meter_color(0.0));
+        assert_eq!(peak_text(-6.0), "-6.0");
+        assert_eq!(peak_text(-96.0), "−∞");
+        let layout = StripLayout::new(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(STRIP_WIDTH, 400.0)),
+            true,
+            SEND_ROW,
+        );
+        assert!(layout.fader.right() < layout.meter.left());
+        assert!(layout.fader.width() >= 40.0);
+    }
+
+    #[test]
+    fn clicking_a_strip_meter_only_resets_that_targets_peak() {
+        let data = mixer_data();
+        let actions = run(&data, &["Reset peak Master", "Reset peak Lectern mic"]);
+        assert_eq!(actions.commands.len(), 2);
+        assert!(pushed(
+            &actions,
+            |command| matches!(command,EngineCommand::ResetAudioMeter{uuid,bus:true} if uuid=="amaster1")
+        ));
+        assert!(pushed(
+            &actions,
+            |command| matches!(command,EngineCommand::ResetAudioMeter{uuid,bus:false} if uuid=="mic00001")
+        ));
+    }
+
+    #[test]
+    fn settings_can_be_moved_by_the_shared_header_and_closed_without_audio_commands() {
+        let data = mixer_data();
+        let mut actions = UIActions::new();
+        {
+            let mut harness = harness(&data, &mut actions);
+            harness.run();
+            harness.get_by_label("Settings Master").click();
+            harness.run();
+            let before = harness.get_by_label("Close audio settings").rect();
+            let start = before.center() - egui::vec2(130.0, 0.0);
+            let offset = egui::vec2(35.0, 25.0);
+            harness.event(egui::Event::PointerMoved(start));
+            harness.event(egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.run_steps(3);
+            harness.event(egui::Event::PointerMoved(start + offset));
+            harness.run_steps(3);
+            harness.event(egui::Event::PointerButton {
+                pos: start + offset,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.run_steps(3);
+            let after = harness.get_by_label("Close audio settings").rect();
+            assert!((after.center() - before.center() - offset).length() < 2.0);
+            harness.get_by_label("Close audio settings").click();
+            harness.run();
+            assert!(harness.query_by_label("Expand audio settings").is_none());
+        }
+        assert!(actions.commands.is_empty());
+    }
+
+    #[test]
     fn an_audio_bus_can_be_renamed_from_its_name() {
         let data = mixer_data();
         let mut actions = UIActions::new();
@@ -1717,12 +2722,18 @@ mod tests {
         harness.run_steps(3);
         harness.get_by_label("Rename bus…").click();
         harness.run_steps(3);
-        assert_eq!(super::super::rename::renaming(&harness.ctx).as_deref(), Some("astream1"));
+        assert_eq!(
+            super::super::rename::renaming(&harness.ctx).as_deref(),
+            Some("astream1")
+        );
         harness.get_by_label("Master").click_secondary();
         harness.run_steps(3);
         harness.get_by_label("Rename bus…").click();
         harness.run_steps(3);
-        assert_eq!(super::super::rename::renaming(&harness.ctx).as_deref(), Some("amaster1"));
+        assert_eq!(
+            super::super::rename::renaming(&harness.ctx).as_deref(),
+            Some("amaster1")
+        );
     }
 
     #[test]
@@ -2021,7 +3032,7 @@ mod tests {
         assert!(
             pushed(&actions, |c| matches!(
                 c,
-                EngineCommand::AddAppSound { app, name } if app == "us.zoom.xos" && name == "zoom.us"
+                EngineCommand::AddAppSound { app, name, .. } if app == "us.zoom.xos" && name == "zoom.us"
             )),
             "{:?}",
             actions.commands

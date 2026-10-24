@@ -59,7 +59,7 @@ New to Nida? Start with [Main mode](18-main.md), [Screen Layouts](20-layouts.md)
   - [Broadcast: Preview / Program and Inputs](20-layouts.md#broadcast-preview--program-and-inputs)
   - [VJ: Layers](20-layouts.md#vj-layers)
 - **21. [Input Settings](21-input-settings.md)** — like vMix's double-click window: a channel's layers (hide, reorder, delete, add), each layer's position, crop, colour, keys and effects, and the channel's own — with layout templates
-  - [Layers](21-input-settings.md#layers) — numbered as vMix numbers them, 1 at the back
+  - [Layers](21-input-settings.md#layers) — listed as Premiere lists tracks: the one in front at the top, 1 at the back
   - [A layer](21-input-settings.md#a-layer) — Position, Playback, Colour, Key, Effects
   - [The whole channel](21-input-settings.md#the-whole-channel) — General, Layout templates, Colour, Key, Effects
 - **22. [LED Screens](22-led-screens.md)** — like Resolume's Advanced Output: several LED screens on one HDMI feed to the processor, each at its own pixels, showing Main or a bus of its own
@@ -81,6 +81,10 @@ New to Nida? Start with [Main mode](18-main.md), [Screen Layouts](20-layouts.md)
   - [Running the show](25-rundown.md#running-the-show) — GO, Cut and Fade; all of it or none; going on by itself
   - [Clips, playlists and timers](25-rundown.md#clips-playlists-and-timers) — a sting on no screen, a talk's countdown
   - [Over the API](25-rundown.md#over-the-api) — `/api/rundown/…`
+- **26. [PowerPoint](26-presentations.md)** — like vMix's PowerPoint input: a deck played by PowerPoint on this Mac, its transitions, animations and videos as PowerPoint plays them, moved on from Nida or a presentation clicker, with its notes
+  - [Moving it on](26-presentations.md#moving-it-on) — ◀ ▶, PageDown / PageUp and B, black and white
+  - [It stays up](26-presentations.md#it-stays-up) — a show ended in PowerPoint comes back; kept with the show
+  - [Over the API](26-presentations.md#over-the-api) — `PresentationGo`, `presentation` in the state
 
 Parts III–VI are the engine underneath, from Varda, with Nida's additions.
 

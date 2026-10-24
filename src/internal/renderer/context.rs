@@ -1441,6 +1441,11 @@ impl OutputWindow {
         self.screen.as_ref()
     }
 
+    /// The display the window is on (a `CGDirectDisplayID`), as last read.
+    pub fn display_id(&self) -> Option<u32> {
+        self.display_id
+    }
+
     /// What the window is, for reading its steps in a present trace.
     pub fn trace_info(&self) -> super::present_trace::OutputInfo {
         super::present_trace::OutputInfo {

@@ -549,6 +549,104 @@ mod tests {
         assert!(!took, "a space in a name is a space");
     }
 
+    /// A key learned for a parameter — a layer's opacity, a mute — acts on
+    /// its own, but typed into a text field it is a letter, nothing more.
+    #[test]
+    fn a_learned_key_typed_into_a_text_field_changes_nothing() {
+        use crate::keymap::{KeyCombo, KeyTarget};
+        let mut data = main_mode();
+        let m = KeyCombo {
+            key: "M".into(),
+            command: false,
+            shift: false,
+            alt: false,
+        };
+        data.keymap_bindings
+            .insert(m, KeyTarget::ParamPath("ch/0/opacity".into()));
+        let data = std::rc::Rc::new(data);
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1920.0, 1080.0))
+            .build_ui_state(
+                move |ui, state: &mut (UIActions, String)| {
+                    let frame = super::super::render_ui(ui, &data);
+                    state.0.commands.extend(frame.commands);
+                    egui::Area::new(egui::Id::new("typing_test"))
+                        .fixed_pos(egui::pos2(900.0, 500.0))
+                        .order(egui::Order::Foreground)
+                        .show(ui.ctx(), |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut state.1).hint_text("typing here"),
+                            );
+                        });
+                },
+                (UIActions::new(), String::new()),
+            );
+        let toggles = |h: &egui_kittest::Harness<'_, (UIActions, String)>| {
+            let commands = &h.state().0.commands;
+            let toggle = |c: &&EngineCommand| matches!(c, EngineCommand::ToggleParam { .. });
+            commands.iter().filter(toggle).count()
+        };
+        h.run();
+        h.key_press(egui::Key::M);
+        h.run();
+        assert_eq!(toggles(&h), 1, "the learned key acts");
+        h.get_all_by_role(egui::accesskit::Role::TextInput)
+            .last()
+            .expect("the test's text field, drawn last")
+            .click();
+        h.run();
+        h.key_press(egui::Key::M);
+        h.run();
+        assert_eq!(toggles(&h), 1, "an M in a name is an M");
+    }
+
+    /// Enter finishing a name is the name's, even when Enter is learned for a
+    /// parameter: the field lets go of the keyboard as the Enter arrives,
+    /// while the panels draw — before the keymap is looked at.
+    #[test]
+    fn the_enter_that_finishes_a_name_changes_nothing() {
+        use crate::keymap::{KeyCombo, KeyTarget};
+        let mut data = main_mode();
+        let enter = KeyCombo {
+            key: "Enter".into(),
+            command: false,
+            shift: false,
+            alt: false,
+        };
+        data.keymap_bindings
+            .insert(enter, KeyTarget::ParamPath("ch/0/opacity".into()));
+        let ch = data.channels[0].clone();
+        let name = ch.name.clone();
+        let data = std::rc::Rc::new(data);
+        let mut opened = false;
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1920.0, 1080.0))
+            .build_ui_state(
+                move |ui, actions: &mut UIActions| {
+                    if !opened {
+                        super::super::rename::open(ui.ctx(), &ch);
+                        opened = true;
+                    }
+                    let frame = super::super::render_ui(ui, &data);
+                    actions.commands.extend(frame.commands);
+                },
+                UIActions::new(),
+            );
+        h.run();
+        h.get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|field| field.value().as_deref() == Some(name.as_str()))
+            .expect("the name being changed")
+            .type_text("Slides");
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        let commands = &h.state().commands;
+        let renamed = |c: &EngineCommand| matches!(c, EngineCommand::RenameChannel { .. });
+        assert!(commands.iter().any(renamed), "the Enter reached the name");
+        let toggled = |c: &EngineCommand| matches!(c, EngineCommand::ToggleParam { .. });
+        assert!(!commands.iter().any(toggled), "and was the name's alone");
+    }
+
     #[test]
     fn the_keys_do_nothing_in_the_layered_mix() {
         let mut data = main_mode();

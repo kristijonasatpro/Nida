@@ -542,6 +542,73 @@ fn arming_from_a_stop_rolls_the_transport() {
     assert!(transport.record_armed);
 }
 
+/// An overlay whose channel a curve holds at 0 is not showing, whatever its
+/// stored fader: Program's transport must not drive what cannot be seen.
+#[test]
+fn an_overlay_a_curve_fades_out_is_not_showing() {
+    use varda::mixer::MixMode;
+    use varda::modulation::Breakpoint;
+    let Some((mut app, _deck)) = app_with_one_region(0.0, 30.0) else {
+        return;
+    };
+    let ch = channel_uuid(&mut app, 0);
+    fire(
+        &mut app,
+        EngineCommand::SetMixMode {
+            mode: MixMode::Program,
+        },
+    );
+    fire(
+        &mut app,
+        EngineCommand::SetChannelOverlay {
+            channel_uuid: ch.clone(),
+            overlay: true,
+        },
+    );
+    fire(
+        &mut app,
+        EngineCommand::SetOverlayOn {
+            channel_uuid: ch.clone(),
+            on: true,
+            fade: false,
+        },
+    );
+    step(&mut app);
+    assert!(
+        app.build_engine_state()
+            .mixer
+            .main
+            .overlays_showing
+            .contains(&ch),
+        "precondition: showing before the curve"
+    );
+    let envelope = new_uuid(send_cmd(
+        &mut app,
+        EngineCommand::AddAutomationLane {
+            target: varda::arrangement::channel_opacity_param_key(&ch),
+            timebase: Timebase::Transport,
+        },
+    ));
+    fire(
+        &mut app,
+        EngineCommand::SetEnvelopeBreakpoints {
+            uuid: envelope,
+            breakpoints: vec![Breakpoint::new(0.0, 0.0), Breakpoint::new(10.0, 0.0)],
+        },
+    );
+    run_from(&mut app, 5.0);
+    assert!(
+        app.mixer_ref().channel_opacity(0) < 1e-4,
+        "precondition: the curve holds it at 0"
+    );
+    assert!(
+        (app.mixer_ref().channels()[0].opacity - 1.0).abs() < 1e-4,
+        "precondition: its stored fader up"
+    );
+    let showing = app.build_engine_state().mixer.main.overlays_showing;
+    assert!(!showing.contains(&ch), "{showing:?}");
+}
+
 /// A channel fader is among the most-played controls in a show, so a curve on
 /// it has to reach the composite. The stored fader position is left alone, the
 /// way every modulated parameter but a deck's opacity works.

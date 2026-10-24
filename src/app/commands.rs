@@ -607,6 +607,32 @@ impl VardaApp {
             EngineCommand::SetAudioBusGain { uuid, gain_db } => {
                 self.cmd_edit_audio_bus(&uuid, |b| b.gain_db = gain_db)
             }
+            EngineCommand::SetAudioBusCompressor { uuid, config } => {
+                self.cmd_set_audio_compressor(&uuid, true, config)
+            }
+            EngineCommand::ResetAudioMeter { uuid, bus } => {
+                self.audio_mix.reset_meter(&uuid, bus);
+                CommandResult::Ok
+            }
+            EngineCommand::ResetAudioLoudness { uuid } => {
+                self.audio_mix.reset_loudness(&uuid);
+                CommandResult::Ok
+            }
+            EngineCommand::SetAudioSourceCompressor { uuid, config } => {
+                self.cmd_set_audio_compressor(&uuid, false, config)
+            }
+            EngineCommand::SetAudioSourceLowCut { uuid, config } => self.cmd_set_audio_processing(
+                &uuid,
+                super::state::audio_mix::AudioProcessing::LowCut(config),
+            ),
+            EngineCommand::SetAudioSourceLeveler { uuid, config } => self.cmd_set_audio_processing(
+                &uuid,
+                super::state::audio_mix::AudioProcessing::Leveler(config),
+            ),
+            EngineCommand::SetAudioBusLimiter { uuid, config } => self.cmd_set_audio_processing(
+                &uuid,
+                super::state::audio_mix::AudioProcessing::Limiter(config),
+            ),
             EngineCommand::SetAudioBusMute { uuid, muted } => {
                 self.cmd_edit_audio_bus(&uuid, |b| b.muted = muted)
             }
@@ -627,7 +653,11 @@ impl VardaApp {
                 left,
                 right,
             } => self.cmd_add_audio_input(&name, &device, left, right),
-            EngineCommand::AddAppSound { app, name } => self.cmd_add_app_sound(&app, &name),
+            EngineCommand::AddAppSound {
+                app,
+                name,
+                deck_uuid,
+            } => self.cmd_add_app_sound(&app, &name, deck_uuid.as_deref()),
             EngineCommand::RemoveAudioInput { uuid } => self.cmd_remove_audio_input(&uuid),
             EngineCommand::SetAudioSourceGain { uuid, gain_db } => {
                 self.cmd_edit_audio_source(&uuid, |s| s.gain_db = gain_db)
@@ -1037,6 +1067,40 @@ impl VardaApp {
             } => wire(self.edit_timer(&deck_uuid, |timer| timer.set_settings(settings))),
             EngineCommand::ControlTimer { deck_uuid, action } => {
                 wire(self.edit_timer(&deck_uuid, |timer| timer.control(action)))
+            }
+
+            // ── PowerPoint ────────────────────────────────────
+            EngineCommand::AddPresentationDeck { channel_uuid, path } => {
+                wire_id(self.add_presentation_deck(&channel_uuid, &path))
+            }
+            EngineCommand::PresentationGo { deck_uuid, to } => {
+                wire(self.presentation_go(deck_uuid.as_deref(), to))
+            }
+            EngineCommand::PresentationVideo { deck_uuid, control } => {
+                wire(self.presentation_video(deck_uuid.as_deref(), control))
+            }
+            EngineCommand::SetPresentationScreen { deck_uuid, screen } => {
+                wire(self.presentation_screen(deck_uuid.as_deref(), screen, false))
+            }
+            EngineCommand::TogglePresentationScreen { deck_uuid, screen } => {
+                wire(self.presentation_screen(deck_uuid.as_deref(), screen, true))
+            }
+            EngineCommand::RestartPresentation { deck_uuid } => {
+                wire(self.restart_presentation(&deck_uuid))
+            }
+            EngineCommand::SetPresenterLayout { deck_uuid, layout } => {
+                wire(self.set_presenter_layout(&deck_uuid, layout))
+            }
+            EngineCommand::SetPresentationPlaysOn {
+                deck_uuid,
+                plays_on,
+            } => wire(self.set_presentation_plays_on(&deck_uuid, plays_on)),
+            EngineCommand::AddPresenterDeck {
+                channel_uuid,
+                deck_uuid,
+            } => wire_id(self.add_presenter_deck(&channel_uuid, &deck_uuid)),
+            EngineCommand::RestartPresenterClock { deck_uuid } => {
+                wire(self.restart_presenter_clock(&deck_uuid))
             }
 
             // ── Deck Auto-Transitions ─────────────────────────
@@ -2098,6 +2162,10 @@ impl VardaApp {
                 self.set_control_screen_rate(on);
                 CommandResult::Ok
             }
+            EngineCommand::SetNightShiftOff { on } => {
+                self.set_night_shift_off(on);
+                CommandResult::Ok
+            }
             EngineCommand::SetControlVsync { on } => {
                 self.set_control_vsync(on);
                 CommandResult::Ok
@@ -2208,7 +2276,8 @@ impl VardaApp {
 
             // ── System ────────────────────────────────────────────
             EngineCommand::Shutdown => {
-                self.shutdown_requested = true;
+                self.shutdown_requested
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 CommandResult::Ok
             }
         }
@@ -2249,6 +2318,13 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::RemoveAudioBus { .. }
             | C::RenameAudioBus { .. }
             | C::SetAudioBusGain { .. }
+            | C::SetAudioBusCompressor { .. }
+            | C::ResetAudioMeter { .. }
+            | C::ResetAudioLoudness { .. }
+            | C::SetAudioSourceCompressor { .. }
+            | C::SetAudioSourceLowCut { .. }
+            | C::SetAudioSourceLeveler { .. }
+            | C::SetAudioBusLimiter { .. }
             | C::SetAudioBusMute { .. }
             | C::SetAudioBusDelay { .. }
             | C::SetAudioBusDevice { .. }
@@ -2317,6 +2393,13 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::ShowPlaylistItem { .. }
             // Starting and stopping a timer is live, like a clip's transport.
             | C::ControlTimer { .. }
+            // A PowerPoint show's steps are live, like a playlist's.
+            | C::PresentationGo { .. }
+            | C::PresentationVideo { .. }
+            | C::SetPresentationScreen { .. }
+            | C::TogglePresentationScreen { .. }
+            | C::RestartPresentation { .. }
+            | C::RestartPresenterClock { .. }
             // ADSR live triggers.
             | C::TriggerAdsr { .. }
             | C::ReleaseAdsr { .. }
@@ -2422,6 +2505,7 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::SetFrameHold { .. }
             | C::SetControlVsync { .. }
             | C::SetControlScreenRate { .. }
+            | C::SetNightShiftOff { .. }
             | C::StartPerfProfile { .. }
             | C::TracePresents { .. }
             // Param toggle is a live keyboard/shortcut affordance (SetParam edits
