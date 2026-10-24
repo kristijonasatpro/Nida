@@ -1,4 +1,5 @@
-//! Blackmagic outputs: a DeckLink card or box — an UltraStudio Monitor 3G on
+//! Blackmagic video outputs on macOS and Windows: a DeckLink card or box —
+//! an UltraStudio Monitor 3G on
 //! Thunderbolt — as one more screen for the show, beside the two a laptop
 //! drives itself (an M1 Pro, two). Its picture goes out on HDMI and SDI at
 //! once, in one of the device's own video formats (1080p60 …).
@@ -16,6 +17,12 @@
 //! Blackmagic's licence, as OBS ships them).
 
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
+
+#[cfg(any(not(target_os = "macos"), test))]
+mod convert;
+
+mod audio;
+pub use audio::AudioInput;
 
 /// One of a device's video formats.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -190,11 +197,22 @@ impl Converter {
 
     /// Convert `rgba`, `width`×`height` at 4 bytes a pixel, into `uyvy`, at 2.
     pub(crate) fn run(&mut self, rgba: &[u8], uyvy: &mut [u8]) -> Result<(), String> {
-        let pixels = self.width as usize * self.height as usize;
-        if rgba.len() < pixels * 4 || uyvy.len() < pixels * 2 {
+        if self.width == 0 || !self.width.is_multiple_of(2) || self.height == 0 {
+            return Err("DeckLink UYVY needs a nonzero picture with an even width".into());
+        }
+        let bytes = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|p| p.checked_mul(4))
+            .ok_or_else(|| "a picture too large".to_string())?;
+        if rgba.len() < bytes || uyvy.len() < bytes / 2 {
             return Err(format!("a picture not {}×{}", self.width, self.height));
         }
-        self.inner.run(rgba, uyvy, self.width, self.height)
+        self.inner.run(
+            &rgba[..bytes],
+            &mut uyvy[..bytes / 2],
+            self.width,
+            self.height,
+        )
     }
 }
 
@@ -349,6 +367,7 @@ fn run_on_time(
 
 /// The CPU time the calling thread has had: against how long a step took,
 /// the work in it, not the waiting.
+#[cfg(unix)]
 fn thread_cpu() -> std::time::Duration {
     let mut at = libc::timespec {
         tv_sec: 0,
@@ -362,6 +381,11 @@ fn thread_cpu() -> std::time::Duration {
         u64::try_from(at.tv_sec).unwrap_or(0),
         u32::try_from(at.tv_nsec).unwrap_or(0),
     )
+}
+
+#[cfg(not(unix))]
+fn thread_cpu() -> std::time::Duration {
+    std::time::Duration::ZERO
 }
 
 struct Shared {
@@ -410,6 +434,21 @@ impl DeckLinkSender {
     ///
     /// When there is no such device or format.
     pub fn start(name: &str, device: &str, mode: &str, full_range: bool) -> anyhow::Result<Self> {
+        Self::start_audio(name, device, mode, full_range, None)
+    }
+
+    /// Start a Blackmagic output with an optional post-mix stereo audio tap.
+    ///
+    /// # Errors
+    ///
+    /// When the selected device or mode is absent, or an output worker fails.
+    pub fn start_audio(
+        name: &str,
+        device: &str,
+        mode: &str,
+        full_range: bool,
+        audio: Option<AudioInput>,
+    ) -> anyhow::Result<Self> {
         let find =
             |devices: Vec<DeckLinkDevice>| devices.into_iter().find(|d| d.name == device);
         // As last copied, at once; else as discovery has it this moment — a
@@ -434,7 +473,7 @@ impl DeckLinkSender {
             let held = hold_device(&device, arrival, DEVICE_FREED_WITHIN)?;
             *ours.lock().unwrap_or_else(PoisonError::into_inner) =
                 Some((held.device.clone(), held.token));
-            let screen = sdk::open(arrival, code, width, height)?;
+            let screen = sdk::open_audio(arrival, code, width, height, audio)?;
             Ok(Box::new(Held {
                 screen,
                 _held: held,
@@ -934,7 +973,7 @@ impl Told {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 mod sdk {
     use super::{DeckLinkDevice, DeckLinkMode, Screen};
     use std::ffi::{c_char, c_void, CStr};
@@ -961,7 +1000,9 @@ mod sdk {
 
     extern "C" {
         fn nida_dl_state(handle: *mut c_void, state: *mut State) -> i32;
+        #[cfg(target_os = "macos")]
         fn nida_dl_converter_new(height: i32, full: i32) -> *mut c_void;
+        #[cfg(target_os = "macos")]
         fn nida_dl_converter_run(
             converter: *mut c_void,
             rgba: *const u8,
@@ -971,14 +1012,28 @@ mod sdk {
             out: *mut u8,
             out_row_bytes: i32,
         ) -> i32;
+        #[cfg(target_os = "macos")]
         fn nida_dl_converter_free(converter: *mut c_void);
         fn nida_dl_api_version(buf: *mut c_char, len: i32) -> i32;
         fn nida_dl_all_device_count() -> i32;
         fn nida_dl_device_count() -> i32;
-        fn nida_dl_device_id(index: i32) -> u64;
-        fn nida_dl_device_name(index: i32, buf: *mut c_char, len: i32) -> i32;
-        fn nida_dl_device_modes(index: i32, modes: *mut Mode, max: i32) -> i32;
-        fn nida_dl_open(id: u64, mode: u32, err: *mut c_char, errlen: i32) -> *mut c_void;
+        fn nida_dl_device_snapshot(
+            index: i32,
+            id: *mut u64,
+            name: *mut c_char,
+            len: i32,
+            modes: *mut Mode,
+            max: i32,
+        ) -> i32;
+        fn nida_dl_open_with_audio(
+            id: u64,
+            mode: u32,
+            read: Option<extern "C" fn(*mut c_void, i64, u32, *mut i32)>,
+            context: *mut c_void,
+            err: *mut c_char,
+            errlen: i32,
+        ) -> *mut c_void;
+        fn nida_dl_audio_delay(handle: *mut c_void) -> u32;
         fn nida_dl_show(
             handle: *mut c_void,
             data: *const u8,
@@ -1014,14 +1069,8 @@ mod sdk {
         // SAFETY: no arguments; loads the API when there is one.
         let count = unsafe { nida_dl_device_count() };
         (0..count)
-            .map(|index| {
+            .filter_map(|index| {
                 let mut name = [0 as c_char; 256];
-                // SAFETY: a buffer of the length given.
-                unsafe { nida_dl_device_name(index, name.as_mut_ptr(), 256) };
-                // SAFETY: NUL-terminated by the shim (copied with a bound).
-                let name = unsafe { CStr::from_ptr(name.as_ptr()) }
-                    .to_string_lossy()
-                    .into_owned();
                 let mut modes: Vec<Mode> = (0..128)
                     .map(|_| Mode {
                         code: 0,
@@ -1032,8 +1081,25 @@ mod sdk {
                         name: [0; 64],
                     })
                     .collect();
-                // SAFETY: room for the 128 asked for.
-                let found = unsafe { nida_dl_device_modes(index, modes.as_mut_ptr(), 128) };
+                let mut arrival = 0;
+                // SAFETY: live scalar and name buffer, and room for 128 modes.
+                let found = unsafe {
+                    nida_dl_device_snapshot(
+                        index,
+                        &raw mut arrival,
+                        name.as_mut_ptr(),
+                        256,
+                        modes.as_mut_ptr(),
+                        128,
+                    )
+                };
+                if found < 0 || arrival == 0 {
+                    return None;
+                }
+                // SAFETY: NUL-terminated by the shim, copied with a bound.
+                let name = unsafe { CStr::from_ptr(name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
                 modes.truncate(usize::try_from(found).unwrap_or(0));
                 let modes = modes
                     .iter()
@@ -1053,19 +1119,18 @@ mod sdk {
                         code: m.code,
                     })
                     .collect();
-                // SAFETY: no pointers.
-                let arrival = unsafe { nida_dl_device_id(index) };
-                DeckLinkDevice {
+                Some(DeckLinkDevice {
                     name,
                     modes,
                     arrival,
-                }
+                })
             })
             .collect()
     }
 
     struct Device {
         handle: *mut c_void,
+        audio: Option<Box<std::sync::Mutex<super::audio::Pull>>>,
         width: i32,
         height: i32,
     }
@@ -1080,6 +1145,13 @@ mod sdk {
                 return Err(super::Refused::TooSmall);
             }
             let row = i32::try_from(row_bytes).map_err(|_| super::Refused::TooSmall)?;
+            if let Some(audio) = &self.audio {
+                // SAFETY: a live output handle, used only on its owning worker.
+                let delay = unsafe { nida_dl_audio_delay(self.handle) };
+                if let Ok(mut audio) = audio.lock() {
+                    audio.begin(std::time::Instant::now(), delay);
+                }
+            }
             // SAFETY: a picture of `height` lines of `row_bytes`.
             let shown =
                 unsafe { nida_dl_show(self.handle, uyvy.as_ptr(), row, self.width, self.height) };
@@ -1145,12 +1217,18 @@ mod sdk {
         format!("'{letters}'")
     }
 
+    #[cfg(target_os = "windows")]
+    pub(super) use super::convert::Converter;
+
     /// RGBA to '2vuy' with Apple's Accelerate (vImage), on the calling thread.
+    #[cfg(target_os = "macos")]
     pub(super) struct Converter(*mut c_void);
 
     // SAFETY: the conversion is used by one thread at a time: the output's.
+    #[cfg(target_os = "macos")]
     unsafe impl Send for Converter {}
 
+    #[cfg(target_os = "macos")]
     impl Converter {
         pub(super) fn new(height: u32, full_range: bool) -> Result<Self, String> {
             let height = i32::try_from(height).map_err(|e| e.to_string())?;
@@ -1189,6 +1267,7 @@ mod sdk {
         }
     }
 
+    #[cfg(target_os = "macos")]
     impl Drop for Converter {
         fn drop(&mut self) {
             // SAFETY: made by `nida_dl_converter_new`, freed once.
@@ -1198,20 +1277,49 @@ mod sdk {
 
     impl Drop for Device {
         fn drop(&mut self) {
-            // SAFETY: opened by `nida_dl_open`, closed once.
+            // SAFETY: opened by `nida_dl_open_with_audio`, closed once.
             unsafe { nida_dl_close(self.handle) };
         }
     }
 
-    pub(super) fn open(
+    extern "C" fn read_audio(context: *mut c_void, frame: i64, frames: u32, out: *mut i32) {
+        // SAFETY: the SDK shim calls with fixed storage for at most 2048 stereo
+        // frames. close stops callbacks before Device drops the boxed mutex.
+        let output = unsafe { std::slice::from_raw_parts_mut(out, frames as usize * 2) };
+        let state = unsafe { &*context.cast::<std::sync::Mutex<super::audio::Pull>>() };
+        if let Ok(mut audio) = state.lock() {
+            audio.read(frame, output);
+        } else {
+            output.fill(0);
+        }
+    }
+
+    pub(super) fn open_audio(
         arrival: u64,
         code: u32,
         width: u32,
         height: u32,
+        audio: Option<super::AudioInput>,
     ) -> Result<Box<dyn Screen>, String> {
+        let width = i32::try_from(width).map_err(|e| e.to_string())?;
+        let height = i32::try_from(height).map_err(|e| e.to_string())?;
+        let mut audio =
+            audio.map(|input| Box::new(std::sync::Mutex::new(super::audio::Pull::new(input))));
+        let context = audio.as_deref_mut().map_or(std::ptr::null_mut(), |state| {
+            std::ptr::from_mut(state).cast::<c_void>()
+        });
         let mut err = [0 as c_char; 256];
         // SAFETY: a buffer of the length given.
-        let handle = unsafe { nida_dl_open(arrival, code, err.as_mut_ptr(), 256) };
+        let handle = unsafe {
+            nida_dl_open_with_audio(
+                arrival,
+                code,
+                audio.as_ref().map(|_| read_audio as extern "C" fn(*mut c_void, i64, u32, *mut i32)),
+                context,
+                err.as_mut_ptr(),
+                256,
+            )
+        };
         if handle.is_null() {
             // SAFETY: NUL-terminated by the shim.
             return Err(unsafe { CStr::from_ptr(err.as_ptr()) }
@@ -1220,14 +1328,15 @@ mod sdk {
         }
         let device = Device {
             handle,
-            width: i32::try_from(width).map_err(|e| e.to_string())?,
-            height: i32::try_from(height).map_err(|e| e.to_string())?,
+            audio,
+            width,
+            height,
         };
         Ok(Box::new(device))
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod sdk {
     use super::{DeckLinkDevice, Screen};
 
@@ -1243,34 +1352,16 @@ mod sdk {
         Vec::new()
     }
 
-    /// RGBA to '2vuy' with Nida's own loop: video range only.
-    pub(super) struct Converter;
+    pub(super) use super::convert::Converter;
 
-    impl Converter {
-        pub(super) fn new(_height: u32, _full_range: bool) -> Result<Self, String> {
-            Ok(Self)
-        }
-
-        #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
-        pub(super) fn run(
-            &mut self,
-            rgba: &[u8],
-            uyvy: &mut [u8],
-            width: u32,
-            height: u32,
-        ) -> Result<(), String> {
-            crate::ndi::rgba_to_uyvy(rgba, uyvy, width, height);
-            Ok(())
-        }
-    }
-
-    pub(super) fn open(
+    pub(super) fn open_audio(
         _arrival: u64,
         _code: u32,
         _width: u32,
         _height: u32,
+        _audio: Option<super::AudioInput>,
     ) -> Result<Box<dyn Screen>, String> {
-        Err("Blackmagic outputs are made on a Mac".into())
+        Err("Blackmagic outputs require macOS or Windows".into())
     }
 }
 
@@ -1559,6 +1650,52 @@ mod tests {
         assert!((126..=130).contains(&grey), "grey at {grey}");
     }
 
+    #[test]
+    fn conversion_checks_dimensions_and_preserves_buffer_tails() {
+        let mut converter = Converter::new(4, 2, true).unwrap();
+        assert!(converter.run(&[0; 31], &mut [0; 16]).is_err());
+        assert!(converter.run(&[0; 32], &mut [0; 15]).is_err());
+        for (width, height) in [(0, 2), (3, 2), (4, 0)] {
+            assert!(Converter::new(width, height, true)
+                .unwrap()
+                .run(&[0; 32], &mut [0; 16])
+                .is_err());
+        }
+        let mut out = [99; 20];
+        converter.run(&[255; 40], &mut out).unwrap();
+        assert_eq!(&out[16..], &[99; 4]);
+        assert_eq!(out[1], 254);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn portable_full_range_matches_accelerate_for_colour_patches() {
+        for height in [576, 1080] {
+            let patches = [
+                [0, 0, 0, 255],
+                [255; 4],
+                [255, 0, 0, 255],
+                [0, 255, 0, 255],
+                [0, 0, 255, 255],
+                [128, 128, 128, 255],
+            ];
+            let rgba = patches.concat().repeat(height as usize);
+            let mut ours = vec![0; 12 * height as usize];
+            let mut theirs = vec![0; ours.len()];
+            convert::Converter::new(height, true)
+                .unwrap()
+                .run(&rgba, &mut ours, 6, height)
+                .unwrap();
+            Converter::new(6, height, true)
+                .unwrap()
+                .run(&rgba, &mut theirs)
+                .unwrap();
+            for (a, b) in ours.iter().zip(theirs) {
+                assert!(a.abs_diff(b) <= 1, "portable {a}, Accelerate {b}");
+            }
+        }
+    }
+
     /// A running output's levels change with the next picture.
     #[test]
     fn levels_change_with_the_next_picture() {
@@ -1584,15 +1721,17 @@ mod tests {
             .map(|i| u8::try_from(i % 251).unwrap_or(0))
             .collect();
         let mut uyvy = vec![0u8; 1920 * 1080 * 2];
-        let mut converter = Converter::new(1920, 1080, false).expect("made");
-        converter.run(&rgba, &mut uyvy).expect("converted");
-        let runs = 100;
-        let started = std::time::Instant::now();
-        for _ in 0..runs {
+        for full_range in [false, true] {
+            let mut converter = Converter::new(1920, 1080, full_range).expect("made");
             converter.run(&rgba, &mut uyvy).expect("converted");
+            let runs = 100;
+            let started = std::time::Instant::now();
+            for _ in 0..runs {
+                converter.run(&rgba, &mut uyvy).expect("converted");
+            }
+            let each = started.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
+            println!("1080p RGBA → 2vuy (full={full_range}): {each:.2} ms each");
         }
-        let each = started.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
-        println!("1080p RGBA → 2vuy: {each:.2} ms each");
     }
 
     /// Stopping an output does not wait for its device — busy putting a
@@ -1856,7 +1995,7 @@ mod tests {
     /// are none, at once.
     #[test]
     fn without_desktop_video_there_are_no_devices() {
-        if std::path::Path::new("/Library/Frameworks/DeckLinkAPI.framework").exists() {
+        if sdk::api_version().is_some() {
             return;
         }
         assert!(devices().is_empty());

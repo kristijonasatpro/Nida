@@ -1,6 +1,6 @@
 // A small C face on Blackmagic's DeckLink API for Nida's Blackmagic outputs
-// (see mod.rs). The API is loaded at run time from the DeckLinkAPI framework
-// Desktop Video installs (DeckLinkAPIDispatch.cpp): without it there are
+// (see mod.rs). Desktop Video supplies the API at runtime: COM on Windows,
+// DeckLinkAPI.framework on macOS (DeckLinkAPIDispatch.cpp). Without it there are
 // simply no devices.
 //
 // Devices are known through the API's discovery, which says when one arrives
@@ -11,18 +11,23 @@
 // hour (a connection torn down under a dispatch source still watching it —
 // libdispatch's "kevent vanished", 2026-10-04 and -05).
 
-#include <Accelerate/Accelerate.h>
-#include <CoreFoundation/CFPlugInCOM.h>
-#include <CoreFoundation/CoreFoundation.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
 
-#include "DeckLinkAPI.h"
+#ifndef NIDA_DECKLINK_PLATFORM_HEADER
+#define NIDA_DECKLINK_PLATFORM_HEADER "platform.hpp"
+#endif
+#include NIDA_DECKLINK_PLATFORM_HEADER
+#include "scheduled.hpp"
 
 extern "C" {
+
+void nida_dl_close(void* handle);
 
 struct nida_dl_mode {
     uint32_t code;
@@ -36,16 +41,6 @@ struct nida_dl_mode {
 }  // extern "C"
 
 namespace {
-
-void copy_cfstring(CFStringRef text, char* buf, int32_t len) {
-    if (len <= 0) {
-        return;
-    }
-    buf[0] = 0;
-    if (text != nullptr) {
-        CFStringGetCString(text, buf, len, kCFStringEncodingUTF8);
-    }
-}
 
 // A device as discovery gave it: kept (one reference) until it goes.
 struct Known {
@@ -67,11 +62,11 @@ uint64_t g_next_id = 1;
 
 std::string name_of(IDeckLink* device) {
     char buf[256];
-    copy_cfstring(nullptr, buf, sizeof(buf));
-    CFStringRef name = nullptr;
+    copy_dlstring(nullptr, buf, sizeof(buf));
+    DlString name = nullptr;
     if (device->GetDisplayName(&name) == S_OK && name != nullptr) {
-        copy_cfstring(name, buf, sizeof(buf));
-        CFRelease(name);
+        copy_dlstring(name, buf, sizeof(buf));
+        free_dlstring(name);
     }
     return std::string(buf);
 }
@@ -84,7 +79,7 @@ std::vector<nida_dl_mode> modes_of(IDeckLinkOutput* output) {
     }
     IDeckLinkDisplayMode* mode = nullptr;
     while (iterator->Next(&mode) == S_OK) {
-        bool supported = false;
+        DlSupported supported = false;
         BMDDisplayMode code = mode->GetDisplayMode();
         if (output->DoesSupportVideoMode(bmdVideoConnectionUnspecified, code, bmdFormat8BitYUV,
                                          bmdNoVideoOutputConversion, bmdSupportedVideoModeDefault, nullptr,
@@ -99,10 +94,10 @@ std::vector<nida_dl_mode> modes_of(IDeckLinkOutput* output) {
             mode->GetFrameRate(&duration, &scale);
             out.frame_duration = duration;
             out.time_scale = scale;
-            CFStringRef name = nullptr;
+            DlString name = nullptr;
             if (mode->GetName(&name) == S_OK && name != nullptr) {
-                copy_cfstring(name, out.name, sizeof(out.name));
-                CFRelease(name);
+                copy_dlstring(name, out.name, sizeof(out.name));
+                free_dlstring(name);
             }
             modes.push_back(out);
         }
@@ -115,7 +110,7 @@ std::vector<nida_dl_mode> modes_of(IDeckLinkOutput* output) {
 // What discovery tells: a device arrived, or went. On the API's own thread.
 class Notifications final : public IDeckLinkDeviceNotificationCallback {
 public:
-    HRESULT DeckLinkDeviceArrived(IDeckLink* device) override {
+    HRESULT NIDA_COM DeckLinkDeviceArrived(IDeckLink* device) override {
         if (device == nullptr) {
             return S_OK;
         }
@@ -134,7 +129,7 @@ public:
         return S_OK;
     }
 
-    HRESULT DeckLinkDeviceRemoved(IDeckLink* device) override {
+    HRESULT NIDA_COM DeckLinkDeviceRemoved(IDeckLink* device) override {
         IDeckLink* gone = nullptr;
         {
             std::lock_guard<std::mutex> lock(g_known_lock);
@@ -153,10 +148,9 @@ public:
         return S_OK;
     }
 
-    HRESULT QueryInterface(REFIID iid, LPVOID* ppv) override {
-        CFUUIDBytes unknown = CFUUIDGetUUIDBytes(IUnknownUUID);
-        if (std::memcmp(&iid, &unknown, sizeof(REFIID)) == 0 ||
-            std::memcmp(&iid, &IID_IDeckLinkDeviceNotificationCallback, sizeof(REFIID)) == 0) {
+    HRESULT NIDA_COM QueryInterface(REFIID iid, LPVOID* ppv) override {
+        if (ppv == nullptr) return E_POINTER;
+        if (dl_is_unknown(iid) || dl_same_iid(iid, IID_IDeckLinkDeviceNotificationCallback)) {
             *ppv = this;
             return S_OK;
         }
@@ -165,11 +159,11 @@ public:
     }
 
     // Lives as long as the process: counting is not needed.
-    ULONG AddRef() override { return 1; }
-    ULONG Release() override { return 1; }
+    ULONG NIDA_COM AddRef() override { return 1; }
+    ULONG NIDA_COM Release() override { return 1; }
 };
 
-Notifications g_notifications;
+Notifications& g_notifications = *new Notifications;
 IDeckLinkDiscovery* g_discovery = nullptr;
 std::once_flag g_discovery_started;
 
@@ -177,11 +171,13 @@ std::once_flag g_discovery_started;
 // at once.
 void discover() {
     std::call_once(g_discovery_started, [] {
-        g_discovery = CreateDeckLinkDiscoveryInstance();
-        if (g_discovery != nullptr && g_discovery->InstallDeviceNotifications(&g_notifications) != S_OK) {
-            g_discovery->Release();
-            g_discovery = nullptr;
-        }
+        dl_start_discovery([] {
+            g_discovery = dl_create_discovery();
+            if (g_discovery != nullptr && g_discovery->InstallDeviceNotifications(&g_notifications) != S_OK) {
+                g_discovery->Release();
+                g_discovery = nullptr;
+            }
+        });
     });
 }
 
@@ -209,6 +205,7 @@ struct Output {
     int32_t width;
     int32_t height;
     BMDDisplayMode mode;
+    Scheduled* scheduled;
 };
 
 }  // namespace
@@ -218,15 +215,15 @@ extern "C" {
 // Desktop Video's DeckLink API version ("16.4") into `buf`; 0 when it is
 // installed, -1 when not.
 int32_t nida_dl_api_version(char* buf, int32_t len) {
-    copy_cfstring(nullptr, buf, len);
-    IDeckLinkAPIInformation* info = CreateDeckLinkAPIInformationInstance();
+    copy_dlstring(nullptr, buf, len);
+    IDeckLinkAPIInformation* info = dl_create_api_information();
     if (info == nullptr) {
         return -1;
     }
-    CFStringRef version = nullptr;
+    DlString version = nullptr;
     if (info->GetString(BMDDeckLinkAPIVersion, &version) == S_OK && version != nullptr) {
-        copy_cfstring(version, buf, len);
-        CFRelease(version);
+        copy_dlstring(version, buf, len);
+        free_dlstring(version);
     }
     info->Release();
     return 0;
@@ -250,60 +247,33 @@ int32_t nida_dl_device_count(void) {
     return count;
 }
 
-// Output device `index`'s arrival number (see `Known::id`); 0 when none.
-uint64_t nida_dl_device_id(int32_t index) {
+// Copy one device's identity, name and modes under one discovery lock. A
+// removal between the count and this read skips the entry instead of mixing
+// one device's name/modes with another device's arrival identity.
+int32_t nida_dl_device_snapshot(int32_t index, uint64_t* id, char* name,
+                               int32_t len, nida_dl_mode* modes, int32_t max) {
+    if (id == nullptr || name == nullptr || modes == nullptr || len <= 0 || max < 0) return -1;
+    *id = 0;
+    name[0] = 0;
     discover();
     std::lock_guard<std::mutex> lock(g_known_lock);
     int32_t found = -1;
     for (const auto& known : g_known) {
         if (known.can_output && ++found == index) {
-            return known.id;
-        }
-    }
-    return 0;
-}
-
-// Output device `index`'s name, UTF-8, into `buf`; 0 when found.
-int32_t nida_dl_device_name(int32_t index, char* buf, int32_t len) {
-    discover();
-    std::lock_guard<std::mutex> lock(g_known_lock);
-    int32_t found = -1;
-    for (const auto& known : g_known) {
-        if (known.can_output && ++found == index) {
-            if (len > 0) {
-                std::strncpy(buf, known.name.c_str(), static_cast<size_t>(len) - 1);
-                buf[len - 1] = 0;
-            }
-            return 0;
-        }
-    }
-    copy_cfstring(nullptr, buf, len);
-    return -1;
-}
-
-// Up to `max` modes output device `index` can put out in 8-bit YUV; how many.
-int32_t nida_dl_device_modes(int32_t index, nida_dl_mode* modes, int32_t max) {
-    discover();
-    std::lock_guard<std::mutex> lock(g_known_lock);
-    int32_t found = -1;
-    for (const auto& known : g_known) {
-        if (known.can_output && ++found == index) {
-            int32_t count = 0;
-            for (const auto& mode : known.modes) {
-                if (count >= max) {
-                    break;
-                }
-                modes[count++] = mode;
-            }
+            *id = known.id;
+            std::strncpy(name, known.name.c_str(), static_cast<size_t>(len) - 1);
+            name[len - 1] = 0;
+            const int32_t count = std::min(max, static_cast<int32_t>(known.modes.size()));
+            std::copy_n(known.modes.begin(), count, modes);
             return count;
         }
     }
-    return 0;
+    return -1;
 }
 
 // Open the output device of arrival `id` in display mode `mode`, 8-bit YUV;
 // null on failure, why in `err`.
-void* nida_dl_open(uint64_t id, uint32_t mode, char* err, int32_t errlen) {
+void* nida_dl_open_with_audio(uint64_t id, uint32_t mode, AudioRead read, void* context, char* err, int32_t errlen) {
     auto fail = [&](const char* why) -> void* {
         if (errlen > 0) {
             std::strncpy(err, why, static_cast<size_t>(errlen) - 1);
@@ -311,6 +281,7 @@ void* nida_dl_open(uint64_t id, uint32_t mode, char* err, int32_t errlen) {
         }
         return nullptr;
     };
+    if (!dl_thread_ready()) return fail("could not initialize the Blackmagic output worker COM apartment");
     IDeckLink* device = output_device(id);
     if (device == nullptr) {
         return fail("the Blackmagic device is not connected (any more)");
@@ -321,16 +292,34 @@ void* nida_dl_open(uint64_t id, uint32_t mode, char* err, int32_t errlen) {
         device->Release();
         return fail("the device puts out no video");
     }
+    DlSupported supported = false;
+    if (output->DoesSupportVideoMode(bmdVideoConnectionUnspecified,
+            static_cast<BMDDisplayMode>(mode), bmdFormat8BitYUV,
+            bmdNoVideoOutputConversion, bmdSupportedVideoModeDefault,
+            nullptr, &supported) != S_OK || !supported) {
+        output->Release();
+        device->Release();
+        return fail("the device does not support 8-bit YUV in that video format");
+    }
     IDeckLinkDisplayMode* display = nullptr;
-    if (output->GetDisplayMode(mode, &display) != S_OK || display == nullptr) {
+    if (output->GetDisplayMode(static_cast<BMDDisplayMode>(mode), &display) != S_OK || display == nullptr) {
         output->Release();
         device->Release();
         return fail("the device has no such video format");
     }
     const int32_t width = static_cast<int32_t>(display->GetWidth());
     const int32_t height = static_cast<int32_t>(display->GetHeight());
+    BMDTimeValue duration = 0;
+    BMDTimeScale scale = 0;
+    display->GetFrameRate(&duration, &scale);
     display->Release();
-    if (output->EnableVideoOutput(mode, bmdVideoOutputFlagDefault) != S_OK) {
+    if (width <= 0 || height <= 0 || width % 2 != 0 ||
+        width > std::numeric_limits<int32_t>::max() / 4) {
+        output->Release();
+        device->Release();
+        return fail("the device returned an invalid video frame size");
+    }
+    if (output->EnableVideoOutput(static_cast<BMDDisplayMode>(mode), bmdVideoOutputFlagDefault) != S_OK) {
         output->Release();
         device->Release();
         return fail("the device would not start its video output (in use by another app?)");
@@ -339,7 +328,19 @@ void* nida_dl_open(uint64_t id, uint32_t mode, char* err, int32_t errlen) {
     if (device->QueryInterface(IID_IDeckLinkStatus, reinterpret_cast<void**>(&status)) != S_OK) {
         status = nullptr;
     }
-    auto* out = new Output{device, output, status, {nullptr, nullptr}, 0, width, height, mode};
+    auto* out = new Output{device, output, status, {nullptr, nullptr}, 0, width, height, static_cast<BMDDisplayMode>(mode), nullptr};
+    if (read != nullptr) {
+        if (duration <= 0 || scale <= 0 || duration > scale || scale > 1000000000) {
+            nida_dl_close(out);
+            return fail("the device returned an invalid audio/video clock");
+        }
+        out->scheduled = new Scheduled(output, width, height, duration, scale, read, context);
+        if (!out->scheduled->enable()) {
+            nida_dl_close(out);
+            return fail("the device would not start embedded 48 kHz stereo audio");
+        }
+        return out;
+    }
     for (auto& frame : out->frames) {
         if (output->CreateVideoFrame(width, height, width * 2, bmdFormat8BitYUV, bmdFrameFlagDefault, &frame) != S_OK) {
             frame = nullptr;
@@ -363,6 +364,16 @@ void* nida_dl_open(uint64_t id, uint32_t mode, char* err, int32_t errlen) {
     return out;
 }
 
+// The existing video-only entry point, also used by native lifecycle tests.
+void* nida_dl_open(uint64_t id, uint32_t mode, char* err, int32_t errlen) {
+    return nida_dl_open_with_audio(id, mode, nullptr, nullptr, err, errlen);
+}
+
+uint32_t nida_dl_audio_delay(void* handle) {
+    auto* out = static_cast<Output*>(handle);
+    return out != nullptr && out->scheduled != nullptr ? out->scheduled->source_delay : 0;
+}
+
 // Put one 8-bit YUV ('2vuy') picture up on the device at its next frame:
 // `row_bytes` per line, `width`×`height` as opened. 0 when shown.
 int32_t nida_dl_show(void* handle, const uint8_t* data, int32_t row_bytes, int32_t width, int32_t height) {
@@ -371,6 +382,7 @@ int32_t nida_dl_show(void* handle, const uint8_t* data, int32_t row_bytes, int32
         row_bytes < width * 2) {
         return -1;
     }
+    if (out->scheduled != nullptr) return out->scheduled->submit(data, row_bytes);
     IDeckLinkMutableVideoFrame* frame = out->frames[out->next];
     out->next ^= 1;
     void* bytes = nullptr;
@@ -408,10 +420,10 @@ int32_t nida_dl_state(void* handle, nida_dl_state* state) {
     state->mode = out->mode;
     IDeckLinkDisplayMode* display = nullptr;
     if (out->output->GetDisplayMode(out->mode, &display) == S_OK && display != nullptr) {
-        CFStringRef name = nullptr;
+        DlString name = nullptr;
         if (display->GetName(&name) == S_OK && name != nullptr) {
-            copy_cfstring(name, state->mode_name, sizeof(state->mode_name));
-            CFRelease(name);
+            copy_dlstring(name, state->mode_name, sizeof(state->mode_name));
+            free_dlstring(name);
         }
         BMDTimeValue duration = 0;
         BMDTimeScale scale = 0;
@@ -435,6 +447,7 @@ int32_t nida_dl_state(void* handle, nida_dl_state* state) {
     return 0;
 }
 
+#if defined(__APPLE__)
 // A converter from RGBA, as read back, to 8-bit 4:2:2 '2vuy' (Cb Y0 Cr Y1),
 // with the matrix of a picture `height` lines high: BT.709 from 720 lines,
 // else BT.601. Video range — Y 16–235 — unless `full`: then Y and C over the
@@ -479,10 +492,16 @@ void nida_dl_converter_free(void* converter) {
     delete static_cast<vImage_ARGBToYpCbCr*>(converter);
 }
 
+#endif  // __APPLE__
+
 void nida_dl_close(void* handle) {
     auto* out = static_cast<Output*>(handle);
     if (out == nullptr) {
         return;
+    }
+    if (out->scheduled != nullptr) {
+        out->scheduled->stop();
+        out->scheduled->Release();
     }
     out->output->DisableVideoOutput();
     for (auto* frame : out->frames) {

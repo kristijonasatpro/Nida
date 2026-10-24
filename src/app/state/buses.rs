@@ -432,6 +432,7 @@ impl VardaApp {
                     device: device.to_string(),
                     mode: format.name.clone(),
                     full_range: false,
+                    embedded_audio: false,
                 },
                 self.render_width,
                 self.render_height,

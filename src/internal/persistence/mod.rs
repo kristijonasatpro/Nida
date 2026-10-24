@@ -9,6 +9,9 @@
 pub mod presets;
 pub mod writer;
 
+#[cfg(test)]
+mod decklink_audio_tests;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -989,10 +992,12 @@ fn target_to_config(target: &OutputTarget) -> OutputTargetConfig {
             device,
             mode,
             full_range,
+            embedded_audio,
         } => OutputTargetConfig::DeckLink {
             device: device.clone(),
             mode: mode.clone(),
             full_range: *full_range,
+            embedded_audio: *embedded_audio,
         },
     }
 }
@@ -1093,10 +1098,12 @@ fn config_to_target(config: &OutputTargetConfig) -> OutputTarget {
             device,
             mode,
             full_range,
+            embedded_audio,
         } => OutputTarget::DeckLink {
             device: device.clone(),
             mode: mode.clone(),
             full_range: *full_range,
+            embedded_audio: *embedded_audio,
         },
     }
 }
@@ -2977,6 +2984,7 @@ mod tests {
             device: "UltraStudio Monitor 3G".into(),
             mode: "1080p60".into(),
             full_range: false,
+            embedded_audio: false,
         };
         let json = serde_json::to_string(&target_to_config(&target)).unwrap();
         assert_eq!(
@@ -2990,6 +2998,7 @@ mod tests {
             device: "UltraStudio Monitor 3G".into(),
             mode: "1080p60".into(),
             full_range: true,
+            embedded_audio: false,
         };
         let json = serde_json::to_string(&target_to_config(&full)).unwrap();
         assert!(json.contains(r#""full_range":true"#), "{json}");
@@ -3020,6 +3029,7 @@ mod tests {
             device: "UltraStudio Monitor 3G".into(),
             mode: "1080p60".into(),
             full_range: false,
+            embedded_audio: false,
         };
         let running = output_config(&make(blackmagic(), true));
         assert!(running.running);

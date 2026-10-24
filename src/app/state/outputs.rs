@@ -87,13 +87,14 @@ impl VardaApp {
                     // the output running on.
                     let levels_only = match (&h.target, &target) {
                         (
-                            OutputTarget::DeckLink { device, mode, .. },
+                            OutputTarget::DeckLink { device, mode, embedded_audio, .. },
                             OutputTarget::DeckLink {
                                 device: to_device,
                                 mode: to_mode,
+                                embedded_audio: to_audio,
                                 ..
                             },
-                        ) => device == to_device && mode == to_mode,
+                        ) => device == to_device && mode == to_mode && embedded_audio == to_audio,
                         _ => false,
                     };
                     if levels_only && h.active {
@@ -294,7 +295,7 @@ impl VardaApp {
             &self.audio_mix,
             &mut self.session.notifications,
             OutputAudio {
-                bus: audio_bus.as_deref(),
+                bus: target.mixer_audio_bus(audio_bus.as_deref()),
                 device: target.audio_device(),
             },
             &name,
@@ -405,17 +406,30 @@ impl VardaApp {
                 device,
                 mode,
                 full_range,
+                embedded_audio,
             } => {
-                // No ffmpeg subprocess and, for now, no sound: the device's
-                // own thread puts each picture up (see `crate::decklink`), at
-                // its format's size, the show scaled to it.
-                self.release_passthrough(passthrough);
-                return match crate::decklink::DeckLinkSender::start(&name, device, mode, *full_range) {
+                if *embedded_audio && audio_input.is_none() {
+                    self.release_passthrough(passthrough);
+                    return CommandResult::Err {
+                        code: ErrorCode::Unavailable,
+                        message: format!("Blackmagic output '{name}': selected audio bus is unavailable"),
+                    };
+                }
+                // Mixer-bus audio is already stereo at 48 kHz, after gain,
+                // mute and delay. Keep its subscription for health/teardown.
+                let audio = audio_input.map(|input| crate::decklink::AudioInput {
+                    receiver: input.rx,
+                    opened: input.started,
+                });
+                return match crate::decklink::DeckLinkSender::start_audio(
+                    &name, device, mode, *full_range, audio,
+                ) {
                     Ok(sender) => {
                         let device = &self.context.device;
                         if let Some(UnifiedOutput::Headless(h)) = self.output.outputs.get_mut(idx) {
                             h.resize(device, sender.width, sender.height);
                             h.decklink = Some(Box::new(sender));
+                            h.audio_pcm = passthrough.map(Box::new);
                             h.keep_running = true;
                             h.waiting_since = None;
                             h.active = true;
@@ -424,10 +438,13 @@ impl VardaApp {
                         log::info!("Blackmagic output '{name}' on {target}");
                         CommandResult::Ok
                     }
-                    Err(e) => CommandResult::Err {
-                        code: ErrorCode::Unavailable,
-                        message: format!("Blackmagic output '{name}': {e}"),
-                    },
+                    Err(e) => {
+                        self.release_passthrough(passthrough);
+                        CommandResult::Err {
+                            code: ErrorCode::Unavailable,
+                            message: format!("Blackmagic output '{name}': {e}"),
+                        }
+                    }
                 };
             }
             _ => {
@@ -1031,10 +1048,9 @@ impl VardaApp {
         }
     }
 
-    /// Choose the audio-mixer bus a recording, stream or NDI sender carries,
-    /// or none. An NDI sender changes over at once; a recording or stream the
-    /// next time it starts, since the encoder's audio input is fixed while it
-    /// runs.
+    /// Choose the audio-mixer bus an output carries, or none. On a stopped
+    /// Blackmagic output this explicitly opts in to embedded audio; loading a
+    /// saved bus does not. NDI changes live; other outputs take it on restart.
     pub fn cmd_set_output_audio_bus(
         &mut self,
         output_uuid: &str,
@@ -1054,6 +1070,17 @@ impl VardaApp {
         }
         match self.output.outputs.get_mut(idx) {
             Some(UnifiedOutput::Headless(h)) => {
+                if let OutputTarget::DeckLink { embedded_audio, .. } = &mut h.target {
+                    if h.active {
+                        return CommandResult::Err {
+                            code: ErrorCode::InvalidInput,
+                            message: "stop the Blackmagic output before changing embedded audio".into(),
+                        };
+                    }
+                    // This command is an explicit operator/API selection;
+                    // restoring a saved audio_bus never passes through here.
+                    *embedded_audio = bus.is_some();
+                }
                 h.audio_bus = bus;
                 CommandResult::Ok
             }
@@ -1317,6 +1344,7 @@ mod tests {
                 device: "Test Box".into(),
                 mode: "1080p60".into(),
                 full_range: false,
+                embedded_audio: false,
             },
             64,
             36,
@@ -1351,6 +1379,7 @@ mod tests {
                     device: "Test Box".into(),
                     mode: mode.into(),
                     full_range,
+                    embedded_audio: false,
                 },
             })
         };
@@ -1366,6 +1395,83 @@ mod tests {
         assert_eq!(state(&app), (true, true, true), "running on, at full levels");
         assert!(matches!(set(&mut app, "1080p50", true), CommandResult::Ok));
         assert_eq!(state(&app), (false, false, true), "another format stops it");
+    }
+
+    #[test]
+    fn blackmagic_audio_is_explicit_and_cannot_change_under_a_running_sender() {
+        use crate::engine::{CommandResult, ErrorCode};
+        use crate::renderer::context::{OutputTarget, UnifiedOutput};
+
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let uuid = running_blackmagic(&mut app);
+        let bus = app
+            .audio_mix
+            .default_bus()
+            .expect("default mixer bus")
+            .to_string();
+        assert!(matches!(
+            app.cmd_set_output_audio_bus(&uuid, Some(bus.clone())),
+            CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                ..
+            }
+        ));
+        let idx = app.resolve_output(&uuid).unwrap();
+        assert!(matches!(
+            app.cmd_set_output_target(
+                idx,
+                OutputTarget::DeckLink {
+                    device: "Test Box".into(),
+                    mode: "1080p60".into(),
+                    full_range: false,
+                    embedded_audio: true,
+                }
+            ),
+            CommandResult::Ok
+        ));
+        let UnifiedOutput::Headless(output) = &app.output.outputs[idx] else {
+            panic!("headless")
+        };
+        assert!(
+            !output.active && output.decklink.is_none(),
+            "audio changes require a fresh sender"
+        );
+        assert!(
+            matches!(
+                app.cmd_start_output(&uuid),
+                CommandResult::Err { code: ErrorCode::Unavailable, message }
+                    if message.contains("selected audio bus is unavailable")
+            ),
+            "explicit audio without a bus fails before opening the hardware"
+        );
+        assert!(matches!(
+            app.cmd_set_output_audio_bus(&uuid, Some(bus.clone())),
+            CommandResult::Ok
+        ));
+        let UnifiedOutput::Headless(output) = &app.output.outputs[idx] else {
+            panic!("headless")
+        };
+        assert_eq!(
+            output.target.mixer_audio_bus(output.audio_bus.as_deref()),
+            Some(bus.as_str())
+        );
+        assert!(matches!(
+            app.cmd_set_output_audio_bus(&uuid, None),
+            CommandResult::Ok
+        ));
+        let UnifiedOutput::Headless(output) = &app.output.outputs[idx] else {
+            panic!("headless")
+        };
+        assert!(matches!(
+            output.target,
+            OutputTarget::DeckLink {
+                embedded_audio: false,
+                ..
+            }
+        ));
+        assert_eq!(output.audio_bus, None);
     }
 
     /// An output without a window — a Blackmagic output, say — shows the

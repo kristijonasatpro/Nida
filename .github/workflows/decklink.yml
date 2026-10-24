@@ -1,0 +1,107 @@
+name: DeckLink backend
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/windows-decklink-output]
+    paths:
+      - 'src/internal/decklink/**'
+      - 'src/internal/ndi/mod.rs'
+      - 'src/internal/audio/mod.rs'
+      - 'src/engine/value/render.rs'
+      - 'src/engine/value/led.rs'
+      - 'src/engine/value/warp.rs'
+      - 'src/internal/scene/mod.rs'
+      - 'src/internal/persistence/**'
+      - 'src/app/state/outputs.rs'
+      - 'src/usecases/ui/panels/outputs.rs'
+      - 'vendor/decklink-sdk/**'
+      - 'tests/decklink-native/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'clippy.toml'
+      - '.github/workflows/decklink.yml'
+  pull_request:
+    paths:
+      - 'src/internal/decklink/**'
+      - 'src/internal/ndi/mod.rs'
+      - 'src/internal/audio/mod.rs'
+      - 'src/engine/value/render.rs'
+      - 'src/engine/value/led.rs'
+      - 'src/engine/value/warp.rs'
+      - 'src/internal/scene/mod.rs'
+      - 'src/internal/persistence/**'
+      - 'src/app/state/outputs.rs'
+      - 'src/usecases/ui/panels/outputs.rs'
+      - 'vendor/decklink-sdk/**'
+      - 'tests/decklink-native/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'clippy.toml'
+      - '.github/workflows/decklink.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  module:
+    name: DeckLink module (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Prepare exact DeckLink source harness
+        run: python tests/decklink-native/prepare.py "${{ runner.temp }}/nida-decklink-check"
+      - name: Check real Windows COM apartments and Unicode names
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tests/decklink-native/check-windows-platform.ps1
+      - name: Compile native SDK shim and run module tests
+        # Priority calls are no-ops in this harness, so their macOS integration
+        # check belongs to the full application suite instead.
+        run: cargo test --manifest-path "${{ runner.temp }}/nida-decklink-check/Cargo.toml" -- --test-threads=1 --skip an_outputs_threads_run_in_real_time
+      - name: Lint production module with repository policy
+        run: cargo clippy --manifest-path "${{ runner.temp }}/nida-decklink-check/Cargo.toml" --lib -- -D warnings
+      - name: Measure optimized video and full range conversion
+        run: cargo test --release --manifest-path "${{ runner.temp }}/nida-decklink-check/Cargo.toml" converting_1080p_is_quick -- --ignored --nocapture
+      - name: Check new Rust file formatting
+        if: always() && runner.os == 'Linux'
+        run: |
+          rustfmt --edition 2021 --check build.rs src/internal/decklink/convert.rs
+          rustfmt --edition 2021 --check src/internal/decklink/audio.rs
+          rustfmt --edition 2021 --check src/internal/persistence/decklink_audio_tests.rs
+      - name: Compile shared shim against behavioral SDK double
+        if: runner.os == 'Linux'
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -pthread -Itests/decklink-native tests/decklink-native/shim_test.cpp -o /tmp/nida-decklink-shim-test
+          /tmp/nida-decklink-shim-test
+          /tmp/nida-decklink-shim-test --missing-driver
+
+  application:
+    name: Application integration (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install application build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libvulkan-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libavdevice-dev libsrt-gnutls-dev libasound2-dev libv4l-dev libpipewire-0.3-dev libwayland-dev libxkbcommon-dev libx11-dev libxrandr-dev libxi-dev libgtk-3-dev
+      - name: Check application audio routing and output UI
+        run: cargo check --locked --lib --no-default-features --features screen-capture
