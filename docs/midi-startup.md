@@ -1,4 +1,13 @@
-# MIDI discovery during startup
+# Responsive startup and MIDI discovery
+
+The window displays a startup view once its GPU surface is ready, before
+constructing the engine and loading the show. It returns to the event loop
+between these phases, handles close/resize events during initialization, and
+restores the normal title and control view when the engine is ready. No saved
+show is overwritten if the window is closed before engine construction.
+
+This view does not draw before GPU initialization finishes or move all show
+loading to a worker. Headless startup continues directly without a UI phase.
 
 The application starts native MIDI discovery on a worker and polls its result
 without waiting. A slow driver no longer delays engine construction or the
