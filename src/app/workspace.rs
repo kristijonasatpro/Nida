@@ -32,6 +32,59 @@ impl WorkspaceLoad {
     }
 }
 
+/// Copy a show's file that did not load beside it — `scene.json` as
+/// `scene.not-loaded-<when>.json`, or `…-2.json` when one of that name is
+/// there (two loads within a second) — never over another. The copy's name.
+fn copy_unloaded(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::ErrorKind;
+    let (Some(stem), Some(ext)) = (
+        path.file_stem().and_then(|s| s.to_str()),
+        path.extension().and_then(|e| e.to_str()),
+    ) else {
+        return Err(std::io::Error::new(ErrorKind::InvalidInput, "no name"));
+    };
+    let when = chrono::Local::now().format("%Y-%m-%d-%H%M%S");
+    for n in 1..100 {
+        let name = if n == 1 {
+            format!("{stem}.not-loaded-{when}.{ext}")
+        } else {
+            format!("{stem}.not-loaded-{when}-{n}.{ext}")
+        };
+        let to = path.with_file_name(&name);
+        let mut copy = match std::fs::File::create_new(&to) {
+            Ok(copy) => copy,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let copied =
+            std::fs::File::open(path).and_then(|mut from| std::io::copy(&mut from, &mut copy));
+        if let Err(e) = copied {
+            drop(copy);
+            let _ = std::fs::remove_file(&to);
+            return Err(e);
+        }
+        return Ok(name);
+    }
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        "no free name",
+    ))
+}
+
+/// Whether `a` and `b` are the one file — by the file itself, so that a
+/// folder reached another way (a link, other capitals) is not taken for
+/// another; by name where that cannot be asked.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            return a.dev() == b.dev() && a.ino() == b.ino();
+        }
+    }
+    a == b
+}
+
 fn duration_config_to_spec(
     config: &crate::scene::DurationSpecConfig,
 ) -> crate::channel::DurationSpec {
@@ -205,6 +258,7 @@ impl VardaApp {
         scene.render_resolution_auto = self.render_auto;
         scene.frames_in_flight = (self.frames_in_flight != 1).then_some(self.frames_in_flight);
         scene.free_control_screen = !self.control_screen_rate();
+        scene.free_night_shift = !self.night_shift_off();
         files.push(ShowFile {
             key: "scene",
             label: "scene",
@@ -252,11 +306,18 @@ impl VardaApp {
             content: text(stage.to_json()),
         });
 
+        let (keymap, newer) = self.input.keymap.to_config().split();
         files.push(ShowFile {
             key: "keymap",
             label: "keymap",
             path: into.keymap_path(),
-            content: text(self.input.keymap.to_config().to_json()),
+            content: text(keymap.to_json()),
+        });
+        files.push(ShowFile {
+            key: "keymap-newer",
+            label: "later keys",
+            path: into.keymap_newer_path(),
+            content: text(newer.to_json()),
         });
         files.push(ShowFile {
             key: "osc",
@@ -265,12 +326,45 @@ impl VardaApp {
             content: text(self.input.osc_config.to_json()),
         });
 
+        files.retain(|file| {
+            let unwritable = &self.session.unwritable;
+            let keep = !unwritable.iter().any(|kept| same_file(kept, &file.path));
+            if !keep {
+                log::warn!(
+                    "{} not saved: it did not load, and no copy of it was kept",
+                    file.label
+                );
+            }
+            keep
+        });
         ShowSave {
             dir: into.varda_dir(),
             files,
             show: super::shows::name_of(into.root()),
             announce,
             then,
+        }
+    }
+
+    /// Keep a show's file that did not load: Nida carries on with what it
+    /// holds instead (the show open before, or nothing), and the next save —
+    /// Quit saves — would write that over it. A copy is kept beside it (see
+    /// [`copy_unloaded`]); one that cannot be made leaves the file not to be
+    /// written over at all. What to add to the error to say so.
+    fn keep_unloaded(&mut self, path: &std::path::Path) -> String {
+        match copy_unloaded(path) {
+            Ok(name) => {
+                log::warn!("{} did not load: kept as {name}", path.display());
+                format!(" (kept as {name})")
+            }
+            Err(e) => {
+                log::error!(
+                    "{} did not load, and no copy could be kept ({e}): not saved over",
+                    path.display()
+                );
+                self.session.unwritable.insert(path.to_path_buf());
+                format!(" (no copy could be kept: {e}; it is not saved over)")
+            }
         }
     }
 
@@ -298,6 +392,8 @@ impl VardaApp {
         // Loading a workspace replaces the live scene/stage, so the undo/redo
         // timeline (which references the previous state) must be cleared.
         self.session.history.clear();
+        // What may not be saved over is found afresh, by this load.
+        self.session.unwritable.clear();
         let mut loaded_layout: Option<UILayoutState> = None;
         let mut errors: Vec<String> = Vec::new();
         // Whether the bus bank now in place came from this load. Buses live in
@@ -359,9 +455,12 @@ impl VardaApp {
                     self.production_buses = if let Some(bus_configs) = prefs.buses {
                         let (bank, rejected) =
                             crate::bus::BusBank::from_configs_reporting(bus_configs);
-                        for reason in rejected {
-                            log::error!("Rejected bus on load: {reason}");
-                            errors.push(format!("stage: {reason}"));
+                        if !rejected.is_empty() {
+                            let kept = self.keep_unloaded(&self.session.workspace.stage_path());
+                            for reason in rejected {
+                                log::error!("Rejected bus on load: {reason}");
+                                errors.push(format!("stage: {reason}{kept}"));
+                            }
                         }
                         bank
                     } else {
@@ -423,7 +522,8 @@ impl VardaApp {
                 }
                 Err(e) => {
                     log::warn!("Failed to load stage: {e}");
-                    errors.push(format!("stage: {e}"));
+                    let kept = self.keep_unloaded(&self.session.workspace.stage_path());
+                    errors.push(format!("stage: {e}{kept}"));
                 }
             }
         }
@@ -451,6 +551,7 @@ impl VardaApp {
                     self.set_render_auto(scene_config.render_resolution_auto);
                     self.set_frames_in_flight(scene_config.frames_in_flight.unwrap_or(1));
                     self.set_control_screen_rate(!scene_config.free_control_screen);
+                    self.set_night_shift_off(!scene_config.free_night_shift);
                     match self.replace_scene(&scene_config) {
                         Ok(()) => {
                             scene_is_the_requested_one = true;
@@ -461,13 +562,15 @@ impl VardaApp {
                         }
                         Err(e) => {
                             log::error!("Failed to restore scene: {e}");
-                            errors.push(format!("scene: {e}"));
+                            let kept = self.keep_unloaded(&self.session.workspace.scene_path());
+                            errors.push(format!("scene: {e}{kept}"));
                         }
                     }
                 }
                 Err(e) => {
                     log::warn!("Failed to load scene file: {e}");
-                    errors.push(format!("scene: {e}"));
+                    let kept = self.keep_unloaded(&self.session.workspace.scene_path());
+                    errors.push(format!("scene: {e}{kept}"));
                 }
             }
         }
@@ -554,22 +657,38 @@ impl VardaApp {
                 }
                 Err(e) => {
                     log::warn!("Failed to load MIDI config: {e}");
-                    errors.push(format!("midi: {e}"));
+                    let kept = self.keep_unloaded(&self.session.workspace.midi_path());
+                    errors.push(format!("midi: {e}{kept}"));
                 }
             }
         }
-        // Load keyboard shortcuts
-        if self.session.workspace.has_keymap() {
-            match crate::keymap::KeymapConfig::load(self.session.workspace.keymap_path()) {
-                Ok(keymap_config) => {
-                    self.input.keymap.load_config(&keymap_config);
-                    log::info!("Loaded {} keyboard shortcuts", keymap_config.bindings.len());
+        // Load keyboard shortcuts: keymap.json, and the later actions' kept
+        // apart for an older Nida (see `KeymapConfig::split`).
+        let mut keymap: Option<crate::keymap::KeymapConfig> = None;
+        for path in [
+            self.session.workspace.keymap_path(),
+            self.session.workspace.keymap_newer_path(),
+        ] {
+            if !path.is_file() {
+                continue;
+            }
+            match crate::keymap::KeymapConfig::load(&path) {
+                Ok(read) => {
+                    keymap = Some(match keymap.take() {
+                        Some(first) => first.with(read),
+                        None => read,
+                    });
                 }
                 Err(e) => {
                     log::warn!("Failed to load keymap config: {e}");
-                    errors.push(format!("keymap: {e}"));
+                    let kept = self.keep_unloaded(&path);
+                    errors.push(format!("keymap: {e}{kept}"));
                 }
             }
+        }
+        if let Some(keymap_config) = keymap {
+            self.input.keymap.load_config(&keymap_config);
+            log::info!("Loaded {} keyboard shortcuts", keymap_config.bindings.len());
         }
         // Load OSC config (already loaded in new(), but refresh feedback targets on workspace load)
         if self.session.workspace.has_osc() {
@@ -593,7 +712,8 @@ impl VardaApp {
                 }
                 Err(e) => {
                     log::warn!("Failed to load OSC config: {e}");
-                    errors.push(format!("osc: {e}"));
+                    let kept = self.keep_unloaded(&self.session.workspace.osc_path());
+                    errors.push(format!("osc: {e}{kept}"));
                 }
             }
         }
@@ -923,7 +1043,8 @@ impl VardaApp {
                         }
                         // A failed replacement must not also destroy what was
                         // working: keep the running runtime if there was one,
-                        // and drop the deck only when there is nothing to keep.
+                        // and else the deck offline, as saved — dropped, the
+                        // show lost it at the next save.
                         Err(e) => {
                             if let Some(kept) = existing {
                                 warnings.push(format!(
@@ -932,11 +1053,18 @@ impl VardaApp {
                                 ));
                                 kept
                             } else {
-                                warnings.push(format!(
-                                    "Failed to restore deck '{}': {e}",
-                                    deck_config.name
+                                warnings.push(crate::persistence::offline_message(
+                                    &deck_config.name,
+                                    &e,
                                 ));
-                                continue;
+                                crate::channel::DeckSlot::new(crate::persistence::offline_deck(
+                                    deck_config,
+                                    &self.context,
+                                    &self.registry,
+                                    &e,
+                                    rw,
+                                    rh,
+                                ))
                             }
                         }
                     }
@@ -952,6 +1080,7 @@ impl VardaApp {
                 &mut ch.effects,
                 &ch_config.effects,
                 &self.context,
+                &self.registry,
                 self.context.compositing_format,
                 &mut warnings,
             );
@@ -1022,6 +1151,7 @@ impl VardaApp {
             self.mixer.master_effects_mut(),
             &target.master_effects,
             &self.context,
+            &self.registry,
             self.context.compositing_format,
             &mut warnings,
         );
@@ -1453,12 +1583,37 @@ impl VardaApp {
                 }
             }
         }
+        // A presenter view's layout, as an undo had it.
+        if let crate::scene::SourceConfig::Presenter { layout, .. } = &config.source {
+            if let Some(presenter) = slot.deck.presenter_mut() {
+                if presenter.layout() != layout.sanitized() {
+                    presenter.set_layout(*layout);
+                }
+            }
+        }
+        // A PowerPoint input's screen to play on (its file is its own, and
+        // its slide the show's: undo does not move the show back a slide).
+        if let crate::scene::SourceConfig::ScreenCapture {
+            presentation: Some(saved),
+            ..
+        } = &config.source
+        {
+            if let Some(live) = slot
+                .deck
+                .screen_capture
+                .as_mut()
+                .and_then(|s| s.presentation.as_mut())
+            {
+                live.plays_on.clone_from(&saved.plays_on);
+            }
+        }
 
         // Patch deck effects
         Self::diff_effects(
             &mut slot.deck.effects,
             &config.effects,
             context,
+            registry,
             context.compositing_format,
             &mut Vec::new(),
         );
@@ -1521,6 +1676,7 @@ impl VardaApp {
         effects: &mut Vec<crate::deck::Effect>,
         target: &[crate::scene::EffectConfig],
         context: &crate::renderer::GpuContext,
+        registry: &crate::registry::ShaderRegistry,
         target_format: wgpu::TextureFormat,
         warnings: &mut Vec<String>,
     ) {
@@ -1534,7 +1690,7 @@ impl VardaApp {
             // changed is rebuilt even though the identity is unchanged.
             let reusable = pool
                 .get(&cfg.uuid)
-                .is_some_and(|eff| eff.shader.file_path.as_deref().unwrap_or("") == cfg.path);
+                .is_some_and(|eff| eff.saved_path() == cfg.path);
             let existing = pool.remove(&cfg.uuid);
             if reusable {
                 let mut eff = existing.expect("checked present above");
@@ -1544,10 +1700,11 @@ impl VardaApp {
                 effects.push(eff);
                 continue;
             }
-            match crate::persistence::restore_effect(cfg, context, target_format) {
+            match crate::persistence::restore_effect(cfg, context, registry, target_format) {
                 Ok(eff) => effects.push(eff),
                 // As with decks: a failed rebuild must not also discard the
-                // effect that was working.
+                // effect that was working, and with nothing working it is
+                // kept offline, as saved.
                 Err(e) => match existing {
                     Some(kept) => {
                         warnings.push(format!(
@@ -1557,7 +1714,16 @@ impl VardaApp {
                         effects.push(kept);
                     }
                     None => {
-                        warnings.push(format!("Failed to restore effect '{}': {e}", cfg.path));
+                        match crate::persistence::offline_effect(cfg, context, target_format, &e) {
+                            Ok(eff) => {
+                                warnings.extend(crate::persistence::offline_effect_message(&eff));
+                                effects.push(eff);
+                            }
+                            Err(_) => {
+                                warnings
+                                    .push(format!("Failed to restore effect '{}': {e}", cfg.path));
+                            }
+                        }
                     }
                 },
             }
@@ -2078,6 +2244,44 @@ mod tests {
         // Nothing to say on the operator's screen: the API asked.
         app.flush_saves();
         assert!(!notices(&app).iter().any(|m| m.contains("saved")));
+    }
+
+    /// The later actions' keys are kept apart from keymap.json, which an
+    /// older Nida reads and saves over: they are there again when this Nida
+    /// opens the show.
+    #[test]
+    fn later_keys_outlast_an_older_nidas_save_of_the_keymap() {
+        use crate::keymap::{ActionId, KeyCombo, KeyTarget};
+        let tmp = TempDir::new().unwrap();
+        let Some(mut app) = headless_app_in(tmp.path()) else {
+            return;
+        };
+        let n = KeyCombo {
+            key: "N".into(),
+            command: false,
+            shift: false,
+            alt: false,
+        };
+        let next = KeyTarget::Action(ActionId::PresentationNext);
+        app.input.keymap.bindings.insert(n.clone(), next.clone());
+        app.save_workspace(&UILayoutState::default()).unwrap();
+        let varda = tmp.path().join(".varda");
+        let keymap = std::fs::read_to_string(varda.join("keymap.json")).unwrap();
+        assert!(!keymap.contains("Presentation"), "{keymap}");
+        let newer = std::fs::read_to_string(varda.join("keymap-newer.json")).unwrap();
+        assert!(newer.contains("PresentationNext"), "{newer}");
+
+        // An older Nida saves the show over: keymap.json its own.
+        std::fs::write(
+            varda.join("keymap.json"),
+            r#"{"version":1,"bindings":[{"key":"S","command":true,"target":{"Action":"Save"}}]}"#,
+        )
+        .unwrap();
+        let Some(mut app) = headless_app_in(tmp.path()) else {
+            return;
+        };
+        assert!(app.load_workspace().is_ok());
+        assert_eq!(app.input.keymap.bindings.get(&n), Some(&next));
     }
 
     /// One file that cannot be written: the window says which, an API save
@@ -3048,6 +3252,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,

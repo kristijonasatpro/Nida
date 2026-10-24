@@ -219,6 +219,8 @@ pub(crate) fn command_is_deck_add(cmd: &EngineCommand) -> bool {
             | EngineCommand::AddHtmlDeck { .. }
             | EngineCommand::AddPlaylistDeck { .. }
             | EngineCommand::AddTimerDeck { .. }
+            | EngineCommand::AddPresentationDeck { .. }
+            | EngineCommand::AddPresenterDeck { .. }
     )
 }
 
@@ -300,8 +302,16 @@ mod tests {
                 channel_uuid: ch(),
                 settings: None,
             },
+            EngineCommand::AddPresentationDeck {
+                channel_uuid: ch(),
+                path: "/talk.pptx".into(),
+            },
+            EngineCommand::AddPresenterDeck {
+                channel_uuid: ch(),
+                deck_uuid: "d1".into(),
+            },
         ];
-        assert_eq!(deck_adds.len(), 15, "expected 15 deck-add variants");
+        assert_eq!(deck_adds.len(), 17, "expected 17 deck-add variants");
         for cmd in &deck_adds {
             assert!(command_is_deck_add(cmd), "not recognized: {cmd:?}");
         }

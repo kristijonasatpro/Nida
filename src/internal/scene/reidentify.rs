@@ -47,8 +47,21 @@ pub fn channel(config: &mut ChannelConfig, taken: &dyn Fn(&str) -> bool) {
     }
     recipes(&mut config.modulation, &renames, taken);
 
+    let mut decks = Renames::new();
     for deck_config in &mut config.decks {
+        let old = deck_config.uuid.clone();
         deck(deck_config, taken);
+        if deck_config.uuid != old {
+            decks.insert(old, deck_config.uuid.clone());
+        }
+    }
+    // A presenter view copied with its PowerPoint input shows the copy.
+    for deck_config in &mut config.decks {
+        if let super::SourceConfig::Presenter { follows, .. } = &mut deck_config.source {
+            if let Some(new) = decks.get(follows.as_str()) {
+                follows.clone_from(new);
+            }
+        }
     }
 }
 
@@ -304,6 +317,41 @@ mod tests {
             config.decks[0].effects[0].uuid, config.decks[1].effects[0].uuid,
             "nor can their effects, which started as the same UUID"
         );
+    }
+
+    #[test]
+    fn a_presenter_view_copied_with_its_powerpoint_input_shows_the_copy() {
+        let mut presenter = a_deck("deck0002");
+        presenter.source = SourceConfig::Presenter {
+            follows: "deck0001".into(),
+            layout: crate::engine::value::presentation::PresenterLayout::default(),
+        };
+        let mut elsewhere = a_deck("deck0003");
+        elsewhere.source = SourceConfig::Presenter {
+            follows: "deck9999".into(),
+            layout: crate::engine::value::presentation::PresenterLayout::default(),
+        };
+        let mut config = ChannelConfig {
+            overlay: false,
+            uuid: "chan0001".to_string(),
+            name: "Talk".to_string(),
+            opacity: 1.0,
+            blend_mode: BlendModeConfig::Normal,
+            decks: vec![a_deck("deck0001"), presenter, elsewhere],
+            effects: Vec::new(),
+            modulation: Vec::new(),
+        };
+        channel(&mut config, &everything_is_taken);
+        let follows = |i: usize| match &config.decks[i].source {
+            SourceConfig::Presenter { follows, .. } => follows.clone(),
+            _ => String::new(),
+        };
+        assert_eq!(
+            follows(1),
+            config.decks[0].uuid,
+            "the copy's own PowerPoint layer"
+        );
+        assert_eq!(follows(2), "deck9999", "one outside the channel is kept");
     }
 
     #[test]

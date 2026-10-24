@@ -1692,7 +1692,8 @@ impl Mixer {
         let mut read_from_composite = true;
 
         for effect in &mut self.master_effects {
-            if !effect.enabled {
+            // An offline effect is kept, not run.
+            if !effect.enabled || effect.offline().is_some() {
                 continue;
             }
 

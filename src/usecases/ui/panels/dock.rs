@@ -349,6 +349,62 @@ mod tests {
         library_toggled: bool,
     }
 
+    /// A layout picked from the menu sticks the first time. Its new panels
+    /// would have egui run the frame twice, the second pass without the
+    /// click, and the runner keeps a frame's last actions, applied once the
+    /// frame is done — so it runs one pass a frame.
+    #[test]
+    fn a_layout_picked_sticks_the_first_time() {
+        struct Frame {
+            data: UIData,
+            actions: Option<crate::usecases::ui::UIActions>,
+            seen: u64,
+            passes: Vec<u64>,
+        }
+        fn apply(state: &mut Frame) {
+            let actions = state.actions.take();
+            if let Some(screen) = actions.and_then(|a| a.session.screen_layout) {
+                state.data.screen = screen;
+            }
+        }
+        let mut data = UIData::test_fixture();
+        // From Broadcast, Classic's panels make egui ask for a second pass.
+        data.screen = ScreenLayout::builtin(Builtin::Broadcast);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1920.0, 1080.0))
+            .build_ui_state(
+                |ui, state: &mut Frame| {
+                    let frame = ui.ctx().cumulative_frame_nr();
+                    if frame != state.seen {
+                        apply(state);
+                        state.seen = frame;
+                        state.passes.push(0);
+                    }
+                    *state.passes.last_mut().unwrap() += 1;
+                    state.actions = Some(super::super::render_ui(ui, &state.data));
+                },
+                Frame {
+                    data,
+                    actions: None,
+                    seen: u64::MAX,
+                    passes: Vec::new(),
+                },
+            );
+        crate::usecases::ui::one_pass_a_frame(&harness.ctx);
+        harness.run();
+        harness.get_by_label_contains("Layout: ").click();
+        harness.run();
+        harness.get_by_label("Classic").click();
+        harness.run();
+        apply(harness.state_mut());
+        assert_eq!(harness.state().data.screen.name, "Classic");
+        assert!(
+            harness.state().passes.iter().all(|&p| p == 1),
+            "{:?}",
+            harness.state().passes
+        );
+    }
+
     /// The whole UI, with each frame's arrangement fed back as the runner
     /// does.
     fn harness(data: UIData) -> (egui_kittest::Harness<'static, Runner>, Rc<RefCell<UIData>>) {

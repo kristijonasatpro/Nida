@@ -36,6 +36,15 @@ struct ChannelDrag {
     name: String,
 }
 
+/// Whether an input's × asks before deleting it: while it is on air — on
+/// Main or a bus's Program, itself or inside another input there, fading
+/// or not, as the engine reckons it (`ChannelUIInfo::on_air`). Off air it
+/// goes at once — **Undo** brings it back — so a row of inputs is cleared a
+/// click each.
+fn asks_before_deleting(ch: &ChannelUIInfo) -> bool {
+    ch.on_air.is_some()
+}
+
 /// The channel whose × asks "delete it and its layers?".
 fn confirm_delete_id() -> egui::Id {
     egui::Id::new("inputs_confirm_delete")
@@ -475,7 +484,13 @@ fn render_tile(
         .is_some_and(|asking| asking == ch.uuid);
     if !confirming {
         super::playlist::overlay_on_picture(ui, picture_rect, ch, actions);
+        // Rows at the foot of the picture, from the bottom: a timer's, a
+        // presentation's, a clip's.
+        let timer = usize::from(super::timer::of_channel(ch).is_some());
+        let slides = usize::from(super::presentation::of_channel(ch).is_some());
+        super::transport::overlay_on_picture(ui, picture_rect, ch, timer + slides, actions);
         super::timer::overlay_on_picture(ui, picture_rect, ch, actions);
+        super::presentation::overlay_on_picture(ui, picture_rect, ch, timer, actions);
     }
 
     render_title_bar(ui, ch, title, data, actions);
@@ -568,7 +583,7 @@ fn render_title_bar(
             .frame(false),
         )
         .on_hover_text(if can_delete {
-            "Delete this channel"
+            "Delete this channel — Undo brings it back"
         } else {
             "A show keeps at least two channels"
         });
@@ -580,17 +595,17 @@ fn render_title_bar(
         )
     });
     if x.clicked() && can_delete {
-        if ch.decks.is_empty() {
-            actions.session.remove_channel = Some(ch.ch_idx);
-        } else {
+        if asks_before_deleting(ch) {
             ui.ctx()
                 .data_mut(|d| d.insert_temp(confirm_delete_id(), ch.uuid.clone()));
+        } else {
+            actions.session.remove_channel = Some(ch.ch_idx);
         }
     }
 }
 
-/// "Delete it and its layers?" over the picture, once its × is clicked on a
-/// channel that holds any.
+/// "Ch 24 is on Main. Delete it and its layer?" over the picture, once its ×
+/// is clicked on a channel that asks first (see `asks_before_deleting`).
 fn render_delete_confirm(
     ui: &mut egui::Ui,
     ch: &ChannelUIInfo,
@@ -614,8 +629,12 @@ fn render_delete_confirm(
     } else {
         format!("its {} layers", ch.decks.len())
     };
+    let question = match &ch.on_air {
+        Some(at) => format!("{} is on {at}.\nDelete it and {layers}?", ch.name),
+        None => format!("Delete {} and {layers}?", ch.name),
+    };
     box_ui.label(
-        egui::RichText::new(format!("Delete {} and {layers}?", ch.name))
+        egui::RichText::new(question)
             .strong()
             .color(egui::Color32::WHITE),
     );
@@ -729,7 +748,8 @@ fn render_deck_chips(
     } else {
         shown
     };
-    for deck in &ch.decks[..shown] {
+    // Front first: the layer seen is the first chip.
+    for deck in ch.decks.iter().rev().take(shown) {
         render_chip(ui, ch, deck, chip, accent, data, actions);
     }
     if shown < ch.decks.len() {
@@ -781,14 +801,62 @@ fn render_chip(
         egui::Stroke::new(width, color),
         egui::StrokeKind::Outside,
     );
+    if deck.offline.is_some() {
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "⚠",
+            egui::FontId::proportional(rect.height().min(rect.width()) * 0.5),
+            ui.visuals().warn_fg_color,
+        );
+    }
+    // A clip is marked, a picture not: ▶ a video, ♪ a sound (which has no
+    // picture of its own), green while it plays.
+    let kind = deck.video_playback.as_ref().map(|vp| {
+        if vp.sound_only {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "♪",
+                egui::FontId::proportional(rect.height() * 0.5),
+                egui::Color32::from_gray(150),
+            );
+        }
+        let badge = egui::Rect::from_min_size(
+            rect.left_bottom() - egui::vec2(0.0, 13.0),
+            egui::vec2(15.0, 13.0),
+        );
+        let fill = if vp.playing {
+            super::transport::PLAYING_GREEN
+        } else {
+            egui::Color32::from_black_alpha(180)
+        };
+        ui.painter().rect_filled(badge, 2.0, fill);
+        let (glyph, kind) = if vp.sound_only {
+            ("♪", "sound ")
+        } else {
+            ("▶", "video ")
+        };
+        ui.painter().text(
+            badge.center(),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            egui::FontId::proportional(9.5),
+            egui::Color32::WHITE,
+        );
+        kind
+    });
     response.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
             true,
-            format!("{} deck", deck.name),
+            format!("{} {}deck", deck.name, kind.unwrap_or_default()),
         )
     });
-    let response = response.on_hover_text(&deck.name);
+    let response = match &deck.offline {
+        Some(why) => response.on_hover_text(format!("{} — offline: {why}", deck.name)),
+        None => response.on_hover_text(&deck.name),
+    };
     if response.clicked() {
         actions.session.select_deck = Some((ch.ch_idx, deck.deck_idx));
     }
@@ -895,6 +963,8 @@ mod tests {
         let mut data = UIData::test_fixture();
         data.main.mode = MixMode::Program;
         data.main.program = MainSource::Channel(data.channels[0].uuid.clone());
+        // What the engine says of it, on Main.
+        data.channels[0].on_air = Some("Main".to_string());
         data.selected_deck = None;
         data.selected_channel = None;
         data
@@ -1127,13 +1197,43 @@ mod tests {
     }
 
     #[test]
-    fn a_channel_with_layers_asks_before_it_goes() {
+    fn an_input_off_air_goes_at_once_layers_and_all() {
+        let data = three_channels();
+        let ch = data.channels[1].clone();
+        assert!(!ch.decks.is_empty(), "precondition: it has layers");
+        assert!(ch.on_air.is_none(), "precondition: off air");
+        let mut harness = harness(data);
+        harness.get_by_label(&format!("Delete {}", ch.name)).click();
+        harness.run();
+        assert_eq!(harness.state().remove_channel, Some(1));
+    }
+
+    #[test]
+    fn an_input_on_a_bus_asks_and_says_which() {
+        let mut data = three_channels();
+        let bus = data.buses[0].bus.name.clone();
+        data.channels[1].on_air = Some(bus.clone());
+        let ch = data.channels[1].clone();
+        let mut harness = harness(data);
+        harness.get_by_label(&format!("Delete {}", ch.name)).click();
+        harness.run();
+        assert_eq!(harness.state().remove_channel, None, "not yet");
+        assert!(harness
+            .query_by_label_contains(&format!("{} is on {bus}.", ch.name))
+            .is_some());
+    }
+
+    #[test]
+    fn an_input_on_main_asks_before_it_goes() {
         let data = three_channels();
         let name = data.channels[0].name.clone();
         let mut harness = harness(data);
         harness.get_by_label(&format!("Delete {name}")).click();
         harness.run();
         assert_eq!(harness.state().remove_channel, None, "not yet");
+        assert!(harness
+            .query_by_label_contains(&format!("{name} is on Main."))
+            .is_some());
         harness.get_by_label("Keep").click();
         harness.run();
         assert_eq!(harness.state().remove_channel, None, "kept");
@@ -1188,6 +1288,17 @@ mod tests {
         );
     }
 
+    /// Front first, as in Premiere: the layer seen is the first chip.
+    #[test]
+    fn a_tiles_chips_put_the_layer_in_front_first() {
+        let data = UIData::test_fixture();
+        let back = data.channels[0].decks[0].name.clone();
+        let front = data.channels[0].decks[1].name.clone();
+        let harness = harness(data);
+        let x = |name: &str| harness.get_by_label(&format!("{name} deck")).rect().left();
+        assert!(x(&front) < x(&back), "{front} before {back}");
+    }
+
     /// A playlist starts from its tile, without opening anything.
     #[test]
     fn a_tile_holding_a_playlist_plays_it() {
@@ -1214,6 +1325,110 @@ mod tests {
                 c,
                 EngineCommand::SetPlaylistPlaying { deck_uuid, playing: true } if *deck_uuid == deck
             )),
+            "{:?}",
+            harness.state().commands
+        );
+    }
+
+    fn clip(sound_only: bool) -> crate::usecases::ui::VideoPlaybackUI {
+        crate::usecases::ui::VideoPlaybackUI {
+            playing: false,
+            position: 20.0,
+            duration: 60.0,
+            speed: 1.0,
+            effective_speed: 1.0,
+            position_offset: 0.0,
+            loop_mode: crate::video::LoopMode::Loop,
+            in_point: 0.0,
+            out_point: 0.0,
+            frame_rate: 25.0,
+            transport_sync: crate::video::DeckTransportSync::default(),
+            hardware_decode: false,
+            auto: crate::engine::value::video::AutoPlayback::default(),
+            sound_only,
+        }
+    }
+
+    /// A clip plays, pauses and goes back to its start from its tile, which
+    /// shows the time gone and left — without putting it on Preview.
+    #[test]
+    fn a_tile_holding_a_clip_plays_and_restarts_it() {
+        let mut data = main_mode_fixture();
+        let deck = data.channels[1].decks[0].uuid.clone();
+        data.channels[1].decks[0].video_playback = Some(clip(false));
+        let mut harness = harness(data);
+        harness.get_by_label(" 0:20 · -0:40 ");
+        let plays: Vec<_> = harness.get_all_by_label("▶").collect();
+        assert_eq!(plays.len(), 1, "only the tile holding it has one");
+        plays[0].click();
+        harness.run();
+        harness.get_by_label("⏮").click();
+        harness.run();
+        let commands = &harness.state().commands;
+        assert!(
+            commands.iter().any(
+                |c| matches!(c, EngineCommand::VideoTogglePlay { deck_uuid } if *deck_uuid == deck)
+            ),
+            "{commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::VideoSeek { deck_uuid, position_secs } if *deck_uuid == deck && *position_secs == 0.0
+            )),
+            "{commands:?}"
+        );
+    }
+
+    /// A video and a picture are told apart on the chips; a sound, with no
+    /// picture, says what it is on its tile.
+    #[test]
+    fn clips_are_marked_and_a_sound_says_what_it_is() {
+        let mut data = main_mode_fixture();
+        data.channels[0].decks[0].video_playback = Some(clip(false));
+        data.channels[1].decks[0].video_playback = Some(clip(true));
+        let video = data.channels[0].decks[0].name.clone();
+        let picture = data.channels[0].decks[1].name.clone();
+        let sound = data.channels[1].decks[0].name.clone();
+        let harness = harness(data);
+        harness.get_by_label(&format!("{video} video deck"));
+        harness.get_by_label(&format!("{picture} deck"));
+        harness.get_by_label(&format!("{sound} sound deck"));
+        harness.get_by_label(&format!("♪ {sound}"));
+    }
+
+    /// A sound's name on its tile is not a widget of its own: a click on it
+    /// is the tile's.
+    #[test]
+    fn clicking_a_sounds_name_selects_its_tile() {
+        let mut data = main_mode_fixture();
+        data.selected_channel = None;
+        data.channels[1].decks[0].video_playback = Some(clip(true));
+        let sound = data.channels[1].decks[0].name.clone();
+        let mut harness = harness(data);
+        harness.get_by_label(&format!("♪ {sound}")).click();
+        harness.run();
+        assert_eq!(harness.state().select_channel, Some(1));
+    }
+
+    /// The tile's clip controls are the top clip's, which the tile shows —
+    /// named when the input holds others — whatever layer is selected.
+    #[test]
+    fn a_tiles_clip_controls_are_its_top_clips_and_say_so() {
+        let mut data = main_mode_fixture();
+        data.channels[1].decks[0].video_playback = Some(clip(false));
+        data.channels[1].decks[1].video_playback = Some(clip(false));
+        let top = data.channels[1].decks[1].uuid.clone();
+        let name = data.channels[1].decks[1].name.clone();
+        data.selected_deck = Some((1, 0));
+        let mut harness = harness(data);
+        harness.get_by_label(&format!(" {name} · 0:20 · -0:40 "));
+        harness.get_by_label("▶").click();
+        harness.run();
+        assert!(
+            harness.state().commands.iter().any(
+                |c| matches!(c, EngineCommand::VideoTogglePlay { deck_uuid } if *deck_uuid == top)
+            ),
             "{:?}",
             harness.state().commands
         );

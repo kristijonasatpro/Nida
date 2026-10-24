@@ -27,6 +27,27 @@ impl Default for UIActions {
     }
 }
 
+/// Run the UI one pass a frame. egui runs a frame's UI again when a pass
+/// asks it to — a grid or a resizable area seen for the first time — but
+/// gives the frame's input to the first pass only, while a frame's actions
+/// are applied once it is done: the last pass's, run from the same data
+/// without the clicks, undid them (a layout picked from the menu went back to
+/// the one before whenever its panels were new), and keeping the first would
+/// lose what a later pass finishes (a drop). One pass sees each input once;
+/// a new grid is sized a frame late.
+pub fn one_pass_a_frame(ctx: &egui::Context) {
+    ctx.options_mut(|o| o.max_passes = std::num::NonZeroUsize::MIN);
+}
+
+/// Keep Nida dark whatever the Mac's appearance. Its colours are made for a
+/// dark window, and it starts dark: the window says nothing of the Mac's
+/// appearance until it changes. When it changed while Nida ran, egui took
+/// it up — to light, its own light look, whitish around the dark tiles,
+/// until Nida was opened again.
+pub fn always_dark(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+}
+
 impl UIActions {
     pub fn new() -> Self {
         Self {
@@ -43,7 +64,16 @@ impl UIActions {
     /// never on `commands`) and channel removal (`remove_channel`, kept a field
     /// so the runner can fix up UI selection with the removed index).
     pub fn has_undoable_action(&self) -> bool {
-        self.session.shader_to_add.is_some() || self.session.remove_channel.is_some()
+        self.session.shader_to_add.is_some()
+            || self.session.remove_channel.is_some()
+            // Files dropped beside the inputs make inputs: in the frame's one
+            // undo with a PowerPoint deck dropped with them, made by its
+            // command. Not when none can make one.
+            || self
+                .session
+                .files_as_inputs
+                .iter()
+                .any(|f| crate::deck::media::MediaKind::of(f).is_some())
     }
 
     /// Whether this frame's actions include any undoable *stage* mutation
@@ -150,4 +180,48 @@ pub fn collect_params(params: &ShaderParams) -> Vec<ParamUIInfo> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The theme a context takes after the Mac's appearance turns light.
+    fn after_a_switch_to_light(ctx: &egui::Context) -> egui::Theme {
+        let input = egui::RawInput {
+            system_theme: Some(egui::Theme::Light),
+            ..Default::default()
+        };
+        ctx.run_ui(input, |_| {}).textures_delta.clear();
+        ctx.theme()
+    }
+
+    /// Files dropped beside the inputs are in the frame's one undo — with
+    /// the input a PowerPoint deck dropped with them makes by its command —
+    /// unless none of them can make an input.
+    #[test]
+    fn files_dropped_as_inputs_are_undone_with_the_frame() {
+        let mut actions = UIActions::new();
+        actions.session.files_as_inputs = vec!["/show/notes.pdf".into()];
+        assert!(!actions.has_undoable_action(), "nothing it can make");
+        actions
+            .session
+            .files_as_inputs
+            .push("/show/slide 1.png".into());
+        assert!(actions.has_undoable_action());
+    }
+
+    #[test]
+    fn nida_stays_dark_when_the_mac_turns_light() {
+        let plain = egui::Context::default();
+        assert_eq!(
+            after_a_switch_to_light(&plain),
+            egui::Theme::Light,
+            "precondition: egui follows the Mac"
+        );
+        let ctx = egui::Context::default();
+        always_dark(&ctx);
+        assert_eq!(after_a_switch_to_light(&ctx), egui::Theme::Dark);
+        assert!(ctx.global_style().visuals.dark_mode);
+    }
 }

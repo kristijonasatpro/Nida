@@ -340,6 +340,10 @@ pub struct DeckSlot {
     pub render_cost_us: f32,
     /// Frame counter for skip logic
     pub skip_counter: u32,
+    /// The deck's textures (see [`Deck::texture_generation`]) last drawn
+    /// into. Nothing of a covered deck shows, so it is not drawn — but until
+    /// its textures have been, its thumbnail is black.
+    pub drawn: Option<u32>,
     /// GPU-measured render cost in microseconds (EMA, 0 = no data yet)
     pub gpu_render_cost_us: f32,
     /// True while the arrangement is driving this deck, which suspends its
@@ -367,6 +371,7 @@ impl DeckSlot {
             render_fps: DeckRenderFps::default(),
             render_cost_us: 0.0,
             skip_counter: 0,
+            drawn: None,
             gpu_render_cost_us: 0.0,
             arrangement_authority: false,
             source_demand: SourceDemand::default(),
@@ -490,6 +495,13 @@ pub struct Channel {
     /// Decks blended into the composite last frame — fewer than the active
     /// ones when a deck covering the frame hides those below it.
     pub composited_deck_count: usize,
+    /// Covered decks drawn last frame for their thumbnails alone.
+    pub thumbnails_drawn: usize,
+    /// Frames rendered, which says when a covered deck's thumbnail is drawn
+    /// again.
+    thumbnail_clock: u64,
+    /// Whose turn it is among the covered decks, for that.
+    thumbnail_turn: usize,
     /// Decks shown on their own somewhere — alone on Main or a bus, or being
     /// edited — by UUID, set by the mixer each frame. A deck hidden under one
     /// that covers the frame still renders when it is one of these.
@@ -505,6 +517,36 @@ pub struct Channel {
     /// (a tap); set by the mixer each frame. It must render then, whatever
     /// its own level on the mix.
     pub tapped: bool,
+}
+
+/// How often a covered deck — nothing of it showing — is drawn anyway for
+/// its thumbnail: every this many frames, two seconds at 60.
+const THUMBNAIL_FRAMES: u64 = 120;
+
+/// The covered deck — of `covered`, by index — to draw this frame for its
+/// thumbnail: the first whose textures are `undrawn`, else, while the frame
+/// is within budget, the next in `turn`, one every `THUMBNAIL_FRAMES` /
+/// covered frames — so each is drawn again about every `THUMBNAIL_FRAMES`
+/// frames (every `covered.len()`, with more of them), none left out.
+fn thumbnail_pick(
+    covered: &[usize],
+    undrawn: Option<usize>,
+    clock: u64,
+    turn: &mut usize,
+    over_budget: bool,
+) -> Option<usize> {
+    if undrawn.is_some() {
+        return undrawn;
+    }
+    if covered.is_empty() || over_budget {
+        return None;
+    }
+    let every = (THUMBNAIL_FRAMES / covered.len() as u64).max(1);
+    if !clock.is_multiple_of(every) {
+        return None;
+    }
+    *turn = turn.wrapping_add(1);
+    Some(covered[*turn % covered.len()])
 }
 
 /// How a deck takes part in its channel's picture this frame.
@@ -580,6 +622,9 @@ impl Channel {
             active_deck_count: 0,
             dt_owed: 0.0,
             composited_deck_count: 0,
+            thumbnails_drawn: 0,
+            thumbnail_clock: 0,
+            thumbnail_turn: 0,
             shown_alone: Vec::new(),
             draw_visible_parts: true,
             draw_every_deck: false,
@@ -930,9 +975,51 @@ impl Channel {
         let mut cmd_buffers: Vec<wgpu::CommandBuffer> = Vec::new();
         let mut active_count: u32 = 0;
         let mut per_deck_timings: Vec<(String, u128, bool)> = Vec::new(); // (name, us, skipped)
+
+        // Nothing of a covered deck shows, but its thumbnail does: one is
+        // drawn whole each frame at most — pictures dropped under a
+        // full-screen one stayed black in the lists until selected; fifty
+        // dropped at once cost a frame each (see `thumbnail_pick`).
+        let covered: Vec<usize> = (0..self.decks.len())
+            .filter(|&i| hidden.contains(&i) || parts.get(&i).is_some_and(Vec::is_empty))
+            .filter(|&i| !self.decks[i].mute && self.decks[i].opacity > 0.0)
+            .collect();
+        let undrawn = covered.iter().copied().find(|&i| {
+            let slot = &self.decks[i];
+            slot.drawn != Some(slot.deck.texture_generation())
+        });
+        self.thumbnail_clock = self.thumbnail_clock.wrapping_add(1);
+        let thumbnail = thumbnail_pick(
+            &covered,
+            undrawn,
+            self.thumbnail_clock,
+            &mut self.thumbnail_turn,
+            frame_over_budget,
+        );
+        let mut thumbnails = 0;
         for (deck_idx, slot) in self.decks.iter_mut().enumerate() {
             let shows = parts.get(&deck_idx);
             if hidden.contains(&deck_idx) || shows.is_some_and(Vec::is_empty) {
+                if thumbnail == Some(deck_idx) {
+                    slot.deck.set_visible(None);
+                    slot.deck.set_render_dt(if target_fps > 0 {
+                        1.0 / target_fps as f32
+                    } else {
+                        dt
+                    });
+                    // Not timed: the budget counts what is drawn every frame.
+                    let param_prefix = slot.deck.param_prefix().to_owned();
+                    slot.deck.render_with_prefix(
+                        context,
+                        audio_data,
+                        modulation,
+                        &param_prefix,
+                        &mut cmd_buffers,
+                        None,
+                    )?;
+                    slot.drawn = Some(slot.deck.texture_generation());
+                    thumbnails += 1;
+                }
                 continue;
             }
             slot.deck.set_visible(shows.map(|rects| {
@@ -997,6 +1084,7 @@ impl Channel {
                         &mut cmd_buffers,
                         gpu_timing,
                     )?;
+                    slot.drawn = Some(slot.deck.texture_generation());
                     let elapsed_us = t_single.elapsed().as_micros() as f32;
                     // Update EMA render cost (α = 0.2 for responsive adaptation)
                     if slot.render_cost_us > 0.0 {
@@ -1016,6 +1104,7 @@ impl Channel {
             }
         }
         self.active_deck_count = active_count;
+        self.thumbnails_drawn = thumbnails;
         let deck_render_us = t_deck_render.elapsed().as_micros();
         // Batch submit all deck renders at once.
         // Drain any prefix command buffers (e.g. video upload copies) and
@@ -1487,7 +1576,8 @@ impl Channel {
             let mut fx_cmd_buffers: Vec<wgpu::CommandBuffer> = Vec::new();
 
             for (eff_idx, effect) in self.effects.iter_mut().enumerate() {
-                if !effect.enabled {
+                // An offline effect is kept, not run.
+                if !effect.enabled || effect.offline().is_some() {
                     continue;
                 }
 

@@ -1,16 +1,17 @@
 //! Files dragged in from Finder (or any file manager).
 //!
 //! While files hover over the window, the place they would land is
-//! highlighted with a label saying what will happen. On the drop they are
-//! added as decks, in the order they were dropped:
+//! highlighted with a label saying what will happen. On the drop, in the
+//! order they were dropped:
 //!
-//! - over a channel column — into that channel;
-//! - over a "Drop here to add channel" zone — into a new channel;
-//! - anywhere else — into the selected channel, else the first one.
+//! - over a channel — its tile, column or settings window — they are layers
+//!   in it;
+//! - anywhere else — the empty tile, a "Drop here to add channel" zone, or
+//!   nothing — each is an input of its own, as Add Input makes them.
 //!
 //! Folders are replaced by the files inside them. Where the pointer is during
 //! the drag comes from the runner, which asks the OS for it; without that
-//! (no position reported this frame) the drop goes to the selected channel.
+//! (no position reported this frame) each is an input of its own.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -23,40 +24,14 @@ use crate::engine::EngineCommand;
 /// Where dropped files will land.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Target {
-    /// The channel column under the pointer.
+    /// The channel under the pointer: layers in it.
     Channel(usize),
-    /// A new channel, made for them.
-    NewChannel,
-    /// Not over anything: the selected channel, else the first.
-    Default(usize),
+    /// No channel: an input each.
+    NewInputs,
 }
-
-fn awaiting_id() -> egui::Id {
-    egui::Id::new("__file_drop_awaiting_new_channel")
-}
-
-/// Files parked until the channel they were dropped into exists: the channel
-/// count that means it does, and the files.
-type Awaiting = (usize, Vec<PathBuf>);
 
 pub(super) fn handle_file_drop(ui: &egui::Ui, data: &UIData, actions: &mut UIActions) {
     let ctx = ui.ctx();
-
-    // A drop on a new-channel zone waits one frame for the engine to make the
-    // channel, then goes into it. No UUID exists until then, and guessing an
-    // index could put the files into someone else's channel.
-    if let Some((expected, files)) = ctx.memory(|m| m.data.get_temp::<Awaiting>(awaiting_id())) {
-        ctx.memory_mut(|m| m.data.remove::<Awaiting>(awaiting_id()));
-        match data.channels.last() {
-            Some(ch) if data.channels.len() >= expected => {
-                actions
-                    .session
-                    .files_to_add
-                    .push((DeckPlace::end_of(ch.uuid.clone()), files));
-            }
-            _ => log::warn!("Dropped files not added: the new channel was never created"),
-        }
-    }
 
     let hovered: Vec<PathBuf> = ctx.input(|i| {
         i.raw
@@ -110,16 +85,33 @@ pub(super) fn handle_file_drop(ui: &egui::Ui, data: &UIData, actions: &mut UIAct
         return;
     }
     let files = expand_folders(&dropped);
+    // A PowerPoint deck is an input of its own, wherever it lands.
+    let (decks, files): (Vec<PathBuf>, Vec<PathBuf>) = files
+        .into_iter()
+        .partition(|f| cfg!(target_os = "macos") && super::presentation::is_deck(f));
+    for deck in decks {
+        log::info!("PowerPoint deck dropped: {}", deck.display());
+        actions.commands.push(EngineCommand::AddInput {
+            source: crate::engine::InputSource::PowerPoint {
+                path: deck.to_string_lossy().into_owned(),
+            },
+            name: None,
+            audio: None,
+        });
+    }
+    if files.is_empty() {
+        return;
+    }
     log::info!("{} file(s) dropped -> {target:?}", files.len());
     match target {
-        Target::Channel(i) | Target::Default(i) => {
+        Target::Channel(i) => {
             if let Some(ch) = data.channels.get(i) {
-                // Over a channel, between the cards under the pointer; when
-                // not pointing at one, after its last deck.
-                // On the input settings window, a new layer goes on top.
-                let before_deck_uuid = match (target, pos) {
-                    (Target::Channel(_), Some(p)) if super::drop_window_at(ctx, p).is_none() => {
-                        insertion_at(ctx, i, p.y).before
+                // Between the cards under the pointer; when not pointing at
+                // one, after its last deck. On the input settings window, a
+                // new layer goes on top.
+                let before_deck_uuid = match pos {
+                    Some(p) if super::drop_window_at(ctx, p).is_none() => {
+                        insertion_at(ctx, i, p).before
                     }
                     _ => None,
                 };
@@ -132,47 +124,35 @@ pub(super) fn handle_file_drop(ui: &egui::Ui, data: &UIData, actions: &mut UIAct
                 ));
             }
         }
-        Target::NewChannel => {
-            actions.commands.push(EngineCommand::AddChannel);
-            ctx.memory_mut(|m| {
-                m.data
-                    .insert_temp::<Awaiting>(awaiting_id(), (data.channels.len() + 1, files));
-            });
-        }
+        Target::NewInputs => actions.session.files_as_inputs.extend(files),
     }
 }
 
 fn resolve_target(ctx: &egui::Context, data: &UIData, pos: Option<egui::Pos2>) -> Target {
-    if let Some(pos) = pos {
-        if let Some(ch_idx) = super::drop_channel_at(ctx, pos, data.channels.len()) {
-            return Target::Channel(ch_idx);
-        }
-        for side in 0..2 {
-            let key = egui::Id::new("new_ch_drop_rect").with(side);
-            if ctx
-                .memory(|m| m.data.get_temp::<egui::Rect>(key))
-                .is_some_and(|r| r.contains(pos))
-            {
-                return Target::NewChannel;
-            }
-        }
-    }
-    let selected = data
-        .selected_deck
-        .map(|(ch, _)| ch)
-        .or(data.selected_channel)
-        .filter(|ch| *ch < data.channels.len());
-    match selected {
-        Some(ch) => Target::Default(ch),
-        None if !data.channels.is_empty() => Target::Default(0),
-        None => Target::NewChannel,
-    }
+    pos.and_then(|pos| super::drop_channel_at(ctx, pos, data.channels.len()))
+        .map_or(Target::NewInputs, Target::Channel)
+}
+
+/// The empty tile, or a "Drop here to add channel" zone, under the pointer.
+fn new_channel_zone_at(ctx: &egui::Context, pos: egui::Pos2) -> Option<egui::Rect> {
+    (0..2).find_map(|side| {
+        ctx.memory(|m| {
+            m.data
+                .get_temp::<egui::Rect>(egui::Id::new("new_ch_drop_rect").with(side))
+        })
+        .filter(|r| r.contains(pos))
+    })
 }
 
 /// What the files are, in words: "2 images, 1 video".
 fn describe(files: &[PathBuf]) -> (String, usize) {
     let (mut images, mut videos, mut sounds, mut shaders, mut other) = (0, 0, 0, 0, 0);
+    let mut decks = 0;
     for f in files {
+        if cfg!(target_os = "macos") && super::presentation::is_deck(f) {
+            decks += 1;
+            continue;
+        }
         match MediaKind::of(f) {
             Some(MediaKind::Image) => images += 1,
             Some(MediaKind::Video) => videos += 1,
@@ -196,6 +176,14 @@ fn describe(files: &[PathBuf]) -> (String, usize) {
     if shaders > 0 {
         parts.push(plural(shaders, "shader", "shaders"));
     }
+    if decks > 0 {
+        // Each a new input of its own, wherever it lands.
+        parts.push(plural(
+            decks,
+            "PowerPoint deck (new input)",
+            "PowerPoint decks (new inputs)",
+        ));
+    }
     (parts.join(", "), other)
 }
 
@@ -207,11 +195,8 @@ fn hover_label(data: &UIData, target: Target, files: &[PathBuf]) -> String {
             .channels
             .get(i)
             .map_or_else(String::new, |c| c.name.clone()),
-        Target::Default(i) => data
-            .channels
-            .get(i)
-            .map_or_else(String::new, |c| format!("{} (selected)", c.name)),
-        Target::NewChannel => "a new channel".to_string(),
+        Target::NewInputs if files.len() - other == 1 => "a new input".to_string(),
+        Target::NewInputs => "a new input each".to_string(),
     };
     let mut label = if what.is_empty() {
         "Nothing here can be added".to_string()
@@ -240,16 +225,11 @@ fn paint_hover(
     let window = pos.and_then(|p| super::drop_window_at(ctx, p));
     let rect = match target {
         Target::Channel(i) if window.is_some_and(|(w, _)| w == i) => window.map(|(_, r)| r),
-        Target::Channel(i) | Target::Default(i) => ctx.memory(|m| {
+        Target::Channel(i) => ctx.memory(|m| {
             m.data
                 .get_temp::<egui::Rect>(egui::Id::new("ch_drop_rect").with(i))
         }),
-        Target::NewChannel => (0..2).find_map(|side| {
-            ctx.memory(|m| {
-                m.data
-                    .get_temp::<egui::Rect>(egui::Id::new("new_ch_drop_rect").with(side))
-            })
-        }),
+        Target::NewInputs => pos.and_then(|p| new_channel_zone_at(ctx, p)),
     };
     if let Some(rect) = rect {
         painter.rect_filled(
@@ -265,7 +245,7 @@ fn paint_hover(
         );
     }
     if let (Target::Channel(i), Some(p), None) = (target, pos, window) {
-        super::insertion::paint(ctx, &insertion_at(ctx, i, p.y), accent);
+        super::insertion::paint(ctx, &insertion_at(ctx, i, p), accent);
     }
     let label = hover_label(data, target, files);
     let at = pos
@@ -319,6 +299,9 @@ mod tests {
                 .build_ui(|ui| {
                     actions = super::super::render_ui(ui, data);
                 });
+            // As the runner runs it: a second pass would see the frame
+            // without its drop, and its actions would replace the drop's.
+            crate::usecases::ui::one_pass_a_frame(&harness.ctx);
             harness.run();
             let paths: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
             harness.input_mut().hovered_files = paths
@@ -385,8 +368,8 @@ mod tests {
             [(
                 DeckPlace {
                     channel_uuid: "cb000001".to_string(),
-                    // Below both of Ch B's cards: after the last one.
-                    before_deck_uuid: None,
+                    // Below both of Ch B's cards: behind them, at the back.
+                    before_deck_uuid: Some(data.channels[1].decks[0].uuid.clone()),
                 },
                 vec![
                     PathBuf::from("/show/slide 1.png"),
@@ -419,7 +402,13 @@ mod tests {
         let data = UIData::test_fixture();
         let cards = card_rects(&data, 0);
         assert!(cards.len() >= 2, "precondition: Ch A has two decks");
-        // The upper half of Ch A's second card.
+        assert_eq!(
+            cards[0].0,
+            data.channels[0].decks.last().unwrap().uuid,
+            "the layer in front is the top card"
+        );
+        // The upper half of Ch A's second card: in front of it, behind the
+        // first — before the first in the stack, drawn from the back.
         let at = egui::pos2(cards[1].1.center().x, cards[1].1.top() + 8.0);
         let (actions, _) = drop_at(&data, &["/show/lower third.png"], Some(at));
         assert_eq!(
@@ -427,29 +416,35 @@ mod tests {
             [(
                 DeckPlace {
                     channel_uuid: "ca000001".to_string(),
-                    before_deck_uuid: Some(cards[1].0.clone()),
+                    before_deck_uuid: Some(cards[0].0.clone()),
                 },
                 vec![PathBuf::from("/show/lower third.png")]
             )]
         );
     }
 
+    /// As vMix: files dropped beside the inputs are inputs, one each — not
+    /// layers in whichever channel was selected.
     #[test]
-    fn files_dropped_on_nothing_go_to_the_selected_channel() {
+    fn files_dropped_on_nothing_are_an_input_each() {
         let mut data = UIData::test_fixture();
         data.selected_deck = Some((1, 0));
-        let (actions, label) = drop_at(&data, &["/show/logo.png", "/show/notes.pdf"], None);
-        assert_eq!(label, "1 image → Ch B (selected)  (1 other file skipped)");
-        assert_eq!(actions.session.files_to_add.len(), 1);
+        let files = ["/show/logo.png", "/show/intro.mov", "/show/notes.pdf"];
+        let (actions, label) = drop_at(&data, &files, None);
         assert_eq!(
-            actions.session.files_to_add[0].0,
-            DeckPlace::end_of("cb000001"),
-            "not pointing at the channel: after its last deck"
+            label,
+            "1 image, 1 video → a new input each  (1 other file skipped)"
+        );
+        assert!(actions.session.files_to_add.is_empty(), "into no channel");
+        assert_eq!(
+            actions.session.files_as_inputs,
+            files.map(PathBuf::from),
+            "in the order dropped; the runner says what it cannot use"
         );
     }
 
     #[test]
-    fn files_dropped_on_the_new_channel_zone_make_a_channel_first() {
+    fn files_dropped_on_the_empty_tile_are_an_input_each() {
         let data = UIData::test_fixture();
         let mut zone = None;
         {
@@ -465,15 +460,25 @@ mod tests {
                     .get_temp::<egui::Rect>(egui::Id::new("new_ch_drop_rect").with(0));
             });
         }
-        let (actions, label) = drop_at(&data, &["/show/intro.mp4"], zone.map(|r| r.center()));
-        assert_eq!(label, "1 video → a new channel");
-        assert!(actions
-            .commands
-            .iter()
-            .any(|c| matches!(c, EngineCommand::AddChannel)));
+        let at = zone.map(|r| r.center());
+        let (actions, label) = drop_at(&data, &["/show/intro.mp4"], at);
+        assert_eq!(label, "1 video → a new input");
+        let (actions2, label2) = drop_at(&data, &["/show/a.png", "/show/b.png"], at);
+        assert_eq!(label2, "2 images → a new input each");
+        assert_eq!(
+            actions2.session.files_as_inputs,
+            [PathBuf::from("/show/a.png"), PathBuf::from("/show/b.png")]
+        );
+        assert_eq!(
+            actions.session.files_as_inputs,
+            [PathBuf::from("/show/intro.mp4")]
+        );
         assert!(
-            actions.session.files_to_add.is_empty(),
-            "the files wait for the channel to exist"
+            !actions
+                .commands
+                .iter()
+                .any(|c| matches!(c, EngineCommand::AddChannel)),
+            "the runner makes the inputs, named after their files"
         );
     }
 

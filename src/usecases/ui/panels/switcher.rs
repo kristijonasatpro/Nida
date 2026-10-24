@@ -681,6 +681,8 @@ mod tests {
             label: format!("{name} (1920×1080)"),
             model: None,
             given_name: None,
+            identity: name.into(),
+            main: is_control,
         };
         assert_eq!(
             screen_label(&screen("Main", true)),

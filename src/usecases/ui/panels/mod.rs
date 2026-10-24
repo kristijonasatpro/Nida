@@ -32,6 +32,7 @@ mod monitors;
 mod notifications_overlay;
 mod outputs;
 mod playlist;
+mod presentation;
 mod popovers;
 mod record;
 mod rename;
@@ -227,11 +228,17 @@ pub fn render_ui(ui: &mut egui::Ui, data: &UIData) -> UIActions {
     begin_fx_surface_frame(ui.ctx());
     begin_drop_target_frame(ui.ctx(), data);
 
+    // Whether a text field was being typed into as the frame began: Enter
+    // finishing a name takes the field's focus away while the panels draw,
+    // before the keymap below is looked at.
+    let was_typing = typing(ui.ctx());
+
     // Main mode takes (Space / Enter), before any panel draws: the keys are
     // consumed here, so a button or checkbox that still has keyboard focus
     // does not also act on them.
     take_to_main_shortcuts(ui, data, &mut actions);
     rundown::go_shortcut(ui, data, &mut actions);
+    presentation::clicker_shortcuts(ui, data, &mut actions);
 
     // The panel arrangement this frame works on: the Layout menu and the
     // dock change it, and it goes back to the runner at the end.
@@ -540,6 +547,7 @@ pub fn render_ui(ui: &mut egui::Ui, data: &UIData) -> UIActions {
     screens::render_screens_window(ui.ctx(), data, &mut actions);
     add_input::render_add_input(ui.ctx(), data, &mut actions);
     playlist::render_playlist_window(ui.ctx(), data, &mut actions);
+    presentation::take_chosen(ui.ctx(), &mut actions);
     timer::render_timer_window(ui.ctx(), data, &mut actions);
 
     // === STREAM: the top bar's STREAM button opens it ===
@@ -578,6 +586,13 @@ pub fn render_ui(ui: &mut egui::Ui, data: &UIData) -> UIActions {
         } else {
             // Normal dispatch: look up each pressed key in the keymap
             for combo in &pressed {
+                // A letter typed into a name is a letter: no key without ⌘
+                // acts while a text field is typed into — one learned for a
+                // layer's opacity or a mute changed the show as a name was
+                // typed — nor the Enter that finishes it.
+                if !combo.command && (was_typing || typing(ui.ctx())) {
+                    continue;
+                }
                 if let Some(target) = data.keymap_bindings.get(combo) {
                     match target {
                         KeyTarget::Action(ActionId::Undo) => actions.session.undo_requested = true,

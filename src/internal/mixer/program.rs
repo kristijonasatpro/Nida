@@ -153,6 +153,9 @@ pub struct MainSnapshot {
     pub transition: MainTransition,
     /// Overlay channels switched on, by UUID.
     pub overlays_on: Vec<String>,
+    /// Overlay channels showing now — on, or still fading out, and drawn
+    /// (their channel's opacity, as resolved, above 0) — by UUID, sorted.
+    pub overlays_showing: Vec<String>,
 }
 
 impl MainSnapshot {
@@ -164,6 +167,7 @@ impl MainSnapshot {
             fade_secs: main.fade_secs,
             transition: main.transition,
             overlays_on: main.overlays_on(),
+            overlays_showing: main.overlays_showing(),
         }
     }
 }
@@ -289,6 +293,19 @@ impl MainProgram {
             .collect();
         on.sort();
         on
+    }
+
+    /// The overlays showing now — on, or still fading out — by channel UUID,
+    /// sorted.
+    pub fn overlays_showing(&self) -> Vec<String> {
+        let mut showing: Vec<String> = self
+            .overlays
+            .iter()
+            .filter(|(_, l)| l.now > 0.0)
+            .map(|(u, _)| u.clone())
+            .collect();
+        showing.sort();
+        showing
     }
 
     /// Put saved overlays back on, as a scene loads.

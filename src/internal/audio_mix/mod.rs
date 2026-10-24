@@ -21,6 +21,8 @@ mod apps;
 mod clip;
 mod core;
 mod device;
+mod dsp;
+mod dynamics;
 mod outputs;
 pub mod reader;
 
@@ -32,6 +34,8 @@ use std::time::{Duration, Instant};
 use self::core::{Bus, Feed, InputFeed, MixCore, OutputRing, Source};
 pub use self::core::{BusTap, BLOCK_FRAMES, MAX_DELAY_MS, SAMPLE_RATE};
 pub use clip::{ClipAudio, ClipAudioShared};
+pub use dsp::{CompressorConfig, LevelerConfig, LimiterConfig, LoudnessSnapshot, LowCutConfig};
+pub use dynamics::DynamicsSnapshot;
 use reader::gain_to_db;
 
 // ── Persisted configuration ─────────────────────────────────────────
@@ -39,6 +43,12 @@ use reader::gain_to_db;
 /// One audio bus as saved.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct AudioBusConfig {
+    #[serde(default)]
+    pub compressor: CompressorConfig,
+    /// Its limiter: on, at −1 dBFS, unless switched off — shows saved before
+    /// it get it too.
+    #[serde(default)]
+    pub limiter: LimiterConfig,
     pub uuid: String,
     pub name: String,
     /// Fader, in dB (-96 is off).
@@ -68,6 +78,8 @@ impl AudioBusConfig {
             delay_ms: 0.0,
             device: None,
             first_channel: 0,
+            compressor: CompressorConfig::default(),
+            limiter: LimiterConfig::default(),
         }
     }
 }
@@ -104,6 +116,12 @@ pub const FOLLOW_MAIN: &str = "main";
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(from = "StripOnDisk")]
 pub struct AudioStripConfig {
+    #[serde(default)]
+    pub compressor: CompressorConfig,
+    #[serde(default)]
+    pub low_cut: LowCutConfig,
+    #[serde(default)]
+    pub leveler: LevelerConfig,
     pub uuid: String,
     #[serde(default)]
     pub gain_db: f32,
@@ -140,6 +158,12 @@ fn is_zero(ms: &f32) -> bool {
 /// meant heard all the time; that becomes Audio Auto on, on air anywhere.
 #[derive(serde::Deserialize)]
 struct StripOnDisk {
+    #[serde(default)]
+    compressor: CompressorConfig,
+    #[serde(default)]
+    low_cut: LowCutConfig,
+    #[serde(default)]
+    leveler: LevelerConfig,
     uuid: String,
     #[serde(default)]
     gain_db: f32,
@@ -165,6 +189,9 @@ impl From<StripOnDisk> for AudioStripConfig {
         };
         Self {
             uuid: s.uuid,
+            compressor: s.compressor.sanitized(),
+            low_cut: s.low_cut.sanitized(),
+            leveler: s.leveler.sanitized(),
             gain_db: s.gain_db,
             muted: s.muted,
             sends: s.sends,
@@ -226,6 +253,8 @@ impl AudioMixConfig {
 /// One bus, as shown.
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct AudioBusSnapshot {
+    pub peak_db: [f32; 2],
+    pub dynamics: DynamicsSnapshot,
     #[serde(flatten)]
     pub config: AudioBusConfig,
     /// Whether the chosen device is playing. `None` with no device chosen.
@@ -260,6 +289,8 @@ pub enum AudioSourceKind {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct AudioSourceSnapshot {
+    pub peak_db: [f32; 2],
+    pub dynamics: DynamicsSnapshot,
     pub uuid: String,
     pub name: String,
     pub kind: AudioSourceKind,
@@ -427,6 +458,9 @@ pub struct AudioEngine {
     /// Sources soloed to the monitor. Live, never saved: a show should not
     /// reopen with the headphones stuck on one microphone.
     solos: std::collections::HashSet<String>,
+    /// The buses the mixing thread has, as last applied: a new one is built
+    /// before the mixer is held (see [`Self::apply`]).
+    applied_buses: std::collections::HashSet<String>,
     output_devices: Vec<String>,
     input_devices: Vec<AudioInputDevice>,
     /// A listing of the sound devices being made (see [`Self::rescan_devices`]).
@@ -497,6 +531,7 @@ impl AudioEngine {
             running_apps: Vec::new(),
             on_air: HashMap::new(),
             solos: std::collections::HashSet::new(),
+            applied_buses: std::collections::HashSet::new(),
             output_devices: Vec::new(),
             input_devices: Vec::new(),
             listing: None,
@@ -511,7 +546,16 @@ impl AudioEngine {
     }
 
     /// Replace every setting, as a workspace load does.
-    pub fn load(&mut self, config: AudioMixConfig) {
+    pub fn load(&mut self, mut config: AudioMixConfig) {
+        for bus in &mut config.buses {
+            bus.compressor = bus.compressor.sanitized();
+            bus.limiter = bus.limiter.sanitized();
+        }
+        for strip in &mut config.strips {
+            strip.compressor = strip.compressor.sanitized();
+            strip.low_cut = strip.low_cut.sanitized();
+            strip.leveler = strip.leveler.sanitized();
+        }
         // An app's sound whose input the show no longer has, or has as
         // something else — another app, a microphone under the same UUID —
         // stops now, not when the app sound thread next looks.
@@ -530,6 +574,15 @@ impl AudioEngine {
             .collect();
         if let Ok(mut core) = self.core.lock() {
             core.sources.retain(|s| !stale.contains(&s.uuid));
+            for source in &mut core.sources {
+                source.dynamics = dynamics::SourceChain::default();
+                source.held_peak = [0.0; 2];
+            }
+            for bus in &mut core.buses {
+                // In place: no allocation with the mixer held.
+                bus.dynamics.reset();
+                bus.held_peak = [0.0; 2];
+            }
         }
         for uuid in stale {
             // Its refusal was the old app's: another app under the UUID,
@@ -546,6 +599,30 @@ impl AudioEngine {
     /// The first bus, which new recordings and streams take.
     pub fn default_bus(&self) -> Option<&str> {
         self.config.buses.first().map(|b| b.uuid.as_str())
+    }
+
+    /// Clear a strip's held sample peaks without changing its audio settings.
+    pub fn reset_meter(&mut self, uuid: &str, bus: bool) {
+        if let Ok(mut core) = self.core.lock() {
+            if bus {
+                if let Some(target) = core.buses.iter_mut().find(|target| target.uuid == uuid) {
+                    target.held_peak = [0.0; 2];
+                }
+            } else if let Some(target) = core.sources.iter_mut().find(|target| target.uuid == uuid)
+            {
+                target.held_peak = [0.0; 2];
+            }
+        }
+    }
+
+    /// Start a bus's loudness readings again — integrated, short-term and
+    /// momentary — as a show starts. Its held peak stays.
+    pub fn reset_loudness(&mut self, uuid: &str) {
+        if let Ok(mut core) = self.core.lock() {
+            if let Some(target) = core.buses.iter_mut().find(|target| target.uuid == uuid) {
+                target.dynamics.reset_loudness();
+            }
+        }
     }
 
     /// Whether a bus with this UUID exists.
@@ -615,6 +692,8 @@ impl AudioEngine {
         edit(bus);
         bus.gain_db = bus.gain_db.clamp(-96.0, 12.0);
         bus.delay_ms = bus.delay_ms.clamp(0.0, MAX_DELAY_MS);
+        bus.compressor = bus.compressor.sanitized();
+        bus.limiter = bus.limiter.sanitized();
         self.apply();
         Ok(())
     }
@@ -660,6 +739,9 @@ impl AudioEngine {
         });
         let sends = self.default_bus().map(str::to_string).into_iter().collect();
         self.config.strips.push(AudioStripConfig {
+            compressor: CompressorConfig::default(),
+            low_cut: LowCutConfig::default(),
+            leveler: LevelerConfig::default(),
             uuid: uuid.clone(),
             gain_db: 0.0,
             muted: deck.is_some(),
@@ -678,17 +760,40 @@ impl AudioEngine {
     /// its UUID: taken straight from the app while it runs (see
     /// [`Self::keep_apps`]), on like a microphone.
     pub fn add_app_input(&mut self, name: &str, app: &str) -> String {
-        let uuid = self.add_device_input(
-            name,
-            &crate::audio::app_sound::device_name(app),
-            0,
-            1,
-            None,
-        );
+        self.add_app_input_of(name, app, None)
+    }
+
+    /// As [`Self::add_app_input`], the sound of the input `deck` (by deck
+    /// UUID) when one is given — PowerPoint's, of a PowerPoint input: Audio
+    /// Auto switches it with that picture, and it goes when the input does.
+    pub fn add_app_input_of(&mut self, name: &str, app: &str, deck: Option<&str>) -> String {
+        let uuid =
+            self.add_device_input(name, &crate::audio::app_sound::device_name(app), 0, 1, deck);
         if let Some(input) = self.config.inputs.iter_mut().find(|i| i.uuid == uuid) {
             input.app = Some(app.to_string());
         }
         uuid
+    }
+
+    /// The app whose sound the input `uuid` is, by bundle ID.
+    #[must_use]
+    pub fn app_of(&self, uuid: &str) -> Option<&str> {
+        self.config
+            .inputs
+            .iter()
+            .find(|i| i.uuid == uuid)?
+            .app
+            .as_deref()
+    }
+
+    /// The sound of app `app` tied to the deck `from` tied to `to` instead:
+    /// one app's sound kept for the input of it still there.
+    pub fn retie_app_inputs(&mut self, app: &str, from: &str, to: &str) {
+        for input in &mut self.config.inputs {
+            if input.app.as_deref() == Some(app) && input.deck.as_deref() == Some(from) {
+                input.deck = Some(to.to_string());
+            }
+        }
     }
 
     /// Remove the inputs that are the sound of a deck that is going.
@@ -789,6 +894,9 @@ impl AudioEngine {
             0.0
         };
         strip.sends.dedup();
+        strip.compressor = strip.compressor.sanitized();
+        strip.low_cut = strip.low_cut.sanitized();
+        strip.leveler = strip.leveler.sanitized();
         self.apply();
         Ok(())
     }
@@ -859,6 +967,9 @@ impl AudioEngine {
         for clip in &clips {
             if !self.config.strips.iter().any(|s| s.uuid == clip.deck_uuid) {
                 self.config.strips.push(AudioStripConfig {
+                    compressor: CompressorConfig::default(),
+                    low_cut: LowCutConfig::default(),
+                    leveler: LevelerConfig::default(),
                     uuid: clip.deck_uuid.clone(),
                     gain_db: 0.0,
                     // Off air until it is taken there.
@@ -925,6 +1036,9 @@ impl AudioEngine {
         for sound in &sounds {
             if !self.config.strips.iter().any(|s| s.uuid == sound.deck_uuid) {
                 self.config.strips.push(AudioStripConfig {
+                    compressor: CompressorConfig::default(),
+                    low_cut: LowCutConfig::default(),
+                    leveler: LevelerConfig::default(),
                     uuid: sound.deck_uuid.clone(),
                     gain_db: 0.0,
                     muted: true,
@@ -1099,6 +1213,7 @@ impl AudioEngine {
         // Before the apps' sound is taken: the sound released with a
         // subscription is then always the device's, never an app's.
         self.release_inputs(|id, token| capture.unsubscribe_pcm(id, token));
+        self.forget_lost_inputs(|id, token| capture.serves(id, token));
         self.keep_apps();
         // An app's sound is taken by `keep_apps`, not through the capture
         // manager.
@@ -1160,6 +1275,32 @@ impl AudioEngine {
             );
         }
         self.apply();
+    }
+
+    /// Drop the inputs whose subscription no longer runs (`serves` says
+    /// not): their device was lost, unplugged (see
+    /// `AudioManager::forget_lost`). Kept, such an input looked connected,
+    /// silent, and was never subscribed again; dropped with its sound, it
+    /// is looked for every [`RETRY`] and taken again once the device is back.
+    fn forget_lost_inputs(
+        &mut self,
+        serves: impl Fn(crate::audio::AudioSourceId, crate::audio::PcmToken) -> bool,
+    ) {
+        let lost: Vec<String> = self
+            .inputs
+            .iter()
+            .filter(|(_, live)| !serves(live.source_id, live.token))
+            .map(|(uuid, _)| uuid.clone())
+            .collect();
+        if lost.is_empty() {
+            return;
+        }
+        if let Ok(mut core) = self.core.lock() {
+            core.sources.retain(|s| !lost.contains(&s.uuid));
+        }
+        for uuid in &lost {
+            self.inputs.remove(uuid);
+        }
     }
 
     /// Let go, through `unsubscribe`, of the device subscriptions — with
@@ -1311,6 +1452,17 @@ impl AudioEngine {
             .buses
             .iter()
             .map(|b| AudioBusSnapshot {
+                peak_db: core
+                    .bus(&b.uuid)
+                    .map_or([-96.0; 2], |bus| meter_db(bus.held_peak)),
+                dynamics: core.bus(&b.uuid).map_or_else(
+                    || DynamicsSnapshot {
+                        config: b.compressor,
+                        limiter: Some(b.limiter),
+                        ..DynamicsSnapshot::default()
+                    },
+                    |bus| bus.dynamics.snapshot(),
+                ),
                 config: b.clone(),
                 device_ok: b.device.as_ref().map(|_| self.outputs.is_playing(&b.uuid)),
                 meter_db: core
@@ -1371,6 +1523,16 @@ impl AudioEngine {
             };
             let live = core.source(&uuid);
             sources.push(AudioSourceSnapshot {
+                peak_db: live.map_or([-96.0; 2], |source| meter_db(source.held_peak)),
+                dynamics: live.map_or_else(
+                    || DynamicsSnapshot {
+                        config: s.compressor,
+                        low_cut: Some(s.low_cut),
+                        leveler: Some(s.leveler),
+                        ..DynamicsSnapshot::default()
+                    },
+                    |source| source.dynamics.snapshot(),
+                ),
                 uuid: uuid.clone(),
                 name,
                 kind,
@@ -1418,6 +1580,16 @@ impl AudioEngine {
 
     /// Copy the settings onto the mixing thread's buses and sources.
     fn apply(&mut self) {
+        // A new bus's processing is built here, before the mixer is held,
+        // not inside it.
+        let mut fresh: HashMap<String, Bus> = self
+            .config
+            .buses
+            .iter()
+            .filter(|cfg| !self.applied_buses.contains(&cfg.uuid))
+            .map(|cfg| (cfg.uuid.clone(), Bus::new(cfg.uuid.clone())))
+            .collect();
+        self.applied_buses = self.config.buses.iter().map(|b| b.uuid.clone()).collect();
         let Ok(mut core) = self.core.lock() else {
             return;
         };
@@ -1428,10 +1600,12 @@ impl AudioEngine {
         for cfg in &self.config.buses {
             let mut bus = old
                 .remove(&cfg.uuid)
+                .or_else(|| fresh.remove(&cfg.uuid))
                 .unwrap_or_else(|| Bus::new(cfg.uuid.clone()));
             bus.gain_db = cfg.gain_db;
             bus.muted = cfg.muted;
             bus.delay_ms = cfg.delay_ms;
+            bus.dynamics.configure(cfg.compressor, cfg.limiter);
             bus.outputs = match (&cfg.device, self.outputs.is_playing(&cfg.uuid)) {
                 (Some(_), true) => self.rings.get(&cfg.uuid).cloned().into_iter().collect(),
                 _ => Vec::new(),
@@ -1444,6 +1618,9 @@ impl AudioEngine {
                 source.muted = strip.muted;
                 source.balance = strip.balance;
                 source.delay_ms = strip.delay_ms;
+                source
+                    .dynamics
+                    .configure(strip.low_cut, strip.leveler, strip.compressor);
                 source.sends.clone_from(&strip.sends);
             }
             source.solo = self.solos.contains(&source.uuid);
@@ -1505,8 +1682,8 @@ fn run_mixer(core: &Mutex<MixCore>, stop: &AtomicBool) {
     let mut next = Instant::now();
     while !stop.load(Ordering::Acquire) {
         if let Ok(mut core) = core.lock() {
-            core.process_block();
-            next += block;
+            // Behind before mixing, not after: what the processing held is
+            // dropped before it could go out (see `MixCore::skipped`).
             let now = Instant::now();
             if next + Duration::from_millis(100) < now {
                 // Too far behind to catch up block by block: jump ahead by
@@ -1520,6 +1697,8 @@ fn run_mixer(core: &Mutex<MixCore>, stop: &AtomicBool) {
                 core.skipped(u64::from(blocks), next);
                 next += block * blocks;
             }
+            core.process_block();
+            next += block;
         } else {
             next += block;
         }
@@ -1570,6 +1749,35 @@ mod tests {
     /// The sound handed back for an input is mixed only while the input
     /// still names that app — a show loaded since may have given its UUID to
     /// another; a refusal is kept for the strip until the sound is taken.
+    /// PowerPoint's sound taken for a PowerPoint input: switched with that
+    /// picture (Audio Auto, off until it is on air), and gone with it.
+    #[test]
+    fn an_apps_sound_for_an_input_goes_with_its_picture() {
+        let mut engine = AudioEngine::with_parts(
+            Box::new(|_: &str, _: u16, _: Arc<OutputRing>| Err(anyhow::anyhow!("no devices here"))),
+            Box::new(OneApp(Arc::new(AtomicBool::new(false)))),
+        );
+        let uuid =
+            engine.add_app_input_of("PowerPoint", "com.microsoft.Powerpoint", Some("deck0001"));
+        let input = engine
+            .config()
+            .inputs
+            .iter()
+            .find(|i| i.uuid == uuid)
+            .unwrap();
+        assert_eq!(input.deck.as_deref(), Some("deck0001"));
+        assert_eq!(input.app.as_deref(), Some("com.microsoft.Powerpoint"));
+        let strip = engine
+            .config()
+            .strips
+            .iter()
+            .find(|s| s.uuid == uuid)
+            .unwrap();
+        assert!(strip.auto && strip.muted);
+        engine.remove_inputs_of_deck("deck0001");
+        assert!(!engine.config().inputs.iter().any(|i| i.uuid == uuid));
+    }
+
     #[test]
     fn app_sound_is_mixed_only_for_the_app_its_input_names() {
         let mut engine = AudioEngine::with_parts(
@@ -1882,7 +2090,9 @@ mod tests {
         ];
         for (n, gone) in ways.into_iter().enumerate() {
             let mut engine = AudioEngine::with_parts(
-                Box::new(|_: &str, _: u16, _: Arc<OutputRing>| Err(anyhow::anyhow!("no devices here"))),
+                Box::new(|_: &str, _: u16, _: Arc<OutputRing>| {
+                    Err(anyhow::anyhow!("no devices here"))
+                }),
                 Box::new(OneApp(Arc::new(AtomicBool::new(false)))),
             );
             let uuid = engine.add_input("Lectern", "USB Mixer", 0, 1);
@@ -1931,6 +2141,49 @@ mod tests {
 
     fn has_sound(engine: &AudioEngine, uuid: &str) -> bool {
         engine.core.lock().unwrap().sources.iter().any(|s| s.uuid == uuid)
+    }
+
+    /// A microphone whose device was unplugged is dropped with its sound:
+    /// kept, it looked connected, silent, and was never subscribed again.
+    /// Dropped, it is taken again once the device is back.
+    #[test]
+    fn a_microphone_whose_device_went_is_dropped_to_be_taken_again() {
+        let mut engine = AudioEngine::with_parts(
+            Box::new(|_: &str, _: u16, _: Arc<OutputRing>| Err(anyhow::anyhow!("no devices here"))),
+            Box::new(OneApp(Arc::new(AtomicBool::new(false)))),
+        );
+        let uuid = engine.add_input("Lectern", "USB Mixer", 0, 1);
+        let mut capture = crate::audio::AudioManager::listing(&["USB Mixer"]);
+        let sub = capture.open_for_test(0, "USB Mixer");
+        // Subscribed, as `connect_inputs` does with a device there.
+        engine.inputs.insert(
+            uuid.clone(),
+            LiveInput {
+                source_id: 0,
+                token: sub.token,
+                device: "USB Mixer".into(),
+                left: 0,
+                right: 1,
+            },
+        );
+        let feed = InputFeed::new(sub.receiver, 48_000, 2, 0, 1);
+        engine
+            .core
+            .lock()
+            .unwrap()
+            .sources
+            .push(Source::new(uuid.clone(), Feed::Input(feed)));
+        engine.connect_inputs(&mut capture);
+        assert!(has_sound(&engine, &uuid), "running: kept");
+
+        capture.lose_for_test(0);
+        assert_eq!(capture.forget_lost(), ["USB Mixer"]);
+        engine.connect_inputs(&mut capture);
+        assert!(!has_sound(&engine, &uuid), "its sound went with its device");
+        assert!(
+            !engine.inputs.contains_key(&uuid),
+            "to be subscribed again once it is back"
+        );
     }
 
     /// A microphone's subscription is released, its sound with it, once a
@@ -2278,13 +2531,29 @@ mod tests {
     #[test]
     fn a_sources_delay_is_kept_in_range_saved_and_mixed() {
         let mut engine = with_clip("d1");
-        for (asked, kept) in [(170.0, 170.0), (5_000.0, MAX_DELAY_MS), (-20.0, 0.0), (f32::NAN, 0.0)] {
-            engine.edit_source("d1", |s| s.delay_ms = asked).expect("the clip");
-            assert!((strip(&engine).delay_ms - kept).abs() < 1e-6, "{asked} kept as {kept}");
+        for (asked, kept) in [
+            (170.0, 170.0),
+            (5_000.0, MAX_DELAY_MS),
+            (-20.0, 0.0),
+            (f32::NAN, 0.0),
+        ] {
+            engine
+                .edit_source("d1", |s| s.delay_ms = asked)
+                .expect("the clip");
+            assert!(
+                (strip(&engine).delay_ms - kept).abs() < 1e-6,
+                "{asked} kept as {kept}"
+            );
         }
-        engine.edit_source("d1", |s| s.delay_ms = 170.0).expect("the clip");
+        engine
+            .edit_source("d1", |s| s.delay_ms = 170.0)
+            .expect("the clip");
         let core = engine.core.lock().unwrap();
-        let mixed = core.sources.iter().find(|s| s.uuid == "d1").expect("in the mix");
+        let mixed = core
+            .sources
+            .iter()
+            .find(|s| s.uuid == "d1")
+            .expect("in the mix");
         assert!((mixed.delay_ms - 170.0).abs() < 1e-6);
         drop(core);
 
@@ -2294,7 +2563,170 @@ mod tests {
         assert_eq!(back, strip(&engine));
         let old: AudioStripConfig = serde_json::from_str(r#"{"uuid":"d1"}"#).unwrap();
         assert_eq!(old.delay_ms, 0.0, "saved before there was one");
-        engine.edit_source("d1", |s| s.delay_ms = 0.0).expect("the clip");
-        assert!(!serde_json::to_string(&strip(&engine)).unwrap().contains("delay_ms"));
+        engine
+            .edit_source("d1", |s| s.delay_ms = 0.0)
+            .expect("the clip");
+        assert!(!serde_json::to_string(&strip(&engine))
+            .unwrap()
+            .contains("delay_ms"));
+    }
+
+    #[test]
+    fn processing_settings_round_trip_and_old_shows_get_only_the_limiter() {
+        let old: AudioStripConfig = serde_json::from_str(r#"{"uuid":"d1","auto":true}"#).unwrap();
+        assert_eq!(old.compressor, CompressorConfig::default());
+        assert!(!old.low_cut.enabled && !old.leveler.enabled && !old.compressor.enabled);
+        let old_bus: AudioBusConfig =
+            serde_json::from_str(r#"{"uuid":"main","name":"Master"}"#).unwrap();
+        assert_eq!(old_bus.compressor, CompressorConfig::default());
+        // A show saved before the limiter gets it on: it only ever acts on
+        // what would otherwise be within 1 dB of clipping.
+        assert_eq!(old_bus.limiter, LimiterConfig::default());
+        assert!(old_bus.limiter.enabled);
+        let mut engine = with_clip("d1");
+        let config = CompressorConfig {
+            enabled: true,
+            ratio: 7.0,
+            makeup_db: 3.0,
+            ..CompressorConfig::default()
+        };
+        let limiter = LimiterConfig {
+            ceiling_db: -2.0,
+            ..LimiterConfig::default()
+        };
+        engine
+            .edit_source("d1", |strip| {
+                strip.compressor = config;
+                strip.low_cut = LowCutConfig::speech();
+                strip.leveler = LevelerConfig::speech();
+            })
+            .unwrap();
+        let bus = engine.default_bus().unwrap().to_string();
+        engine
+            .edit_bus(&bus, |bus| {
+                bus.compressor = config;
+                bus.limiter = limiter;
+            })
+            .unwrap();
+        let saved = serde_json::to_string(engine.config()).unwrap();
+        let back: AudioMixConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(&back, engine.config());
+        assert_eq!(back.strips[0].compressor, config);
+        assert_eq!(back.strips[0].low_cut, LowCutConfig::speech());
+        assert_eq!(back.strips[0].leveler, LevelerConfig::speech());
+        assert_eq!(back.buses[0].compressor, config);
+        assert_eq!(back.buses[0].limiter, limiter);
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.sources[0].dynamics.low_cut, Some(LowCutConfig::speech()));
+        assert_eq!(snapshot.buses[0].dynamics.limiter, Some(limiter));
+        engine
+            .edit_source("d1", |strip| strip.compressor.ratio = f32::NAN)
+            .unwrap();
+        assert_eq!(strip(&engine).compressor, CompressorConfig::default());
+    }
+
+    #[test]
+    fn unrelated_edits_preserve_compressor_history_and_reconnect_recreates_it() {
+        let mut engine = with_clip("d1");
+        engine.stop.store(true, Ordering::Relaxed);
+        engine.thread.take().unwrap().join().unwrap();
+        let config = CompressorConfig {
+            enabled: true,
+            threshold_db: -30.0,
+            ..CompressorConfig::default()
+        };
+        engine
+            .edit_source("d1", |strip| strip.compressor = config)
+            .unwrap();
+        {
+            let mut core = engine.core.lock().unwrap();
+            let source = core
+                .sources
+                .iter_mut()
+                .find(|source| source.uuid == "d1")
+                .unwrap();
+            let mut block = vec![[0.5; 2]; BLOCK_FRAMES];
+            for _ in 0..10 {
+                block.fill([0.5; 2]);
+                source.dynamics.process(&mut block);
+            }
+        }
+        let before = engine.snapshot().sources[0].dynamics.reduction_db;
+        assert!(before > 10.0);
+        engine
+            .edit_source("d1", |strip| strip.gain_db = -6.0)
+            .unwrap();
+        assert_eq!(engine.snapshot().sources[0].dynamics.reduction_db, before);
+        engine.load(engine.config().clone());
+        assert_eq!(engine.snapshot().sources[0].dynamics.reduction_db, 0.0);
+        engine.sync_clips(vec![]);
+        engine.sync_clips(vec![ClipSource {
+            deck_uuid: "d1".into(),
+            name: "reconnected".into(),
+            shared: Arc::new(ClipAudioShared::default()),
+        }]);
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.sources[0].dynamics.config, config);
+        assert_eq!(snapshot.sources[0].dynamics.reduction_db, 0.0);
+    }
+
+    #[test]
+    fn peak_reset_is_per_target_and_does_not_edit_audio_settings() {
+        let mut engine=with_clip("d1");
+        engine.stop.store(true,Ordering::Relaxed);
+        engine.thread.take().unwrap().join().unwrap();
+        let bus=engine.default_bus().unwrap().to_string();
+        let config=engine.config().clone();
+        {
+            let mut core=engine.core.lock().unwrap();
+            core.sources.iter_mut().find(|source|source.uuid=="d1").unwrap().held_peak=[0.5;2];
+            core.buses.iter_mut().find(|target|target.uuid==bus).unwrap().held_peak=[1.0;2];
+        }
+        engine.reset_meter("d1",false);
+        assert_eq!(engine.snapshot().sources[0].peak_db,[-96.0;2]);
+        assert_eq!(engine.snapshot().buses[0].peak_db,[0.0;2]);
+        engine.reset_meter(&bus,true);
+        assert_eq!(engine.snapshot().buses[0].peak_db,[-96.0;2]);
+        assert_eq!(engine.config(),&config);
+    }
+
+    #[test]
+    fn resetting_a_buses_peak_keeps_its_loudness_and_resetting_loudness_keeps_its_peak() {
+        let mut engine = with_clip("d1");
+        engine.stop.store(true, Ordering::Relaxed);
+        engine.thread.take().unwrap().join().unwrap();
+        let bus = engine.default_bus().unwrap().to_string();
+        {
+            let mut core = engine.core.lock().unwrap();
+            let target = core.buses.iter_mut().find(|b| b.uuid == bus).unwrap();
+            let tone: Vec<reader::Frame> = (0..BLOCK_FRAMES)
+                .map(|i| {
+                    let v = 0.1 * (i as f32 * 0.13).sin();
+                    [v, v]
+                })
+                .collect();
+            for _ in 0..200 {
+                let mut block = tone.clone();
+                target.dynamics.process_post(&mut block);
+            }
+            target.held_peak = [0.1; 2];
+        }
+        let loudness = |e: &AudioEngine| {
+            e.snapshot().buses[0]
+                .dynamics
+                .loudness
+                .unwrap()
+                .integrated_lufs
+        };
+        assert!(loudness(&engine).is_some());
+        engine.reset_meter(&bus, true);
+        assert!(
+            loudness(&engine).is_some(),
+            "the peak reset left the loudness"
+        );
+        engine.core.lock().unwrap().buses[0].held_peak = [0.1; 2];
+        engine.reset_loudness(&bus);
+        assert_eq!(loudness(&engine), None);
+        assert_eq!(engine.core.lock().unwrap().buses[0].held_peak, [0.1; 2]);
     }
 }

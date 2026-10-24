@@ -60,6 +60,15 @@ Preview is the channel selected — or the one holding the selected deck — and
 is what **Space** cuts and **Enter** fades to Main (see [Main](18-main.md)).
 Clicking a tile puts it in Preview; the tile's own **Cut** and **Fade** take it
 to Main at once. A tile's red frame means ON MAIN, green means Preview.
+
+A tile holding a clip (video or sound) has its own controls on the picture,
+as a playlist has: **⏮** back to the start, **▶ / ⏸** (green while it plays),
+and the time gone and left, with the playhead along the foot of the picture —
+start, stop and watch a clip without putting it in Preview. A sound, which
+has no picture, shows a **♪** and its name. The chips under a tile mark each
+clip, **▶** a video and **♪** a sound (green while it plays); a picture has no
+mark. A layer that is covered (under a full-screen one) still has its chip's
+picture: it is drawn for it once, and again every two seconds or so.
 Every tile is live: a channel on Main, in Preview or selected is drawn every
 frame, and one that is only a tile is still drawn 20 times a second — a clock
 keeps ticking, a slide show moves on — at a third of the cost. A preview is
@@ -70,7 +79,9 @@ picture's: making every preview full size every frame, shown or not, was the
 GPU's biggest cost on a MacBook.
 
 Under the Preview picture is the transport of its clip (video or sound) —
-the selected layer when it is a clip, else the input's top clip:
+the selected layer when it is a clip, else the input's top clip — and under
+the Program picture the same for the clip on air, so a clip playing on Main
+can be paused there and its time left seen (none in a layered mix):
 
 | | |
 |---|---|
@@ -87,8 +98,10 @@ Along the foot of each tile are the decks layered in the channel: click one
 for its settings, double-click to adjust it, right-click to take it to Main on
 its own. **Double-click a tile** for its [Input Settings](21-input-settings.md)
 — layers, position, crop, colour, keys and effects, as vMix opens them.
-Files and Library items dropped on a tile go into that channel; dropped on the
-empty tile at the end, they make a new channel.
+Files and Library items dropped on a tile go into that channel. Files dropped
+anywhere else — beside the tiles, or on the empty tile at the end — are an
+input each, named after its file; a Library item dropped on the empty tile
+makes a new channel holding it.
 
 With the layered mixer on, the take buttons are replaced by a **Main mode**
 button, and every channel mixes to the output as before.
@@ -100,7 +113,7 @@ A tile's **name bar** is its handle:
 | Drag | Move the channel along the row; a blue line shows where it lands. Drop it on the empty tile at the end to make it last |
 | Double-click | Rename the channel (Enter keeps the name, Esc leaves it) |
 | Right-click | Fold the tile to a narrow strip with its name down it, to make room for the channels in use; right-click the strip to open it out. A strip is framed red on Main and green in Preview, takes clicks, double-clicks and drops like a tile, and stays folded when Nida opens again |
-| × | Delete the channel. One holding layers asks first; **Undo** brings it back. The last two channels stay |
+| × | Delete the channel, at once: **Undo** brings it back. One that is on air — on Main or a bus's Program, itself or inside another input there, fading or not — asks first, saying where ("Ch 24 is on Main"). The last two channels stay |
 
 A channel's right-click menu (in any layout) also has **Rename…**, **Move
 earlier** and **Move later**.

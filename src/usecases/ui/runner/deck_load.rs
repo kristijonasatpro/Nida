@@ -63,9 +63,52 @@ pub(super) fn apply_deck_texture_outcomes(
     }
 }
 
+/// What each dropped file loads as, in the order given: a picture, a clip (a
+/// sound file is a clip with a clear picture) or a shader. Anything that is
+/// not an image, video or shader is reported and left out; so is a shader
+/// that does not parse.
+fn deck_files(
+    varda: &mut crate::app::VardaApp,
+    paths: Vec<std::path::PathBuf>,
+) -> Vec<(std::path::PathBuf, crate::app::render::DeckFile)> {
+    use crate::app::render::DeckFile;
+    use crate::deck::media::MediaKind;
+    let mut files = Vec::new();
+    let mut skipped = Vec::new();
+    for path in paths {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let file = match MediaKind::of(&path) {
+            Some(MediaKind::Image) => DeckFile::Image(path.clone()),
+            Some(MediaKind::Video | MediaKind::Audio) => DeckFile::Video(path.clone()),
+            Some(MediaKind::Shader) => match crate::isf::ISFShader::from_file(&path) {
+                Ok(shader) => DeckFile::Shader(Box::new(shader)),
+                Err(e) => {
+                    varda.notify_error(format!("'{name}' is not a usable ISF shader: {e}"));
+                    continue;
+                }
+            },
+            None => {
+                skipped.push(name);
+                continue;
+            }
+        };
+        files.push((path, file));
+    }
+    if !skipped.is_empty() {
+        varda.notify_error(format!(
+            "Not added (not an image, video or shader): {}",
+            skipped.join(", ")
+        ));
+    }
+    files
+}
+
 /// Start loading files dropped in from Finder as decks in one channel, in the
-/// order given, before the deck `place` names (or at the end). Anything that is not an image, video or shader is reported
-/// and left out; so is a shader that does not parse.
+/// order given, before the deck `place` names (or at the end). See
+/// `deck_files` for what is left out.
 pub(super) fn add_dropped_files(
     varda: &mut crate::app::VardaApp,
     targets: &mut DeckLoadTargets,
@@ -74,8 +117,6 @@ pub(super) fn add_dropped_files(
     place: &crate::usecases::ui::DeckPlace,
     paths: Vec<std::path::PathBuf>,
 ) {
-    use crate::app::render::DeckFile;
-    use crate::deck::media::MediaKind;
     let channel_uuid = place.channel_uuid.as_str();
 
     if varda
@@ -89,42 +130,50 @@ pub(super) fn add_dropped_files(
         );
         return;
     }
-    let mut files = Vec::new();
-    let mut skipped = Vec::new();
-    for path in paths {
-        let name = path.file_name().map_or_else(
-            || path.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
-        let file = match MediaKind::of(&path) {
-            Some(MediaKind::Image) => DeckFile::Image(path),
-            // A sound file is a clip with a clear picture.
-            Some(MediaKind::Video | MediaKind::Audio) => DeckFile::Video(path),
-            Some(MediaKind::Shader) => match crate::isf::ISFShader::from_file(&path) {
-                Ok(shader) => DeckFile::Shader(Box::new(shader)),
-                Err(e) => {
-                    varda.notify_error(format!("'{name}' is not a usable ISF shader: {e}"));
-                    continue;
-                }
-            },
-            None => {
-                skipped.push(name);
-                continue;
-            }
-        };
-        // Every file goes before the same deck, so they keep their order:
-        // A before X, then B before X, is A, B, X.
-        files.push((
-            targets.record_before(channel_uuid.to_string(), place.before_deck_uuid.clone()),
-            file,
-        ));
-    }
-    if !skipped.is_empty() {
-        varda.notify_error(format!(
-            "Not added (not an image, video or shader): {}",
-            skipped.join(", ")
-        ));
-    }
+    // Every file goes before the same deck, loaded last first so they keep
+    // their order in the lists, which show the front first: B before X,
+    // then A before X, is B, A, X — listed X, A, B.
+    let mut files: Vec<_> = deck_files(varda, paths)
+        .into_iter()
+        .map(|(_, file)| {
+            let token =
+                targets.record_before(channel_uuid.to_string(), place.before_deck_uuid.clone());
+            (token, file)
+        })
+        .collect();
+    files.reverse();
+    let size = (varda.render_width(), varda.render_height());
+    crate::app::VardaApp::spawn_ordered_deck_loads(
+        sender,
+        varda.gpu_context(),
+        pending,
+        size,
+        files,
+    );
+}
+
+/// Start loading files dropped where no channel is: an input each, at the
+/// end of the row and named after its file, as Add Input makes them, in the
+/// order dropped. The frame's one undo takes them all away (see
+/// `UIActions::has_undoable_action`); an input whose file does not open
+/// goes with it (see `remove_if_empty`). See `deck_files` for what is left
+/// out — it makes no input.
+pub(super) fn add_dropped_files_as_inputs(
+    varda: &mut crate::app::VardaApp,
+    targets: &mut DeckLoadTargets,
+    awaiting: &mut std::collections::HashSet<String>,
+    sender: &std::sync::mpsc::Sender<crate::app::render::DeckLoadResult>,
+    pending: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    paths: Vec<std::path::PathBuf>,
+) {
+    let files = deck_files(varda, paths)
+        .into_iter()
+        .filter_map(|(path, file)| {
+            let uuid = new_input_for(varda, &path)?;
+            awaiting.insert(uuid.clone());
+            Some((targets.record(uuid), file))
+        })
+        .collect();
     let size = (varda.render_width(), varda.render_height());
     crate::app::VardaApp::spawn_ordered_deck_loads(
         sender,
@@ -253,5 +302,93 @@ mod tests {
         assert_eq!(targets.claim(b), Some(("ch-bbb".to_string(), None)));
         assert_eq!(targets.claim(c), Some(("ch-ccc".to_string(), None)));
         assert_eq!(targets.claim(a), Some(("ch-aaa".to_string(), None)));
+    }
+
+    /// Files dropped together go before the same deck, the last loaded
+    /// first: each in front of those loaded before it, the first dropped is
+    /// the front one, at the top of the lists — in the order dropped.
+    #[test]
+    fn dropped_files_load_last_first() {
+        let Ok(gpu) = crate::renderer::context::GpuContext::new_headless() else {
+            return;
+        };
+        let Ok(mut app) = crate::app::VardaApp::new(gpu, &crate::testing::headless_config()) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<std::path::PathBuf> = ["a", "b", "c"]
+            .iter()
+            .map(|name| {
+                let path = dir.path().join(format!("{name}.png"));
+                image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 0, 255]))
+                    .save(&path)
+                    .unwrap();
+                path
+            })
+            .collect();
+        let channel_uuid = app.mixer_ref().channels()[0].uuid().to_string();
+        let mut targets = DeckLoadTargets::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pending = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let place = crate::usecases::ui::DeckPlace {
+            channel_uuid,
+            before_deck_uuid: None,
+        };
+        add_dropped_files(&mut app, &mut targets, &tx, &pending, &place, paths);
+        let names: Vec<String> = (0..3)
+            .map(|_| {
+                rx.recv_timeout(std::time::Duration::from_secs(30))
+                    .expect("every file loads")
+                    .name
+            })
+            .collect();
+        assert_eq!(names, ["c.png", "b.png", "a.png"]);
+    }
+
+    /// Files dropped where no channel is: an input each, named after its
+    /// file, in the order dropped, each file loading into its own; a file
+    /// Nida cannot use makes none.
+    #[test]
+    fn files_dropped_on_nothing_load_into_an_input_each() {
+        let Ok(gpu) = crate::renderer::context::GpuContext::new_headless() else {
+            return;
+        };
+        let Ok(mut app) = crate::app::VardaApp::new(gpu, &crate::testing::headless_config()) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths: Vec<std::path::PathBuf> = ["slide 1", "slide 2"]
+            .iter()
+            .map(|name| {
+                let path = dir.path().join(format!("{name}.png"));
+                image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 0, 255]))
+                    .save(&path)
+                    .unwrap();
+                path
+            })
+            .collect();
+        let notes = dir.path().join("notes.txt");
+        std::fs::write(&notes, "not a picture").unwrap();
+        paths.insert(1, notes);
+        let before = app.mixer_ref().channels().len();
+        let mut targets = DeckLoadTargets::default();
+        let mut awaiting = std::collections::HashSet::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pending = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        add_dropped_files_as_inputs(&mut app, &mut targets, &mut awaiting, &tx, &pending, paths);
+        let made: Vec<(String, String)> = app.mixer_ref().channels()[before..]
+            .iter()
+            .map(|ch| (ch.uuid().to_string(), ch.name.clone()))
+            .collect();
+        let names: Vec<&str> = made.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(names, ["slide 1", "slide 2"]);
+        assert_eq!(awaiting.len(), 2, "each goes if its file does not open");
+        for (uuid, _) in &made {
+            let result = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("every file loads");
+            let (target, before_deck) = targets.claim(result.token).expect("recorded");
+            assert_eq!((&target, before_deck), (uuid, None), "{}", result.name);
+        }
     }
 }

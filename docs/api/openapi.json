@@ -510,6 +510,54 @@
         }
       }
     },
+    "/api/audio-buses/{bus_uuid}/compressor": {
+      "put": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "summary": "A bus's compressor, before its fader.",
+        "operationId": "set_bus_compressor",
+        "parameters": [
+          {
+            "name": "bus_uuid",
+            "in": "path",
+            "description": "Audio bus UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompressorConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A value out of its range"
+          },
+          "404": {
+            "description": "No such bus"
+          }
+        }
+      }
+    },
     "/api/audio-buses/{bus_uuid}/delay": {
       "put": {
         "tags": [
@@ -638,6 +686,118 @@
           },
           "404": {
             "description": "No such bus"
+          }
+        }
+      }
+    },
+    "/api/audio-buses/{bus_uuid}/limiter": {
+      "put": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "summary": "A bus's limiter, after its fader: no sample past its ceiling.",
+        "operationId": "set_bus_limiter",
+        "parameters": [
+          {
+            "name": "bus_uuid",
+            "in": "path",
+            "description": "Audio bus UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LimiterConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Ceiling out of −12–0 dBFS or release out of 10–1000 ms"
+          },
+          "404": {
+            "description": "No such bus"
+          }
+        }
+      }
+    },
+    "/api/audio-buses/{bus_uuid}/loudness/reset": {
+      "post": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "summary": "Start a bus's loudness readings again — integrated, short-term and\nmomentary — as a show starts.",
+        "operationId": "reset_bus_loudness",
+        "parameters": [
+          {
+            "name": "bus_uuid",
+            "in": "path",
+            "description": "Audio bus UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/audio-buses/{bus_uuid}/meters/reset": {
+      "post": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "summary": "Reset a bus's held peak (its loudness readings stay).",
+        "operationId": "reset_bus_meters",
+        "parameters": [
+          {
+            "name": "bus_uuid",
+            "in": "path",
+            "description": "Audio bus UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
           }
         }
       }
@@ -1027,6 +1187,54 @@
         }
       }
     },
+    "/api/audio-sources/{source_uuid}/compressor": {
+      "put": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "summary": "A source's compressor, after its leveler.",
+        "operationId": "set_source_compressor",
+        "parameters": [
+          {
+            "name": "source_uuid",
+            "in": "path",
+            "description": "Source UUID (the deck's, for a clip)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompressorConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A value out of its range"
+          },
+          "404": {
+            "description": "No such source"
+          }
+        }
+      }
+    },
     "/api/audio-sources/{source_uuid}/delay": {
       "put": {
         "tags": [
@@ -1159,6 +1367,134 @@
         }
       }
     },
+    "/api/audio-sources/{source_uuid}/leveler": {
+      "put": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "summary": "A source's leveler: each speaker brought slowly to the same loudness.",
+        "operationId": "set_source_leveler",
+        "parameters": [
+          {
+            "name": "source_uuid",
+            "in": "path",
+            "description": "Source UUID (the deck's, for a clip)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LevelerConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A value out of its range"
+          },
+          "404": {
+            "description": "No such source"
+          }
+        }
+      }
+    },
+    "/api/audio-sources/{source_uuid}/low-cut": {
+      "put": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "summary": "A source's low cut: rumble and hum under a voice.",
+        "operationId": "set_source_low_cut",
+        "parameters": [
+          {
+            "name": "source_uuid",
+            "in": "path",
+            "description": "Source UUID (the deck's, for a clip)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LowCutConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Frequency out of 20–400 Hz, or a slope other than 12 or 24"
+          },
+          "404": {
+            "description": "No such source"
+          }
+        }
+      }
+    },
+    "/api/audio-sources/{source_uuid}/meters/reset": {
+      "post": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "summary": "Reset a source's held peak.",
+        "operationId": "reset_source_meters",
+        "parameters": [
+          {
+            "name": "source_uuid",
+            "in": "path",
+            "description": "Source UUID (the deck's, for a clip)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/audio-sources/{source_uuid}/mute": {
       "put": {
         "tags": [
@@ -1283,6 +1619,41 @@
           },
           "required": true
         },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such source"
+          }
+        }
+      }
+    },
+    "/api/audio-sources/{source_uuid}/speech-preset": {
+      "post": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "summary": "The Speech preset on a source: low cut at 100 Hz, the leveler to −20 dB,\ngentle compression — what a talk's microphone needs, in one call.",
+        "operationId": "apply_speech_preset",
+        "parameters": [
+          {
+            "name": "source_uuid",
+            "in": "path",
+            "description": "Source UUID (the deck's, for a clip)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "",
@@ -13722,6 +14093,13 @@
             "type": "string",
             "description": "The app's bundle ID, as listed in `audio_mix.apps` (\"us.zoom.xos\")."
           },
+          "deck_uuid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The input whose sound it is, by deck UUID (PowerPoint's, of a\nPowerPoint input): heard with its picture on air, removed with it."
+          },
           "name": {
             "type": "string",
             "description": "The strip's name; the app's when empty."
@@ -14662,6 +15040,46 @@
               "type": "string"
             },
             "description": "UUIDs of the surfaces to combine."
+          }
+        }
+      },
+      "CompressorConfig": {
+        "type": "object",
+        "description": "A compressor: above its threshold a voice rises only 1/ratio as much,\nstereo linked, from the louder channel's peak.",
+        "properties": {
+          "attack_ms": {
+            "type": "number",
+            "format": "float",
+            "default": 10.0
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "knee_db": {
+            "type": "number",
+            "format": "float",
+            "default": 6.0
+          },
+          "makeup_db": {
+            "type": "number",
+            "format": "float",
+            "default": 0.0
+          },
+          "ratio": {
+            "type": "number",
+            "format": "float",
+            "default": 3.0
+          },
+          "release_ms": {
+            "type": "number",
+            "format": "float",
+            "default": 100.0
+          },
+          "threshold_db": {
+            "type": "number",
+            "format": "float",
+            "default": -18.0
           }
         }
       },
@@ -16251,6 +16669,45 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "description": "A PowerPoint deck, played by PowerPoint on this computer in a window\nNida captures — its transitions, animations and videos as PowerPoint\nplays them — and moved on from Nida (macOS).",
+            "required": [
+              "path",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "powerpoint"
+                ]
+              },
+              "path": {
+                "type": "string",
+                "description": "The deck's file, absolute."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A presenter view of a PowerPoint input, for the speaker's screen: its\nslide, live, with the speaker notes, what comes next and the talk's\nclocks. `deck_uuid` is the PowerPoint input's layer.",
+            "required": [
+              "deck_uuid",
+              "kind"
+            ],
+            "properties": {
+              "deck_uuid": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "presenter_view"
+                ]
+              }
+            }
           }
         ],
         "description": "What a new input shows, for [`EngineCommand::AddInput`]: a live source,\nas vMix's Add Input window offers them. Files come in through the file\ndialog instead, a new input each."
@@ -16477,6 +16934,68 @@
           }
         }
       },
+      "LevelerConfig": {
+        "type": "object",
+        "description": "A source's leveler: brings each speaker slowly to the same loudness, as a\nradio station's processor does, so a soft speaker after a loud one needs no\nhand on the fader. It holds still through pauses, so it never pumps the\nroom's noise up between sentences.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "hold_below_db": {
+            "type": "number",
+            "format": "float",
+            "description": "Below this average level, dBFS (−80 to −20), it takes the sound for a\npause or the room and holds still.",
+            "default": -50.0
+          },
+          "max_boost_db": {
+            "type": "number",
+            "format": "float",
+            "description": "The most it turns a soft voice up, 0–24 dB.",
+            "default": 12.0
+          },
+          "max_cut_db": {
+            "type": "number",
+            "format": "float",
+            "description": "The most it turns a loud voice down, 0–24 dB.",
+            "default": 12.0
+          },
+          "speed_secs": {
+            "type": "number",
+            "format": "float",
+            "description": "How slowly it moves, 0.5–20 s: about the time it takes to make up most\nof a difference. It turns down three times as fast as it turns up.",
+            "default": 3.0
+          },
+          "target_db": {
+            "type": "number",
+            "format": "float",
+            "description": "The level it rides the voice to: the average (RMS) level, dBFS,\n−40 to −6.",
+            "default": -20.0
+          }
+        }
+      },
+      "LimiterConfig": {
+        "type": "object",
+        "description": "A bus's limiter: the last thing before its recordings, streams and\nscreens, so a shout, a dropped microphone or a loud clip can never clip\nthem. It looks a little ahead to turn down before a peak arrives.",
+        "properties": {
+          "ceiling_db": {
+            "type": "number",
+            "format": "float",
+            "description": "The highest a sample may go, dBFS, −12 to 0.",
+            "default": -1.0
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "release_ms": {
+            "type": "number",
+            "format": "float",
+            "description": "How quickly it lets go after a peak, 10–1000 ms.",
+            "default": 100.0
+          }
+        }
+      },
       "LinkTick": {
         "type": "object",
         "description": "One display-link callback.",
@@ -16552,6 +17071,29 @@
           "start": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "LowCutConfig": {
+        "type": "object",
+        "description": "A source's low cut: the rumble, handling noise and hum under a voice.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "hz": {
+            "type": "number",
+            "format": "float",
+            "description": "Where it starts to cut, 20–400 Hz. Speech has little below 100 Hz.",
+            "default": 100.0
+          },
+          "slope_db": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How steeply below it: 12 or 24 dB an octave.",
+            "default": 24,
+            "minimum": 0
           }
         }
       },
@@ -17952,14 +18494,14 @@
         "oneOf": [
           {
             "type": "object",
-            "description": "This deck's channel, directly below it.",
+            "description": "This deck's channel, just after it in the stack: in front of it.",
             "required": [
               "AfterDeck"
             ],
             "properties": {
               "AfterDeck": {
                 "type": "string",
-                "description": "This deck's channel, directly below it."
+                "description": "This deck's channel, just after it in the stack: in front of it."
               }
             }
           },
@@ -18010,7 +18552,7 @@
             ]
           }
         ],
-        "description": "Where a paste lands.\n\nThe `After*` forms are what a right-click uses, so a copy arrives directly\nbelow the thing the menu was opened on; the `Into*` forms append, which is\nwhat the container's own menu and an API caller mean."
+        "description": "Where a paste lands.\n\nThe `After*` forms are what a right-click uses, so a copy arrives next to\nthe thing the menu was opened on — a deck's just after it in its\nchannel's stack, in front of it, which the lists of layers show above\nit; the `Into*` forms append, which is what the container's own menu and\nan API caller mean."
       },
       "PathSegment": {
         "oneOf": [

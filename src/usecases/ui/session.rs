@@ -73,6 +73,9 @@ pub struct UISession {
     /// Files dropped in from Finder, each batch with where it goes, in the
     /// order they were dropped.
     pub files_to_add: Vec<(DeckPlace, Vec<std::path::PathBuf>)>,
+    /// Files dropped where no channel is, in the order they were dropped:
+    /// an input each.
+    pub files_as_inputs: Vec<std::path::PathBuf>,
     /// Open a folder picker for where recordings go (outside the frame, like
     /// the file dialogs).
     pub choose_record_folder: bool,
@@ -196,6 +199,7 @@ impl UISession {
             open_image_dialog_for_new_inputs: false,
             open_video_dialog_for_new_inputs: false,
             files_to_add: Vec::new(),
+            files_as_inputs: Vec::new(),
             choose_record_folder: false,
             reveal_file: None,
             notifications_to_dismiss: Vec::new(),

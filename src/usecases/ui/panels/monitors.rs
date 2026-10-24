@@ -180,6 +180,59 @@ fn render_program(ui: &mut egui::Ui, size: egui::Vec2, data: &UIData, actions: &
     response.context_menu(|ui| {
         super::switcher::take_menu_items(ui, &crate::bus::BusInputRef::Master, data, actions);
     });
+    // The transport of the clip on air, as Preview has its own: paused
+    // there, and how much of it is left seen.
+    ui.add_space(6.0);
+    let (clip, several_layers) = on_air_clip(data);
+    super::transport::render_transport(ui, clip, several_layers, size.x, actions);
+}
+
+/// The clip Program's transport drives, and whether to name it: Main's
+/// input's clip that shows (see [`super::transport::top_clip`]) or the layer
+/// on Main on its own; else the top overlay's showing; else, while a fade
+/// runs, the one fading out. None in a layered mix.
+fn on_air_clip(
+    data: &UIData,
+) -> (
+    Option<(&super::super::DeckUIInfo, &super::super::VideoPlaybackUI)>,
+    bool,
+) {
+    if !main_desk::in_main_mode(data) {
+        return (None, false);
+    }
+    let channel = |uuid: &str| data.channels.iter().find(|c| c.uuid == uuid);
+    let clip_of = |source: &crate::mixer::MainSource| match source {
+        crate::mixer::MainSource::Channel(uuid) => channel(uuid)
+            .and_then(|ch| super::transport::top_clip(ch).map(|clip| (clip, ch.decks.len() > 1))),
+        crate::mixer::MainSource::Deck(uuid) => data
+            .channels
+            .iter()
+            .flat_map(|c| &c.decks)
+            .find(|d| d.uuid == *uuid)
+            .and_then(|d| d.video_playback.as_ref().map(|vp| ((d, vp), false))),
+        crate::mixer::MainSource::Black => None,
+    };
+    // The top overlay showing — composited in channel order, the last
+    // over the rest — still while it fades out.
+    let overlay = || {
+        data.channels
+            .iter()
+            .rev()
+            .filter(|c| data.main.overlays_showing.contains(&c.uuid))
+            .find_map(super::transport::top_clip)
+            .map(|clip| (clip, true))
+    };
+    let fading = || {
+        data.main
+            .fade
+            .as_ref()
+            .and_then(|fade| clip_of(&fade.from))
+            .map(|(clip, _)| (clip, true))
+    };
+    match clip_of(&data.main.program).or_else(overlay).or_else(fading) {
+        Some((clip, named)) => (Some(clip), named),
+        None => (None, false),
+    }
 }
 
 fn render_take_column(
@@ -296,8 +349,15 @@ mod tests {
     }
 
     fn harness(data: UIData) -> egui_kittest::Harness<'static, Vec<EngineCommand>> {
+        let mut harness = unrun(data);
+        harness.run();
+        harness
+    }
+
+    /// The monitors, not yet drawn: a fade running repaints every frame.
+    fn unrun(data: UIData) -> egui_kittest::Harness<'static, Vec<EngineCommand>> {
         let data = std::rc::Rc::new(data);
-        let mut harness = egui_kittest::Harness::builder()
+        egui_kittest::Harness::builder()
             .with_size(egui::vec2(1400.0, 420.0))
             .build_ui_state(
                 move |ui, commands: &mut Vec<EngineCommand>| {
@@ -306,9 +366,7 @@ mod tests {
                     commands.extend(actions.commands);
                 },
                 Vec::new(),
-            );
-        harness.run();
-        harness
+            )
     }
 
     /// Preview's channel with a 60-second clip on top, 20 s in, paused.
@@ -368,6 +426,109 @@ mod tests {
         assert_eq!(seeks(&harness), vec![25.0, 15.0, 0.0]);
     }
 
+    /// Program has the transport of the clip on air, as Preview has its own:
+    /// paused there, and how much of it is left seen.
+    #[test]
+    fn programs_clip_is_paused_from_under_its_picture() {
+        let (mut data, _) = with_clip();
+        // The clip on Main instead, playing; Preview's input has none.
+        let mut vp = data.channels[1]
+            .decks
+            .last_mut()
+            .unwrap()
+            .video_playback
+            .take();
+        if let Some(vp) = vp.as_mut() {
+            vp.playing = true;
+        }
+        let deck = data.channels[0].decks.last_mut().unwrap();
+        deck.video_playback = vp;
+        let uuid = deck.uuid.clone();
+        let mut harness = harness(data);
+        harness.get_by_label("-00:40.0");
+        harness.get_by_label("Pause").click();
+        harness.run();
+        assert!(
+            harness.state().iter().any(
+                |c| matches!(c, EngineCommand::VideoTogglePlay { deck_uuid } if *deck_uuid == uuid)
+            ),
+            "{:?}",
+            harness.state()
+        );
+    }
+
+    /// Program's transport is the clip that shows on Main, whatever layer
+    /// is selected; with none on Main, an overlay's switched on, named; and
+    /// while a fade runs, the one fading out.
+    #[test]
+    fn programs_transport_follows_what_shows_on_main() {
+        // Two clips in Main's input, the lower one selected.
+        let make = || {
+            let (mut data, _) = with_clip();
+            let vp = data.channels[1]
+                .decks
+                .last_mut()
+                .unwrap()
+                .video_playback
+                .take();
+            data.channels[0].decks[0].video_playback.clone_from(&vp);
+            data.channels[0].decks[1].video_playback.clone_from(&vp);
+            data.selected_deck = Some((0, 0));
+            data.selected_channel = Some(1);
+            data
+        };
+        let data = make();
+        let upper = data.channels[0].decks[1].uuid.clone();
+        let name = data.channels[0].decks[1].name.clone();
+        let mut on_main = harness(data);
+        on_main.get_by_label("Play").click();
+        on_main.run();
+        assert!(on_main.state().iter().any(
+            |c| matches!(c, EngineCommand::VideoTogglePlay { deck_uuid } if *deck_uuid == upper)
+        ));
+
+        // Main black; Main's input showing as an overlay instead — still
+        // while it fades out.
+        let mut data = make();
+        data.main.program = MainSource::Black;
+        data.main.overlays_showing = vec![data.channels[0].uuid.clone()];
+        let overlay = harness(data);
+        assert!(overlay.query_by_label(&name).is_some(), "named");
+        assert!(overlay.query_by_label("Play").is_some());
+
+        // Two overlays with clips: the later channel's is over the other.
+        let mut data = make();
+        data.main.program = MainSource::Black;
+        let later = data.channels[1].decks[0].uuid.clone();
+        let vp = data.channels[0].decks[0].video_playback.clone();
+        data.channels[1].decks[0].video_playback = vp;
+        // Nothing in Preview, whose transport would be another Play.
+        data.selected_deck = None;
+        data.selected_channel = None;
+        data.main.overlays_showing =
+            vec![data.channels[0].uuid.clone(), data.channels[1].uuid.clone()];
+        let mut two = harness(data);
+        two.get_by_label("Play").click();
+        two.run();
+        assert!(two.state().iter().any(
+            |c| matches!(c, EngineCommand::VideoTogglePlay { deck_uuid } if *deck_uuid == later)
+        ));
+
+        // Fading from Main's input to black.
+        let mut data = make();
+        let from = data.main.program.clone();
+        data.main.program = MainSource::Black;
+        data.main.fade = Some(crate::mixer::MainFade {
+            from,
+            progress: 0.5,
+            duration: 1.0,
+            transition: crate::mixer::MainTransition::default(),
+        });
+        let mut fade = unrun(data);
+        fade.run_steps(2);
+        assert!(fade.query_by_label("Play").is_some());
+    }
+
     #[test]
     fn clicking_the_bar_moves_the_playhead_there() {
         let (data, _) = with_clip();
@@ -415,10 +576,14 @@ mod tests {
 
     #[test]
     fn an_input_with_nothing_to_play_says_so() {
+        // Under Preview and under Program alike.
         let harness = harness(main_mode_fixture());
-        assert!(harness
-            .query_by_label_contains("No video or sound in this input")
-            .is_some());
+        assert_eq!(
+            harness
+                .query_all_by_label_contains("No video or sound in this input")
+                .count(),
+            2
+        );
         assert!(harness.query_by_label("Play").is_none());
     }
 

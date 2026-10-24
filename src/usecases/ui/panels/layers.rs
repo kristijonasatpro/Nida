@@ -125,7 +125,8 @@ fn render_row(ui: &mut egui::Ui, ch: &ChannelUIInfo, data: &UIData, actions: &mu
                             // tall as the panel.
                             ui.add_space(4.0);
                             let cell = cell_width(data);
-                            for deck in &ch.decks {
+                            // Front first, as the other lists of layers.
+                            for deck in ch.decks.iter().rev() {
                                 ui.allocate_ui_with_layout(
                                     egui::vec2(cell, 0.0),
                                     egui::Layout::top_down(egui::Align::Min),
@@ -193,6 +194,11 @@ fn render_header(
             let size = egui::vec2(28.0, 22.0);
             super::timer::start_button(ui, &deck.uuid, timer, size, actions);
             super::timer::settings_button(ui, &deck.uuid, size);
+        });
+    }
+    if let Some((deck, _)) = super::presentation::of_channel(ch) {
+        ui.horizontal(|ui| {
+            super::presentation::step_buttons(ui, &deck.uuid, egui::vec2(28.0, 22.0), actions);
         });
     }
 
@@ -463,6 +469,22 @@ mod tests {
         };
         let pitch = (y(&first) - y(&last)) / (UIData::test_fixture().channels.len() - 1) as f32;
         assert!(pitch < 250.0, "rows {pitch} px apart");
+    }
+
+    /// In a row, as in a channel's other lists: the layer in front first.
+    #[test]
+    fn a_rows_cards_put_the_layer_in_front_first() {
+        let data = UIData::test_fixture();
+        let back = data.channels[0].decks[0].name.clone();
+        let front = data.channels[0].decks[1].name.clone();
+        let harness = harness(data);
+        let x = |name: &str| {
+            harness
+                .get_by_label(&format!("{name} deck card"))
+                .rect()
+                .left()
+        };
+        assert!(x(&front) < x(&back), "{front} before {back}");
     }
 
     #[test]

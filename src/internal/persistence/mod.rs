@@ -317,6 +317,12 @@ impl Workspace {
         self.varda_dir().join("keymap.json")
     }
 
+    /// Path to `keymap-newer.json`: the keys of later actions, apart from
+    /// `keymap.json` (see [`crate::keymap::KeymapConfig::split`]).
+    pub fn keymap_newer_path(&self) -> PathBuf {
+        self.varda_dir().join("keymap-newer.json")
+    }
+
     /// Path to `osc.json`.
     pub fn osc_path(&self) -> PathBuf {
         self.varda_dir().join("osc.json")
@@ -705,6 +711,7 @@ pub fn snapshot_scene(
                                 show_cursor: state.config.show_cursor,
                                 exclude_varda: Some(state.config.exclude_varda),
                                 scaling_mode: slot.deck.scaling_mode().unwrap_or_default(),
+                                presentation: state.presentation.clone(),
                             }
                         }
                         "tap" => {
@@ -731,6 +738,16 @@ pub fn snapshot_scene(
                                 elapsed: timer.elapsed(),
                             }
                         }
+                        "presenter" => {
+                            let presenter = slot.deck.presenter()?;
+                            SourceConfig::Presenter {
+                                follows: presenter.follows().to_string(),
+                                layout: presenter.layout(),
+                            }
+                        }
+                        // Its input as saved, back unchanged: left out, the
+                        // show lost it.
+                        "offline" => slot.deck.offline()?.saved.clone(),
                         _ => return None,
                     };
 
@@ -857,6 +874,7 @@ pub fn snapshot_scene(
         render_resolution_auto: false,
         frames_in_flight: None,
         free_control_screen: false,
+        free_night_shift: false,
         tonemap_mode: mixer.tonemap_mode(),
         active_lut: mixer
             .active_lut_filename()
@@ -1342,21 +1360,36 @@ pub fn restore_scene(
                 render_height,
             ) {
                 Ok(deck) => {
+                    warnings.extend(deck.effects.iter().filter_map(offline_effect_message));
                     let slot = slot_from_config(deck, deck_config, context, registry);
                     channel.add_deck_slot(slot);
                 }
+                // Kept offline: dropped here, the show lost it at the next
+                // save.
                 Err(e) => {
-                    let msg = format!("Failed to restore deck '{}': {}", deck_config.name, e);
+                    let msg = offline_message(&deck_config.name, &e);
                     log::warn!("{msg}");
                     warnings.push(msg);
+                    let deck = offline_deck(
+                        deck_config,
+                        context,
+                        registry,
+                        &e,
+                        render_width,
+                        render_height,
+                    );
+                    channel.add_deck_slot(slot_from_config(deck, deck_config, context, registry));
                 }
             }
         }
 
         // Restore channel effects
         for eff_config in &ch_config.effects {
-            match restore_effect(eff_config, context, context.compositing_format) {
-                Ok(eff) => channel.add_effect(eff),
+            match restore_effect_kept(eff_config, context, registry, context.compositing_format) {
+                Ok(eff) => {
+                    warnings.extend(offline_effect_message(&eff));
+                    channel.add_effect(eff);
+                }
                 Err(e) => {
                     let msg = format!(
                         "Failed to restore channel effect '{}': {}",
@@ -1402,8 +1435,11 @@ pub fn restore_scene(
 
     // Restore master effects
     for eff_config in &config.master_effects {
-        match restore_effect(eff_config, context, context.compositing_format) {
-            Ok(eff) => mixer.master_effects_mut().push(eff),
+        match restore_effect_kept(eff_config, context, registry, context.compositing_format) {
+            Ok(eff) => {
+                warnings.extend(offline_effect_message(&eff));
+                mixer.master_effects_mut().push(eff);
+            }
             Err(e) => {
                 let msg = format!(
                     "Failed to restore master effect '{}': {}",
@@ -1637,11 +1673,48 @@ pub(crate) fn apply_slot_settings(
     slot.deck.set_render_scale(context, config.render_scale);
 }
 
+/// A layer whose input could not be restored, kept offline (see
+/// [`crate::deck::OfflineSource`]): its input as saved, its name, place and
+/// effects, drawn clear until the show is opened again.
+pub(crate) fn offline_deck(
+    config: &DeckConfig,
+    context: &GpuContext,
+    registry: &crate::registry::ShaderRegistry,
+    why: &anyhow::Error,
+    render_width: u32,
+    render_height: u32,
+) -> Deck {
+    let mut deck = Deck::new_offline(
+        context,
+        config.name.clone(),
+        config.source.clone(),
+        format!("{why:#}"),
+        render_width,
+        render_height,
+    );
+    if !config.uuid.is_empty() {
+        deck.set_uuid(config.uuid.clone());
+    }
+    for eff_config in &config.effects {
+        match restore_effect_kept(eff_config, context, registry, context.compositing_format) {
+            Ok(eff) => deck.effects.push(eff),
+            Err(e) => log::warn!("Failed to restore deck effect '{}': {}", eff_config.path, e),
+        }
+    }
+    deck.settle_layer_mask();
+    deck
+}
+
+/// What the operator is told of a layer kept offline.
+pub(crate) fn offline_message(name: &str, why: &anyhow::Error) -> String {
+    format!("“{name}” is offline, kept in the show: {why}")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn restore_deck(
     config: &DeckConfig,
     context: &GpuContext,
-    _registry: &crate::registry::ShaderRegistry,
+    registry: &crate::registry::ShaderRegistry,
     camera_manager: &mut crate::camera::CameraManager,
     screen_capture_manager: &mut crate::screen_capture::ScreenCaptureManager,
     depth_manager: &mut crate::depth::DepthSensorManager,
@@ -1657,7 +1730,7 @@ pub(crate) fn restore_deck(
             params,
             depth_prepro,
         } => {
-            let shader = ISFShader::from_file(path)
+            let shader = saved_shader(path, registry, true)
                 .with_context(|| format!("Failed to load shader: {path}"))?;
             let metadata = shader.metadata.clone();
             let mut deck = if shader.metadata.is_compute() {
@@ -1665,6 +1738,8 @@ pub(crate) fn restore_deck(
             } else {
                 Deck::new(context, shader, render_width, render_height)?
             };
+            // A stand-in's: the show's path, saved back as it was.
+            deck.keep_source_path(path.clone());
             // Restore parameter values
             for (name, value) in params {
                 deck.generator_params.set(name, *value);
@@ -1776,9 +1851,17 @@ pub(crate) fn restore_deck(
             show_cursor,
             exclude_varda,
             scaling_mode,
+            presentation,
         } => {
             let identity = crate::screen_capture::backend::TargetIdentity::from(target);
-            let found = screen_capture_manager.find_target(&identity).cloned();
+            // A PowerPoint input's window is its show's, found by the
+            // presentation worker once PowerPoint plays it — never matched by
+            // name here, which could take PowerPoint's editor window.
+            let found = if presentation.is_some() {
+                None
+            } else {
+                screen_capture_manager.find_target(&identity).cloned()
+            };
             let config = crate::screen_capture::backend::CaptureConfig {
                 rate: *rate,
                 crop: crop.map(Into::into).unwrap_or_default(),
@@ -1825,10 +1908,12 @@ pub(crate) fn restore_deck(
 
             let (label, capture_id, src_w, src_h) = opened.map_or_else(
                 || {
-                    log::warn!(
-                        "Capture target '{}' not available — deck restored unbound",
-                        target.label()
-                    );
+                    if presentation.is_none() {
+                        log::warn!(
+                            "Capture target '{}' not available — deck restored unbound",
+                            target.label()
+                        );
+                    }
                     (
                         target.label(),
                         crate::screen_capture::UNBOUND_CAPTURE_ID,
@@ -1846,6 +1931,7 @@ pub(crate) fn restore_deck(
                     identity,
                     config,
                     config_dirty: false,
+                    presentation: presentation.clone(),
                 },
                 &label,
                 src_w,
@@ -1893,6 +1979,19 @@ pub(crate) fn restore_deck(
             render_width,
             render_height,
         )?,
+        SourceConfig::Presenter { follows, layout } => {
+            let mut deck = Deck::new_presenter(
+                context,
+                follows.clone(),
+                config.name.trim_start_matches("🗒 "),
+                render_width,
+                render_height,
+            )?;
+            if let Some(presenter) = deck.presenter_mut() {
+                presenter.set_layout(*layout);
+            }
+            deck
+        }
         SourceConfig::Ndi { name } => match ndi_manager.start_receive(name, &context.device) {
             Some(receiver_idx) => {
                 let (src_w, src_h) = ndi_manager
@@ -2108,7 +2207,7 @@ pub(crate) fn restore_deck(
 
     // Restore effects
     for eff_config in &config.effects {
-        match restore_effect(eff_config, context, context.compositing_format) {
+        match restore_effect_kept(eff_config, context, registry, context.compositing_format) {
             Ok(eff) => deck.effects.push(eff),
             Err(e) => log::warn!("Failed to restore deck effect '{}': {}", eff_config.path, e),
         }
@@ -2124,11 +2223,15 @@ pub(crate) fn restore_deck(
 pub(crate) fn restore_effect(
     config: &EffectConfig,
     context: &GpuContext,
+    registry: &crate::registry::ShaderRegistry,
     target_format: wgpu::TextureFormat,
 ) -> Result<Effect> {
-    let shader = ISFShader::from_file(&config.path)
+    let shader = saved_shader(&config.path, registry, false)
         .with_context(|| format!("Failed to load effect shader: {}", config.path))?;
     let mut effect = Effect::new_with_format(context, shader, target_format)?;
+    if effect.shader.file_path.as_deref() != Some(config.path.as_str()) {
+        effect.keep_show_path(config.path.clone());
+    }
     effect.set_uuid(config.uuid.clone());
     effect.enabled = config.enabled;
     effect.mask = config
@@ -2144,6 +2247,128 @@ pub(crate) fn restore_effect(
         effect.params.set(name, *value);
     }
     Ok(effect)
+}
+
+/// What an effect whose shader cannot be loaded draws, kept offline: the
+/// picture as it is.
+const OFFLINE_EFFECT: &str = r#"/*{
+    "DESCRIPTION": "An effect whose shader is not there: the picture as it is",
+    "ISFVSN": "2.0",
+    "CATEGORIES": ["Filter"],
+    "INPUTS": [{ "NAME": "inputImage", "TYPE": "image" }]
+}*/
+#version 450
+
+layout(location = 0) out vec4 fragColor;
+layout(location = 0) in vec2 uv;
+
+layout(set = 0, binding = 0) uniform ISFUniforms {
+    float TIME;
+    float TIMEDELTA;
+    uint FRAMEINDEX;
+    int PASSINDEX;
+    vec2 RENDERSIZE;
+    float audio_level;
+    float audio_bass;
+    float audio_mid;
+    float audio_treble;
+    float audio_bpm;
+    float audio_beat_phase;
+    vec4 DATE;
+    float PHASE_TIME_0;
+    float PHASE_TIME_1;
+    float PHASE_TIME_2;
+    float PHASE_TIME_3;
+};
+
+layout(set = 0, binding = 1) uniform sampler texSampler;
+layout(set = 0, binding = 2) uniform texture2D inputImage;
+
+void main() {
+    fragColor = texture(sampler2D(inputImage, texSampler), uv);
+}
+"#;
+
+/// An effect as saved, or — its shader not loading — kept offline: drawing
+/// nothing, its shader's path and settings saved back as they were. Left
+/// out, the show lost it at the next save. Fails only when not even the
+/// stand-in can be made.
+pub(crate) fn restore_effect_kept(
+    config: &EffectConfig,
+    context: &GpuContext,
+    registry: &crate::registry::ShaderRegistry,
+    target_format: wgpu::TextureFormat,
+) -> Result<Effect> {
+    match restore_effect(config, context, registry, target_format) {
+        Ok(effect) => Ok(effect),
+        Err(why) => offline_effect(config, context, target_format, &why),
+    }
+}
+
+/// The effect in `config` kept offline for `why` (see
+/// [`restore_effect_kept`]).
+pub(crate) fn offline_effect(
+    config: &EffectConfig,
+    context: &GpuContext,
+    target_format: wgpu::TextureFormat,
+    why: &anyhow::Error,
+) -> Result<Effect> {
+    let mut effect = Effect::new_with_format(
+        context,
+        ISFShader::from_string(OFFLINE_EFFECT)?,
+        target_format,
+    )?;
+    effect.set_uuid(config.uuid.clone());
+    effect.enabled = config.enabled;
+    effect.mask.clone_from(&config.mask);
+    effect.params.values.clone_from(&config.params);
+    effect.keep_show_path(config.path.clone());
+    effect.set_offline(format!("{why:#}"));
+    log::warn!(
+        "Effect {} is offline, kept in the show: {why:#}",
+        config.path
+    );
+    Ok(effect)
+}
+
+/// What the operator is told of an effect kept offline, if `effect` is.
+pub(crate) fn offline_effect_message(effect: &Effect) -> Option<String> {
+    effect.offline().map(|why| {
+        format!(
+            "Effect “{}” is offline, kept in the show: {why}",
+            effect.name()
+        )
+    })
+}
+
+/// The shader a show names by its file: that file, else — the file gone —
+/// this copy's shader of the same name and kind (a generator for a deck, an
+/// effect's filter). A show keeps the path as it was when saved: inside an
+/// app since moved, updated or translocated (a new random folder each
+/// launch), or in another computer's checkout. So a deck or effect is not
+/// lost at the next save for it; a file there that does not load stays an
+/// error.
+fn saved_shader(
+    path: &str,
+    registry: &crate::registry::ShaderRegistry,
+    generator: bool,
+) -> Result<ISFShader> {
+    let saved = Path::new(path);
+    if !saved.exists() {
+        let here = saved
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|name| registry.get(name))
+            .filter(|shader| shader.metadata.is_generator() == generator);
+        if let Some(shader) = here {
+            log::info!(
+                "Shader {path} is gone: {} stands in",
+                shader.file_path.as_deref().unwrap_or("this copy's")
+            );
+            return Ok(shader.clone());
+        }
+    }
+    ISFShader::from_file(path)
 }
 
 /// Bring a transform saved before `scale` existed onto the current shader,
@@ -2196,6 +2421,11 @@ pub(crate) fn migrate_legacy_transform(
 #[allow(clippy::match_same_arms)]
 pub(crate) fn source_configs_match(deck: &Deck, config: &SourceConfig) -> bool {
     match (deck.source_type(), config) {
+        // The input it keeps, as saved: an undo leaves it offline, and only
+        // opening the show tries it again.
+        ("offline", config) => deck.offline().is_some_and(|offline| {
+            serde_json::to_value(&offline.saved).ok() == serde_json::to_value(config).ok()
+        }),
         ("shader", SourceConfig::Shader { path, .. }) => deck.source_path() == Some(path.as_str()),
         ("video", SourceConfig::Video { path, .. }) => deck.source_path() == Some(path.as_str()),
         ("image", SourceConfig::Image { path, .. }) => deck.source_path() == Some(path.as_str()),
@@ -2237,6 +2467,10 @@ pub(crate) fn source_configs_match(deck: &Deck, config: &SourceConfig) -> bool {
         ("playlist", SourceConfig::Playlist { .. }) => true,
         // Its settings are patched in place: an undo does not reset it.
         ("timer", SourceConfig::Timer { .. }) => true,
+        // Its layout is patched in place: an undo does not make it again.
+        ("presenter", SourceConfig::Presenter { follows, .. }) => {
+            deck.presenter().is_some_and(|p| p.follows() == follows)
+        }
         _ => false,
     }
 }
@@ -2380,8 +2614,13 @@ mod tests {
             params: HashMap::new(),
             mask: None,
         };
-        let effect = restore_effect(&cfg, &gpu, crate::renderer::COLOR_PATH_FORMAT)
-            .expect("invert.fs restores");
+        let effect = restore_effect(
+            &cfg,
+            &gpu,
+            &crate::registry::ShaderRegistry::new(),
+            crate::renderer::COLOR_PATH_FORMAT,
+        )
+        .expect("invert.fs restores");
 
         assert_eq!(effect.uuid(), "fxsaved1");
         assert_eq!(
@@ -2571,7 +2810,85 @@ mod tests {
             mask: None,
         };
         // Should fail (file doesn't exist) but shouldn't be a compile error
-        assert!(restore_effect(&cfg, &gpu, wgpu::TextureFormat::Rgba8Unorm).is_err());
+        assert!(restore_effect(
+            &cfg,
+            &gpu,
+            &crate::registry::ShaderRegistry::new(),
+            wgpu::TextureFormat::Rgba8Unorm
+        )
+        .is_err());
+    }
+
+    /// A show saved by another copy of Nida names its shader library's place
+    /// — a translocated app's random folder, another Mac's checkout: an
+    /// effect is this copy's shader of that name, its settings kept, and
+    /// saves as the show named it, for the Nida that has the file there; a
+    /// generator deck's likewise.
+    #[test]
+    fn a_shader_whose_file_has_moved_is_this_copys_of_that_name() {
+        let library = tempfile::tempdir().unwrap();
+        let crop = library.path().join("crop.fs");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/crop.fs"),
+            &crop,
+        )
+        .unwrap();
+        let mut registry = crate::registry::ShaderRegistry::new();
+        registry.add_library_path(library.path()).unwrap();
+        registry.scan().unwrap();
+        let gone = "/private/var/folders/xx/T/AppTranslocation/0000/d/Nida.app/Contents/Resources/shaders/crop.fs";
+        let cfg = EffectConfig {
+            uuid: "c0ffee01".to_string(),
+            path: gone.into(),
+            enabled: false,
+            params: legacy(&[("crop_left", 0.25)]),
+            mask: None,
+        };
+        let effect = restore_effect(
+            &cfg,
+            &headless_gpu(),
+            &registry,
+            crate::renderer::COLOR_PATH_FORMAT,
+        )
+        .expect("the library's crop stands in");
+        assert_eq!(
+            Path::new(effect.shader.file_path.as_deref().unwrap())
+                .canonicalize()
+                .unwrap(),
+            crop.canonicalize().unwrap(),
+            "this copy's crop stands in"
+        );
+        let saved = EffectConfig::of(&effect);
+        assert_eq!(saved.path, gone, "saved as the show named it");
+        assert_eq!(saved.uuid, "c0ffee01");
+        assert!(!saved.enabled);
+        assert!(matches!(
+            saved.params.get("crop_left"),
+            Some(crate::params::ParamValue::Float(v)) if (*v - 0.25).abs() < 1e-6
+        ));
+
+        // No shader of that name, or a file there that does not load: as
+        // before, an error.
+        assert!(saved_shader("/gone/shaders/no_such_effect.fs", &registry, false).is_err());
+        let broken = library.path().join("elsewhere");
+        std::fs::create_dir(&broken).unwrap();
+        std::fs::write(broken.join("crop.fs"), "not a shader").unwrap();
+        assert!(saved_shader(broken.join("crop.fs").to_str().unwrap(), &registry, false).is_err());
+        // A generator of that name is not an effect, but a deck's.
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/abstract_field.fs"),
+            library.path().join("abstract_field.fs"),
+        )
+        .unwrap();
+        let mut registry = crate::registry::ShaderRegistry::new();
+        registry.add_library_path(library.path()).unwrap();
+        registry.scan().unwrap();
+        assert!(registry.get("abstract_field").is_some());
+        assert!(saved_shader("/gone/shaders/abstract_field.fs", &registry, false).is_err());
+        let generator = saved_shader("/gone/shaders/abstract_field.fs", &registry, true)
+            .expect("the library's generator stands in for a deck");
+        assert_eq!(generator.name(), "abstract_field");
+        assert!(saved_shader("/gone/shaders/crop.fs", &registry, true).is_err());
     }
 
     #[test]

@@ -110,6 +110,11 @@ pub struct AppConfig {
     #[arg(long = "no-screen-capture")]
     pub screen_capture_disabled: bool,
 
+    /// Disable PowerPoint inputs (never opens or drives PowerPoint, so the
+    /// Automation permission is never asked for)
+    #[arg(long = "no-powerpoint")]
+    pub powerpoint_disabled: bool,
+
     /// Disable camera deck sources (skips device enumeration entirely, so no
     /// Camera permission is ever requested)
     ///
@@ -212,6 +217,10 @@ pub(crate) struct InputSubsystem {
     pub timecode: crate::timecode::TimecodeManager,
     /// The PCM tap LTC is decoded from, while one is patched.
     pub ltc_tap: Option<LtcTap>,
+    /// The source whose device went (unplugged) while LTC was read from it,
+    /// and when it was last looked for: taken again once it is back, the
+    /// patch kept.
+    pub ltc_lost: Option<(crate::audio::AudioSourceId, std::time::Instant)>,
 }
 
 /// A live subscription to the raw PCM of the audio input carrying LTC.
@@ -576,6 +585,9 @@ pub(crate) struct SessionState {
     /// being written right now. Session state: an arm is a mode the performer
     /// is in. See /spec/automation-recording.md.
     pub recorder: state::recorder::Recorder,
+    /// Show files that did not load and of which no copy could be kept:
+    /// not written over by a save (see `VardaApp::keep_unloaded`).
+    pub unwritable: std::collections::HashSet<std::path::PathBuf>,
 }
 
 /// Cross-thread message passing.
@@ -640,6 +652,8 @@ pub struct VardaApp {
     depth_manager: DepthSensorManager,
     /// Screen / window capture manager. See spec/screen-capture.md.
     screen_capture_manager: ScreenCaptureManager,
+    /// PowerPoint inputs' worker, started with the first of them.
+    presentations: state::presentations::Presentations,
     registry: ShaderRegistry,
     analyzer_registry: crate::analyzer::AnalyzerRegistry,
     context: GpuContext,
@@ -688,6 +702,9 @@ pub struct VardaApp {
     /// The control window's screen set to the show's rate while Nida runs
     /// (see `screen_rate`).
     control_screen_rate: bool,
+    /// Night Shift kept off while an output window is on a screen (see
+    /// `night_shift`).
+    night_shift_off: bool,
 
     // ── Channel preview / cue (ephemeral, published by UI each frame) ──
     // Channels force-rendered for off-air preview. Never persisted; affects the
@@ -709,7 +726,9 @@ pub struct VardaApp {
     pub(crate) midi_pending_save: bool,
 
     // ── Shutdown request flag ──────────────────────────────────
-    pub(crate) shutdown_requested: bool,
+    /// Set by `EngineCommand::Shutdown` (the API's): shared with the
+    /// runner, which quits the app — windowed or headless — when it is set.
+    pub(crate) shutdown_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 // In the windowed app the engine runs on a thread of its own and is handed
@@ -757,12 +776,8 @@ impl VardaApp {
         if let Err(e) = registry.add_library_path("shaders") {
             log::warn!("Failed to add shaders path: {e}");
         }
-        let ws_shaders = workspace.shaders_dir();
-        if ws_shaders.is_dir() {
-            if let Err(e) = registry.add_library_path(&ws_shaders) {
-                log::warn!("Failed to add workspace shaders path: {e}");
-            }
-        }
+        registry.mark_show_slot();
+        registry.set_show_library(&workspace.shaders_dir());
         for path in crate::registry::get_default_library_paths() {
             if path.is_dir() {
                 if let Err(e) = registry.add_library_path(&path) {
@@ -883,6 +898,7 @@ impl VardaApp {
             } else {
                 ScreenCaptureManager::new()
             },
+            presentations: state::presentations::Presentations::new(config.powerpoint_disabled),
             registry,
             analyzer_registry: crate::analyzer::default_registry(),
             context: gpu,
@@ -903,6 +919,7 @@ impl VardaApp {
                 clock_manager: crate::clock::ClockManager::new(),
                 timecode: crate::timecode::TimecodeManager::new(),
                 ltc_tap: None,
+                ltc_lost: None,
             },
             output: OutputSubsystem {
                 outputs: Vec::new(),
@@ -998,6 +1015,7 @@ impl VardaApp {
                 chase_silence_reported: false,
                 published_timecode: None,
                 recorder: state::recorder::Recorder::default(),
+                unwritable: std::collections::HashSet::new(),
             },
             bus: MessageBus {
                 command_rx,
@@ -1028,6 +1046,7 @@ impl VardaApp {
             frame_hold: cfg!(target_os = "macos"),
             control_vsync: false,
             control_screen_rate: true,
+            night_shift_off: true,
             preview_channels: Vec::new(),
             ui_selected_deck: None,
             camera_retry_at: None,
@@ -1035,7 +1054,7 @@ impl VardaApp {
             midi_pending_undo: false,
             midi_pending_redo: false,
             midi_pending_save: false,
-            shutdown_requested: false,
+            shutdown_requested: std::sync::Arc::default(),
         };
         if waiting_for_sound {
             app.session.notifications.warn(
@@ -1769,6 +1788,43 @@ impl VardaApp {
             log::info!("The control window's screen set to the show's rate: {on}");
         }
         self.control_screen_rate = on;
+    }
+
+    /// Whether Night Shift is kept off while an output window is on a
+    /// screen (see `crate::night_shift` and `SetNightShiftOff`).
+    pub fn night_shift_off(&self) -> bool {
+        self.night_shift_off
+    }
+
+    pub fn set_night_shift_off(&mut self, on: bool) {
+        if on != self.night_shift_off {
+            log::info!("Night Shift kept off while an output is on a screen: {on}");
+        }
+        self.night_shift_off = on;
+    }
+
+    /// Tell the log, and the operator the first time, what was done to
+    /// Night Shift (see `crate::night_shift`).
+    pub fn note_night_shift(&mut self, kept: crate::night_shift::Kept) {
+        use crate::night_shift::Kept;
+        match kept {
+            Kept::TurnedOff { first: true } => {
+                let text = "Night Shift is off while outputs are on screens: macOS warms every \
+                     screen with it, the outputs too, and lets no app leave one out, so this \
+                     screen is not warmed either. Nida turns it back on when no output is on a \
+                     screen, if it is due on then. Turn this off in the frame-rate menu (Keep \
+                     Night Shift off for the outputs).";
+                log::info!("{text}");
+                self.session.notifications.info(text);
+            }
+            Kept::TurnedOff { first: false } => {
+                log::info!("Night Shift came on while outputs were on screens: turned off again");
+            }
+            Kept::GivenBack { on: true } => log::info!("Night Shift given back: on"),
+            Kept::GivenBack { on: false } => {
+                log::info!("Night Shift given back: off until its schedule turns it on");
+            }
+        }
     }
 
     /// Tell the log, and the operator once, what was done to the control

@@ -128,6 +128,20 @@ pub enum InputSource {
         #[serde(default)]
         settings: Option<crate::engine::value::timer::TimerSettings>,
     },
+    /// A PowerPoint deck, played by PowerPoint on this computer in a window
+    /// Nida captures — its transitions, animations and videos as PowerPoint
+    /// plays them — and moved on from Nida (macOS).
+    #[serde(rename = "powerpoint")]
+    PowerPoint {
+        /// The deck's file, absolute.
+        path: String,
+    },
+    /// A presenter view of a PowerPoint input, for the speaker's screen: its
+    /// slide, live, with the speaker notes, what comes next and the talk's
+    /// clocks. `deck_uuid` is the PowerPoint input's layer.
+    PresenterView {
+        deck_uuid: String,
+    },
 }
 
 impl InputSource {
@@ -190,6 +204,11 @@ impl InputSource {
             Self::Timer { settings } => EngineCommand::AddTimerDeck {
                 channel_uuid,
                 settings,
+            },
+            Self::PowerPoint { path } => EngineCommand::AddPresentationDeck { channel_uuid, path },
+            Self::PresenterView { deck_uuid } => EngineCommand::AddPresenterDeck {
+                channel_uuid,
+                deck_uuid,
             },
         }
     }
@@ -604,6 +623,77 @@ pub enum EngineCommand {
     ControlTimer {
         deck_uuid: String,
         action: crate::engine::value::timer::TimerAction,
+    },
+
+    // ── PowerPoint ───────────────────────────────────────────────
+    /// Add a PowerPoint input's layer: the deck at `path`, opened in
+    /// PowerPoint and played in a window that is captured.
+    AddPresentationDeck {
+        channel_uuid: String,
+        path: String,
+    },
+    /// Move a PowerPoint show on or back: `{"to": "next"}`, `"previous"`,
+    /// `"first"`, `"last"` or `{"slide": 4}`. Without a `deck_uuid`, the
+    /// show on air (on Main or a bus), else the one moved last.
+    PresentationGo {
+        #[serde(default)]
+        deck_uuid: Option<String>,
+        to: crate::engine::value::presentation::Go,
+    },
+    /// Play, pause or move the video on a PowerPoint show's slide on screen:
+    /// `"toggle"`, `"play"`, `"pause"`, `"restart"` or `{"skip": 10}`
+    /// (seconds; negative back). Without a `deck_uuid`, as for
+    /// `PresentationGo`.
+    PresentationVideo {
+        #[serde(default)]
+        deck_uuid: Option<String>,
+        control: crate::engine::value::presentation::VideoControl,
+    },
+    /// Black or white a PowerPoint show's screen out (`"black"`, `"white"`),
+    /// or show its slide again (`"slide"`). Without a `deck_uuid`, as for
+    /// `PresentationGo`.
+    SetPresentationScreen {
+        #[serde(default)]
+        deck_uuid: Option<String>,
+        screen: crate::engine::value::presentation::Screen,
+    },
+    /// Black (or white) a PowerPoint show's screen out, or show its slide
+    /// again when it already is: a clicker's black-screen button. Without a
+    /// `deck_uuid`, as for `PresentationGo`.
+    TogglePresentationScreen {
+        #[serde(default)]
+        deck_uuid: Option<String>,
+        screen: crate::engine::value::presentation::Screen,
+    },
+    /// Play a PowerPoint show again where it was.
+    RestartPresentation {
+        deck_uuid: String,
+    },
+    /// How a presenter view (its own layer, `deck_uuid`) is laid out: its
+    /// talk timer and time of day, on or off and at the `top` or `bottom`,
+    /// what comes next on or off, and the sizes of slide, notes and the next
+    /// line.
+    SetPresenterLayout {
+        deck_uuid: String,
+        layout: crate::engine::value::presentation::PresenterLayout,
+    },
+    /// Which screen a PowerPoint input's show plays on: `"auto"` (where it
+    /// plays sharpest — a spare screen when as sharp as this Mac's),
+    /// `"main"` (this Mac's screen) or `{"screen": "<identity>"}` (one of
+    /// `outputs.monitors`).
+    SetPresentationPlaysOn {
+        deck_uuid: String,
+        plays_on: crate::engine::value::presentation::PlaysOn,
+    },
+    /// Add a presenter view layer showing the PowerPoint input whose layer
+    /// is `deck_uuid`.
+    AddPresenterDeck {
+        channel_uuid: String,
+        deck_uuid: String,
+    },
+    /// A presenter view's talk clock back to 0:00 (its own layer's UUID).
+    RestartPresenterClock {
+        deck_uuid: String,
     },
 
     // ── Deck Auto-Transitions ──────────────────────────────────
@@ -1575,6 +1665,14 @@ pub enum EngineCommand {
     SetControlScreenRate {
         on: bool,
     },
+    /// Keep Night Shift off while an output window is on a screen — on by
+    /// default, kept with the show. macOS warms every screen with it, the
+    /// outputs too, and lets no app leave one out; Nida gives it back when
+    /// no output is on a screen or it quits, on again if it is due on then.
+    /// macOS only.
+    SetNightShiftOff {
+        on: bool,
+    },
 
     // ── Performance profiling ──────────────────────────────────
     /// Start GPU performance profiling for the next N frames.
@@ -1733,6 +1831,38 @@ pub enum EngineCommand {
         uuid: String,
         gain_db: f32,
     },
+    SetAudioBusCompressor {
+        uuid: String,
+        config: crate::audio_mix::CompressorConfig,
+    },
+    ResetAudioMeter {
+        uuid: String,
+        bus: bool,
+    },
+    /// Start a bus's loudness readings again, as a show starts. Its held
+    /// peak stays (that is `ResetAudioMeter`).
+    ResetAudioLoudness {
+        uuid: String,
+    },
+    SetAudioSourceCompressor {
+        uuid: String,
+        config: crate::audio_mix::CompressorConfig,
+    },
+    /// A source's low cut: rumble and hum under a voice.
+    SetAudioSourceLowCut {
+        uuid: String,
+        config: crate::audio_mix::LowCutConfig,
+    },
+    /// A source's leveler: each speaker brought to the same loudness.
+    SetAudioSourceLeveler {
+        uuid: String,
+        config: crate::audio_mix::LevelerConfig,
+    },
+    /// A bus's limiter, the last thing before its recordings and streams.
+    SetAudioBusLimiter {
+        uuid: String,
+        config: crate::audio_mix::LimiterConfig,
+    },
     SetAudioBusMute {
         uuid: String,
         muted: bool,
@@ -1764,6 +1894,11 @@ pub enum EngineCommand {
     AddAppSound {
         app: String,
         name: String,
+        /// The input whose sound it is (PowerPoint's, of a PowerPoint
+        /// input): heard with that picture on air (Audio Auto), removed
+        /// with it.
+        #[serde(default)]
+        deck_uuid: Option<String>,
     },
     RemoveAudioInput {
         uuid: String,

@@ -111,6 +111,16 @@ impl VardaApp {
     /// The screens output windows are on, asked of each window now — on the
     /// main thread; `None` elsewhere, or while a window's screen is not
     /// known.
+    /// Whether an output window is open: on a screen, which Night Shift
+    /// warms (see `crate::night_shift`). A Blackmagic device's output is not
+    /// a window, and is not warmed.
+    pub fn outputs_on_screens(&self) -> bool {
+        self.output
+            .outputs
+            .iter()
+            .any(|output| matches!(output, UnifiedOutput::Window(_)))
+    }
+
     pub fn output_screens_now(&self) -> Option<Vec<winit::monitor::MonitorHandle>> {
         self.output
             .outputs

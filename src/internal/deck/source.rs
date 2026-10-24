@@ -439,6 +439,7 @@ impl Deck {
             analyzers: crate::analyzer::DeckAnalyzers::new(),
             gpu_error: None,
             rendered_still: None,
+            texture_generation: 0,
             visible: None,
             drawn_visible: None,
             drawn_share: 1.0,
@@ -845,6 +846,58 @@ impl Deck {
         ))
     }
 
+    /// A presenter view (see [`super::presenter`]) of the PowerPoint input
+    /// whose layer is `follows`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if its drawing pipelines cannot be made.
+    pub fn new_presenter(
+        context: &GpuContext,
+        follows: String,
+        name: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let presenter = super::presenter::Presenter::new(context, follows, (width, height))?;
+        Ok(Self::build_media_deck(
+            context,
+            format!("🗒 {name}"),
+            None,
+            DeckSource::Presenter(Box::new(presenter)),
+            width,
+            height,
+        ))
+    }
+
+    /// A layer whose input could not be opened (see [`super::OfflineSource`]):
+    /// `name` as saved, drawn clear. A file's path stays its source path, to
+    /// show which file is missing.
+    pub fn new_offline(
+        context: &GpuContext,
+        name: String,
+        saved: crate::scene::SourceConfig,
+        reason: String,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        use crate::scene::SourceConfig;
+        let path = match &saved {
+            SourceConfig::Video { path, .. }
+            | SourceConfig::Image { path, .. }
+            | SourceConfig::Shader { path, .. } => Some(path.clone()),
+            _ => None,
+        };
+        Self::build_media_deck(
+            context,
+            name,
+            path,
+            DeckSource::Offline(Box::new(super::OfflineSource { saved, reason })),
+            width,
+            height,
+        )
+    }
+
     /// Create a new deck from decoded pixels. `tree` is carried by SVG decks so
     /// a later resolution change can re-render the artwork instead of scaling
     /// up the pixels it happened to be rasterized at first.
@@ -1153,6 +1206,7 @@ impl Deck {
             analyzers: crate::analyzer::DeckAnalyzers::new(),
             gpu_error: None,
             rendered_still: None,
+            texture_generation: 0,
             visible: None,
             drawn_visible: None,
             drawn_share: 1.0,
@@ -1509,6 +1563,7 @@ impl Deck {
             analyzers: crate::analyzer::DeckAnalyzers::new(),
             gpu_error: None,
             rendered_still: None,
+            texture_generation: 0,
             visible: None,
             drawn_visible: None,
             drawn_share: 1.0,

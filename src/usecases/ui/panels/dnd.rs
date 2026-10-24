@@ -145,7 +145,7 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
     let ctx = ui.ctx();
     let had_payload_id = egui::Id::new("__lib_dnd_had_payload");
     let hover_ch_id = egui::Id::new("__lib_dnd_hover_ch");
-    let hover_y_id = egui::Id::new("__lib_dnd_hover_y");
+    let hover_y_id = egui::Id::new("__lib_dnd_hover_pos");
     let hover_fx_target_id = egui::Id::new("__lib_dnd_hover_fx_target");
     let on_new_ch_id = egui::Id::new("__lib_dnd_on_new_ch_zone");
     let awaiting_new_ch_id = egui::Id::new("__lib_dnd_awaiting_new_ch");
@@ -178,7 +178,7 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
 
             ctx.memory_mut(|mem| {
                 mem.data.insert_temp(hover_ch_id, found_ch);
-                mem.data.insert_temp(hover_y_id, pos.y);
+                mem.data.insert_temp(hover_y_id, pos);
                 mem.data.insert_temp(hover_fx_target_id, found_fx);
                 mem.data.insert_temp::<bool>(on_new_ch_id, on_new_ch);
                 mem.data.insert_temp::<bool>(had_payload_id, true);
@@ -190,7 +190,7 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
         if drag_just_ended {
             let hover_ch: Option<usize> =
                 ctx.memory(|mem| mem.data.get_temp(hover_ch_id).unwrap_or(None));
-            let hover_y: Option<f32> = ctx.memory(|mem| mem.data.get_temp(hover_y_id));
+            let hover_pos: Option<egui::Pos2> = ctx.memory(|mem| mem.data.get_temp(hover_y_id));
             let hover_fx: Option<FxHover> =
                 ctx.memory(|mem| mem.data.get_temp(hover_fx_target_id).unwrap_or(None));
             let on_new_ch_zone: bool =
@@ -242,10 +242,10 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
                         ctx.memory(|mem| mem.data.get_temp(on_window_id).unwrap_or(false));
                     let before_deck_uuid =
                         hover_ch
-                            .zip(hover_y)
+                            .zip(hover_pos)
                             .filter(|_| !on_window)
-                            .and_then(|(ch_idx, y)| {
-                                super::insertion::insertion_at(ctx, ch_idx, y).before
+                            .and_then(|(ch_idx, pos)| {
+                                super::insertion::insertion_at(ctx, ch_idx, pos).before
                             });
                     actions.session.shader_to_add = Some((
                         crate::usecases::ui::DeckPlace {
@@ -459,7 +459,7 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
             ctx.memory_mut(|mem| {
                 mem.data.remove::<bool>(had_payload_id);
                 mem.data.remove::<Option<usize>>(hover_ch_id);
-                mem.data.remove::<f32>(hover_y_id);
+                mem.data.remove::<egui::Pos2>(hover_y_id);
                 mem.data.remove::<Option<FxHover>>(hover_fx_target_id);
                 mem.data.remove::<bool>(on_new_ch_id);
                 mem.data.remove::<usize>(egui::Id::new("__lib_dnd_gen_idx"));

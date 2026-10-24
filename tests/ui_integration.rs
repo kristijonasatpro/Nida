@@ -1333,20 +1333,21 @@ fn dragging_a_lane_header_reorders_the_deck() {
 
     // Lane headers sit immediately left of their track and share its rows, so
     // the rows are located by their tracks and the header point is stepped back
-    // from the track's left edge.
-    let first = harness
-        .get_by_label("test_generator_a timeline track")
-        .rect();
-    let second = harness
+    // from the track's left edge. Lanes are listed front first: the layer in
+    // front, test_generator_b, on top.
+    let upper = harness
         .get_by_label("test_generator_b timeline track")
         .rect();
-    let header_x = first.left() - 20.0;
+    let lower = harness
+        .get_by_label("test_generator_a timeline track")
+        .rect();
+    let header_x = upper.left() - 20.0;
 
     drag(
         &mut harness,
-        egui::pos2(header_x, second.center().y),
-        // The top half of the first lane is the gap above it.
-        egui::pos2(header_x, first.top() + 3.0),
+        egui::pos2(header_x, lower.center().y),
+        // The top half of the upper lane is the gap above it: in front.
+        egui::pos2(header_x, upper.top() + 3.0),
     );
 
     let (channel, from, to) = harness
@@ -1355,7 +1356,7 @@ fn dragging_a_lane_header_reorders_the_deck() {
         .clone()
         .expect("dropping a lane above another should reorder the deck");
     assert_eq!(channel, channel_uuid);
-    assert_eq!((from, to), (1, 0));
+    assert_eq!((from, to), (0, 1), "the back layer goes to the front");
 }
 
 /// Dropping a lane back where it started must not emit a command, or every
@@ -2063,6 +2064,7 @@ fn click_remove_channel_with_three_channels() {
         decks: vec![],
         effects: vec![],
         overlay: false,
+        on_air: None,
     });
     data.channel_count = 3;
     let mut harness = make_harness(data);
@@ -2577,8 +2579,10 @@ fn right_clicking_a_channel_fades_it_to_a_bus() {
 fn a_deck_dragged_to_another_channel_lands_between_its_decks() {
     let mut harness = make_harness(UIData::test_fixture());
     let moving = harness.get_by_label("test_generator_a deck card").rect();
-    // Ch B holds test_generator_c then test_generator_d.
-    let second = harness.get_by_label("test_generator_d deck card").rect();
+    // Ch B holds test_generator_c then test_generator_d, listed front first:
+    // test_generator_d's card on top. Above the second card is in front of
+    // test_generator_c, behind test_generator_d — before d in the stack.
+    let second = harness.get_by_label("test_generator_c deck card").rect();
     drag(
         &mut harness,
         moving.center(),
@@ -2595,12 +2599,13 @@ fn a_deck_dragged_to_another_channel_lands_between_its_decks() {
 }
 
 /// Within a channel, the same drop moves a card up or down; dropped just
-/// under itself it stays put and makes no undo step.
+/// under itself it stays put and makes no undo step. Cards are listed front
+/// first: `test_generator_b`, in front, on top.
 #[test]
 fn a_deck_dragged_within_its_channel_moves_or_stays() {
     let mut harness = make_harness(UIData::test_fixture());
-    let first = harness.get_by_label("test_generator_a deck card").rect();
-    let second = harness.get_by_label("test_generator_b deck card").rect();
+    let first = harness.get_by_label("test_generator_b deck card").rect();
+    let second = harness.get_by_label("test_generator_a deck card").rect();
     drag(
         &mut harness,
         second.center(),
@@ -2608,16 +2613,12 @@ fn a_deck_dragged_within_its_channel_moves_or_stays() {
     );
     assert_eq!(
         harness.state().move_deck,
-        Some((
-            "a0000002".to_string(),
-            "ca000001".to_string(),
-            Some("a0000001".to_string())
-        )),
-        "the second card moves above the first"
+        Some(("a0000001".to_string(), "ca000001".to_string(), None)),
+        "the second card moves above the first: in front of it, the end of the stack"
     );
 
     let mut harness = make_harness(UIData::test_fixture());
-    let first = harness.get_by_label("test_generator_a deck card").rect();
+    let first = harness.get_by_label("test_generator_b deck card").rect();
     drag(
         &mut harness,
         first.center(),

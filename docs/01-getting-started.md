@@ -140,12 +140,13 @@ Drag images, videos, ISF shaders (`.fs`) or whole folders from Finder onto the
 Nida window. While you drag, the place they will land is highlighted with a
 label such as **2 images, 1 video → Ch B**:
 
-- over a **channel column** — they become decks in that channel, placed where
-  the blue line shows: before the card whose upper half you are over, or after
-  the last card;
-- over **Drop here to add channel** — a new channel is made for them;
-- anywhere else — they go to the selected channel (the first channel if none
-  is selected).
+- over a **channel** — its tile, column or Input Settings — they become
+  decks in that channel, placed where the blue line shows: before the card
+  whose upper half you are over, or after the last card;
+- anywhere else — beside the tiles, on the empty tile at the end, on **Drop
+  here to add channel** — each becomes an input of its own, named after its
+  file, as **Add Input** makes them (**2 images → a new input each**); one
+  **Undo** takes them all away.
 
 Deck cards move the same way: drag a card within its channel or into another
 channel, and it lands at the line — between two cards, at the top, or at the
@@ -157,8 +158,8 @@ slide 10), so a folder of numbered speaker slides lands in order. Files Nida
 cannot use (PDFs, documents, audio-only files) are skipped and named in a
 notification. Each new deck gets crop and transform, like any other.
 
-Pointing at a channel while dragging needs macOS; on Linux, dropped files go
-to the selected channel.
+Pointing at a channel while dragging needs macOS; on Linux, dropped files
+each become an input.
 
 ### Adjusting a deck against the result
 
@@ -244,7 +245,10 @@ Press **Cmd+S** or click the **💾 Save** button to save the current state. Nid
 - `scene.json` — your show (channels, decks, effects, modulation)
 - `stage.json` — the venue (surfaces, outputs, warp calibration)
 - `midi.json` — controller mappings
-- `keymap.json` — keyboard shortcuts
+- `keymap.json` — keyboard shortcuts, and `keymap-newer.json` those of
+  actions newer than Nida 0.9 (the clicker keys): apart, so an older Nida
+  opens the show — on another Mac, the same show in iCloud — and leaves
+  them be when it saves it
 
 Nida also saves the show whenever it closes — its window closed, or Quit
 (⌘Q, or Quit in the Dock).
@@ -275,7 +279,9 @@ A show is a folder (holding `.varda/`), like one of vMix's presets. The
 - **Open…** — pick a show's folder. The show open is saved first. The
   show's screens that are already open stay up as they are (not opened
   twice), and screens it does not have close; a show made at another size
-  switches Nida to that size.
+  switches Nida to that size. A show whose scene or stage cannot be read —
+  saved by a later Nida, or damaged — is not opened, saying why, and the
+  show open stays.
 - **Open recent** — the shows opened lately.
 - **Save As…** — save the show under a new name (a new folder, or an empty
   one) and carry on in it; its presets, LUTs and shaders go with it. The
@@ -286,6 +292,29 @@ A show is a folder (holding `.varda/`), like one of vMix's presets. The
 New and Open are greyed out while the stream or a recording is running:
 opening another show would stop them. Nida opens the show it had open last
 — unless `--workspace` on the command line names one.
+
+A file of the show that does not load as it opens (its scene, stage, MIDI
+mappings, keys or OSC settings) is copied beside itself in `.varda/` first —
+`scene.json` as `scene.not-loaded-2026-10-24-093015.json` — and the notice
+says so: Nida carries on without it, and the next save writes over it. One
+that cannot even be copied is not saved over at all.
+
+### An input that is not there
+
+An input that cannot be opened as its show opens — its file moved,
+renamed or on a drive not plugged in, a camera not connected — stays in
+the show, marked **⚠ Offline**: it draws nothing, and its panel says why.
+Its settings and effects stay as they were, and saving writes it back as
+it was saved, so nothing of it is lost. Put the file back where it was (or
+connect the device) and open the show again: it is there as before.
+
+An effect, or a shader input, names its shader file where it was when the
+show was saved: inside the Nida app that saved it, or another Mac's copy.
+When that file is not there, Nida uses its own shader of the same name,
+and the show keeps naming the file as it did, for the Nida that has it
+there. An effect whose shader Nida does not have at all — one of a
+show's own, never copied to this Mac — is kept like an offline input:
+**⚠ offline** beside its name, drawing nothing, saved back as it was.
 
 ## CLI Flags
 

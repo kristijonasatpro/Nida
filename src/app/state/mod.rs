@@ -13,13 +13,14 @@
 //! - `rundown` — the rundown: taking a step whole, and its commands
 //! - `playlists` — playlist layers: adding one, its list, settings and transport
 //! - `timers` — timer layers: adding one, its settings, starting and stopping it
+//! - `presentations` — PowerPoint inputs: adding one, its steps, the worker kept in step
 //! - `presets` — deck/channel preset load + save
 //! - `sequences` — transition sequence CRUD and step mutations
 //! - `surfaces` — surface command state mutations
 //! - `io` — external I/O deck creation and stream library mutations
 
 mod arrangement;
-mod audio_mix;
+pub(crate) mod audio_mix;
 mod buses;
 mod channel_order;
 pub(crate) mod clipboard;
@@ -30,6 +31,7 @@ mod main_program;
 pub(crate) mod on_air;
 mod outputs;
 mod playlists;
+pub(crate) mod presentations;
 pub(crate) mod presets;
 pub(crate) mod record;
 pub(crate) mod recorder;

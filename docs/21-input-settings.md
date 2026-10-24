@@ -31,14 +31,17 @@ whatever it is editing.
 ## Layers
 
 Down the left: the channel's **result** (every layer composited), then the
-channel itself, then its layers. They are numbered as vMix numbers them —
-**Layer 1 at the back**, each higher one drawn over it.
+channel itself, then its layers, listed as Premiere lists its tracks: **the
+layer in front at the top**, Layer 1 at the back at the bottom, each higher
+one drawn over it. Every list of a channel's layers — the Channels panel, the
+Layers panel's rows, the chips on its tile — puts the layer in front first.
+Files dropped together keep their order: the first is in front.
 
 | On a layer's row | |
 |---|---|
 | Click | Edit this layer |
 | ☑ | Shown — untick to hide it, keeping all its settings |
-| ⏶ ⏷ | Swap with the layer before / after it |
+| ⏶ ⏷ | Move up, in front of the layer above it / down, behind the layer below it |
 | 🗑 | Delete the layer |
 | Right-click | Take this layer alone to Main or a bus, **Copy position** / **Paste position**, copy, paste |
 

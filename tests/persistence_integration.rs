@@ -604,6 +604,456 @@ fn load_missing_assets_graceful() {
     let _ = app2.load_workspace();
 }
 
+/// An input whose file has gone since the show was saved — moved, renamed, a
+/// drive not there — stays in the show, offline and drawn clear, rather than
+/// dropped: the next save writes it back as it was, an undo leaves it be, and
+/// with the file back, opening the show brings it back.
+#[test]
+fn an_input_whose_file_has_gone_is_kept_offline_until_it_is_back() {
+    let tmp = TempDir::new().unwrap();
+    let art = tmp.path().join("logo.svg");
+    std::fs::write(
+        &art,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 50"
+            width="200" height="50"><rect width="200" height="50" fill="#20c0a0"/></svg>"##,
+    )
+    .unwrap();
+    let Some(mut app) = headless_app_in(tmp.path()) else {
+        return;
+    };
+    let ch = channel_uuid(&mut app, 0);
+    let CommandResult::OkWithId { uuid: deck } = send_cmd(
+        &mut app,
+        EngineCommand::AddImageDeck {
+            channel_uuid: ch,
+            path: art.clone(),
+        },
+    ) else {
+        panic!("no image deck");
+    };
+    let _ = send_cmd(
+        &mut app,
+        EngineCommand::AddEffect {
+            target: EffectTarget::Deck(deck.clone()),
+            shader_name: "invert".to_string(),
+        },
+    );
+    fire(
+        &mut app,
+        EngineCommand::SetDeckOpacity {
+            deck_uuid: deck.clone(),
+            opacity: 0.75,
+        },
+    );
+    app.save_workspace(&UILayoutState::default())
+        .expect("save workspace");
+    let scene = tmp.path().join(".varda/scene.json");
+    let saved_deck = |text: &str| {
+        serde_json::from_str::<serde_json::Value>(text).unwrap()["channels"][0]["decks"][0].clone()
+    };
+    let first = saved_deck(&std::fs::read_to_string(&scene).unwrap());
+    assert_eq!(first["source"]["type"], "Image");
+
+    let out = tmp.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::rename(&art, out.join("logo.svg")).unwrap();
+
+    let Some(mut app) = headless_app_in(tmp.path()) else {
+        return;
+    };
+    let loaded = app.load_workspace();
+    assert!(loaded.is_ok(), "an offline input is not a failed load");
+    let offline = |app: &mut VardaApp| {
+        let state = app.build_engine_state();
+        let decks = &state.mixer.channels[0].decks;
+        assert_eq!(decks.len(), 1, "kept, not dropped");
+        assert_eq!(decks[0].uuid, deck);
+        decks[0].offline.clone()
+    };
+    let why = offline(&mut app).expect("offline");
+    assert!(why.contains("logo.svg"), "{why}");
+
+    // An undo leaves it offline, its settings its own.
+    fire(
+        &mut app,
+        EngineCommand::SetDeckOpacity {
+            deck_uuid: deck.clone(),
+            opacity: 0.5,
+        },
+    );
+    fire(&mut app, EngineCommand::Undo);
+    assert!(offline(&mut app).is_some(), "still offline after an undo");
+    // Removed and the removal undone: back, offline, though nothing of it ran.
+    fire(
+        &mut app,
+        EngineCommand::RemoveDeck {
+            deck_uuid: deck.clone(),
+        },
+    );
+    assert!(app.build_engine_state().mixer.channels[0].decks.is_empty());
+    fire(&mut app, EngineCommand::Undo);
+    assert!(offline(&mut app).is_some(), "back offline");
+
+    app.save_workspace(&UILayoutState::default())
+        .expect("save workspace");
+    assert_eq!(
+        saved_deck(&std::fs::read_to_string(&scene).unwrap()),
+        first,
+        "written back as it was"
+    );
+
+    std::fs::rename(out.join("logo.svg"), &art).unwrap();
+    let Some(mut app) = headless_app_in(tmp.path()) else {
+        return;
+    };
+    assert!(app.load_workspace().is_ok());
+    assert_eq!(offline(&mut app), None, "the file is back, and so is it");
+}
+
+/// Duplicated, or its channel duplicated, an offline input comes along
+/// offline: not refused, nor left out of the channel's copy.
+#[test]
+fn an_offline_input_is_duplicated_offline() {
+    let tmp = TempDir::new().unwrap();
+    let art = tmp.path().join("logo.svg");
+    std::fs::write(
+        &art,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 50"
+            width="200" height="50"><rect width="200" height="50" fill="#20c0a0"/></svg>"##,
+    )
+    .unwrap();
+    let Some(mut app) = headless_app_in(tmp.path()) else {
+        return;
+    };
+    let ch = channel_uuid(&mut app, 0);
+    let CommandResult::OkWithId { uuid: deck } = send_cmd(
+        &mut app,
+        EngineCommand::AddImageDeck {
+            channel_uuid: ch.clone(),
+            path: art.clone(),
+        },
+    ) else {
+        panic!("no image deck");
+    };
+    app.save_workspace(&UILayoutState::default())
+        .expect("save workspace");
+    std::fs::remove_file(&art).unwrap();
+
+    let Some(mut app) = headless_app_in(tmp.path()) else {
+        return;
+    };
+    assert!(app.load_workspace().is_ok());
+    let offline = |app: &mut VardaApp| {
+        app.build_engine_state()
+            .mixer
+            .channels
+            .iter()
+            .flat_map(|c| &c.decks)
+            .filter(|d| d.offline.is_some())
+            .count()
+    };
+    assert_eq!(offline(&mut app), 1);
+
+    let layer = send_cmd(
+        &mut app,
+        EngineCommand::Duplicate {
+            source: varda::engine::ClipboardSource::Deck(deck),
+        },
+    );
+    assert!(!matches!(layer, CommandResult::Err { .. }), "{layer:?}");
+    assert_eq!(offline(&mut app), 2, "the layer's copy");
+
+    let channel = send_cmd(
+        &mut app,
+        EngineCommand::Duplicate {
+            source: varda::engine::ClipboardSource::Channel(ch),
+        },
+    );
+    assert!(!matches!(channel, CommandResult::Err { .. }), "{channel:?}");
+    assert_eq!(offline(&mut app), 4, "the channel's copy, both layers");
+}
+
+/// An effect whose shader is not there — one of the show's own, never copied
+/// to this Mac — stays in the show, offline and drawing nothing, on a layer,
+/// a channel and Main alike: saved back as it was, its settings its own.
+#[test]
+fn an_effect_whose_shader_is_not_there_is_kept_offline() {
+    let tmp = TempDir::new().unwrap();
+    let Some(mut app) = headless_app_in(tmp.path()) else {
+        return;
+    };
+    let ch = channel_uuid(&mut app, 0);
+    let CommandResult::OkWithId { uuid: deck } = send_cmd(
+        &mut app,
+        EngineCommand::AddSolidColorDeck {
+            channel_uuid: ch.clone(),
+            color: [1.0, 0.0, 0.0, 1.0],
+        },
+    ) else {
+        panic!("no deck");
+    };
+    for target in [
+        EffectTarget::Deck(deck.clone()),
+        EffectTarget::Channel(ch.clone()),
+        EffectTarget::Master,
+    ] {
+        let CommandResult::OkWithId { uuid: effect } = send_cmd(
+            &mut app,
+            EngineCommand::AddEffect {
+                target,
+                shader_name: "invert".to_string(),
+            },
+        ) else {
+            panic!("no effect");
+        };
+        fire(
+            &mut app,
+            EngineCommand::SetEffectParam {
+                effect_uuid: effect,
+                name: "amount".into(),
+                value: varda::params::ParamValue::Float(0.3),
+            },
+        );
+    }
+    app.save_workspace(&UILayoutState::default())
+        .expect("save workspace");
+
+    // Its shader one this Mac does not have.
+    let scene = tmp.path().join(".varda/scene.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&scene).unwrap()).unwrap();
+    let mut gone = Vec::new();
+    let chains = [
+        "/channels/0/decks/0/effects",
+        "/channels/0/effects",
+        "/master_effects",
+    ];
+    for chain in chains {
+        let effect = saved
+            .pointer_mut(chain)
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|e| e["path"].as_str().unwrap().ends_with("invert.fs"))
+            .expect("the invert");
+        effect["path"] = "/Users/elsewhere/Show/.varda/shaders/my_wash.fs".into();
+        gone.push(effect.clone());
+    }
+    std::fs::write(&scene, serde_json::to_string_pretty(&saved).unwrap()).unwrap();
+
+    let Some(mut app) = headless_app_in(tmp.path()) else {
+        return;
+    };
+    assert!(
+        app.load_workspace().is_ok(),
+        "an offline effect is not a failed load"
+    );
+    let state = app.build_engine_state();
+    let offline: Vec<_> = state.mixer.channels[0].decks[0]
+        .effects
+        .iter()
+        .chain(&state.mixer.channels[0].effects)
+        .chain(&state.mixer.master_effects)
+        .filter(|e| e.offline.is_some())
+        .collect();
+    assert_eq!(offline.len(), 3, "kept on the layer, the channel and Main");
+    assert!(offline.iter().all(|e| e.name == "my_wash"));
+
+    app.save_workspace(&UILayoutState::default())
+        .expect("save workspace");
+    let again: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&scene).unwrap()).unwrap();
+    let kept: Vec<serde_json::Value> = chains
+        .into_iter()
+        .map(|chain| {
+            again
+                .pointer(chain)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["path"] == "/Users/elsewhere/Show/.varda/shaders/my_wash.fs")
+                .expect("saved back")
+                .clone()
+        })
+        .collect();
+    assert_eq!(kept, gone, "as it was, its settings its own");
+}
+
+/// An offline effect duplicated, or the channel it is on, comes along
+/// offline: not refused, nor left out of the channel's copy.
+#[test]
+fn an_offline_effect_is_duplicated_offline() {
+    let tmp = TempDir::new().unwrap();
+    let Some(mut app) = headless_app_in(tmp.path()) else {
+        return;
+    };
+    let ch = channel_uuid(&mut app, 0);
+    let CommandResult::OkWithId { uuid: deck } = send_cmd(
+        &mut app,
+        EngineCommand::AddSolidColorDeck {
+            channel_uuid: ch.clone(),
+            color: [1.0, 0.0, 0.0, 1.0],
+        },
+    ) else {
+        panic!("no deck");
+    };
+    for target in [
+        EffectTarget::Deck(deck.clone()),
+        EffectTarget::Channel(ch.clone()),
+    ] {
+        let CommandResult::OkWithId { .. } = send_cmd(
+            &mut app,
+            EngineCommand::AddEffect {
+                target,
+                shader_name: "invert".to_string(),
+            },
+        ) else {
+            panic!("no effect");
+        };
+    }
+    app.save_workspace(&UILayoutState::default())
+        .expect("save workspace");
+    let scene = tmp.path().join(".varda/scene.json");
+    // Its shader one this Mac does not have.
+    let text = std::fs::read_to_string(&scene).unwrap();
+    std::fs::write(&scene, text.replace("invert.fs", "my_wash.fs")).unwrap();
+
+    let Some(mut app) = headless_app_in(tmp.path()) else {
+        return;
+    };
+    assert!(app.load_workspace().is_ok());
+    let offline = |app: &mut VardaApp| {
+        let state = app.build_engine_state();
+        state
+            .mixer
+            .channels
+            .iter()
+            .flat_map(|c| {
+                c.effects
+                    .iter()
+                    .chain(c.decks.iter().flat_map(|d| &d.effects))
+            })
+            .filter(|e| e.offline.is_some())
+            .count()
+    };
+    assert_eq!(offline(&mut app), 2, "the layer's and the channel's");
+    let effect = app.build_engine_state().mixer.channels[0].decks[0]
+        .effects
+        .iter()
+        .find(|e| e.offline.is_some())
+        .expect("the layer's")
+        .uuid
+        .clone();
+
+    let copy = send_cmd(
+        &mut app,
+        EngineCommand::Duplicate {
+            source: varda::engine::ClipboardSource::Effect(effect),
+        },
+    );
+    assert!(!matches!(copy, CommandResult::Err { .. }), "{copy:?}");
+    assert_eq!(offline(&mut app), 3, "the effect's copy");
+
+    let copy = send_cmd(
+        &mut app,
+        EngineCommand::Duplicate {
+            source: varda::engine::ClipboardSource::Channel(ch),
+        },
+    );
+    assert!(!matches!(copy, CommandResult::Err { .. }), "{copy:?}");
+    assert_eq!(
+        offline(&mut app),
+        6,
+        "the channel's copy: its own and its layer's two"
+    );
+}
+
+/// A show saved by another copy of Nida names its shaders where that copy had
+/// them — inside an app since moved or translocated, another Mac's checkout:
+/// this copy's shader of the same name stands in for a generator and an
+/// effect alike, and the show still names them as it did, so the Nida that
+/// has them there finds them as before.
+#[test]
+fn shaders_another_nida_had_elsewhere_stand_in_and_save_as_named() {
+    let tmp = TempDir::new().unwrap();
+    let Some(mut app) = headless_app_in(tmp.path()) else {
+        return;
+    };
+    let ch = channel_uuid(&mut app, 0);
+    let CommandResult::OkWithId { uuid: deck } = send_cmd(
+        &mut app,
+        EngineCommand::AddDeck {
+            channel_uuid: ch,
+            shader_name: "abstract_field".to_string(),
+        },
+    ) else {
+        panic!("no generator deck");
+    };
+    let CommandResult::OkWithId { .. } = send_cmd(
+        &mut app,
+        EngineCommand::AddEffect {
+            target: EffectTarget::Deck(deck.clone()),
+            shader_name: "invert".to_string(),
+        },
+    ) else {
+        panic!("no effect");
+    };
+    app.save_workspace(&UILayoutState::default())
+        .expect("save workspace");
+
+    // As another Nida saved it.
+    let scene = tmp.path().join(".varda/scene.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&scene).unwrap()).unwrap();
+    let elsewhere = "/Users/elsewhere/Nida.app/Contents/Resources/shaders";
+    let layer = &mut saved["channels"][0]["decks"][0];
+    layer["source"]["path"] = format!("{elsewhere}/abstract_field.fs").into();
+    let effects = layer["effects"].as_array_mut().unwrap();
+    assert!(effects.len() > 1, "the new layer's own and the invert");
+    for effect in effects.iter_mut() {
+        let file = std::path::Path::new(effect["path"].as_str().unwrap())
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        effect["path"] = format!("{elsewhere}/{file}").into();
+    }
+    let named = layer.clone();
+    std::fs::write(&scene, serde_json::to_string_pretty(&saved).unwrap()).unwrap();
+
+    let Some(mut app) = headless_app_in(tmp.path()) else {
+        return;
+    };
+    assert!(app.load_workspace().is_ok());
+    let state = app.build_engine_state();
+    let layer = &state.mixer.channels[0].decks[0];
+    assert_eq!(layer.uuid, deck);
+    assert_eq!(layer.offline, None, "the generator stood in");
+    assert_eq!(
+        layer.effects.len(),
+        named["effects"].as_array().unwrap().len(),
+        "every effect stood in"
+    );
+
+    app.save_workspace(&UILayoutState::default())
+        .expect("save workspace");
+    let again: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&scene).unwrap()).unwrap();
+    let layer = &again["channels"][0]["decks"][0];
+    assert_eq!(layer["source"]["path"], named["source"]["path"]);
+    let paths = |layer: &serde_json::Value| -> Vec<serde_json::Value> {
+        layer["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["path"].clone())
+            .collect()
+    };
+    assert_eq!(paths(layer), paths(&named), "saved as the show named them");
+}
+
 #[test]
 fn save_creates_varda_directory() {
     let tmp = TempDir::new().unwrap();

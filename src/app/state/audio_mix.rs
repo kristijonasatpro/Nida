@@ -21,6 +21,14 @@ fn done(result: Result<(), AudioMixError>) -> CommandResult {
     }
 }
 
+/// A processing setting for [`VardaApp::cmd_set_audio_processing`].
+#[derive(Debug, Clone, Copy)]
+pub enum AudioProcessing {
+    LowCut(crate::audio_mix::LowCutConfig),
+    Leveler(crate::audio_mix::LevelerConfig),
+    Limiter(crate::audio_mix::LimiterConfig),
+}
+
 impl VardaApp {
     /// Bring the mixer in line with this frame: which decks have sound, what
     /// is on air (see `on_air`), input devices and sound devices. Called once
@@ -58,6 +66,14 @@ impl VardaApp {
         let live = self.live_sounds();
         self.audio_mix.sync_live(live);
         self.update_on_air();
+        // A device unplugged: its capture let go, the operator told; its
+        // inputs are taken again as soon as it is back.
+        for name in self.audio_manager.forget_lost() {
+            self.notify_error(format!(
+                "Sound from '{name}' stopped — unplugged? It is taken again as soon as it is back."
+            ));
+        }
+        self.audio_manager.reopen_pins();
         self.audio_mix.connect_inputs(&mut self.audio_manager);
         self.audio_mix.poll_devices();
     }
@@ -110,6 +126,56 @@ impl VardaApp {
 
     // ── Commands ────────────────────────────────────────────────────
 
+    pub fn cmd_set_audio_compressor(
+        &mut self,
+        uuid: &str,
+        bus: bool,
+        config: crate::audio_mix::CompressorConfig,
+    ) -> CommandResult {
+        if let Err(message) = config.validate() {
+            return CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                message: message.into(),
+            };
+        }
+        if bus {
+            self.cmd_edit_audio_bus(uuid, |target| target.compressor = config)
+        } else {
+            self.cmd_edit_audio_source(uuid, |target| target.compressor = config)
+        }
+    }
+
+    /// Set a source's low cut or leveler, or a bus's limiter: refused, the
+    /// sound untouched, when a value is out of range.
+    pub fn cmd_set_audio_processing(
+        &mut self,
+        uuid: &str,
+        change: AudioProcessing,
+    ) -> CommandResult {
+        let valid = match &change {
+            AudioProcessing::LowCut(config) => config.validate(),
+            AudioProcessing::Leveler(config) => config.validate(),
+            AudioProcessing::Limiter(config) => config.validate(),
+        };
+        if let Err(message) = valid {
+            return CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                message: message.into(),
+            };
+        }
+        match change {
+            AudioProcessing::LowCut(config) => {
+                self.cmd_edit_audio_source(uuid, |target| target.low_cut = config)
+            }
+            AudioProcessing::Leveler(config) => {
+                self.cmd_edit_audio_source(uuid, |target| target.leveler = config)
+            }
+            AudioProcessing::Limiter(config) => {
+                self.cmd_edit_audio_bus(uuid, |target| target.limiter = config)
+            }
+        }
+    }
+
     pub fn cmd_add_audio_bus(&mut self, name: &str) -> CommandResult {
         CommandResult::OkWithId {
             uuid: self.audio_mix.add_bus(name),
@@ -143,16 +209,39 @@ impl VardaApp {
     /// Add an app's sound as a source (see [`EngineCommand::AddAppSound`]).
     ///
     /// [`EngineCommand::AddAppSound`]: crate::engine::EngineCommand::AddAppSound
-    pub fn cmd_add_app_sound(&mut self, app: &str, name: &str) -> CommandResult {
+    pub fn cmd_add_app_sound(
+        &mut self,
+        app: &str,
+        name: &str,
+        deck: Option<&str>,
+    ) -> CommandResult {
         if app.trim().is_empty() {
             return CommandResult::Err {
                 code: crate::engine::ErrorCode::InvalidInput,
                 message: "no app named".into(),
             };
         }
+        if let Some(deck) = deck {
+            if let Err(e) = self.resolve_deck(deck) {
+                return CommandResult::Err {
+                    code: crate::engine::ErrorCode::NotFound,
+                    message: e.to_string(),
+                };
+            }
+        }
+        // PowerPoint's sound is one: for a PowerPoint input, the strip of it
+        // there is already is it.
+        if app == crate::presentation::powerpoint::POWERPOINT_ID {
+            let powerpoint = self.powerpoint_decks();
+            if deck.is_some_and(|d| powerpoint.iter().any(|p| p == d)) {
+                if let Some(uuid) = self.powerpoint_sound_strip(&powerpoint) {
+                    return CommandResult::OkWithId { uuid };
+                }
+            }
+        }
         let name = if name.trim().is_empty() { app } else { name };
         CommandResult::OkWithId {
-            uuid: self.audio_mix.add_app_input(name, app),
+            uuid: self.audio_mix.add_app_input_of(name, app, deck),
         }
     }
 

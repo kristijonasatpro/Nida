@@ -214,6 +214,7 @@ impl Deck {
             }
             DeckSource::Playlist(list) => list.tick(encoder),
             DeckSource::Timer(timer) => timer.tick(),
+            DeckSource::Presenter(presenter) => presenter.tick(),
             _ => {}
         }
         Ok(())
@@ -754,6 +755,34 @@ impl Deck {
                 }
                 cmd_buffers.push(encoder.finish());
             }
+            // Its input not opened: nothing to draw, so clear.
+            DeckSource::Offline(_) => {
+                let mut encoder =
+                    context
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Offline Clear Encoder"),
+                        });
+                {
+                    let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Offline Clear Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: generator_target,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                }
+                cmd_buffers.push(encoder.finish());
+            }
             DeckSource::ExternalSource {
                 kind,
                 blit_pipeline,
@@ -937,6 +966,11 @@ impl Deck {
                 );
             }
             DeckSource::Timer(timer) => timer.render(cmd_buffers, generator_target),
+            DeckSource::Presenter(presenter) => presenter.render(
+                cmd_buffers,
+                generator_target,
+                (self.texture.width(), self.texture.height()),
+            ),
         }
 
         // Apply effect chain (ping-pong between textures)
@@ -1065,7 +1099,9 @@ impl Deck {
             DeckSource::SolidColor { .. }
             | DeckSource::ComputeShader { .. }
             | DeckSource::Playlist(_)
-            | DeckSource::Timer(_) => false,
+            | DeckSource::Timer(_)
+            | DeckSource::Presenter(_)
+            | DeckSource::Offline(_) => false,
         };
         if !source_in_parts {
             plan[0] = None;
@@ -1099,11 +1135,20 @@ impl Deck {
     /// anything that moves — video, generators, cameras — each was a
     /// full-frame pass per frame, ~130 MB at 4K.
     fn drawn_effects(&self, modulation: &ModulationEngine) -> Vec<usize> {
+        // An offline input draws nothing at all: an effect that fills the
+        // frame — feedback trails, a colour wash — would cover the layers
+        // under it with its clear picture.
+        if matches!(self.source, DeckSource::Offline(_)) {
+            return Vec::new();
+        }
         self.effects
             .iter()
             .enumerate()
             .filter(|(_, e)| {
-                e.enabled && !e.is_neutral_framing(modulation) && !e.is_idle_layer_mask()
+                e.enabled
+                    && e.offline().is_none()
+                    && !e.is_neutral_framing(modulation)
+                    && !e.is_idle_layer_mask()
             })
             .map(|(i, _)| i)
             .collect()
@@ -1762,6 +1807,8 @@ impl Deck {
             DeckSource::Playlist(list) => list.resize(width, height),
             // Its numbers are sized and placed against the master.
             DeckSource::Timer(timer) => timer.resize(width, height),
+            // So is a presenter view's panel.
+            DeckSource::Presenter(presenter) => presenter.resize(width, height),
             // A tap shows a channel's picture or the master's, the master's
             // size now: left at the old one, it would fit the new picture as
             // if it were that size — bars round it, or cut off.
@@ -1780,6 +1827,7 @@ impl Deck {
         // Fresh textures are empty, whatever their size: a still image must
         // render into them again.
         self.rendered_still = None;
+        self.texture_generation = self.texture_generation.wrapping_add(1);
         // Include COPY_DST so compute shader decks survive resize
         let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
@@ -2339,6 +2387,43 @@ mod tests {
             "deck0",
         );
         assert!((accum[0] - 0.5).abs() < 1e-5, "got {}", accum[0]);
+    }
+
+    // ── An offline input draws nothing ───────────────────────────────
+
+    /// An offline input runs none of its effects: one that fills the frame
+    /// would cover the layers under it with its clear picture.
+    #[test]
+    fn an_offline_input_runs_none_of_its_effects() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        let invert = || {
+            let shader = crate::isf::ISFShader::from_file(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/invert.fs"),
+            )
+            .unwrap();
+            crate::deck::Effect::new_with_format(&gpu, shader, gpu.compositing_format).unwrap()
+        };
+        let mut online =
+            crate::deck::Deck::new_solid_color(&gpu, [1.0, 0.0, 0.0, 1.0], 64, 64).unwrap();
+        online.effects.push(invert());
+        assert_eq!(online.drawn_effects(&no_modulation()), vec![0]);
+
+        let mut offline = crate::deck::Deck::new_offline(
+            &gpu,
+            "logo".into(),
+            crate::scene::SourceConfig::Image {
+                path: "/gone/logo.png".into(),
+                scaling_mode: ScalingMode::default(),
+            },
+            "not found".into(),
+            64,
+            64,
+        );
+        offline.effects.push(invert());
+        assert!(offline.drawn_effects(&no_modulation()).is_empty());
     }
 
     // ── Offensive: zero-size texture guard on resize ─────────────────

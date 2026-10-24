@@ -914,3 +914,128 @@ fn a_prores_recording_keeps_the_sound_with_the_picture() {
     };
     assert_together(&offsets, "ProRes in MOV");
 }
+
+#[test]
+fn processing_saves_with_the_stage_and_a_bad_value_is_refused() {
+    use clap::Parser as _;
+    use varda::audio_mix::{CompressorConfig, LevelerConfig, LimiterConfig, LowCutConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().to_str().unwrap().to_string();
+    let config = |ws: &str| {
+        varda::app::AppConfig::try_parse_from([
+            "varda",
+            "--headless",
+            "--no-osc",
+            "--no-ndi",
+            "--no-syphon",
+            "--no-camera",
+            "--workspace",
+            ws,
+        ])
+        .unwrap()
+    };
+    let limiter = LimiterConfig {
+        ceiling_db: -2.0,
+        ..LimiterConfig::default()
+    };
+    let (stream, mic) = {
+        let Some(gpu) = common::headless_gpu() else {
+            return;
+        };
+        let mut app = VardaApp::new(gpu, &config(&ws)).unwrap();
+        let stream = new_uuid(send_cmd(
+            &mut app,
+            EngineCommand::AddAudioBus {
+                name: "STREAM".into(),
+            },
+        ));
+        let mic = new_uuid(send_cmd(
+            &mut app,
+            EngineCommand::AddAudioInput {
+                name: "Lectern".into(),
+                device: "No Such Interface".into(),
+                left: 1,
+                right: 1,
+            },
+        ));
+        // Out of range: refused, nothing changed.
+        assert!(matches!(
+            send_cmd(
+                &mut app,
+                EngineCommand::SetAudioSourceLowCut {
+                    uuid: mic.clone(),
+                    config: LowCutConfig {
+                        enabled: true,
+                        hz: 5_000.0,
+                        slope_db: 24,
+                    },
+                },
+            ),
+            CommandResult::Err { .. }
+        ));
+        assert!(matches!(
+            send_cmd(
+                &mut app,
+                EngineCommand::SetAudioBusLimiter {
+                    uuid: stream.clone(),
+                    config: LimiterConfig {
+                        ceiling_db: 3.0,
+                        ..LimiterConfig::default()
+                    },
+                },
+            ),
+            CommandResult::Err { .. }
+        ));
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::SetAudioSourceLowCut {
+                uuid: mic.clone(),
+                config: LowCutConfig::speech(),
+            },
+        ));
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::SetAudioSourceLeveler {
+                uuid: mic.clone(),
+                config: LevelerConfig::speech(),
+            },
+        ));
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::SetAudioSourceCompressor {
+                uuid: mic.clone(),
+                config: CompressorConfig::speech(),
+            },
+        ));
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::SetAudioBusLimiter {
+                uuid: stream.clone(),
+                config: limiter,
+            },
+        ));
+        ok(send_cmd(&mut app, EngineCommand::SaveWorkspace));
+        (stream, mic)
+    };
+    let gpu = common::headless_gpu().expect("gpu");
+    let mut app = VardaApp::new(gpu, &config(&ws)).unwrap();
+    let _ = app.load_workspace();
+    let state = app.build_engine_state();
+    let strip = state
+        .audio_mix
+        .sources
+        .iter()
+        .find(|s| s.uuid == mic)
+        .expect("the microphone came back");
+    assert_eq!(strip.dynamics.low_cut, Some(LowCutConfig::speech()));
+    assert_eq!(strip.dynamics.leveler, Some(LevelerConfig::speech()));
+    assert_eq!(strip.dynamics.config, CompressorConfig::speech());
+    let bus = state
+        .audio_mix
+        .buses
+        .iter()
+        .find(|b| b.config.uuid == stream)
+        .expect("the bus came back");
+    assert_eq!(bus.config.limiter, limiter);
+    assert!(bus.dynamics.loudness.is_some(), "a bus is measured");
+}

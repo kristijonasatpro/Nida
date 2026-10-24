@@ -132,6 +132,10 @@ This enables visual feedback in TouchOSC, Lemur, and other bidirectional OSC con
 
 MIDI learn and keyboard learn are mutually exclusive — entering one exits the other.
 
+A learned key does nothing while a text field is being typed into — a letter
+in a name is a letter — and neither does the Enter that finishes it; keys
+with ⌘ still work.
+
 The [Rundown](25-rundown.md)'s **GO** is learned this way too: click **GO** in
 learn mode and press its key. It has none until then.
 
@@ -275,7 +279,8 @@ transport chases.
 The asymmetry is deliberate. MIDI ports are already open and already delivering bytes, so listening
 for MTC costs nothing. LTC means opening an audio device, and opening every input on the machine to
 sniff for timecode would take hardware you did not offer it. So LTC is listened for only once you
-have said where it is.
+have said where it is. Its device unplugged, LTC is listened for again as soon as it is back —
+looked for every two seconds, the input and channel kept.
 
 Set the source to **Chase timecode** and the popover grows the timecode controls:
 

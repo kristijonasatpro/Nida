@@ -306,12 +306,24 @@ impl MixerCommands for VardaApp {
             .iter()
             .find(|d| d.id == camera_id)
             .map_or_else(|| format!("Camera {camera_id}"), |d| d.name.clone());
-        let (src_w, src_h) =
-            self.camera_manager
+        // Open already — another input shows it — it shows at once. Else it
+        // starts in the background, and the deck waits for it, black, as a
+        // show's camera not plugged in does (see `reconcile_cameras`):
+        // starting takes macOS a moment — up to `OPEN_WAIT` for a device
+        // that hangs — and the outputs drew nothing while the show waited.
+        let open = self.camera_manager.is_active(camera_id);
+        let (bound, (src_w, src_h)) = if open {
+            let size = self
+                .camera_manager
                 .open_camera(camera_id, &self.context.device, mode)?;
+            (camera_id, size)
+        } else {
+            let size = mode.map_or((1920, 1080), |m| (m.width, m.height));
+            (crate::camera::UNBOUND_CAMERA, size)
+        };
         let mut deck = Deck::new_from_camera(
             &self.context,
-            camera_id,
+            bound,
             &cam_name,
             src_w,
             src_h,
@@ -322,6 +334,12 @@ impl MixerCommands for VardaApp {
         deck.camera_device = self.camera_manager.unique_id(camera_id).map(str::to_string);
         self.read_as_its_camera_is(&mut deck);
         let uuid = deck.uuid().to_string();
+        if !open {
+            // What fails before the camera starts (not there, no access)
+            // fails the add, nothing left behind.
+            self.camera_manager
+                .open_in_background(camera_id, mode, vec![uuid.clone()], true)?;
+        }
         self.add_default_effects(&mut deck);
         let ch = self
             .mixer
@@ -379,6 +397,7 @@ impl MixerCommands for VardaApp {
                 identity,
                 config,
                 config_dirty: false,
+                presentation: None,
             },
             &info.label,
             src_w,
@@ -492,6 +511,7 @@ impl MixerCommands for VardaApp {
 
     fn remove_deck(&mut self, deck_uuid: &str) -> Result<()> {
         let (channel_idx, deck_idx) = self.resolve_deck(deck_uuid)?;
+        let was_powerpoint = self.powerpoint_decks().iter().any(|d| d == deck_uuid);
         // Release external resources before removal. The held identifiers are
         // read out first so the mixer borrow ends before the managers are
         // touched.
@@ -552,6 +572,20 @@ impl MixerCommands for VardaApp {
         // A lane is where this deck sits in show time, so it leaves with the
         // deck. See /spec/arrangement.md § A lane is a deck.
         self.drop_lane(deck_uuid);
+        // PowerPoint's sound is every PowerPoint input's: tied to this one,
+        // it goes to one still there rather than with it.
+        let other = self
+            .powerpoint_decks()
+            .into_iter()
+            .find(|d| d != deck_uuid)
+            .filter(|_| was_powerpoint);
+        if let Some(other) = other {
+            self.audio_mix.retie_app_inputs(
+                crate::presentation::powerpoint::POWERPOINT_ID,
+                deck_uuid,
+                &other,
+            );
+        }
         // So does a camera's sound, added with it.
         self.audio_mix.remove_inputs_of_deck(deck_uuid);
         Ok(())
@@ -1532,6 +1566,7 @@ impl OutputQueries for VardaApp {
                 let facts = &self.output.screen_facts;
                 let labels =
                     super::screens::labels(&keys, facts, &self.output.screen_names, &sizes);
+                let main = crate::presentation::screens::main_display();
                 keys.into_iter()
                     .zip(labels)
                     .enumerate()
@@ -1548,6 +1583,10 @@ impl OutputQueries for VardaApp {
                                 .and_then(|f| self.output.screen_names.get(&f.identity))
                                 .map(str::to_string),
                             refresh_hz: fact.and_then(|f| f.refresh_hz),
+                            identity: fact.map(|f| f.identity.clone()).unwrap_or_default(),
+                            main: fact
+                                .and_then(|f| f.display_id)
+                                .is_some_and(|d| Some(d) == main),
                         }
                     })
                     .collect()
@@ -1906,6 +1945,65 @@ mod tests {
         let gpu = crate::renderer::context::GpuContext::new_headless().ok()?;
         let config = crate::testing::headless_config();
         super::super::VardaApp::new(gpu, &config).ok()
+    }
+
+    /// A camera that takes the OS 600 ms to start, then captures until told
+    /// to stop.
+    fn slow_to_start(
+        _: &crate::camera::CameraDeviceInfo,
+        _: Option<crate::camera::CameraMode>,
+        _: &std::sync::Arc<crate::camera::Sink>,
+        stop: &std::sync::atomic::AtomicBool,
+        opened: &std::sync::mpsc::Sender<Result<crate::camera::CameraMode>>,
+    ) {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let _ = opened.send(Ok(crate::camera::CameraMode {
+            width: 64,
+            height: 36,
+            fps: 60,
+        }));
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A camera input added in a show takes its camera when the OS has
+    /// started it, the show going on meanwhile: it waited for it, every
+    /// output still for as long as that took.
+    #[test]
+    fn a_camera_slow_to_start_never_holds_up_the_show() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        app.camera_manager =
+            crate::camera::CameraManager::with_devices(&[("a", "ATEM")], slow_to_start);
+        let id = app.camera_manager.devices()[0].id;
+        let channel = channel_uuid(&app, 0);
+        let asked = std::time::Instant::now();
+        let uuid = app.add_camera_deck(&channel, id, None).expect("added");
+        let took = asked.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(300),
+            "the show waited {took:?}"
+        );
+        let deck = |app: &super::super::VardaApp| {
+            let (ch, dk) = app.mixer.find_deck_by_uuid(&uuid).expect("the input");
+            app.mixer.channels()[ch].decks[dk].deck.camera_id()
+        };
+        assert_eq!(deck(&app), Some(crate::camera::UNBOUND_CAMERA), "waits");
+        let start = std::time::Instant::now();
+        while deck(&app) != Some(id) && start.elapsed() < std::time::Duration::from_secs(3) {
+            let frame = std::time::Instant::now();
+            app.reconcile_cameras();
+            let took = frame.elapsed();
+            assert!(
+                took < std::time::Duration::from_millis(100),
+                "a frame waited {took:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(deck(&app), Some(id), "shows its camera once it runs");
+        assert!(app.camera_manager.is_active(id));
     }
 
     fn channel_uuid(app: &super::super::VardaApp, idx: usize) -> String {

@@ -271,6 +271,14 @@ pub struct DeckUIInfo {
     pub playlist: Option<crate::engine::value::playlist::PlaylistSnapshot>,
     /// A timer's settings and what it reads (None = not a timer).
     pub timer: Option<crate::engine::value::timer::TimerSnapshot>,
+    /// A PowerPoint input's show (None = not a PowerPoint input).
+    pub presentation: Option<crate::engine::value::presentation::PresentationSnapshot>,
+    /// A presenter view: the PowerPoint input's layer it shows.
+    pub presenter_of: Option<String>,
+    /// A presenter view's layout.
+    pub presenter_layout: Option<crate::engine::value::presentation::PresenterLayout>,
+    /// An input kept offline, as saved: why (None = not offline).
+    pub offline: Option<String>,
     /// How a camera's picture is read into colours (None = not a camera).
     pub camera_colour: Option<crate::engine::value::camera::CameraColour>,
     /// What a camera's picture is coded as (None = not a camera).
@@ -323,6 +331,9 @@ pub struct ChannelUIInfo {
     pub effects: Vec<EffectInfo>,
     /// An overlay in Main mode: switched on and off over Main.
     pub overlay: bool,
+    /// Where it is on air: "Main", or the name of the bus showing it (see
+    /// `ChannelSnapshot::on_air`). `None` off air.
+    pub on_air: Option<String>,
 }
 
 /// Audio input device info for UI display.
@@ -683,6 +694,8 @@ pub struct UIData {
     /// Latency: frames the GPU may still be drawing when the next starts
     /// (1 Low, 2 Normal, 3 High).
     pub frames_in_flight: u32,
+    /// Night Shift kept off while an output is on a screen.
+    pub night_shift_off: bool,
     /// The control window's screen set to the show's rate while Nida runs.
     pub control_screen_rate: bool,
     /// Whether undo is available
@@ -770,6 +783,10 @@ pub struct MonitorInfo {
     pub model: Option<String>,
     /// The name given to it on this computer.
     pub given_name: Option<String>,
+    /// Its lasting identity (see `app::screens`).
+    pub identity: String,
+    /// This Mac's screen: the one with the menu bar.
+    pub main: bool,
 }
 
 /// MIDI device info for UI display.

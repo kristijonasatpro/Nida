@@ -671,6 +671,10 @@ pub(super) fn render_channel_column(
                             super::timer::start_button(ui, &deck.uuid, timer, size, actions);
                             super::timer::settings_button(ui, &deck.uuid, size);
                         }
+                        if let Some((deck, _)) = super::presentation::of_channel(ch) {
+                            let size = egui::vec2(26.0, 20.0);
+                            super::presentation::step_buttons(ui, &deck.uuid, size, actions);
+                        }
                         if desk {
                             render_desk_tallies(ui, ch, on_main, data, actions);
                             return;
@@ -737,10 +741,12 @@ pub(super) fn render_channel_column(
                                 actions.session.select_channel = Some(ch_idx);
                             }
                         }
-                        // Where each card was drawn, so a drop between two of
-                        // them lands between them (see `insertion`).
+                        // Front first, as in Premiere: the top card is the
+                        // layer in front. Where each card was drawn, so a drop
+                        // between two of them lands between them (see
+                        // `insertion`).
                         let mut cards: super::insertion::Cards = Vec::with_capacity(ch.decks.len());
-                        for deck in &ch.decks {
+                        for deck in ch.decks.iter().rev() {
                             let card = ui
                                 .scope(|ui| {
                                     render_deck_thumbnail(ui, ch_idx, deck, accent, data, actions);
@@ -750,7 +756,6 @@ pub(super) fn render_channel_column(
                             cards.push((deck.uuid.clone(), card));
                             ui.add_space(2.0);
                         }
-                        super::insertion::publish_cards(ui.ctx(), ch_idx, cards);
 
                         // Drop hint when dragging over a channel with existing decks
                         if is_hovering && !ch.decks.is_empty() {
@@ -766,6 +771,14 @@ pub(super) fn render_channel_column(
                             egui::vec2(ui.available_width(), 20.0_f32.max(ui.available_height())),
                             egui::Sense::click() | egui::Sense::hover(),
                         );
+                        // The cards, and the column round them down to its
+                        // foot, as far as it is scrolled into view: a drop
+                        // anywhere else — a tile — is not between them.
+                        let area = cards
+                            .iter()
+                            .fold(drop_resp.rect, |area, (_, card)| area.union(*card))
+                            .intersect(ui.clip_rect());
+                        super::insertion::publish_cards(ui.ctx(), ch_idx, cards, area);
                         if drop_resp.clicked() {
                             actions.session.select_channel = Some(ch_idx);
                         }
@@ -852,7 +865,7 @@ pub(super) fn handle_deck_drop(
     if !deck_drag && !generator_drag {
         return;
     }
-    let insertion = super::insertion::insertion_at(&ctx, ch.ch_idx, pos.y);
+    let insertion = super::insertion::insertion_at(&ctx, ch.ch_idx, pos);
     super::insertion::paint(&ctx, &insertion, accent);
     let Some(payload) = column.dnd_release_payload::<DeckDrag>() else {
         return;
