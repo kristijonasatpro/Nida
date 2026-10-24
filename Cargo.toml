@@ -307,7 +307,9 @@ egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
 proptest = "1.9"
-varda = { path = ".", features = ["test-fixtures"] }
+# Honor the caller's feature selection in tests too. In particular, Windows
+# builds exclude `depth`, whose native libfreenect dependency is unavailable.
+varda = { path = ".", default-features = false, features = ["test-fixtures"] }
 
 [[bench]]
 name = "compositing"

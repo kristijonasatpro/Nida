@@ -1416,7 +1416,7 @@ impl OutputWindow {
     /// thread — would wait for the main thread.
     pub fn request_redraw(&self) {
         #[cfg(not(target_os = "macos"))]
-        self.window.on_main(|window| window.request_redraw());
+        self.window.on_main(winit::window::Window::request_redraw);
     }
 
     /// The refresh interval of the display the window is on, as last read.

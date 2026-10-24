@@ -134,7 +134,10 @@ fn splice(existing: &str, generated: &str) -> String {
 #[test]
 fn route_reference_is_up_to_date() {
     let path = manifest_path("docs/13-api.md");
-    let existing = std::fs::read_to_string(&path).expect("read docs/13-api.md");
+    // Git may check Markdown out with CRLF on Windows; compare document content.
+    let existing = std::fs::read_to_string(&path)
+        .expect("read docs/13-api.md")
+        .replace("\r\n", "\n");
     let updated = splice(&existing, &render_reference());
 
     if existing == updated {

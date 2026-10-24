@@ -105,6 +105,7 @@ impl Rate {
     }
 
     /// As a person reads it: "1920×1080 60p".
+    #[cfg(target_os = "macos")]
     pub(crate) fn label(&self) -> String {
         self.mode().label()
     }
@@ -190,6 +191,7 @@ pub(crate) fn choose(rates: &[Rate], mode: Option<CameraMode>) -> Option<Rate> {
 /// The rates to list from one of a device's ranges of rates: its fastest,
 /// and where it runs at any rate between two, the usual rates between them
 /// and its slowest when that is a rate anyone would choose.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn rates_in_range(slowest: f64, fastest: f64) -> Vec<f64> {
     let mut rates = vec![fastest];
     if fastest - slowest > 1e-3 {

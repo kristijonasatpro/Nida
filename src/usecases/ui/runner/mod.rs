@@ -1892,7 +1892,11 @@ fn reveal_in_file_manager(file: &std::path::Path) {
         .arg("-R")
         .arg(file)
         .spawn();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    let spawned = std::process::Command::new("explorer.exe")
+        .arg(file.parent().unwrap_or(file))
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let spawned = std::process::Command::new("xdg-open")
         .arg(file.parent().unwrap_or(file))
         .spawn();
