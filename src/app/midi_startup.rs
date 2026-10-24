@@ -156,9 +156,9 @@ mod tests {
         app.save_workspace(&crate::usecases::ui::UILayoutState::default())
             .unwrap();
         app.flush_saves();
-        let path = app.session.workspace.midi_path();
+        let midi_file = app.session.workspace.midi_path();
         assert_eq!(
-            MidiConfig::load(&path).unwrap().mappings[0].device_name,
+            MidiConfig::load(&midi_file).unwrap().mappings[0].device_name,
             "Test device 42"
         );
         assert!(send.send(Ok(device())).is_ok());
