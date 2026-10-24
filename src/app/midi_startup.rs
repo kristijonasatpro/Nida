@@ -177,7 +177,7 @@ mod tests {
         );
         // Deletion for a connected device must not resurrect its saved entry.
         app.input.midi_mappings.remove(&MidiKey::CC(42, 0, 7));
-        assert!(app.midi_config_for_save().unwrap().mappings.is_empty());
+        assert_eq!(app.midi_config_for_save().unwrap().mappings.len(), 0);
     }
 
     #[test]
@@ -218,11 +218,11 @@ mod tests {
             preference: TimecodePreference::Off,
         });
         app.execute_command(EngineCommand::ClearMidiMappings);
-        assert!(app.midi_config_for_save().unwrap().mappings.is_empty());
+        assert_eq!(app.midi_config_for_save().unwrap().mappings.len(), 0);
         assert!(send.send(Ok(device())).is_ok());
         app.poll_midi_discovery();
         assert_eq!(app.input.timecode.preference(), TimecodePreference::Off);
-        assert!(app.input.midi_mappings.sorted_mappings().is_empty());
+        assert_eq!(app.input.midi_mappings.sorted_mappings().len(), 0);
     }
 
     #[test]
