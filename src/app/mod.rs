@@ -18,6 +18,7 @@ mod inputs;
 pub(crate) mod interactive;
 mod keep_awake;
 pub mod log_file;
+mod midi_startup;
 pub(crate) mod monitors;
 mod outputs;
 pub(crate) mod render;
@@ -202,6 +203,9 @@ pub(crate) struct InputSubsystem {
     pub osc_feedback: Option<OscFeedbackSender>,
     pub osc_config: OscConfig,
     pub midi_devices: Option<midi::MidiDeviceManager>,
+    pub midi_pending: Option<midi_startup::Discovery>,
+    pub saved_midi: Option<midi::MidiConfig>,
+    pub pending_mtc: Option<String>,
     pub midi_mappings: midi::MidiMappingStore,
     pub controller_led_mgr: midi::ControllerLedManager,
     pub auto_map_engine: midi::AutoMapEngine,
@@ -736,7 +740,7 @@ const _: () = {
 };
 
 impl VardaApp {
-    /// Create a new `VardaApp` with all subsystems initialized.
+    /// Create a new `VardaApp`; MIDI devices are adopted asynchronously.
     ///
     /// Requires a fully initialized `GpuContext` — the engine cannot exist
     /// without a GPU. A default two-channel mixer is always created.
@@ -857,25 +861,8 @@ impl VardaApp {
             }
         };
 
-        log::info!("[STARTUP]   MIDI init...");
-        let mut controller_led_mgr = midi::ControllerLedManager::new();
-        let mut auto_map_engine = midi::AutoMapEngine::new();
-        let midi_devices = match midi::MidiDeviceManager::new() {
-            Ok(mut mgr) => {
-                mgr.load_user_profiles(&workspace.controller_profiles_dir());
-                if workspace.controller_profiles_dir().is_dir() {
-                    let _ = mgr.scan_devices();
-                }
-                log::info!("MIDI initialized: {} device(s)", mgr.devices.len());
-                controller_led_mgr.sync_devices(&mgr);
-                auto_map_engine.sync_devices(&mgr);
-                Some(mgr)
-            }
-            Err(e) => {
-                log::warn!("Failed to initialize MIDI: {e}");
-                None
-            }
-        };
+        log::info!("[STARTUP]   MIDI discovery in background...");
+        let midi_pending = midi_startup::discover();
 
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let state_tx = std::sync::Arc::new(std::sync::RwLock::new(None));
@@ -921,11 +908,14 @@ impl VardaApp {
                 osc_receiver,
                 osc_feedback,
                 osc_config,
-                midi_devices,
+                midi_devices: None,
+                midi_pending,
+                saved_midi: None,
+                pending_mtc: None,
                 keymap: KeymapStore::with_defaults(),
                 midi_mappings: midi::MidiMappingStore::new(),
-                controller_led_mgr,
-                auto_map_engine,
+                controller_led_mgr: midi::ControllerLedManager::new(),
+                auto_map_engine: midi::AutoMapEngine::new(),
                 clock_manager: crate::clock::ClockManager::new(),
                 timecode: crate::timecode::TimecodeManager::new(),
                 ltc_tap: None,

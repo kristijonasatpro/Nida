@@ -65,7 +65,11 @@ impl ApplicationHandler for UIRunner {
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Guard re-entry (resumed can be called multiple times on some platforms)
-        if self.varda.is_some() {
+        if self.varda.is_some()
+            || self.engine.is_some()
+            || self.gpu_init_handle.is_some()
+            || self.engine_init_pending.is_some()
+        {
             return;
         }
 
@@ -109,7 +113,7 @@ impl ApplicationHandler for UIRunner {
             };
             let mut window_attrs = crate::app::app_id::tagged(
                 Window::default_attributes()
-                    .with_title("Nida")
+                    .with_title("Nida — Starting…")
                     .with_inner_size(winit::dpi::LogicalSize::new(1920, 1080)),
                 crate::app::app_id::MAIN,
             );
@@ -168,6 +172,22 @@ impl ApplicationHandler for UIRunner {
         event: WindowEvent,
     ) {
         if self.varda.is_none() && self.engine.is_none() {
+            if self.main_window_id == Some(window_id) {
+                match event {
+                    WindowEvent::CloseRequested => self.quit(event_loop),
+                    WindowEvent::Resized(size) => {
+                        self.cached_screen_size = size;
+                        if let (Some(surface), Some(gpu)) = (&mut self.window_surface, &self.gpu) {
+                            surface.resize(gpu, size);
+                        }
+                    }
+                    WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                        self.cached_scale_factor = scale_factor as f32;
+                    }
+                    WindowEvent::RedrawRequested => self.paint_startup(),
+                    _ => {}
+                }
+            }
             return;
         }
         if self.main_window_id == Some(window_id) {
@@ -223,6 +243,9 @@ impl ApplicationHandler for UIRunner {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.shut_down {
+            return;
+        }
         // The API's Shutdown or Ctrl-C: the windowed app saves and quits as
         // on ⌘Q (headless does so in `render_headless`) — Ctrl-C while the
         // GPU is still being set up included. Answered "ok", it went on
@@ -237,6 +260,9 @@ impl ApplicationHandler for UIRunner {
             return;
         }
 
+        if let Some((gpu, started)) = self.engine_init_pending.take() {
+            self.finish_engine_init(gpu, started, event_loop);
+        }
         // ── Phase 2 of deferred GPU init: poll the background thread ────
         if let Some(handle) = self.gpu_init_handle.as_ref() {
             if handle.is_finished() {
@@ -246,6 +272,9 @@ impl ApplicationHandler for UIRunner {
                     Ok((gpu, win_surface)) => {
                         log::info!("[STARTUP] GPU context ready ({:.0?})", startup_t0.elapsed());
                         self.finish_init(gpu, Some(win_surface), startup_t0, event_loop);
+                        // Return to winit once with the startup view painted:
+                        // close/resize events can run before engine setup.
+                        return;
                     }
                     Err(e) => {
                         log::error!("Failed to create render context: {e}");
@@ -253,11 +282,10 @@ impl ApplicationHandler for UIRunner {
                         return;
                     }
                 }
-            } else {
-                // GPU init still in progress — keep the event loop alive.
-                event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
-                return;
             }
+            // GPU init still in progress — keep the event loop alive.
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+            return;
         }
 
         if self.config.headless {

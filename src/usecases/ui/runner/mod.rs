@@ -23,6 +23,7 @@ mod engine_thread;
 mod event_loop;
 mod preview;
 mod shows;
+mod startup;
 mod vsync;
 
 pub(crate) use event_loop::WindowHost;
@@ -155,6 +156,7 @@ pub struct UIRunner {
     // ── Deferred GPU init (avoids Metal dispatch-queue deadlock on Rosetta/Intel) ──
     gpu_init_handle: Option<std::thread::JoinHandle<anyhow::Result<(GpuContext, WindowSurface)>>>,
     startup_t0: Option<std::time::Instant>,
+    engine_init_pending: Option<(GpuContext, std::time::Instant)>,
 
     // ── Undo/redo ─────────────────────────────────────────────────────
     // The undo/redo timeline itself lives on `VardaApp` (shared with the
@@ -283,6 +285,7 @@ impl UIRunner {
             gpu: None,
             gpu_init_handle: None,
             startup_t0: None,
+            engine_init_pending: None,
             prev_gesture_active: false,
             publish_counter: 0,
             api_handle: None,
@@ -578,10 +581,26 @@ impl UIRunner {
                 }
             }
         }
-        if let Some(ws) = win_surface {
+        if let Some(mut ws) = win_surface {
+            ws.resize(&gpu, self.cached_screen_size);
             self.window_surface = Some(ws);
         }
 
+        if self.window.is_some() {
+            self.gpu = Some(gpu.clone());
+            self.paint_startup();
+            self.engine_init_pending = Some((gpu, startup_t0));
+        } else {
+            self.finish_engine_init(gpu, startup_t0, event_loop);
+        }
+    }
+
+    fn finish_engine_init(
+        &mut self,
+        gpu: GpuContext,
+        startup_t0: std::time::Instant,
+        event_loop: &ActiveEventLoop,
+    ) {
         // Create engine now that GPU is ready
         log::info!("[STARTUP] Creating engine (audio, MIDI, shaders, mixer)...");
         let mut varda = match VardaApp::new(gpu, &self.config) {
@@ -683,6 +702,10 @@ impl UIRunner {
             "[STARTUP] Initialization complete ({:.0?})",
             startup_t0.elapsed()
         );
+        if let Some(window) = self.window {
+            window.set_title("Nida");
+            window.request_redraw();
+        }
     }
 
     /// Advance the cadence anchor after a frame completes (render or headless).

@@ -1471,6 +1471,7 @@ impl VardaApp {
                 CommandResult::Ok
             }
             EngineCommand::SetTimecodePreference { preference } => {
+                self.input.pending_mtc = None;
                 self.input.timecode.set_preference(preference);
                 CommandResult::Ok
             }
@@ -1960,6 +1961,9 @@ impl VardaApp {
                 CommandResult::Ok
             }
             EngineCommand::RescanMidi => {
+                if self.input.midi_devices.is_none() && self.input.midi_pending.is_none() {
+                    self.input.midi_pending = super::midi_startup::discover();
+                }
                 if let Some(ref mut midi) = self.input.midi_devices {
                     midi.load_user_profiles(&self.session.workspace.controller_profiles_dir());
                     if let Err(e) = midi.scan_devices() {
@@ -2001,6 +2005,10 @@ impl VardaApp {
             // ── MIDI Mappings ─────────────────────────────────────
             EngineCommand::ClearMidiMappings => {
                 self.input.midi_mappings.clear_all();
+                self.input.saved_midi = Some(crate::midi::MidiConfig {
+                    version: 1,
+                    mappings: Vec::new(),
+                });
                 CommandResult::Ok
             }
             EngineCommand::RemoveMidiMapping { key } => {

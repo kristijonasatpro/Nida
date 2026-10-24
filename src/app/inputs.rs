@@ -61,6 +61,7 @@ impl VardaApp {
     /// Process all external inputs: shader hot-reload, audio, OSC, MIDI.
     /// Changed parameter paths are collected and broadcast to OSC feedback targets.
     pub fn process_inputs(&mut self) {
+        self.poll_midi_discovery();
         // Collect (path, value) pairs changed this frame for OSC feedback
         let mut changed_params: Vec<(String, f32)> = Vec::new();
         // Cues a control surface asked for. Applied after the loops below,

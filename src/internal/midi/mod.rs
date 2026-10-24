@@ -347,6 +347,11 @@ impl MidiDeviceManager {
     /// Load user controller profiles from a directory (e.g. `.varda/controller-profiles/`).
     pub fn load_user_profiles(&mut self, dir: &std::path::Path) {
         self.profile_registry.load_user_profiles(dir);
+        // A show can finish loading after background discovery. Reclassifying
+        // its ports needs no second native scan (which may block in a driver).
+        for device in self.devices.values_mut() {
+            device.profile = self.profile_registry.detect(&device.name);
+        }
     }
 
     /// Scan for MIDI devices. Can be called again to rescan (hot-plug).
