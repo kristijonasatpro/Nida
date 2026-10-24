@@ -381,6 +381,8 @@ impl UIData {
             library_panel_open: true,
             right_panel_open: true,
             screen: crate::usecases::ui::screen_layout::ScreenLayout::default(),
+            windows_hardware_decode: false,
+            software_decode_forced: false,
             saved_layouts: std::sync::Arc::default(),
             show_name: "Conference".to_string(),
             show_folder: std::path::PathBuf::from("/Shows/Conference"),

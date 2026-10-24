@@ -129,6 +129,13 @@ pub(super) fn render_main_output(ui: &mut egui::Ui, data: &UIData, actions: &mut
 /// The Setup panel: what is set up before a show rather than touched during
 /// it.
 pub(super) fn render_setup(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
+    if cfg!(target_os = "windows") {
+        egui::CollapsingHeader::new(egui::RichText::new("Performance").strong())
+            .default_open(true)
+            .show(ui, |ui| render_performance(ui, data, actions));
+        ui.add_space(4.0);
+    }
+
     // Named in full on the header so the active curve is legible without
     // opening anything.
     egui::CollapsingHeader::new(
@@ -172,9 +179,77 @@ pub(super) fn render_setup(ui: &mut egui::Ui, data: &UIData, actions: &mut UIAct
         });
 }
 
+fn render_performance(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
+    let mut enabled = data.windows_hardware_decode;
+    if ui.add_enabled(!data.software_decode_forced, egui::Checkbox::new(
+        &mut enabled, "Use GPU video decoding (experimental)"))
+        .on_hover_text("Experimental: frames still pass through RAM and CPU colour conversion. This can be slower and use more CPU than software decoding.")
+        .changed()
+    {
+        actions.session.windows_hardware_decode = Some(enabled);
+    }
+    ui.label(
+        egui::RichText::new(
+            "Applies to videos and streams opened afterward. Unsupported videos use CPU decoding.",
+        )
+        .small()
+        .weak(),
+    );
+    if data.software_decode_forced {
+        ui.label("CPU decoding is forced by VARDA_SOFTWARE_DECODE. Remove it and restart to use GPU decoding.");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use egui_kittest::kittest::{NodeT, Queryable};
+
+    #[test]
+    fn performance_checkbox_requests_a_decoding_change_without_reloading_inputs() {
+        let data = UIData::test_fixture();
+        let mut harness = egui_kittest::Harness::builder().build_ui_state(
+            move |ui, requested: &mut Option<bool>| {
+                let mut actions = UIActions::new();
+                render_setup(ui, &data, &mut actions);
+                if let Some(enabled) = actions.session.windows_hardware_decode {
+                    assert!(actions.commands.is_empty());
+                    *requested = Some(enabled);
+                }
+            },
+            None,
+        );
+        harness.run();
+        if cfg!(target_os = "windows") {
+            harness
+                .get_by_label("Use GPU video decoding (experimental)")
+                .click();
+            harness.run();
+            assert_eq!(*harness.state(), Some(true));
+        } else {
+            assert!(harness
+                .query_by_label("Use GPU video decoding (experimental)")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn software_override_disables_the_performance_checkbox_and_explains_why() {
+        let mut data = UIData::test_fixture();
+        data.windows_hardware_decode = true;
+        data.software_decode_forced = true;
+        let harness = egui_kittest::Harness::new_ui(move |ui| {
+            render_performance(ui, &data, &mut UIActions::new());
+        });
+        assert!(harness
+            .get_by_label("Use GPU video decoding (experimental)")
+            .accesskit_node()
+            .is_disabled());
+        assert!(harness
+            .query_by_label_contains("CPU decoding is forced")
+            .is_some());
+    }
 
     #[test]
     fn render_main_output_and_setup_smoke() {

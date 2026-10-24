@@ -94,6 +94,9 @@ fi
 BREW="$(brew --prefix)"
 FFMPEG_FULL="$BREW/opt/ffmpeg-full"
 [ -x "$FFMPEG_FULL/bin/ffmpeg" ] || { echo "No ffmpeg-full: brew install ffmpeg-full" >&2; exit 1; }
+PKG_CONFIG_PATH="$FFMPEG_FULL/lib/pkgconfig" pkg-config --atleast-version=63 libavcodec \
+  || { echo "FFmpeg 9+ development libraries are required; upgrade ffmpeg-full" >&2; exit 1; }
+
 
 if [ -z "$BINARY" ]; then
   # The flags .cargo/config.toml gives, which RUSTFLAGS would replace, and

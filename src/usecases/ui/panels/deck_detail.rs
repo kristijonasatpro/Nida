@@ -1947,9 +1947,9 @@ pub(super) fn render_playback_controls(
         .weak(),
     )
     .on_hover_text(if vp.hardware_decode {
-        "Decoded on the Mac's media engine — almost no CPU"
+        "Decoded on the GPU/media engine. Colour conversion and upload may still use the CPU"
     } else {
-        "Decoded on the CPU: HAP, or a codec this Mac's media engine does not take"
+        "Decoded on the CPU: hardware decoding is unavailable for this codec, profile or device, or is disabled"
     });
 }
 

@@ -161,6 +161,8 @@ pub struct UISession {
     pub save_layout_as: Option<String>,
     /// Forget this saved layout.
     pub delete_saved_layout: Option<String>,
+    /// Windows GPU decoding preference, kept for every show and run.
+    pub windows_hardware_decode: Option<bool>,
     /// Choices made in windows to keep for every show — where the Input
     /// Settings window puts its controls (see `window_choices`).
     pub window_choices: Option<crate::usecases::ui::window_choices::WindowChoices>,
@@ -236,6 +238,7 @@ impl UISession {
             screen_layout: None,
             save_layout_as: None,
             delete_saved_layout: None,
+            windows_hardware_decode: None,
             window_choices: None,
             toggle_collapsed_channel: None,
             save_requested: false,
