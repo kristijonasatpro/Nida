@@ -212,11 +212,7 @@ impl VardaApp {
             content: text(scene.to_json()),
         });
 
-        if let Some(midi) = &self.input.midi_devices {
-            let midi_config = self
-                .input
-                .midi_mappings
-                .to_config(&midi.devices, &self.input.auto_map_engine);
+        if let Some(midi_config) = self.midi_config_for_save() {
             files.push(ShowFile {
                 key: "midi",
                 label: "MIDI mappings",
@@ -289,6 +285,9 @@ impl VardaApp {
         // not be taken into this one — whatever becomes of the load, a show
         // that is not there or opens only in part included.
         self.rundown.hold();
+        self.input.saved_midi = None;
+        self.input.pending_mtc = None;
+        self.input.midi_mappings.clear_all();
         if !self.session.workspace.exists() {
             log::info!("No .varda/ directory found, starting fresh");
             return WorkspaceLoad {
@@ -551,6 +550,7 @@ impl VardaApp {
                             "MIDI config found but no MIDI devices connected, mappings deferred"
                         );
                     }
+                    self.input.saved_midi = Some(midi_config);
                 }
                 Err(e) => {
                     log::warn!("Failed to load MIDI config: {e}");
@@ -1064,7 +1064,7 @@ impl VardaApp {
 
     /// The timecode patch with its devices named, ready to persist.
     pub fn timecode_config(&self) -> crate::timecode::TimecodeConfig {
-        self.input.timecode.to_config(
+        let mut config = self.input.timecode.to_config(
             |id| {
                 self.audio_manager
                     .devices()
@@ -1079,12 +1079,26 @@ impl VardaApp {
                     .and_then(|midi| midi.devices.get(&id))
                     .map(|d| d.name.clone())
             },
-        )
+        );
+        if let Some(device) = &self.input.pending_mtc {
+            config.preference = crate::timecode::PreferenceConfig::ForceMtc {
+                device: device.clone(),
+            };
+        }
+        config
     }
 
     /// Restore a saved timecode patch against the devices present now,
     /// reporting anything the rig no longer has.
     pub fn apply_timecode_config(&mut self, config: &crate::timecode::TimecodeConfig) {
+        let mut config = config.clone();
+        self.input.pending_mtc = None;
+        if self.input.midi_pending.is_some() {
+            if let crate::timecode::PreferenceConfig::ForceMtc { device } = &config.preference {
+                self.input.pending_mtc = Some(device.clone());
+                config.preference = crate::timecode::PreferenceConfig::Auto;
+            }
+        }
         let audio: Vec<(crate::audio::AudioSourceId, String)> = self
             .audio_manager
             .devices()
@@ -1099,7 +1113,7 @@ impl VardaApp {
             .unwrap_or_default();
 
         let warnings = self.input.timecode.apply_config(
-            config,
+            &config,
             |name| {
                 audio
                     .iter()
