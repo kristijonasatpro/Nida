@@ -666,8 +666,13 @@ def sources(packages, in_app, head, installs, tar_path, version):
     env = dict(os.environ, HOMEBREW_CACHE=str(cache), HOMEBREW_NO_AUTO_UPDATE="1",
                HOMEBREW_API_AUTO_UPDATE_SECS="1000000")
     pinned = [f"{TAP[0]}/{TAP[1]}/{name}" for name in sorted(packages)]
+    # Homebrew 7 loads formulae of a tap that is not its own only once the
+    # tap is trusted (`brew trust`); the trust goes again with the tap.
+    trusts = "trust" in run("brew", "commands", "--quiet").split()
     try:
         (tap / "Formula").mkdir(parents=True)
+        if trusts:
+            run("brew", "trust", "--tap", "/".join(TAP), env=env)
         for name, ruby in recipes.items():
             # What only official taps may say: how Homebrew bumps versions,
             # nothing about what a formula builds or fetches.
@@ -678,6 +683,8 @@ def sources(packages, in_app, head, installs, tar_path, version):
         mains = {name: Path(run("brew", "--cache", "--build-from-source", "--formula", f, env=env).strip())
                  for name, f in zip(sorted(packages), pinned)}
     finally:
+        if trusts:
+            subprocess.run(["brew", "untrust", "--tap", "/".join(TAP)], capture_output=True, env=env)
         shutil.rmtree(tap.parent, ignore_errors=True)
 
     for name in sorted(packages):
