@@ -23,7 +23,7 @@ With --sources, it also makes the archive the GPL asks to be offered beside
 the DMG: the exact source Homebrew built each bundled package from (patches
 and resources too), the formula that built it, and its install receipt.
 
-Usage: bundle-macos-libs.py APP --min-macos 15.7.9 [--identifier ID]
+Usage: bundle-macos-libs.py APP --min-macos 15.8.1 [--identifier ID]
          [--origin nida=target/release/varda] [--origin ffmpeg=PATH]
          [--cargo-args "--no-default-features --features screen-capture"]
          [--version 0.9.0 --sources Nida-0.9.0-third-party-source.tar.gz]

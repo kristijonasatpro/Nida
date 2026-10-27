@@ -5,11 +5,11 @@
 # where Homebrew put it), this app carries what it needs: the FFmpeg
 # libraries Nida links, the `ffmpeg` program it runs for REC and STREAM, and
 # every library those load (bundle-macos-libs.py), and the shaders. It opens
-# on any Mac with Apple silicon and macOS 15.7.9 or later — Homebrew's
+# on any Mac with Apple silicon and macOS 15.8.1 or later — Homebrew's
 # libraries need the macOS they were built for, so build this on macOS 15
 # (as the release workflow does). Most of Homebrew's packages for macOS 15
 # need 15.0; tesseract's (FFmpeg's OCR filter, linked by ffmpeg-full) needs
-# 15.7.9, so that is the floor. Anything needing more stops the build.
+# 15.8.1 since its October 2026 bottle, so that is the floor. Anything needing more stops the build.
 #
 # The FFmpeg inside is Homebrew's `ffmpeg-full`, under GPL version 3 or later,
 # so the app as a whole is given away under the GPLv3; Nida's own source
@@ -27,7 +27,7 @@
 # (shaders-left-out.txt).
 #
 # Usage: scripts/ci/build-macos.sh [--skip-deps] [--binary PATH] [--out DIR]
-#          [--min-macos 15.7.9] [--no-sources]
+#          [--min-macos 15.8.1] [--no-sources]
 #   --binary      package a nida already built, instead of building one
 #   --no-sources  skip the source archive (a try-out, not for giving away)
 #   --label NAME  a try-out's name after the version — its bundle version
@@ -44,7 +44,7 @@ SOURCES=true
 LABEL=""
 BINARY=""
 OUT="$ROOT"
-MIN_MACOS="15.7.9"
+MIN_MACOS="15.8.1"
 BUNDLE_ID="lt.proconf.nida"
 FEATURES="--no-default-features --features screen-capture"
 while [ $# -gt 0 ]; do
