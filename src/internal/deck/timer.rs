@@ -140,6 +140,10 @@ impl Painter {
 pub struct Timer {
     context: GpuContext,
     settings: TimerSettings,
+    /// How this run counts, as a rundown step started it — down from a
+    /// length of its own, or up — over `settings` till they are set by hand:
+    /// not saved with the show, nor put back by an undo.
+    run: Option<TimerSettings>,
     /// The master's size, which the numbers are sized and placed against.
     frame: (u32, u32),
     watch: Stopwatch,
@@ -165,6 +169,7 @@ impl Timer {
         Ok(Self {
             context: context.clone(),
             settings: settings.clamped(),
+            run: None,
             frame,
             watch: Stopwatch {
                 banked: if elapsed.is_finite() { elapsed } else { 0.0 },
@@ -177,29 +182,74 @@ impl Timer {
         })
     }
 
+    /// Its settings, as saved with the show.
     pub fn settings(&self) -> &TimerSettings {
         &self.settings
     }
 
+    /// How it counts now: as a rundown step started this run, else as set.
+    fn current(&self) -> &TimerSettings {
+        self.run.as_ref().unwrap_or(&self.settings)
+    }
+
+    /// What it shows now: as a rundown step started this run, else as set.
+    pub fn mode(&self) -> TimerMode {
+        self.current().mode
+    }
+
     /// New settings; the time run so far stays — but a count down stopped
     /// on zero and given a new length starts again from its top, rather
-    /// than showing what the new length leaves after the old.
+    /// than showing what the new length leaves after the old. A step's way
+    /// of counting this run gives way to them.
     pub fn set_settings(&mut self, settings: TimerSettings) {
         let now = Instant::now();
         self.settle(now);
         let done = !self.watch.running() && self.at_zero(now);
-        let old_length = self.settings.duration_secs;
+        let old_length = self.current().duration_secs;
         self.settings = settings.clamped();
+        self.run = None;
         if done && self.settings.duration_secs != old_length {
             self.watch = Stopwatch::default();
         }
         self.settle(now);
     }
 
+    /// Settings put back by an undo or a show's history: as
+    /// [`Self::set_settings`], but a step's way of counting this run — its
+    /// count down or up — stays, the rest taken from them: undoing a colour
+    /// does not stop a talk's count.
+    pub fn restore_settings(&mut self, settings: TimerSettings) {
+        let Some(run) = self.run.clone() else {
+            self.set_settings(settings);
+            return;
+        };
+        // Settled by the run's own count throughout, never the saved one's:
+        // a count of 900 s at 400 s is not stopped by a saved 300.
+        let now = Instant::now();
+        self.settle(now);
+        self.settings = settings.clamped();
+        self.run = Some(TimerSettings {
+            mode: run.mode,
+            duration_secs: run.duration_secs,
+            ..self.settings.clone()
+        });
+        self.settle(now);
+    }
+
+    /// Count this run as `settings` say — a rundown step's count down of a
+    /// length of its own, or count up — leaving the saved settings as they
+    /// are: an undo, or the show saved, does not take them up.
+    pub fn run_as(&mut self, settings: TimerSettings) {
+        let now = Instant::now();
+        self.settle(now);
+        self.run = Some(settings.clamped());
+        self.settle(now);
+    }
+
     /// Start, pause, reset or adjust it. The time of day and a count to a
     /// time run by the clock and take none of these.
     pub fn control(&mut self, action: TimerAction) {
-        if !self.settings.mode.has_transport() {
+        if !self.current().mode.has_transport() {
             return;
         }
         let now = Instant::now();
@@ -217,7 +267,7 @@ impl Timer {
                 #[allow(clippy::cast_precision_loss)]
                 let secs = secs as f64;
                 let elapsed = self.watch.elapsed_at(now);
-                let elapsed = match self.settings.mode {
+                let elapsed = match self.current().mode {
                     // More time left is less time run.
                     TimerMode::Countdown => elapsed - secs,
                     _ => (elapsed + secs).max(0.0),
@@ -231,9 +281,10 @@ impl Timer {
     /// A count down stopping on zero stops there, rather than running on
     /// unseen — which a longer length set later would show.
     fn settle(&mut self, now: Instant) {
-        let length = f64::from(self.settings.duration_secs);
-        if self.settings.mode == TimerMode::Countdown
-            && self.settings.at_zero == AtZero::Stop
+        let current = self.current();
+        let length = f64::from(current.duration_secs);
+        if current.mode == TimerMode::Countdown
+            && current.at_zero == AtZero::Stop
             && self.watch.running()
             && self.watch.elapsed_at(now) >= length
         {
@@ -246,13 +297,14 @@ impl Timer {
 
     /// A count down stopped on zero.
     fn at_zero(&self, now: Instant) -> bool {
-        self.settings.mode == TimerMode::Countdown
-            && self.watch.elapsed_at(now) >= f64::from(self.settings.duration_secs)
+        let current = self.current();
+        current.mode == TimerMode::Countdown
+            && self.watch.elapsed_at(now) >= f64::from(current.duration_secs)
     }
 
     /// Counting: a count down or up started and not paused, or a clock.
     pub fn running(&self) -> bool {
-        !self.settings.mode.has_transport() || self.watch.running()
+        !self.current().mode.has_transport() || self.watch.running()
     }
 
     /// How long a count down or up has run, in seconds.
@@ -261,7 +313,7 @@ impl Timer {
     }
 
     fn reading(&self, now: Instant) -> Reading {
-        self.settings
+        self.current()
             .reading(self.watch.elapsed_at(now), time_of_day())
     }
 
@@ -271,7 +323,8 @@ impl Timer {
         let now = Instant::now();
         let reading = self.reading(now);
         TimerSnapshot {
-            settings: self.settings.clone(),
+            // As it counts now: a panel changing it from there sets it so.
+            settings: self.current().clone(),
             running: self.running(),
             text: reading.text,
             state: reading.state,
@@ -287,10 +340,11 @@ impl Timer {
         let now = Instant::now();
         self.settle(now);
         let reading = self.reading(now);
+        let current = self.current();
         let spec = FaceSpec {
-            color: self.settings.color(reading.state),
+            color: current.color(reading.state),
             text: reading.text,
-            look: self.settings.look.clone(),
+            look: current.look.clone(),
             frame_height: self.frame.1,
         };
         if self.asked.as_ref() != Some(&spec) {
@@ -384,7 +438,7 @@ impl Timer {
     fn placement(&self, size: (u32, u32)) -> ([f32; 2], [f32; 2]) {
         let frame = (self.frame.0.max(1) as f32, self.frame.1.max(1) as f32);
         let size = (size.0.max(1) as f32, size.1.max(1) as f32);
-        let look = &self.settings.look;
+        let look = &self.current().look;
         let (x, y) = look.anchor.place(size, frame, look.margin * frame.1);
         (
             [frame.0 / size.0, frame.1 / size.1],
@@ -416,7 +470,7 @@ impl Timer {
 }
 
 /// Seconds after local midnight, now.
-fn time_of_day() -> f64 {
+pub(crate) fn time_of_day() -> f64 {
     use chrono::Timelike as _;
     let now = chrono::Local::now().time();
     f64::from(now.num_seconds_from_midnight()) + f64::from(now.nanosecond().min(999_999_999)) / 1e9

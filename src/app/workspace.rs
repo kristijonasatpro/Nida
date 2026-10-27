@@ -382,7 +382,8 @@ impl VardaApp {
         // A rundown step being waited on belongs to the show before: it must
         // not be taken into this one — whatever becomes of the load, a show
         // that is not there or opens only in part included.
-        self.rundown.hold();
+        self.rundown.drop_wait();
+        self.forget_rundown_live();
         if !self.session.workspace.exists() {
             log::info!("No .varda/ directory found, starting fresh");
             return WorkspaceLoad {
@@ -556,6 +557,9 @@ impl VardaApp {
                     match self.replace_scene(&scene_config) {
                         Ok(()) => {
                             scene_is_the_requested_one = true;
+                            // Its decks are new, if under the same UUIDs: no
+                            // fade of the show before keeps them down.
+                            self.rundown_scene_replaced();
                             log::info!(
                                 "Loaded scene with {} channels",
                                 scene_config.channels.len()
@@ -1562,10 +1566,34 @@ impl VardaApp {
                 list.set_scaling_mode(*scaling_mode);
             }
         }
+        // A Slides layer's list and settings; the talk on, and what was
+        // picked to come next, are the show's — undo does not change them.
+        if let crate::scene::SourceConfig::Slides {
+            talks,
+            settings,
+            scaling_mode,
+            ..
+        } = &config.source
+        {
+            if let Some(slides) = slot.deck.slides_mut() {
+                let same = slides.talks().len() == talks.len()
+                    && slides
+                        .talks()
+                        .iter()
+                        .zip(talks)
+                        .all(|(a, b)| a.id == b.id && a.path == b.path && a.name == b.name);
+                if !same {
+                    slides.set_talks(talks.clone());
+                }
+                slides.set_settings(settings.clone());
+                slides.set_scaling_mode(*scaling_mode);
+            }
+        }
         if let crate::scene::SourceConfig::Timer { settings, .. } = &config.source {
             if let Some(timer) = slot.deck.timer_mut() {
                 if timer.settings() != settings {
-                    timer.set_settings(settings.clone());
+                    // A step's count this run stays.
+                    timer.restore_settings(settings.clone());
                 }
             }
         }
@@ -3466,6 +3494,7 @@ mod tests {
                 device: "No Such Blackmagic Device".into(),
                 mode: "1080p60".into(),
                 full_range: false,
+                follow_show: true,
             },
             running,
             ..crate::scene::OutputConfig::default_windowed()
@@ -3540,6 +3569,7 @@ mod tests {
                 device: "No Such Blackmagic Device".into(),
                 mode: "1080p60".into(),
                 full_range: false,
+                follow_show: true,
             },
             running: true,
             ..crate::scene::OutputConfig::default_windowed()

@@ -13,7 +13,10 @@ use crate::bus::BusInputRef;
 use crate::engine::value::render::OutputSource;
 use crate::engine::{EngineCommand, RundownStepSnapshot};
 use crate::mixer::MainSource;
-use crate::rundown::{PlayAction, Step, MAX_THEN_SECS};
+use crate::engine::value::timer::{
+    parse_span, parse_time_of_day, span_text, target_text, TimeFormat, MAX_DURATION_SECS,
+};
+use crate::rundown::{PlayAction, PlaySet, Step, TimerSet, DAY_SECS, MAX_THEN_SECS};
 
 const WARN: egui::Color32 = egui::Color32::from_rgb(230, 180, 60);
 /// `GO`: the one button pressed without looking.
@@ -108,14 +111,30 @@ fn summary(data: &UIData, step: &Step) -> String {
         )
     }));
     parts.extend(step.plays.iter().map(|p| {
-        format!(
+        let mut said = format!(
             "{} {}",
             action_mark(p.action),
             deck_name(data, &p.deck).unwrap_or(MISSING)
-        )
+        );
+        let playing = matches!(p.action, PlayAction::Start | PlayAction::Resume);
+        if p.until_next && playing {
+            said.push_str(" till the next step");
+        }
+        match p.timer.filter(|_| p.action == PlayAction::Start) {
+            Some(TimerSet::Down { secs }) => {
+                said.push_str(" from ");
+                said.push_str(&span_text(u64::from(secs), TimeFormat::Auto));
+            }
+            Some(TimerSet::Up) => said.push_str(" counting up"),
+            None => {}
+        }
+        said
     }));
     if let Some(secs) = step.then_secs {
         parts.push(format!("then the next after {}", seconds(secs)));
+    }
+    if let Some(at) = step.at_secs {
+        parts.insert(0, format!("at {}", target_text(at)));
     }
     if parts.is_empty() {
         "Sets nothing yet — double-click to say what".to_string()
@@ -144,6 +163,52 @@ fn why_not_faded(step: &RundownStepSnapshot) -> String {
     )
 }
 
+/// The step GO takes next, taken by itself at `at` (seconds after
+/// midnight): how long till then, with Hold — or held, or its time passed.
+fn render_due_at(
+    ui: &mut egui::Ui,
+    data: &UIData,
+    next: &RundownStepSnapshot,
+    at: u32,
+    actions: &mut UIActions,
+) {
+    let held = data.rundown.at_held.as_deref() == Some(next.step.uuid.as_str());
+    let left = f64::from(at) - crate::deck::timer::time_of_day();
+    let (name, when) = (&next.step.name, target_text(at));
+    ui.horizontal(|ui| {
+        if held {
+            ui.label(egui::RichText::new(format!("{name} at {when} — held: GO takes it")).weak());
+            if ui
+                .small_button("By its time again")
+                .on_hover_text("Taken by itself at its time after all")
+                .clicked()
+            {
+                actions.commands.push(EngineCommand::SetRundownNext {
+                    uuid: next.step.uuid.clone(),
+                });
+            }
+        } else if left > 0.0 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let left_text = span_text(left.ceil() as u64, TimeFormat::Auto);
+            let text = egui::RichText::new(format!("{name} at {when} — in {left_text}")).strong();
+            ui.label(if left <= 60.0 { text.color(WARN) } else { text });
+            if ui
+                .small_button("Hold")
+                .on_hover_text("Not by itself at its time: it waits for GO")
+                .clicked()
+            {
+                actions.commands.push(EngineCommand::RundownHold);
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        } else {
+            ui.label(
+                egui::RichText::new(format!("{name} at {when} — that time has gone: GO takes it"))
+                    .weak(),
+            );
+        }
+    });
+}
+
 /// Whether the stream or the recording takes this bus.
 fn on_air_bus(data: &UIData, bus: &BusUI) -> bool {
     [
@@ -156,14 +221,16 @@ fn on_air_bus(data: &UIData, bus: &BusUI) -> bool {
 
 // ── The panel ──────────────────────────────────────────────────────
 
-/// Where the panel is, for a step's window to open beside it.
-fn panel_rect_id() -> egui::Id {
-    egui::Id::new("rundown_panel_rect")
+/// Where the panel is, in the window it is drawn in (`ctx`'s viewport), for
+/// a step's window to open beside it there.
+fn panel_rect_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::new("rundown_panel_rect").with(ctx.viewport_id())
 }
 
 pub(super) fn render_rundown(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
     let panel = ui.max_rect();
-    ui.ctx().data_mut(|d| d.insert_temp(panel_rect_id(), panel));
+    let rect_id = panel_rect_id(ui.ctx());
+    ui.ctx().data_mut(|d| d.insert_temp(rect_id, panel));
     render_top(ui, data, actions);
     if let Some(wait) = &data.rundown.wait {
         ui.horizontal(|ui| {
@@ -181,6 +248,10 @@ pub(super) fn render_rundown(ui: &mut egui::Ui, data: &UIData, actions: &mut UIA
                 actions.commands.push(EngineCommand::RundownHold);
             }
         });
+    } else if let Some(next) = step_called(data, data.rundown.next.as_deref()) {
+        if let Some(at) = next.step.at_secs {
+            render_due_at(ui, data, next, at, actions);
+        }
     }
     ui.add_space(4.0);
     if data.rundown.steps.is_empty() {
@@ -451,12 +522,16 @@ pub(super) fn go_shortcut(ui: &egui::Ui, data: &UIData, actions: &mut UIActions)
     if data.keyboard_learn_active || data.stage_editor_open || super::typing(ui.ctx()) {
         return;
     }
-    for combo in crate::usecases::ui::keyboard::collect_pressed_keys(ui.ctx()) {
+    for (combo, repeat) in crate::usecases::ui::keyboard::collect_key_downs(ui.ctx()) {
         if data.keymap_bindings.get(&combo) != Some(&KeyTarget::Action(ActionId::RundownGo)) {
             continue;
         }
-        // The key is GO's alone: it must not also press a focused button.
+        // The key is GO's alone: it must not also press a focused button —
+        // held, as it repeats, either. One GO a press.
         super::consume(ui.ctx(), &combo);
+        if repeat {
+            continue;
+        }
         actions.commands.push(EngineCommand::RundownGo {
             fade: true,
             expect: data.rundown.next.clone(),
@@ -621,7 +696,8 @@ fn open_editor(ctx: &egui::Context, step: &Step) {
     let pointer = ctx
         .pointer_latest_pos()
         .unwrap_or_else(|| ctx.content_rect().center());
-    let x = match ctx.data(|d| d.get_temp::<egui::Rect>(panel_rect_id())) {
+    let rect_id = panel_rect_id(ctx);
+    let x = match ctx.data(|d| d.get_temp::<egui::Rect>(rect_id)) {
         Some(panel) if panel.left() >= EDITOR_WIDTH + 8.0 => panel.left() - EDITOR_WIDTH - 8.0,
         Some(panel) => panel.right() + 8.0,
         None => pointer.x,
@@ -717,6 +793,7 @@ fn render_editor(ctx: &egui::Context, data: &UIData, actions: &mut UIActions) {
             edit_plays(ui, step, data, actions);
             ui.separator();
             edit_then(ui, step, data, actions);
+            edit_at(ui, step, actions);
             ui.separator();
             if ui
                 .button("Update from what is on now")
@@ -883,6 +960,58 @@ fn unheard(data: &UIData, deck: &str) -> Option<&'static str> {
     }
 }
 
+/// What a step starts and stops of a deck, as the panel sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Runs {
+    /// A clip or a playlist: a picture, a sound, or both.
+    Media,
+    Timer,
+}
+
+fn runs_of(data: &UIData, deck: &str) -> Option<Runs> {
+    let deck = data
+        .channels
+        .iter()
+        .flat_map(|ch| &ch.decks)
+        .find(|d| d.uuid == deck)?;
+    if deck.timer.is_some() {
+        Some(Runs::Timer)
+    } else if deck.playlist.is_some() || deck.video_playback.is_some() {
+        Some(Runs::Media)
+    } else {
+        None
+    }
+}
+
+/// How wide a name is in the step's window, and what is said under an
+/// action: cut short, or wrapped, rather than pushing the window wider.
+const PLAY_NAME_WIDTH: f32 = 150.0;
+const PLAY_NOTE_WIDTH: f32 = 230.0;
+
+/// `text` in at most `width`, cut short with "…" — all of it on hover.
+fn short_label(ui: &mut egui::Ui, text: &str, width: f32) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, ui.spacing().interact_size.y),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_max_width(width);
+            ui.add(egui::Label::new(text).truncate()).on_hover_text(text);
+        },
+    );
+}
+
+/// A small note under an action, wrapped to `PLAY_NOTE_WIDTH`.
+fn play_note(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(PLAY_NOTE_WIDTH, 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_max_width(PLAY_NOTE_WIDTH);
+            ui.add(egui::Label::new(egui::RichText::new(text).small().color(colour)).wrap());
+        },
+    );
+}
+
 /// The clips, playlists and timers the step starts and stops.
 fn edit_plays(ui: &mut egui::Ui, step: &Step, data: &UIData, actions: &mut UIActions) {
     ui.label(egui::RichText::new("Starts and stops").strong());
@@ -893,10 +1022,19 @@ fn edit_plays(ui: &mut egui::Ui, step: &Step, data: &UIData, actions: &mut UIAct
     };
     egui::Grid::new("rundown_editor_plays")
         .num_columns(3)
-        .spacing([10.0, 4.0])
+        .spacing([8.0, 4.0])
         .show(ui, |ui| {
             for play in &step.plays {
-                ui.label(deck_name(data, &play.deck).unwrap_or(MISSING));
+                // Taken out first in the row: a long name never pushes it out
+                // of a narrow window.
+                if ui
+                    .small_button("🗑")
+                    .on_hover_text("Take it out of this step: the step leaves it alone")
+                    .clicked()
+                {
+                    actions.commands.push(set(&play.deck, None));
+                }
+                short_label(ui, deck_name(data, &play.deck).unwrap_or(MISSING), PLAY_NAME_WIDTH);
                 let choices = [
                     PlayAction::Start,
                     PlayAction::Resume,
@@ -919,18 +1057,42 @@ fn edit_plays(ui: &mut egui::Ui, step: &Step, data: &UIData, actions: &mut UIAct
                     choices,
                     actions,
                 );
-                if ui
-                    .small_button("×")
-                    .on_hover_text("The step leaves it alone")
-                    .clicked()
-                {
-                    actions.commands.push(set(&play.deck, None));
-                }
                 ui.end_row();
                 let playing = matches!(play.action, PlayAction::Start | PlayAction::Resume);
+                match runs_of(data, &play.deck) {
+                    Some(Runs::Media) if playing => {
+                        ui.label("");
+                        ui.label("");
+                        let mut on = play.until_next;
+                        if ui
+                            .checkbox(&mut on, "Fade out at the next step")
+                            .on_hover_text(
+                                "When another step is taken — one that does not start or stop \
+                                 it itself — its sound fades out over that step's fade, then it \
+                                 stops, back at its beginning: music for this moment only",
+                            )
+                            .changed()
+                        {
+                            actions.commands.push(EngineCommand::SetRundownUntilNext {
+                                uuid: step.uuid.clone(),
+                                deck_uuid: play.deck.clone(),
+                                on,
+                            });
+                        }
+                        ui.end_row();
+                    }
+                    Some(Runs::Timer) if play.action == PlayAction::Start => {
+                        ui.label("");
+                        ui.label("");
+                        edit_timer_set(ui, step, play, data, actions);
+                        ui.end_row();
+                    }
+                    _ => {}
+                }
                 if let Some(why) = unheard(data, &play.deck).filter(|_| playing) {
                     ui.label("");
-                    ui.label(egui::RichText::new(why).small().color(WARN));
+                    ui.label("");
+                    play_note(ui, why, WARN);
                     ui.end_row();
                 }
             }
@@ -981,6 +1143,121 @@ fn edit_plays(ui: &mut egui::Ui, step: &Step, data: &UIData, actions: &mut UIAct
         })
         .response
         .on_disabled_hover_text("The show has no clip, playlist or timer it does not start");
+    });
+}
+
+/// How the step sets a timer it starts: as the timer is set, down from a
+/// length of its own — this talk's — or up.
+fn edit_timer_set(
+    ui: &mut egui::Ui,
+    step: &Step,
+    play: &PlaySet,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
+    let send = |timer: Option<TimerSet>| EngineCommand::SetRundownTimer {
+        uuid: step.uuid.clone(),
+        deck_uuid: play.deck.clone(),
+        timer,
+    };
+    // A count down chosen here starts from the timer's own length.
+    let length = match play.timer {
+        Some(TimerSet::Down { secs }) => secs,
+        _ => data
+            .channels
+            .iter()
+            .flat_map(|ch| &ch.decks)
+            .find(|d| d.uuid == play.deck)
+            .and_then(|d| d.timer.as_ref())
+            .map_or(15 * 60, |t| t.settings.duration_secs),
+    };
+    let named = |set: Option<TimerSet>| match set {
+        None => "As the timer is set",
+        Some(TimerSet::Down { .. }) => "Count down",
+        Some(TimerSet::Up) => "Count up",
+    };
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(("rundown_timer_set", &play.deck))
+            .selected_text(named(play.timer))
+            .width(130.0)
+            .show_ui(ui, |ui| {
+                for set in [None, Some(TimerSet::Down { secs: length }), Some(TimerSet::Up)] {
+                    let current = named(set) == named(play.timer);
+                    if ui.selectable_label(current, named(set)).clicked() && !current {
+                        actions.commands.push(send(set));
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Each talk its own: counting down from its length, or up");
+        if let Some(TimerSet::Down { secs }) = play.timer {
+            let mut now = secs;
+            let drag = ui
+                .add(
+                    egui::DragValue::new(&mut now)
+                        .range(1..=MAX_DURATION_SECS)
+                        .speed(5.0)
+                        .custom_formatter(|v, _| {
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            span_text(v.max(0.0) as u64, TimeFormat::Auto)
+                        })
+                        .custom_parser(|text| parse_span(text).map(f64::from)),
+                )
+                .on_hover_text("Drag, or click and type: 15, 15:00 or 1:30:00");
+            // A drag is one change to undo, not one a frame.
+            if drag.dragged() {
+                actions.session.gesture_active = true;
+            }
+            if drag.changed() && now != secs {
+                actions.commands.push(send(Some(TimerSet::Down { secs: now })));
+            }
+        }
+    });
+}
+
+/// Whether the step is taken by itself at a time of day, and at which.
+fn edit_at(ui: &mut egui::Ui, step: &Step, actions: &mut UIActions) {
+    let set = |at_secs: Option<u32>| EngineCommand::SetRundownAt {
+        uuid: step.uuid.clone(),
+        at_secs,
+    };
+    ui.horizontal(|ui| {
+        let mut on = step.at_secs.is_some();
+        if ui
+            .checkbox(&mut on, "Start by itself at")
+            .on_hover_text(
+                "At that time of day, while it is the step GO takes next, it is taken as GO \
+                 takes it — Hold stops it",
+            )
+            .changed()
+        {
+            // The next quarter of an hour, to change.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let day = crate::deck::timer::time_of_day().max(0.0) as u32;
+            let quarter = (day / 900 + 1) * 900 % DAY_SECS;
+            actions.commands.push(set(on.then_some(quarter)));
+        }
+        if let Some(at) = step.at_secs {
+            let mut now = at;
+            let drag = ui
+                .add(
+                    egui::DragValue::new(&mut now)
+                        .range(0..=DAY_SECS - 1)
+                        .speed(60.0)
+                        .custom_formatter(|v, _| {
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                            target_text(v.max(0.0) as u32)
+                        })
+                        .custom_parser(|text| parse_time_of_day(text).map(f64::from)),
+                )
+                .on_hover_text("Drag, or click and type: 9:15, 14:05 or 1405");
+            if drag.dragged() {
+                actions.session.gesture_active = true;
+            }
+            if drag.changed() && now != at {
+                actions.commands.push(set(Some(now)));
+            }
+        }
     });
 }
 
@@ -1064,6 +1341,7 @@ mod tests {
             last: None,
             next: Some("s1".into()),
             wait: None,
+            at_held: None,
         };
         data
     }
@@ -1303,7 +1581,7 @@ mod tests {
         ];
         step.main = Some(MainSource::Channel(CH_A.into()));
         step.overlays = vec![OverlaySet { channel: CH_B.into(), on: false }];
-        step.plays = vec![PlaySet { deck: "a0000001".into(), action: PlayAction::Start }];
+        step.plays = vec![PlaySet::new("a0000001", PlayAction::Start)];
         step.then_secs = Some(5.0);
         let harness = harness(&data);
         harness.get_by_label(
@@ -1388,7 +1666,7 @@ mod tests {
             ScreenSet { bus: TV.into(), input: BusInputRef::Channel(CH_B.into()) },
             ScreenSet { bus: "gone".into(), input: BusInputRef::Black },
         ];
-        step.plays = vec![PlaySet { deck: "a0000001".into(), action: PlayAction::Start }];
+        step.plays = vec![PlaySet::new("a0000001", PlayAction::Start)];
         step.then_secs = Some(2.0);
         data.rundown.steps[1].missing = vec!["a bus that is gone".into()];
         let mut harness = harness(&data);
@@ -1405,7 +1683,7 @@ mod tests {
         settle(&mut harness);
         harness.get_by_label(action_name(PlayAction::Stop)).click();
         settle(&mut harness);
-        harness.get_by_label("×").click();
+        harness.get_by_label("🗑").click();
         settle(&mut harness);
         harness.get_by_label("Then go on to the next step after").click();
         settle(&mut harness);
@@ -1572,7 +1850,7 @@ mod tests {
         };
         let mut data = show();
         data.rundown.steps[1].step.plays =
-            vec![PlaySet { deck: "a0000001".into(), action: PlayAction::Start }];
+            vec![PlaySet::new("a0000001", PlayAction::Start)];
         for (muted, auto, said) in [
             (true, true, Some("Its sound is off in the Audio Mixer")),
             (false, true, Some("Heard only while its input is on Main or a screen")),
@@ -1701,4 +1979,94 @@ mod tests {
         }
         assert_eq!(picked.as_deref(), Some(GO_ACTION));
     }
+    /// A clip's playback as the step's window reads it: sound only, music.
+    fn music() -> crate::usecases::ui::VideoPlaybackUI {
+        crate::usecases::ui::VideoPlaybackUI {
+            playing: false,
+            position: 0.0,
+            duration: 180.0,
+            speed: 1.0,
+            effective_speed: 1.0,
+            position_offset: 0.0,
+            loop_mode: crate::video::LoopMode::default(),
+            in_point: 0.0,
+            out_point: 180.0,
+            frame_rate: 25.0,
+            transport_sync: crate::video::DeckTransportSync::default(),
+            hardware_decode: false,
+            auto: crate::engine::value::video::AutoPlayback::default(),
+            sound_only: true,
+        }
+    }
+
+    /// What a step starts is taken out with 🗑 at the head of its row — a
+    /// long name cut short after it, never pushing it out of a narrow
+    /// window; music is faded out at the next step; a timer counts down
+    /// from a length of the step's own, or up; and the step is started by
+    /// itself at a time of day.
+    #[test]
+    fn a_steps_window_sets_how_it_plays_and_when() {
+        let mut data = with_timer(show());
+        let long = "Nida 2026-10-26 10-10-13 — the walk-in music for the morning.mp3";
+        data.channels[1].decks[0].video_playback = Some(music());
+        data.channels[1].decks[0].name = long.into();
+        let clip = data.channels[1].decks[0].uuid.clone();
+        let length = data.channels[0].decks[0]
+            .timer
+            .as_ref()
+            .map(|t| t.settings.duration_secs)
+            .unwrap();
+        data.rundown.steps[1].step.plays = vec![
+            PlaySet::new(clip.clone(), PlayAction::Start),
+            PlaySet::new("a0000001", PlayAction::Start),
+        ];
+        let mut harness = harness(&data);
+        open_editor_of(&mut harness, "B");
+        let bin = harness.get_all_by_label("🗑").next().unwrap().rect();
+        let name = harness.get_by_label(long).rect();
+        assert!(bin.right() <= name.left(), "🗑 {bin:?} before the name {name:?}");
+        assert!(name.width() <= PLAY_NAME_WIDTH + 0.5, "cut short: {name:?}");
+
+        harness.get_by_label("Fade out at the next step").click();
+        settle(&mut harness);
+        harness.get_by_value("As the timer is set").click();
+        settle(&mut harness);
+        harness.get_by_label("Count down").click();
+        settle(&mut harness);
+        harness.get_by_label("Start by itself at").click();
+        settle(&mut harness);
+        let sent = sent(&harness);
+        assert!(
+            sent.contains(&format!(
+                r#"SetRundownUntilNext {{ uuid: "s2", deck_uuid: {clip:?}, on: true }}"#
+            )),
+            "{sent}"
+        );
+        assert!(
+            sent.contains(&format!(
+                r#"SetRundownTimer {{ uuid: "s2", deck_uuid: "a0000001", timer: Some(Down {{ secs: {length} }}) }}"#
+            )),
+            "{sent}"
+        );
+        assert!(sent.contains(r#"SetRundownAt { uuid: "s2", at_secs: Some("#), "{sent}");
+    }
+
+    /// A step started by itself at a time says so on its row; next and held,
+    /// the panel says it waits for GO — and offers its time again.
+    #[test]
+    fn a_step_at_a_time_of_day_says_so_and_a_held_one_waits_for_go() {
+        let mut data = show();
+        data.rundown.steps[1].step.at_secs = Some(9 * 3600 + 15 * 60);
+        data.rundown.last = Some("s1".into());
+        data.rundown.next = Some("s2".into());
+        data.rundown.at_held = Some("s2".into());
+        let mut harness = harness(&data);
+        settle(&mut harness);
+        harness.get_by_label("at 09:15");
+        harness.get_by_label("B at 09:15 — held: GO takes it");
+        harness.get_by_label("By its time again").click();
+        settle(&mut harness);
+        assert_eq!(sent(&harness), r#"[SetRundownNext { uuid: "s2" }]"#);
+    }
 }
+

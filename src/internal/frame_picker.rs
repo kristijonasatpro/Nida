@@ -195,6 +195,12 @@ impl<F> FramePicker<F> {
         Self::default()
     }
 
+    /// The frames waiting let go — a capture's, replaced by another — its
+    /// timing kept.
+    pub fn discard_waiting(&mut self) {
+        self.waiting.clear();
+    }
+
     /// One keeping at most `keep` frames waiting (at least 2): for frames
     /// that hold something their source needs back, as a captured screen's
     /// do its surfaces.

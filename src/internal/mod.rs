@@ -6,6 +6,7 @@ pub mod bus;
 pub mod camera;
 pub mod channel;
 pub mod cli_install;
+pub mod clicker;
 pub mod clock;
 pub mod deck;
 pub mod decklink;

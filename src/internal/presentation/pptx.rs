@@ -19,6 +19,11 @@ const MAX_PART_BYTES: u64 = 64 * 1024 * 1024;
 /// The slide size PowerPoint writes for 4:3 when a file names none.
 const DEFAULT_SIZE_EMU: (u64, u64) = (9_144_000, 6_858_000);
 
+/// A zip claiming more parts than this, or a longer list of them, is no
+/// deck to open: opening one reserves room for every part it claims.
+const MAX_PARTS: u64 = 100_000;
+const MAX_LIST_BYTES: u64 = 256 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PptxError {
     #[error("cannot open {0}: {1}")]
@@ -83,7 +88,10 @@ pub fn read(path: &Path) -> Result<Document, PptxError> {
 /// # Errors
 ///
 /// As [`read`].
-pub fn read_from<R: Read + Seek>(reader: R, name: &str) -> Result<Document, PptxError> {
+pub fn read_from<R: Read + Seek>(mut reader: R, name: &str) -> Result<Document, PptxError> {
+    if !zip_fits(&mut reader, MAX_PARTS, MAX_LIST_BYTES) {
+        return Err(PptxError::NotPptx(name.to_string()));
+    }
     let zip = zip::ZipArchive::new(reader).map_err(|_| PptxError::NotPptx(name.to_string()))?;
     let mut package = Package::new(zip, name);
     let presentation_part = "ppt/presentation.xml";
@@ -242,6 +250,93 @@ impl<R: Read + Seek> Package<R> {
     }
 }
 
+/// Whether the zip in `file` claims at most `max_parts` parts and a list of
+/// them at most `max_list` bytes long — read from its end records before
+/// the zip is opened: opening one reserves room for every part it claims,
+/// and a zip may claim millions. Every end record in its last 64 KB that a
+/// zip reader could take — its comment within the file; bytes that only
+/// look like one, their "comment" running past the end, are not — is
+/// counted, each with the ZIP64 record a locator before it points to, whose
+/// extra data must be small. Not a zip at all: false. `file` is left at its
+/// start.
+///
+/// A file made to mislead a zip reader can still lead it to an end record
+/// further back than this looks, or to a ZIP64 record other than the one
+/// its locator points to; a speaker's deck, or a damaged one, is not that.
+pub fn zip_fits(file: &mut (impl Read + Seek), max_parts: u64, max_list: u64) -> bool {
+    let fits = claims(file).is_some_and(|claims| {
+        !claims.is_empty()
+            && claims
+                .iter()
+                .all(|&(parts, list)| parts <= max_parts && list <= max_list)
+    });
+    let _ = file.seek(std::io::SeekFrom::Start(0));
+    fits
+}
+
+/// What a zip's end records claim: for each, how many parts and how long a
+/// list of them — its ZIP64 record's too, when a locator is before it.
+/// None when one cannot be read through (a ZIP64 locator pointing nowhere).
+fn claims(file: &mut (impl Read + Seek)) -> Option<Vec<(u64, u64)>> {
+    use std::io::SeekFrom;
+    let le16 = |b: &[u8], at: usize| Some(u64::from(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?)));
+    let le32 = |b: &[u8], at: usize| Some(u64::from(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?)));
+    let le64 = |b: &[u8], at: usize| Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?));
+    let len = file.seek(SeekFrom::End(0)).ok()?;
+    // An end record (22 bytes) and a comment of up to 65,535 after it.
+    let window = len.min(22 + 65_535);
+    let start = len - window;
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = vec![0_u8; usize::try_from(window).ok()?];
+    file.read_exact(&mut tail).ok()?;
+    let mut out = Vec::new();
+    let Some(latest) = tail.len().checked_sub(22) else {
+        return Some(out);
+    };
+    for at in (0..=latest).filter(|&i| tail[i..i + 4] == [0x50, 0x4b, 0x05, 0x06]) {
+        // Its comment must end within the file, or no reader takes it.
+        let comment = usize::try_from(le16(&tail, at + 20)?).ok()?;
+        if at + 22 + comment > tail.len() {
+            continue;
+        }
+        let (parts, list) = (le16(&tail, at + 10)?, le32(&tail, at + 12)?);
+        // "See the ZIP64 record" is what all-ones means here, not a count.
+        let to_zip64 = parts == 0xFFFF || list == 0xFFFF_FFFF;
+        // A ZIP64 locator just before it — read where it is in the file,
+        // whether or not this record says it needs one.
+        let record_at = start + u64::try_from(at).ok()?;
+        let mut locator = [0_u8; 20];
+        let located = record_at.checked_sub(20).is_some_and(|locator_at| {
+            file.seek(SeekFrom::Start(locator_at)).is_ok()
+                && file.read_exact(&mut locator).is_ok()
+                && locator[..4] == [0x50, 0x4b, 0x06, 0x07]
+        });
+        if !located {
+            out.push((parts, list));
+            continue;
+        }
+        if !to_zip64 {
+            out.push((parts, list));
+        }
+        file.seek(SeekFrom::Start(le64(&locator, 8)?)).ok()?;
+        let mut record = [0_u8; 56];
+        file.read_exact(&mut record).ok()?;
+        // No ZIP64 record where it points: the end record of a zip inside
+        // this one (a workbook a deck carries, stored near its end), whose
+        // locator counts from where that zip starts — not this deck's.
+        if record[..4] != [0x50, 0x4b, 0x06, 0x06] {
+            continue;
+        }
+        // Its extra data (a reader holds all of it) small: the record is 44
+        // bytes after its size, and what follows that is the extra.
+        if le64(&record, 4)? > 44 + 64 * 1024 {
+            return None;
+        }
+        out.push((le64(&record, 32)?, le64(&record, 40)?));
+    }
+    Some(out)
+}
+
 fn broken(file: &str, part: &str, reason: &dyn std::fmt::Display) -> PptxError {
     PptxError::Broken {
         file: file.to_string(),
@@ -396,6 +491,114 @@ mod tests {
             r#"<?xml version="1.0"?><p:notes xmlns:p="{P}" xmlns:a="{A}"><p:cSld><p:spTree>{}</p:spTree></p:cSld></p:notes>"#,
             shapes.concat()
         )
+    }
+
+    /// A zip's parts are counted from its end record before it is opened:
+    /// one claiming more than a deck has — in its own record or its ZIP64
+    /// one — is no deck, as is no zip at all; a real deck fits.
+    #[test]
+    fn a_zip_claiming_more_parts_than_a_deck_has_is_not_opened() {
+        let deck = sample();
+        assert!(zip_fits(&mut Cursor::new(&deck), 100, 1 << 20));
+        assert!(!zip_fits(&mut Cursor::new(&deck), 3, 1 << 20), "more parts than allowed");
+        assert!(!zip_fits(&mut Cursor::new(b"not a zip at all".to_vec()), 100, 1 << 20));
+        // An end record claiming 60,000 parts.
+        let mut claims = deck.clone();
+        let at = claims.windows(4).rposition(|w| w == [0x50, 0x4b, 0x05, 0x06]).unwrap();
+        claims[at + 8..at + 12].copy_from_slice(&[0x60, 0xEA, 0x60, 0xEA]);
+        assert!(!zip_fits(&mut Cursor::new(&claims), 20_000, 1 << 30));
+        // A ZIP64 end record claiming a billion parts.
+        let mut zip64 = deck.clone();
+        let at = zip64.windows(4).rposition(|w| w == [0x50, 0x4b, 0x05, 0x06]).unwrap();
+        let record_at = u64::try_from(at).unwrap();
+        let mut record = vec![0x50, 0x4b, 0x06, 0x06];
+        record.extend_from_slice(&44_u64.to_le_bytes());
+        record.extend_from_slice(&[0; 20]);
+        record.extend_from_slice(&1_000_000_000_u64.to_le_bytes());
+        record.extend_from_slice(&1_000_000_000_u64.to_le_bytes());
+        record.extend_from_slice(&64_u64.to_le_bytes());
+        let mut locator = vec![0x50, 0x4b, 0x06, 0x07, 0, 0, 0, 0];
+        locator.extend_from_slice(&record_at.to_le_bytes());
+        locator.extend_from_slice(&1_u32.to_le_bytes());
+        let mut end = zip64.split_off(at);
+        end[8..12].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        zip64.extend_from_slice(&record);
+        zip64.extend_from_slice(&locator);
+        zip64.extend_from_slice(&end);
+        assert!(!zip_fits(&mut Cursor::new(&zip64), MAX_PARTS, MAX_LIST_BYTES));
+        assert!(matches!(read_from(Cursor::new(zip64.clone()), "huge.pptx"), Err(PptxError::NotPptx(_))));
+        // The same, its own record saying it needs none: still counted.
+        let mut quiet = zip64.clone();
+        let at = quiet.windows(4).rposition(|w| w == [0x50, 0x4b, 0x05, 0x06]).unwrap();
+        quiet[at + 12..at + 16].copy_from_slice(&64_u32.to_le_bytes());
+        assert!(!zip_fits(&mut Cursor::new(&quiet), MAX_PARTS, MAX_LIST_BYTES));
+        // A record earlier in the comment claiming a million: counted too.
+        let mut two = deck.clone();
+        let at = two.windows(4).rposition(|w| w == [0x50, 0x4b, 0x05, 0x06]).unwrap();
+        let mut fake = two[at..].to_vec();
+        fake[10..12].copy_from_slice(&[0xFF, 0xFE]);
+        let comment = u16::try_from(fake.len()).unwrap();
+        two[at + 20..at + 22].copy_from_slice(&comment.to_le_bytes());
+        two.extend_from_slice(&fake);
+        assert!(!zip_fits(&mut Cursor::new(&two), 20_000, 1 << 30));
+        // Bytes that only look like an end record, in a comment: their own
+        // "comment" runs past the end of the file. Not counted: the deck fits.
+        let mut commented = deck.clone();
+        let at = commented.windows(4).rposition(|w| w == [0x50, 0x4b, 0x05, 0x06]).unwrap();
+        let mut junk = vec![0x50, 0x4b, 0x05, 0x06];
+        junk.extend_from_slice(&[b'A'; 32]);
+        let length = u16::try_from(junk.len()).unwrap();
+        commented[at + 20..at + 22].copy_from_slice(&length.to_le_bytes());
+        commented.extend_from_slice(&junk);
+        assert!(zip_fits(&mut Cursor::new(&commented), 100, 1 << 20));
+        assert!(read_from(Cursor::new(commented), "commented.pptx").is_ok());
+        // A zip carried inside, stored near the end, its ZIP64 locator
+        // counting from its own start: not this deck's, and the deck fits.
+        let mut carried = deck.clone();
+        let at = carried.windows(4).rposition(|w| w == [0x50, 0x4b, 0x05, 0x06]).unwrap();
+        let mut inner = vec![0x50, 0x4b, 0x06, 0x07, 0, 0, 0, 0];
+        inner.extend_from_slice(&3_u64.to_le_bytes());
+        inner.extend_from_slice(&1_u32.to_le_bytes());
+        inner.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
+        inner.extend_from_slice(&[0xFF; 8]);
+        inner.extend_from_slice(&[0, 0]);
+        let length = u16::try_from(inner.len()).unwrap();
+        carried[at + 20..at + 22].copy_from_slice(&length.to_le_bytes());
+        carried.extend_from_slice(&inner);
+        assert!(zip_fits(&mut Cursor::new(&carried), 100, 1 << 20));
+        assert!(read_from(Cursor::new(carried), "carried.pptx").is_ok());
+        // A ZIP64 record declaring 4 GB of extra data: not opened.
+        let mut extra = zip64.clone();
+        let record = extra.windows(4).rposition(|w| w == [0x50, 0x4b, 0x06, 0x06]).unwrap();
+        extra[record + 4..record + 12].copy_from_slice(&(4_u64 << 30).to_le_bytes());
+        assert!(!zip_fits(&mut Cursor::new(&extra), u64::MAX, u64::MAX));
+    }
+
+    /// A real ZIP64 deck with a long comment fits: its locator is found
+    /// where it is in the file, though before the last 64 KB.
+    #[test]
+    fn a_zip64_deck_with_a_long_comment_fits() {
+        let deck = sample();
+        let at = deck.windows(4).rposition(|w| w == [0x50, 0x4b, 0x05, 0x06]).unwrap();
+        let mut zip64 = deck[..at].to_vec();
+        let record_at = u64::try_from(zip64.len()).unwrap();
+        let mut record = vec![0x50, 0x4b, 0x06, 0x06];
+        record.extend_from_slice(&44_u64.to_le_bytes());
+        record.extend_from_slice(&[0; 20]);
+        record.extend_from_slice(&5_u64.to_le_bytes());
+        record.extend_from_slice(&400_u64.to_le_bytes());
+        record.extend_from_slice(&0_u64.to_le_bytes());
+        let mut locator = vec![0x50, 0x4b, 0x06, 0x07, 0, 0, 0, 0];
+        locator.extend_from_slice(&record_at.to_le_bytes());
+        locator.extend_from_slice(&1_u32.to_le_bytes());
+        let mut end = deck[at..at + 22].to_vec();
+        end[8..12].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        end[20..22].copy_from_slice(&65_530_u16.to_le_bytes());
+        zip64.extend_from_slice(&record);
+        zip64.extend_from_slice(&locator);
+        zip64.extend_from_slice(&end);
+        zip64.extend(std::iter::repeat_n(b'c', 65_530));
+        assert!(zip_fits(&mut Cursor::new(&zip64), 100, 1 << 20));
     }
 
     /// Three slides, played in an order unlike their part names: the first

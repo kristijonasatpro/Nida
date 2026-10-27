@@ -455,6 +455,9 @@ pub struct AudioEngine {
     running_apps: Vec<crate::audio::app_sound::RunningApp>,
     /// Last frame's on-air level of every Audio Auto source, 0 to 1.
     on_air: HashMap<String, f32>,
+    /// Sources a rundown step is fading out, 0 to 1 — Audio Auto or not:
+    /// what their sound is multiplied by.
+    step_fades: HashMap<String, f32>,
     /// Sources soloed to the monitor. Live, never saved: a show should not
     /// reopen with the headphones stuck on one microphone.
     solos: std::collections::HashSet<String>,
@@ -530,6 +533,7 @@ impl AudioEngine {
             apps_generation: HashMap::new(),
             running_apps: Vec::new(),
             on_air: HashMap::new(),
+            step_fades: HashMap::new(),
             solos: std::collections::HashSet::new(),
             applied_buses: std::collections::HashSet::new(),
             output_devices: Vec::new(),
@@ -1117,6 +1121,24 @@ impl AudioEngine {
         }
     }
 
+    /// This frame's level (0 to 1) of every source a rundown step is fading
+    /// out, keyed by UUID; missing is not faded. It scales the sound as an
+    /// Audio Auto fade does — with it, for a source on air — whether the
+    /// strip has Audio Auto or not: music on no screen fades out too.
+    pub fn set_step_fades(&mut self, levels: HashMap<String, f32>) {
+        if levels == self.step_fades {
+            return;
+        }
+        self.step_fades = levels;
+        self.apply_gates();
+    }
+
+    /// A source's rundown fade as last set, for tests.
+    #[cfg(test)]
+    pub(crate) fn step_fade(&self, uuid: &str) -> Option<f32> {
+        self.step_fades.get(uuid).copied()
+    }
+
     /// Take the sound of the apps the inputs name, each while it runs (see
     /// [`apps`]): tell the app sound thread which apps are wanted, and mix
     /// the sound it hands back — or stop mixing it when the app is let go.
@@ -1646,11 +1668,19 @@ impl AudioEngine {
             // Only a level on its way somewhere scales the sound: a fade.
             // Steady on air or off, the On button decides.
             let level = self.on_air.get(&source.uuid).copied().unwrap_or(0.0);
-            source.gate = if strip.is_some_and(|s| s.auto) && level > 0.0 && level < 1.0 {
+            let auto = if strip.is_some_and(|s| s.auto) && level > 0.0 && level < 1.0 {
                 level
             } else {
                 1.0
             };
+            // A rundown step fading it out, on top.
+            let step = self
+                .step_fades
+                .get(&source.uuid)
+                .copied()
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+            source.gate = auto * step;
             if let Feed::Clip(shared) = &source.feed {
                 let heard = source.solo
                     || source.gate > 0.0
@@ -2504,6 +2534,30 @@ mod tests {
             (gate(&engine) - 1.0).abs() < 1e-6,
             "no fade without Audio Auto"
         );
+    }
+
+    /// A rundown step fading a clip out — music on no screen, Audio Auto
+    /// off — turns its sound down, and back up once let go; with Audio Auto
+    /// fading it too, the two multiply.
+    #[test]
+    fn a_rundown_step_fades_a_sound_out_with_or_without_audio_auto() {
+        let mut engine = with_clip("d1");
+        engine
+            .edit_source("d1", |s| {
+                s.auto = false;
+                s.muted = false;
+            })
+            .unwrap();
+        engine.set_on_air(HashMap::new());
+        engine.set_step_fades(HashMap::from([("d1".to_string(), 0.25)]));
+        assert!((gate(&engine) - 0.25).abs() < 1e-6, "{}", gate(&engine));
+        engine.set_step_fades(HashMap::new());
+        assert!((gate(&engine) - 1.0).abs() < 1e-6, "let go");
+
+        engine.edit_source("d1", |s| s.auto = true).unwrap();
+        engine.set_on_air(at(0.5));
+        engine.set_step_fades(HashMap::from([("d1".to_string(), 0.5)]));
+        assert!((gate(&engine) - 0.25).abs() < 1e-6, "both: {}", gate(&engine));
     }
 
     #[test]

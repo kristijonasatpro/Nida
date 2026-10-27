@@ -82,6 +82,11 @@ struct ActiveCapture {
     stop_flag: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Frames put in its texture: none yet, and its texture shows nothing.
+    uploaded: u64,
+    /// Of those, the ones from the capture running now — none yet after it
+    /// replaced another, though the texture still shows that one's last.
+    fresh: u64,
 }
 
 /// Manages capture-target enumeration, capture sessions, and shared textures.
@@ -291,9 +296,37 @@ impl ScreenCaptureManager {
     pub fn adopt(
         &mut self,
         target: &CaptureTargetInfo,
+        session: Box<dyn ScreenCaptureBackend>,
+        config: CaptureConfig,
+        device: &wgpu::Device,
+    ) -> Result<(CaptureId, u32, u32), CaptureError> {
+        self.adopt_with(target, session, config, device, true)
+    }
+
+    /// [`Self::adopt`], but never shared: the window already captured has
+    /// the running capture's place taken by this one, under its id — one
+    /// opened again because the running one never sent a picture.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::adopt`].
+    pub fn adopt_afresh(
+        &mut self,
+        target: &CaptureTargetInfo,
+        session: Box<dyn ScreenCaptureBackend>,
+        config: CaptureConfig,
+        device: &wgpu::Device,
+    ) -> Result<(CaptureId, u32, u32), CaptureError> {
+        self.adopt_with(target, session, config, device, false)
+    }
+
+    fn adopt_with(
+        &mut self,
+        target: &CaptureTargetInfo,
         mut session: Box<dyn ScreenCaptureBackend>,
         config: CaptureConfig,
         device: &wgpu::Device,
+        share: bool,
     ) -> Result<(CaptureId, u32, u32), CaptureError> {
         if self.disabled {
             return Err(CaptureError::Unavailable(
@@ -313,12 +346,12 @@ impl ScreenCaptureManager {
                 (*id, same)
             });
         match running {
-            Some((_, true)) => {
+            Some((_, true)) if share => {
                 if let Some(shared) = self.share(target) {
                     return Ok(shared);
                 }
             }
-            Some((id, false)) => {
+            Some((id, _)) => {
                 if let Err(e) = session.set_config(&config) {
                     log::warn!(
                         "Screen capture of '{}': settings not taken: {e}",
@@ -361,6 +394,11 @@ impl ScreenCaptureManager {
         if let Ok(mut guard) = active.config.lock() {
             *guard = config;
         }
+        // What the one replaced sent and is not yet shown is not this one's.
+        if let Ok(mut picker) = active.frame_data.lock() {
+            picker.discard_waiting();
+        }
+        active.fresh = 0;
         let stop_flag = Arc::new(AtomicBool::new(false));
         let frame_tx = Arc::clone(&active.frame_data);
         let config_rx = Arc::clone(&active.config);
@@ -512,6 +550,8 @@ impl ScreenCaptureManager {
                 stop_flag,
                 connected,
                 thread: Some(thread),
+                uploaded: 0,
+                fresh: 0,
             },
         );
 
@@ -626,6 +666,18 @@ impl ScreenCaptureManager {
 
     pub fn is_active(&self, id: CaptureId) -> bool {
         self.active.contains_key(&id)
+    }
+
+    /// Whether a frame has been put in the capture's texture: until then it
+    /// shows nothing — a talk starting waits for it.
+    pub fn has_picture(&self, id: CaptureId) -> bool {
+        self.active.get(&id).is_some_and(|a| a.uploaded > 0)
+    }
+
+    /// Whether the capture running now has sent a picture — not only one
+    /// it replaced, whose last its texture may still show.
+    pub fn has_fresh_picture(&self, id: CaptureId) -> bool {
+        self.active.get(&id).is_some_and(|a| a.fresh > 0)
     }
 
     /// Whether the capture has delivered at least one frame and is still healthy.
@@ -760,7 +812,10 @@ impl ScreenCaptureManager {
         if let Some(surface) = frame.surface {
             if let Err(e) = surface::copy_into(context, surface, &active.texture) {
                 log::warn!("Screen capture {id}: frame not copied: {e}");
+                return;
             }
+            active.uploaded += 1;
+            active.fresh += 1;
             return;
         }
 
@@ -788,6 +843,8 @@ impl ScreenCaptureManager {
                 depth_or_array_layers: 1,
             },
         );
+        active.uploaded += 1;
+        active.fresh += 1;
     }
 }
 

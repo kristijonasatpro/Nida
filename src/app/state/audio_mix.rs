@@ -239,6 +239,15 @@ impl VardaApp {
                 }
             }
         }
+        // So is web talks', for a Slides input.
+        if app == crate::audio::app_sound::WEB_TALKS {
+            let slides = self.slides_decks();
+            if deck.is_some_and(|d| slides.iter().any(|s| s == d)) {
+                if let Some(uuid) = self.web_sound_strip(&slides) {
+                    return CommandResult::OkWithId { uuid };
+                }
+            }
+        }
         let name = if name.trim().is_empty() { app } else { name };
         CommandResult::OkWithId {
             uuid: self.audio_mix.add_app_input_of(name, app, deck),

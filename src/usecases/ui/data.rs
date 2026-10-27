@@ -269,6 +269,8 @@ pub struct DeckUIInfo {
     pub tap: Option<TapUI>,
     /// A playlist's items and where it has got (None = not a playlist).
     pub playlist: Option<crate::engine::value::playlist::PlaylistSnapshot>,
+    /// A Slides input's talks and where it has got (None = not one).
+    pub slides: Option<crate::engine::value::slides::SlidesSnapshot>,
     /// A timer's settings and what it reads (None = not a timer).
     pub timer: Option<crate::engine::value::timer::TimerSnapshot>,
     /// A PowerPoint input's show (None = not a PowerPoint input).
@@ -473,6 +475,9 @@ pub struct UIData {
     /// All current keybindings (read-only snapshot for dispatch + settings panel)
     pub keymap_bindings:
         std::collections::HashMap<crate::keymap::KeyCombo, crate::keymap::KeyTarget>,
+    /// How the clicker read with another app in front stands (see
+    /// `crate::clicker`).
+    pub clicker: crate::clicker::ClickerStatus,
     /// Available transition shader names (from registry)
     pub transition_names: Vec<String>,
     /// Currently active transition name, if any

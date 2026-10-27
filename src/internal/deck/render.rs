@@ -178,6 +178,7 @@ impl Deck {
                     let height = handle.height;
                     staging.upload(&frame.color_data, texture, width, height, encoder);
                     handle.recycle(frame);
+                    self.frames_uploaded += 1;
                 }
             }
             DeckSource::HapVideo {
@@ -210,9 +211,11 @@ impl Deck {
                         }
                     }
                     handle.recycle(frame);
+                    self.frames_uploaded += 1;
                 }
             }
             DeckSource::Playlist(list) => list.tick(encoder),
+            DeckSource::Slides(slides) => slides.tick(encoder),
             DeckSource::Timer(timer) => timer.tick(),
             DeckSource::Presenter(presenter) => presenter.tick(),
             _ => {}
@@ -237,6 +240,7 @@ impl Deck {
                 }
             }
             DeckSource::Playlist(list) => list.for_each_deck_mut(Deck::request_video_remap),
+            DeckSource::Slides(slides) => slides.for_each_deck_mut(Deck::request_video_remap),
             _ => {}
         }
     }
@@ -965,6 +969,15 @@ impl Deck {
                     generator_target,
                 );
             }
+            DeckSource::Slides(slides) => {
+                slides.render(
+                    audio_data,
+                    modulation,
+                    param_prefix,
+                    cmd_buffers,
+                    generator_target,
+                );
+            }
             DeckSource::Timer(timer) => timer.render(cmd_buffers, generator_target),
             DeckSource::Presenter(presenter) => presenter.render(
                 cmd_buffers,
@@ -1099,6 +1112,7 @@ impl Deck {
             DeckSource::SolidColor { .. }
             | DeckSource::ComputeShader { .. }
             | DeckSource::Playlist(_)
+            | DeckSource::Slides(_)
             | DeckSource::Timer(_)
             | DeckSource::Presenter(_)
             | DeckSource::Offline(_) => false,
@@ -1809,6 +1823,8 @@ impl Deck {
             DeckSource::Timer(timer) => timer.resize(width, height),
             // So is a presenter view's panel.
             DeckSource::Presenter(presenter) => presenter.resize(width, height),
+            // So are a Slides layer's talks.
+            DeckSource::Slides(slides) => slides.resize(width, height),
             // A tap shows a channel's picture or the master's, the master's
             // size now: left at the old one, it would fit the new picture as
             // if it were that size — bars round it, or cut off.
@@ -1911,6 +1927,30 @@ impl Deck {
         *texture_view = new_view;
         *source_width = raster_w;
         *source_height = raster_h;
+    }
+
+    /// Show `rgba` in place of a picture deck's image — a PDF talk's page
+    /// — at its own size, fitted as the deck fits it. Nothing for any other
+    /// deck.
+    pub fn replace_picture(&mut self, context: &GpuContext, rgba: &image::RgbaImage) {
+        self.rendered_still = None;
+        if let DeckSource::Image {
+            texture,
+            texture_view,
+            source_width,
+            source_height,
+            opaque,
+            svg,
+            ..
+        } = &mut self.source
+        {
+            let (new_texture, new_view) = super::source::upload_image_texture(context, rgba);
+            *texture = new_texture;
+            *texture_view = new_view;
+            (*source_width, *source_height) = rgba.dimensions();
+            *opaque = rgba.pixels().all(|p| p[3] == u8::MAX);
+            *svg = None;
+        }
     }
 
     /// Get the final output texture view (after effect chain)

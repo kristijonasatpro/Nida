@@ -99,7 +99,7 @@ pub fn request_permission() {
 /// Recording, or [`CaptureError::Backend`] if `SCShareableContent` fails or does
 /// not answer within [`ENUMERATE_TIMEOUT`].
 pub fn enumerate() -> Result<Vec<CaptureTargetInfo>, CaptureError> {
-    let content = shareable_content()?;
+    let content = shareable_content(true)?;
     let our_pid = std::process::id().cast_signed();
     let mut targets = Vec::new();
 
@@ -180,7 +180,10 @@ pub fn open(
     Ok(Box::new(backend))
 }
 
-fn shareable_content() -> Result<Retained<SCShareableContent>, CaptureError> {
+/// What macOS lets Nida capture: the displays, and the windows on a screen
+/// — or every window, `on_screen_only` false, to find one by its number
+/// that is on no screen (a web talk's, kept off every screen).
+fn shareable_content(on_screen_only: bool) -> Result<Retained<SCShareableContent>, CaptureError> {
     if !CGPreflightScreenCaptureAccess() {
         return Err(CaptureError::PermissionDenied);
     }
@@ -208,7 +211,7 @@ fn shareable_content() -> Result<Retained<SCShareableContent>, CaptureError> {
     unsafe {
         SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
             true,
-            true,
+            on_screen_only,
             &handler,
         );
     }
@@ -441,7 +444,8 @@ pub struct MacosBackend {
 
 impl MacosBackend {
     fn new(target: &CaptureTargetInfo, config: &CaptureConfig) -> Result<Self, CaptureError> {
-        let content = shareable_content()?;
+        // A window is found by its number, on a screen or not.
+        let content = shareable_content(target.kind == CaptureTargetKind::Display)?;
         let filter = build_filter(&content, target, config)?;
         // A Retina display has two pixels to each of its points, and is
         // captured at its pixels: its points would halve its sharpness.

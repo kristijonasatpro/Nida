@@ -843,6 +843,7 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `PUT` | `/api/rundown/next` | Make a step the one GO takes next, without taking anything. |
 | `POST` | `/api/rundown/steps` |  |
 | `DELETE` | `/api/rundown/steps/{step_uuid}` |  |
+| `PUT` | `/api/rundown/steps/{step_uuid}/at` |  |
 | `POST` | `/api/rundown/steps/{step_uuid}/capture` | Make the step's picture what is on now, for the parts it sets. |
 | `POST` | `/api/rundown/steps/{step_uuid}/duplicate` | Put a copy of the step right after it; replies with the copy's UUID. |
 | `PUT` | `/api/rundown/steps/{step_uuid}/main` |  |
@@ -850,6 +851,8 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `PUT` | `/api/rundown/steps/{step_uuid}/name` |  |
 | `PUT` | `/api/rundown/steps/{step_uuid}/overlays/{channel_uuid}` |  |
 | `PUT` | `/api/rundown/steps/{step_uuid}/plays/{deck_uuid}` |  |
+| `PUT` | `/api/rundown/steps/{step_uuid}/plays/{deck_uuid}/timer` |  |
+| `PUT` | `/api/rundown/steps/{step_uuid}/plays/{deck_uuid}/until-next` |  |
 | `PUT` | `/api/rundown/steps/{step_uuid}/screens/{bus_uuid}` |  |
 | `POST` | `/api/rundown/steps/{step_uuid}/take` | Take a step, all of it or none; refused, the reply says why. |
 | `PUT` | `/api/rundown/steps/{step_uuid}/then` |  |

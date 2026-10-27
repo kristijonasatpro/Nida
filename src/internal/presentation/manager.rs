@@ -10,7 +10,7 @@
 //! deck closed there, PowerPoint quit — is started again where it was, a
 //! little later: while the input exists, it shows its slides.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -55,6 +55,16 @@ pub enum Job {
         slide: Option<u32>,
         pixels: (u32, u32),
         spot: Option<ScreenSpot>,
+        /// Its show played; else the deck only opened in PowerPoint, ready —
+        /// a Slides input's next talk, or the one before it.
+        show: bool,
+    },
+    /// Play the deck's show (from `slide`, when given), or end it and keep
+    /// the deck open, ready.
+    SetShow {
+        deck: String,
+        show: bool,
+        slide: Option<u32>,
     },
     /// Play the deck's show on the screen `spot` from now on: moved there
     /// now when it runs.
@@ -88,7 +98,33 @@ pub enum Job {
         deck: String,
         control: crate::engine::value::presentation::VideoControl,
     },
+    /// Have PowerPoint save the deck at `path` as a PDF at `out` — its
+    /// slides as pictures, for the presenter view's next slide (see
+    /// `super::pictures`): opened for it when PowerPoint does not have it,
+    /// and closed again then. Never while a show of PowerPoint's runs: the
+    /// question it may ask (Grant Access) holds the show till answered.
+    SavePdf { path: PathBuf, out: PathBuf },
 }
+
+impl Job {
+    /// Whether it plays a show: the saves of slide pictures waiting are
+    /// dropped for it (see [`Worker::take`]).
+    fn plays_a_show(&self) -> bool {
+        matches!(
+            self,
+            Self::Open { show: true, .. } | Self::SetShow { show: true, .. } | Self::Restart { .. }
+        )
+    }
+}
+
+/// Why a save of slide pictures was refused: a show of PowerPoint's runs.
+const SHOW_RUNNING: &str = "a PowerPoint show is running: slide pictures are made with none \
+     running — PowerPoint may ask for access first, and holds its show till that is answered";
+
+/// Why the saves of slide pictures waiting were dropped (see
+/// [`Worker::take`]).
+const SAVES_DROPPED: &str =
+    "not made: a PowerPoint talk was started first — make them again with none on";
 
 /// How a deck's show stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +133,8 @@ pub enum Status {
     Opening,
     /// The show is running and its window captured.
     Showing,
+    /// Open in PowerPoint, its show not played: ready to start.
+    Ready,
     /// It is not, and why; tried again by itself.
     Failed(ScriptError),
     /// The show runs but its window is not captured, and why.
@@ -140,6 +178,13 @@ pub enum Event {
     Video {
         deck: String,
         video: Option<Video>,
+    },
+    /// The deck at `path` saved as a PDF at `out` ([`Job::SavePdf`]), or
+    /// why not, in words.
+    SavedPdf {
+        path: PathBuf,
+        out: PathBuf,
+        result: Result<(), String>,
     },
 }
 
@@ -381,6 +426,8 @@ pub fn main_display_scale() -> f64 {
 
 struct Session {
     path: PathBuf,
+    /// Its show is to play; else the deck is only kept open.
+    wants_show: bool,
     pixels: (u32, u32),
     /// The screen its window goes on; this Mac's when `None`.
     spot: Option<ScreenSpot>,
@@ -453,7 +500,9 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
                 slide,
                 pixels,
                 spot,
-            } => self.open(&deck, path, slide, pixels, spot, now),
+                show,
+            } => self.open(&deck, path, slide, pixels, spot, show, now),
+            Job::SetShow { deck, show, slide } => self.set_show(&deck, show, slide, now),
             Job::Place { deck, spot } => self.move_to(&deck, spot, now),
             Job::Go { deck, to } => self.go(&deck, to, now),
             Job::Video { deck, control } => self.video(&deck, control),
@@ -476,6 +525,17 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
                 self.bring_up(&deck, now);
             }
             Job::Close { deck } => self.close(&deck),
+            Job::SavePdf { path, out } => {
+                let result = self.save_pdf(&path, &out);
+                match &result {
+                    Ok(()) => log::info!("PowerPoint saved {} as slide pictures", path.display()),
+                    Err(why) => log::warn!(
+                        "PowerPoint did not save {} as slide pictures: {why}",
+                        path.display()
+                    ),
+                }
+                self.send(Event::SavedPdf { path, out, result });
+            }
             Job::Window { deck } => {
                 if let Some(session) = self.sessions.get_mut(&deck) {
                     session.window = None;
@@ -486,12 +546,81 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
         }
     }
 
+    /// [`Job::SavePdf`]: the deck at `path` saved as a PDF at `out`, opened
+    /// for it and closed again when PowerPoint did not have it. Written
+    /// under another name first, and put at `out` once it opens: a save cut
+    /// short leaves nothing that looks made.
+    fn save_pdf(&mut self, path: &Path, out: &Path) -> Result<(), String> {
+        // A talk on, or on its way up.
+        if self.sessions.values().any(|s| s.show.is_some() || s.wants_show) {
+            return Err(SHOW_RUNNING.into());
+        }
+        // A show started in PowerPoint itself, of any deck: Nida's sessions
+        // do not know it. Asked before anything is opened.
+        match self.ppt.slide_shows() {
+            Ok(0) => {}
+            Ok(_) | Err(ScriptError::Showing) => return Err(SHOW_RUNNING.into()),
+            Err(e) => return Err(e.to_string()),
+        }
+        if let Some(dir) = out.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("no folder for them at {}: {e}", dir.display()))?;
+        }
+        let part = super::pictures::part_of(out);
+        // A save cut short before, finished by PowerPoint since or not.
+        let _ = std::fs::remove_file(&part);
+        let opened = self.ppt.open(path, OPEN_WAIT).map_err(|e| e.to_string())?;
+        let saved = self.ppt.save_pdf(path, &part).map_err(|e| match e {
+            ScriptError::TimedOut => "PowerPoint did not finish: if it asks for access to the \
+                folder, click Grant Access there, then make the pictures again"
+                .to_string(),
+            ScriptError::Showing => SHOW_RUNNING.to_string(),
+            e => e.to_string(),
+        });
+        // Opened for this alone: closed again. A deck an input keeps open,
+        // or the user had open, stays.
+        if opened.by_nida && !self.sessions.values().any(|s| s.path == path) {
+            let _ = self.ppt.close(path);
+        }
+        let put = saved.and_then(|()| super::pictures::put_in_place(&part, out));
+        if put.is_err() {
+            let _ = std::fs::remove_file(&part);
+        }
+        put
+    }
+
+    /// A job from the engine. A save of slide pictures waits till nothing
+    /// else is asked ([`Self::run`]): a show never waits behind saves asked
+    /// before it — and one played drops the saves waiting, each answered so.
+    fn take(&mut self, job: Job, saves: &mut VecDeque<(PathBuf, PathBuf)>, now: Instant) {
+        match job {
+            Job::SavePdf { path, out } => saves.push_back((path, out)),
+            job => {
+                if job.plays_a_show() {
+                    for (path, out) in saves.drain(..) {
+                        log::info!(
+                            "Slide pictures of {} dropped: a show was played first",
+                            path.display()
+                        );
+                        self.send(Event::SavedPdf {
+                            path,
+                            out,
+                            result: Err(SAVES_DROPPED.into()),
+                        });
+                    }
+                }
+                self.handle(job, now);
+            }
+        }
+    }
+
     /// The file of a deck whose show is running.
     fn showing(&self, deck: &str) -> Option<PathBuf> {
         let session = self.sessions.get(deck)?;
         session.show.map(|_| session.path.clone())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open(
         &mut self,
         deck: &str,
@@ -499,6 +628,7 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
         slide: Option<u32>,
         pixels: (u32, u32),
         spot: Option<ScreenSpot>,
+        show: bool,
         now: Instant,
     ) {
         // The deck showed another file: that one is ended (and closed, if
@@ -516,6 +646,7 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
             deck.to_string(),
             Session {
                 path,
+                wants_show: show,
                 pixels,
                 spot,
                 aspect,
@@ -568,7 +699,60 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
                 Err(e) => return self.failed(deck, e, now),
             }
         }
-        self.start(deck, now);
+        self.start_or_ready(deck, now);
+    }
+
+    /// The deck is open: play its show when it is wanted, else say it is
+    /// ready.
+    fn start_or_ready(&mut self, deck: &str, now: Instant) {
+        if self.sessions.get(deck).is_some_and(|s| s.wants_show) {
+            self.start(deck, now);
+        } else {
+            self.status(deck, Status::Ready);
+        }
+    }
+
+    /// Play the deck's show — from `slide`, when given — or end it and keep
+    /// the deck open, ready to start again where it was.
+    fn set_show(&mut self, deck: &str, show: bool, slide: Option<u32>, now: Instant) {
+        let Some(session) = self.sessions.get_mut(deck) else {
+            return;
+        };
+        if show {
+            if session.wants_show {
+                return;
+            }
+            session.wants_show = true;
+            if slide.is_some() {
+                session.slide = slide;
+            }
+            session.retry_at = None;
+            session.retry_wait = RETRY_FIRST;
+            self.bring_up(deck, now);
+            return;
+        }
+        if !session.wants_show {
+            return;
+        }
+        session.wants_show = false;
+        session.slide = session.show.map(|s| s.slide).or(session.slide);
+        let was_showing = session.show.take().is_some();
+        session.window = None;
+        session.looking_since = None;
+        session.retry_at = None;
+        let path = session.path.clone();
+        self.set_video(deck, None);
+        // Another input of the file still wants the show: it stays.
+        let shared = self
+            .sessions
+            .iter()
+            .any(|(d, s)| d != deck && s.path == path && s.wants_show);
+        if was_showing && !shared {
+            let _ = self.ppt.end(&path);
+        }
+        if self.sessions.get(deck).is_some_and(|s| s.opened.is_some()) {
+            self.status(deck, Status::Ready);
+        }
     }
 
     /// The show of `deck` on the screen `spot` from now on: moved there now
@@ -592,10 +776,13 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
     /// where Nida wants it — and played again in a window if it played full
     /// screen, which Nida cannot show.
     fn start(&mut self, deck: &str, now: Instant) {
-        let Some(session) = self.sessions.get(deck) else {
+        let Some(session) = self.sessions.get(deck).filter(|s| s.wants_show) else {
             return;
         };
         let path = session.path.clone();
+        // A hidden PowerPoint's windows are off the screen: nothing of its
+        // show would be captured.
+        self.ppt.unhide();
         // At the top-left of its screen, that screen's pixels to a point:
         // macOS moves it below the menu bar, and keeps it within the screen.
         let spot = session.spot.unwrap_or(ScreenSpot::main_at(self.scale));
@@ -646,10 +833,12 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
                 }
                 // A new run of the show, in a new window, for every input of
                 // the file: each captures it again.
+                // Every input of the file that wants its show: one that only
+                // keeps the deck open ahead stays ready.
                 let sharing: Vec<String> = self
                     .sessions
                     .iter()
-                    .filter(|(_, s)| s.path == path)
+                    .filter(|(_, s)| s.path == path && s.wants_show)
                     .map(|(d, _)| d.clone())
                     .collect();
                 for each in sharing {
@@ -757,7 +946,7 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
         let sharing: Vec<String> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.path == path)
+            .filter(|(_, s)| s.path == path && s.wants_show)
             .map(|(d, _)| d.clone())
             .collect();
         for each in sharing {
@@ -790,7 +979,7 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
     }
 
     fn look_for_window(&mut self, deck: &str, now: Instant) {
-        let Some(session) = self.sessions.get(deck) else {
+        let Some(session) = self.sessions.get(deck).filter(|s| s.wants_show) else {
             return;
         };
         let (Some(state), None) = (session.show, session.window) else {
@@ -865,6 +1054,7 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
     pub fn tick(&mut self, now: Instant) {
         self.close_orphans(now);
         let decks: Vec<String> = self.sessions.keys().cloned().collect();
+        let mut showing_any = false;
         // One file's show is read for its video once, for all its inputs.
         let mut videos_read: HashSet<PathBuf> = HashSet::new();
         for deck in decks {
@@ -879,7 +1069,7 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
                             session.launching = None;
                             session.opened = Some(true);
                         }
-                        self.start(&deck, now);
+                        self.start_or_ready(&deck, now);
                     }
                     Err(ScriptError::NotOpen | ScriptError::NotRunning | ScriptError::TimedOut)
                         if now.saturating_duration_since(since) < OPEN_WAIT => {}
@@ -895,10 +1085,16 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
                 continue;
             }
             if session.show.is_none() {
-                if session.retry_at.is_some_and(|at| now >= at) {
+                // A show wanted, or a deck that would not open, is tried
+                // again; one open and ready waits to be started.
+                let open_and_ready = !session.wants_show && session.opened.is_some();
+                if !open_and_ready && session.retry_at.is_some_and(|at| now >= at) {
                     self.bring_up(&deck, now);
                 }
                 continue;
+            }
+            if session.wants_show {
+                showing_any = true;
             }
             match self.ppt.read(&path) {
                 Ok(Reading::Showing(state)) => {
@@ -911,6 +1107,11 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
                 Ok(Reading::Open { .. }) => self.failed(&deck, ScriptError::NoShow, now),
                 Err(e) => self.failed(&deck, e, now),
             }
+        }
+        // PowerPoint hidden (⌘H) while a show plays: its windows are off the
+        // screen and the show's picture stops. Shown again, behind Nida.
+        if showing_any {
+            self.ppt.unhide();
         }
     }
 
@@ -955,7 +1156,7 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
         let decks: Vec<String> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.path == path)
+            .filter(|(_, s)| s.path == path && s.wants_show)
             .map(|(d, _)| d.clone())
             .collect();
         for deck in decks {
@@ -1035,11 +1236,21 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
         let Some(session) = self.sessions.remove(deck) else {
             return;
         };
-        // Another input showing the same file keeps it — and closes it when
-        // it goes, if Nida opened it for this one.
+        // Its show was this one's to play, and nobody else wants it now.
+        let others_want_show = self
+            .sessions
+            .values()
+            .any(|s| s.path == session.path && s.wants_show);
+        let ends_show = session.wants_show && !others_want_show;
+        // Another input of the same file keeps the deck — and closes it when
+        // it goes, if Nida opened it for this one — but not a show only this
+        // one wanted: a talk opened ahead holds the deck, not its show.
         if let Some(other) = self.sessions.values_mut().find(|s| s.path == session.path) {
             if session.opened == Some(true) || session.launching.is_some() {
                 other.opened = Some(true);
+            }
+            if ends_show {
+                let _ = self.ppt.end(&session.path);
             }
             return;
         }
@@ -1048,9 +1259,19 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
             self.orphans.push((session.path, since));
             return;
         }
-        let _ = self.ppt.end(&session.path);
+        // A deck only opened ahead never ends a show: one playing is the
+        // user's, started by hand.
+        if session.wants_show {
+            let _ = self.ppt.end(&session.path);
+        }
         if session.opened == Some(true) {
-            let _ = self.ppt.close(&session.path);
+            // Opened ahead by Nida, its show since started by hand: the
+            // user's now — closing it would end their show.
+            let theirs = !session.wants_show
+                && matches!(self.ppt.read(&session.path), Ok(Reading::Showing(_)));
+            if !theirs {
+                let _ = self.ppt.close(&session.path);
+            }
         }
     }
 
@@ -1063,8 +1284,10 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
                 continue;
             }
             match self.ppt.read(&path) {
+                // A show of it playing was started by hand, Nida's never
+                // having started: the user's, left as it is.
+                Ok(Reading::Showing(_)) => {}
                 Ok(_) => {
-                    let _ = self.ppt.end(&path);
                     let _ = self.ppt.close(&path);
                 }
                 Err(ScriptError::NotOpen | ScriptError::NotRunning | ScriptError::TimedOut)
@@ -1088,10 +1311,17 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
     /// Run until the engine's side goes; then end the shows and say so.
     fn run(mut self, jobs: &mpsc::Receiver<Job>, done: &mpsc::Sender<()>) {
         let mut last_tick = Instant::now();
+        // Saves of slide pictures, waiting till nothing else is asked.
+        let mut saves = VecDeque::new();
         loop {
-            match jobs.recv_timeout(POLL) {
-                Ok(job) => self.handle(job, Instant::now()),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            let wait = if saves.is_empty() { POLL } else { Duration::ZERO };
+            match jobs.recv_timeout(wait) {
+                Ok(job) => self.take(job, &mut saves, Instant::now()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some((path, out)) = saves.pop_front() {
+                        self.handle(Job::SavePdf { path, out }, Instant::now());
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.shut_down();
                     let _ = done.send(());
@@ -1111,6 +1341,8 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct View {
     pub path: PathBuf,
+    /// Its show is to play; else the deck is kept open, ready.
+    pub wants_show: bool,
     pub status: Status,
     pub show: Option<ShowState>,
     /// Notes and slide size from the file, once read.
@@ -1148,6 +1380,17 @@ pub struct PresentationManager {
     views: HashMap<String, View>,
     /// When the engine last asked for each deck's window.
     asked_window: HashMap<String, Instant>,
+    /// Decks saved as PDFs since last taken ([`Self::take_saved`]).
+    saved: Vec<SavedPdf>,
+}
+
+/// A deck PowerPoint was asked to save as a PDF ([`Job::SavePdf`]): its
+/// file, the PDF, and whether it did, or why not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedPdf {
+    pub path: PathBuf,
+    pub out: PathBuf,
+    pub result: Result<(), String>,
 }
 
 impl PresentationManager {
@@ -1174,7 +1417,32 @@ impl PresentationManager {
             done: spawned.ok().map(|_| done_rx),
             views: HashMap::new(),
             asked_window: HashMap::new(),
+            saved: Vec::new(),
         }
+    }
+
+    /// Have PowerPoint save the deck at `path` as a PDF at `out`
+    /// ([`Job::SavePdf`]); what came of it is taken with
+    /// [`Self::take_saved`].
+    pub fn save_pdf(&self, path: &Path, out: &Path) {
+        self.send(Job::SavePdf {
+            path: path.to_path_buf(),
+            out: out.to_path_buf(),
+        });
+    }
+
+    /// The decks saved as PDFs, or not, since last asked.
+    pub fn take_saved(&mut self) -> Vec<SavedPdf> {
+        std::mem::take(&mut self.saved)
+    }
+
+    /// Whether a show of PowerPoint's is running, or asked for, as last
+    /// heard.
+    #[must_use]
+    pub fn any_showing(&self) -> bool {
+        self.views
+            .values()
+            .any(|v| v.wants_show || v.show.is_some() || v.status == Status::Showing)
     }
 
     fn send(&self, job: Job) {
@@ -1194,10 +1462,37 @@ impl PresentationManager {
         spot: Option<ScreenSpot>,
     ) {
         log::info!("PowerPoint input {deck}: opening {}", path.display());
+        self.start_session(deck, path, slide, pixels, spot, true);
+    }
+
+    /// Open the deck at `path` for `deck` without playing its show — a
+    /// Slides input's next talk, or the one before the talk on — so playing
+    /// it later is quick ([`Self::set_show`]).
+    pub fn prepare(
+        &mut self,
+        deck: &str,
+        path: &Path,
+        pixels: (u32, u32),
+        spot: Option<ScreenSpot>,
+    ) {
+        log::info!("Slides talk {deck}: opening {} ahead", path.display());
+        self.start_session(deck, path, None, pixels, spot, false);
+    }
+
+    fn start_session(
+        &mut self,
+        deck: &str,
+        path: &Path,
+        slide: Option<u32>,
+        pixels: (u32, u32),
+        spot: Option<ScreenSpot>,
+        show: bool,
+    ) {
         self.views.insert(
             deck.to_string(),
             View {
                 path: path.to_path_buf(),
+                wants_show: show,
                 status: Status::Opening,
                 show: None,
                 doc: None,
@@ -1212,6 +1507,29 @@ impl PresentationManager {
             slide,
             pixels,
             spot,
+            show,
+        });
+    }
+
+    /// Play `deck`'s show — from `slide`, when given — or end it and keep
+    /// the deck open, ready.
+    pub fn set_show(&mut self, deck: &str, show: bool, slide: Option<u32>) {
+        let Some(view) = self.views.get_mut(deck) else {
+            return;
+        };
+        if view.wants_show == show {
+            return;
+        }
+        view.wants_show = show;
+        if !show {
+            view.show = None;
+            view.video = None;
+        }
+        self.asked_window.remove(deck);
+        self.send(Job::SetShow {
+            deck: deck.to_string(),
+            show,
+            slide,
         });
     }
 
@@ -1317,7 +1635,7 @@ impl PresentationManager {
                         let why = match &status {
                             Status::Failed(e) => Some(format!("not showing: {e}")),
                             Status::NoWindow(why) => Some(format!("the show plays, but {why}")),
-                            Status::Opening | Status::Showing => None,
+                            Status::Opening | Status::Showing | Status::Ready => None,
                         };
                         match why {
                             Some(why) if view.reason_logged.as_ref() != Some(&why) => {
@@ -1332,18 +1650,28 @@ impl PresentationManager {
                             }
                             _ => {}
                         }
+                        if status == Status::Ready {
+                            view.show = None;
+                            view.video = None;
+                        }
                         view.status = status;
                     }
                 }
                 Event::Show { deck, state } => {
                     if let Some(view) = self.views.get_mut(&deck) {
-                        view.show = Some(state);
+                        // A show ended for a talk opened ahead says no more.
+                        if view.wants_show {
+                            view.show = Some(state);
+                        }
                     }
                 }
                 Event::Video { deck, video } => {
                     if let Some(view) = self.views.get_mut(&deck) {
                         view.video = video;
                     }
+                }
+                Event::SavedPdf { path, out, result } => {
+                    self.saved.push(SavedPdf { path, out, result });
                 }
                 Event::Window {
                     deck,
@@ -1418,6 +1746,7 @@ mod tests {
             slide,
             pixels: (1920, 1080),
             spot: None,
+            show: true,
         }
     }
 
@@ -1448,6 +1777,189 @@ mod tests {
         })
     }
 
+    fn saved(events: &[Event]) -> Vec<Result<(), String>> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::SavedPdf { result, .. } => Some(result.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A deck PowerPoint does not have is opened to be saved as slide
+    /// pictures, and closed again; one an input keeps open stays open. With
+    /// a show running nothing is asked of PowerPoint: the question it may
+    /// ask first (Grant Access) would hold the show.
+    #[test]
+    fn a_deck_is_saved_as_slide_pictures_only_with_no_show_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let deck = dir.path().join("talk.pptx");
+        std::fs::write(&deck, b"deck").unwrap();
+        let out = dir.path().join("pictures").join("talk.pdf");
+        let now = Instant::now();
+
+        // Not open: opened for it, saved, closed again.
+        let ppt = FakePowerPoint::with_slides(4);
+        let (mut w, rx) = worker(&ppt, 1.0);
+        w.handle(
+            Job::SavePdf {
+                path: deck.clone(),
+                out: out.clone(),
+            },
+            now,
+        );
+        assert_eq!(saved(&drain(&rx)), vec![Ok(())]);
+        assert!(out.is_file(), "the PDF");
+        assert_eq!(ppt.opened_files(), vec![deck.clone()]);
+        assert!(ppt.closed(), "closed again");
+
+        // A show running: refused, nothing asked.
+        let ppt = FakePowerPoint::with_slides(4);
+        let (mut w, rx) = worker(&ppt, 1.0);
+        w.handle(open_job("d1", None), now);
+        w.tick(now);
+        assert!(ppt.showing());
+        drain(&rx);
+        let out = dir.path().join("pictures").join("other.pdf");
+        w.handle(
+            Job::SavePdf {
+                path: "/Talks/talk.pptx".into(),
+                out: out.clone(),
+            },
+            now,
+        );
+        let results = saved(&drain(&rx));
+        assert!(matches!(&results[..], [Err(why)] if why.contains("show is running")), "{results:?}");
+        assert!(!out.exists());
+        assert!(ppt.showing(), "its show untouched");
+
+        // Kept open by an input, its show ended: saved, and left open.
+        w.handle(
+            Job::SetShow {
+                deck: "d1".into(),
+                show: false,
+                slide: None,
+            },
+            now,
+        );
+        w.tick(now);
+        drain(&rx);
+        w.handle(
+            Job::SavePdf {
+                path: "/Talks/talk.pptx".into(),
+                out: out.clone(),
+            },
+            now,
+        );
+        assert_eq!(saved(&drain(&rx)), vec![Ok(())]);
+        assert!(ppt.open(), "left open");
+        assert!(!ppt.closed());
+
+        // Another deck's show started in PowerPoint itself, by hand: Nida
+        // knows of no show, PowerPoint does. Refused, the deck never opened.
+        let decks = crate::presentation::fake::FakeDecks::with_slides(4);
+        decks.play_by_hand("other.pptx");
+        let (tx, rx) = mpsc::channel();
+        let mut w = Worker::new(decks.clone(), decks.windows(), 1.0, tx);
+        let out = dir.path().join("pictures").join("by-hand.pdf");
+        w.handle(
+            Job::SavePdf {
+                path: deck.clone(),
+                out: out.clone(),
+            },
+            now,
+        );
+        let results = saved(&drain(&rx));
+        assert!(matches!(&results[..], [Err(why)] if why.contains("show is running")), "{results:?}");
+        assert!(!out.exists());
+        assert_eq!(decks.log(), vec!["show other.pptx by hand"], "the deck never opened");
+
+        // Saved cut short: nothing that looks made, nothing left over.
+        let ppt = FakePowerPoint::with_slides(4);
+        ppt.save_broken_pdfs();
+        let (mut w, rx) = worker(&ppt, 1.0);
+        let out = dir.path().join("pictures").join("cut.pdf");
+        w.handle(
+            Job::SavePdf {
+                path: deck.clone(),
+                out: out.clone(),
+            },
+            now,
+        );
+        let results = saved(&drain(&rx));
+        assert!(matches!(&results[..], [Err(why)] if why.contains("does not open")), "{results:?}");
+        assert!(!out.exists(), "no PDF that looks made");
+        assert!(!super::super::pictures::part_of(&out).exists(), "nothing left over");
+    }
+
+    /// A talk on its way up — PowerPoint still opening its deck, no show yet
+    /// for PowerPoint to tell — counts as on: no slide pictures made.
+    #[test]
+    fn a_talk_on_its_way_up_counts_as_on_for_slide_pictures() {
+        let dir = tempfile::tempdir().unwrap();
+        let deck = dir.path().join("talk.pptx");
+        std::fs::write(&deck, b"deck").unwrap();
+        let out = dir.path().join("talk.pdf");
+        let now = Instant::now();
+        let ppt = FakePowerPoint::with_slides(4);
+        ppt.open_slowly(50);
+        let (mut w, rx) = worker(&ppt, 1.0);
+        w.handle(open_job("d1", None), now);
+        assert!(!ppt.showing(), "not up yet");
+        drain(&rx);
+        w.handle(
+            Job::SavePdf {
+                path: deck,
+                out: out.clone(),
+            },
+            now,
+        );
+        let results = saved(&drain(&rx));
+        assert!(matches!(&results[..], [Err(why)] if why.contains("show is running")), "{results:?}");
+        assert!(!out.exists());
+    }
+
+    /// Saves of slide pictures wait for every other job, and a show played
+    /// drops those waiting, each answered: a talk never waits behind them.
+    #[test]
+    fn a_talk_played_drops_the_slide_pictures_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let deck = dir.path().join("talk.pptx");
+        std::fs::write(&deck, b"deck").unwrap();
+        let out = |n: u32| dir.path().join(format!("{n}.pdf"));
+        let now = Instant::now();
+        let ppt = FakePowerPoint::with_slides(4);
+        let (mut w, rx) = worker(&ppt, 1.0);
+        let mut saves = VecDeque::new();
+        for n in 1..=2 {
+            let job = Job::SavePdf {
+                path: deck.clone(),
+                out: out(n),
+            };
+            w.take(job, &mut saves, now);
+        }
+        assert_eq!(saves.len(), 2, "kept, not made yet");
+        assert!(saved(&drain(&rx)).is_empty());
+
+        // Another job: done first, the saves still waiting.
+        w.take(Job::Window { deck: "d0".into() }, &mut saves, now);
+        assert_eq!(saves.len(), 2);
+
+        // A talk played: the saves dropped, each answered; its show plays.
+        w.take(open_job("d1", None), &mut saves, now);
+        w.tick(now);
+        assert!(saves.is_empty());
+        let results = saved(&drain(&rx));
+        assert!(
+            matches!(&results[..], [Err(a), Err(b)] if a.contains("talk was started") && a == b),
+            "{results:?}"
+        );
+        assert!(!out(1).exists() && !out(2).exists());
+        assert!(ppt.showing());
+        assert!(!ppt.opened_files().contains(&deck), "never opened for a save");
+    }
+
     #[test]
     fn a_show_plays_on_the_screen_asked_for_and_moves_when_asked() {
         let ppt = FakePowerPoint::with_slides(5);
@@ -1470,6 +1982,7 @@ mod tests {
                 slide: None,
                 pixels: (1920, 1080),
                 spot: Some(spare),
+                show: true,
             },
             now,
         );
@@ -1919,6 +2432,164 @@ mod tests {
         assert!(!ppt.showing() && ppt.open() && !ppt.closed());
     }
 
+    fn statuses(rx: &mpsc::Receiver<Event>) -> Vec<Status> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Status { status, .. } => Some(status),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_deck_opened_ahead_is_opened_its_show_not_played_until_asked() {
+        let ppt = FakePowerPoint::with_slides(3);
+        let (mut w, rx) = worker(&ppt, 1.0);
+        let now = Instant::now();
+        w.handle(
+            Job::Open {
+                deck: "talk".into(),
+                path: "/Talks/talk.pptx".into(),
+                slide: None,
+                pixels: (1920, 1080),
+                spot: None,
+                show: false,
+            },
+            now,
+        );
+        w.tick(now);
+        assert!(ppt.open(), "opened ahead");
+        assert!(!ppt.showing(), "its show not played");
+        assert!(statuses(&rx).contains(&Status::Ready));
+        // Ticks leave it so: no retry starts a show nobody asked for.
+        for _ in 0..3 {
+            w.tick(now + Duration::from_secs(30));
+        }
+        assert!(!ppt.showing());
+        // Asked: played, from the slide asked.
+        w.handle(
+            Job::SetShow {
+                deck: "talk".into(),
+                show: true,
+                slide: Some(3),
+            },
+            now,
+        );
+        assert!(ppt.showing());
+        assert_eq!(ppt.slide(), 3);
+        // Ended again: the show stops, the deck stays open, ready.
+        w.handle(
+            Job::SetShow {
+                deck: "talk".into(),
+                show: false,
+                slide: None,
+            },
+            now,
+        );
+        assert!(!ppt.showing());
+        assert!(ppt.open() && !ppt.closed(), "kept open");
+        assert!(statuses(&rx).contains(&Status::Ready));
+        // Played again: where it was left.
+        w.handle(
+            Job::SetShow {
+                deck: "talk".into(),
+                show: true,
+                slide: None,
+            },
+            now,
+        );
+        assert!(ppt.showing());
+        assert_eq!(ppt.slide(), 3, "back at the slide it was left on");
+    }
+
+    fn prepare_job(deck: &str) -> Job {
+        Job::Open {
+            deck: deck.into(),
+            path: "/Talks/talk.pptx".into(),
+            slide: None,
+            pixels: (1920, 1080),
+            spot: None,
+            show: false,
+        }
+    }
+
+    #[test]
+    fn a_deck_opened_ahead_never_ends_a_show_started_by_hand() {
+        let ppt = FakePowerPoint::with_slides(3);
+        ppt.show_full_screen_by_hand();
+        let (mut w, _rx) = worker(&ppt, 1.0);
+        let now = Instant::now();
+        w.handle(prepare_job("next"), now);
+        w.tick(now);
+        w.handle(Job::Close { deck: "next".into() }, now);
+        assert!(ppt.showing(), "the user's show plays on");
+        assert!(ppt.open() && !ppt.closed(), "and the deck stays open");
+    }
+
+    #[test]
+    fn a_deck_nida_opened_ahead_is_left_open_once_its_show_is_started_by_hand() {
+        let ppt = FakePowerPoint::with_slides(3);
+        let (mut w, _rx) = worker(&ppt, 1.0);
+        let now = Instant::now();
+        w.handle(prepare_job("next"), now);
+        w.tick(now);
+        assert!(ppt.open() && !ppt.showing(), "opened by Nida, ahead");
+        // The user starts its show in PowerPoint; then the talk goes.
+        ppt.show_full_screen_by_hand();
+        w.handle(Job::Close { deck: "next".into() }, now);
+        assert!(ppt.showing(), "their show plays on");
+        assert!(!ppt.closed(), "and the deck is not closed under it");
+    }
+
+    #[test]
+    fn a_show_only_one_input_wanted_ends_with_it_though_another_holds_the_deck() {
+        let ppt = FakePowerPoint::with_slides(3);
+        let (mut w, rx) = worker(&ppt, 1.0);
+        let now = Instant::now();
+        w.handle(open_job("on", None), now);
+        w.tick(now);
+        assert!(ppt.showing());
+        // The same file opened ahead for another talk: it gets no show of
+        // its own, and stays ready.
+        w.handle(prepare_job("ahead"), now);
+        w.tick(now);
+        let shown_to_ahead = drain(&rx).iter().any(|e| {
+            matches!(e, Event::Show { deck, .. } if deck == "ahead")
+                || matches!(e, Event::Status { deck, status } if deck == "ahead" && *status == Status::Showing)
+        });
+        assert!(!shown_to_ahead, "a deck opened ahead is not told of the other's show");
+        // The talk on goes: its show ends, the deck stays open for the other.
+        w.handle(Job::Close { deck: "on".into() }, now);
+        assert!(!ppt.showing(), "nobody wants the show now");
+        assert!(ppt.open() && !ppt.closed(), "kept open, ready");
+    }
+
+    #[test]
+    fn a_hidden_powerpoint_is_shown_again_while_a_show_plays() {
+        let ppt = FakePowerPoint::with_slides(3);
+        let (mut w, _rx) = worker(&ppt, 1.0);
+        let now = Instant::now();
+        w.handle(open_job("d1", None), now);
+        w.tick(now);
+        assert!(ppt.showing());
+        ppt.hide();
+        w.tick(now);
+        assert_eq!(ppt.hidden(), (false, 1), "shown again");
+        // With no show wanted, a hidden PowerPoint is left hidden.
+        w.handle(
+            Job::SetShow {
+                deck: "d1".into(),
+                show: false,
+                slide: None,
+            },
+            now,
+        );
+        ppt.hide();
+        w.tick(now);
+        assert_eq!(ppt.hidden(), (true, 1));
+    }
+
     #[test]
     fn a_deck_given_another_file_closes_the_first() {
         let ppt = FakePowerPoint::with_slides(3);
@@ -1933,6 +2604,7 @@ mod tests {
                 slide: None,
                 pixels: (1920, 1080),
                 spot: None,
+                show: true,
             },
             now,
         );

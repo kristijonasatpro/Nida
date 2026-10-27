@@ -28,6 +28,11 @@ pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// time, each build one, about 55 ms each (measured) — up to its 1000 steps.
 pub const WALK_TIMEOUT: Duration = Duration::from_secs(70);
 
+/// How long PowerPoint may take to save a deck as a PDF: a long deck full
+/// of pictures takes a while — and the first time PowerPoint asks for the
+/// folder (Grant Access), which waits on the user.
+pub const SAVE_PDF_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Why PowerPoint did not do what it was told.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ScriptError {
@@ -46,6 +51,10 @@ pub enum ScriptError {
     /// The deck is open but no slide show of it is running.
     #[error("the slide show is not running")]
     NoShow,
+    /// A slide show of PowerPoint's is running — of any deck, Nida's or one
+    /// started in PowerPoint itself.
+    #[error("a slide show is running in PowerPoint")]
+    Showing,
     #[error("PowerPoint did not answer in time")]
     TimedOut,
     #[error("PowerPoint: {0}")]
@@ -330,6 +339,13 @@ pub trait Runner: Send + 'static {
     /// again, so its keys (Space cuts) do not go to PowerPoint. macOS may
     /// say no; then a click in Nida does it.
     fn refocus(&self) {}
+    /// Show PowerPoint again if it is hidden (⌘H): a hidden app's windows
+    /// are off the screen, and its show's picture stops coming (tried on
+    /// PowerPoint 16.114: the capture says it is suspended). Not brought
+    /// forward. Gives back whether it was hidden.
+    fn unhide(&self) -> bool {
+        false
+    }
 }
 
 /// The real runner.
@@ -411,6 +427,33 @@ impl Runner for Osascript {
                 }
             }
         });
+    }
+
+    fn unhide(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            objc2::rc::autoreleasepool(|_| {
+                use objc2_app_kit::NSRunningApplication;
+                let id = objc2_foundation::NSString::from_str(POWERPOINT_ID);
+                let mut was = false;
+                for app in NSRunningApplication::runningApplicationsWithBundleIdentifier(&id) {
+                    if app.isHidden() {
+                        was = true;
+                        // Its answer says nothing: the app shows again all
+                        // the same (tried).
+                        let _ = app.unhide();
+                        log::warn!(
+                            "PowerPoint was hidden: shown again, so its show can be captured"
+                        );
+                    }
+                }
+                was
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
     fn open(&self, path: &Path) -> Result<(), ScriptError> {
@@ -517,6 +560,11 @@ impl<R: Runner> PowerPoint<R> {
         self.runner.refocus();
     }
 
+    /// PowerPoint shown again if it was hidden (see [`Runner::unhide`]).
+    pub fn unhide(&self) -> bool {
+        self.runner.unhide()
+    }
+
     /// Play the open deck at `path` in a window placed at `at`, from
     /// `slide` (from 1) or its first.
     ///
@@ -585,6 +633,47 @@ impl<R: Runner> PowerPoint<R> {
     /// As for every command (see [`PowerPoint`]).
     pub fn close(&self, path: &Path) -> Result<(), ScriptError> {
         self.run(&scripts::close(path)).map(|_| ())
+    }
+
+    /// Have PowerPoint save the deck at `path`, open in it, as a PDF at
+    /// `out` — every slide a page, as it looks once its builds are done.
+    /// The deck itself is left as it was. PowerPoint, sandboxed, asks once
+    /// for `out`'s folder (Grant Access): it holds everything else it does
+    /// till the user answers.
+    ///
+    /// # Errors
+    ///
+    /// As for every command (see [`PowerPoint`]); [`ScriptError::TimedOut`]
+    /// when it took longer than [`SAVE_PDF_TIMEOUT`] — PowerPoint asking,
+    /// unanswered.
+    pub fn save_pdf(&self, path: &Path, out: &Path) -> Result<(), ScriptError> {
+        let reply = self.runner.run(&scripts::save_pdf(path, out), SAVE_PDF_TIMEOUT)?;
+        match reply.trim() {
+            "saved" => Ok(()),
+            "showing" => Err(ScriptError::Showing),
+            "nopres" => Err(ScriptError::NotOpen),
+            "notrunning" => Err(ScriptError::NotRunning),
+            other => Err(ScriptError::Failed(format!("saving a PDF: {other}"))),
+        }
+    }
+
+    /// How many slide shows PowerPoint runs, of any deck — Nida's, or one
+    /// started in PowerPoint itself; none when PowerPoint is not running
+    /// (it is not started for this).
+    ///
+    /// # Errors
+    ///
+    /// As for every command (see [`PowerPoint`]).
+    pub fn slide_shows(&self) -> Result<u32, ScriptError> {
+        let reply = self.run(&scripts::slide_shows())?;
+        let reply = reply.trim();
+        if reply == "notrunning" {
+            return Ok(0);
+        }
+        reply
+            .strip_prefix("shows\t")
+            .and_then(|n| n.trim().parse().ok())
+            .ok_or_else(|| ScriptError::Failed(format!("counting its slide shows: {reply}")))
     }
 
     /// The video on the slide on screen — the shape `known` holds when its
@@ -953,6 +1042,37 @@ end findPres
     #[must_use]
     pub fn close(path: &Path) -> String {
         with_deck(path, "close thePres saving no", Reply::Closed)
+    }
+
+    /// Save the deck as a PDF at `out`, and answer `saved`: given as long
+    /// as PowerPoint takes, within the command's own timeout. Not with a
+    /// slide show running, of any deck: `showing` then.
+    #[must_use]
+    pub fn save_pdf(path: &Path, out: &Path) -> String {
+        let out = literal(&out.to_string_lossy());
+        with_deck(
+            path,
+            &format!(
+                "if (count of slide show windows) > 0 then return \"showing\"
+                 with timeout of 110 seconds
+                 	save thePres in (POSIX file {out}) as save as PDF
+                 end timeout
+                 return \"saved\""
+            ),
+            Reply::Own,
+        )
+    }
+
+    /// How many slide shows PowerPoint runs, of any deck: `shows` and the
+    /// count, or `notrunning` — PowerPoint is not started for it.
+    #[must_use]
+    pub fn slide_shows() -> String {
+        format!(
+            "if application id \"{POWERPOINT_ID}\" is not running then return \"notrunning\"\n\
+             with timeout of 8 seconds\n\
+             \ttell application id \"{POWERPOINT_ID}\" to return \"shows\" & tab & (count of slide show windows)\n\
+             end timeout\n"
+        )
     }
 
     /// The video on the slide on screen, `action` done to it first: the
@@ -1459,6 +1579,46 @@ mod tests {
         assert!(script.contains(
             "\t\t\ttry\n\t\t\t\tif thePaths contains (full name of presentation i) then return presentation i\n\t\t\tend try"
         ));
+    }
+
+    /// A save asks PowerPoint for its slide shows first — any deck's — and
+    /// saves only with none: its question (Grant Access) would hold one.
+    /// The count alone starts nothing and reads as a number.
+    #[test]
+    fn a_pdf_is_saved_only_with_no_slide_show_running() {
+        let script = scripts::save_pdf(Path::new("/Talks/a.pptx"), Path::new("/P/a.saving.pdf"));
+        let asks = script
+            .find("if (count of slide show windows) > 0 then return \"showing\"")
+            .expect("asks first");
+        let saves = script.find("save thePres in (POSIX file \"/P/a.saving.pdf\") as save as PDF");
+        assert!(saves.is_some_and(|at| at > asks), "{script}");
+
+        let count = scripts::slide_shows();
+        assert!(count.starts_with(&format!(
+            "if application id \"{POWERPOINT_ID}\" is not running then return \"notrunning\"\n"
+        )));
+        assert!(count.contains("count of slide show windows"), "{count}");
+        for (reply, read) in [("notrunning", Some(0)), ("shows\t2", Some(2)), ("nopres", None)] {
+            let ppt = PowerPoint::new(Replies(reply));
+            assert_eq!(ppt.slide_shows().ok(), read, "{reply}");
+        }
+        assert!(matches!(
+            PowerPoint::new(Replies("showing")).save_pdf(Path::new("/a.pptx"), Path::new("/a.pdf")),
+            Err(ScriptError::Showing)
+        ));
+    }
+
+    /// A runner that answers every script with the same reply.
+    struct Replies(&'static str);
+
+    impl Runner for Replies {
+        fn run(&self, _script: &str, _timeout: Duration) -> Result<String, ScriptError> {
+            Ok(self.0.to_string())
+        }
+
+        fn open(&self, _path: &Path) -> Result<(), ScriptError> {
+            Ok(())
+        }
     }
 
     #[test]

@@ -81,10 +81,15 @@ New to Nida? Start with [Main mode](18-main.md), [Screen Layouts](20-layouts.md)
   - [Running the show](25-rundown.md#running-the-show) — GO, Cut and Fade; all of it or none; going on by itself
   - [Clips, playlists and timers](25-rundown.md#clips-playlists-and-timers) — a sting on no screen, a talk's countdown
   - [Over the API](25-rundown.md#over-the-api) — `/api/rundown/…`
-- **26. [PowerPoint](26-presentations.md)** — like vMix's PowerPoint input: a deck played by PowerPoint on this Mac, its transitions, animations and videos as PowerPoint plays them, moved on from Nida or a presentation clicker, with its notes
+- **26. [Presentations](26-presentations.md)** — a conference's talks in one Slides input — PowerPoint decks, PDFs, web presentations, clips, pictures — in running order, each started with one press in the Presentations panel; a PiP or presenter view showing it follows the talk on
+  - [The Presentations panel](26-presentations.md#the-presentations-panel) — ON AIR, NEXT, the running order
+  - [Starting a talk](26-presentations.md#starting-a-talk) — what is on stays on until the new talk's picture is there
+  - [PDF talks](26-presentations.md#pdf-talks) and [web talks](26-presentations.md#web-talks) — drawn by Nida; played by the Mac's WebKit off screen
+  - [Checked before the show](26-presentations.md#checked-before-the-show) — linked videos not copied, fonts this Mac lacks, 4:3 decks, pages that need the internet
+  - [PowerPoint](26-presentations.md#powerpoint) — a deck played by PowerPoint on this Mac, its transitions, animations and videos as PowerPoint plays them; as a talk or an input of its own
   - [Moving it on](26-presentations.md#moving-it-on) — ◀ ▶, PageDown / PageUp and B, black and white
   - [It stays up](26-presentations.md#it-stays-up) — a show ended in PowerPoint comes back; kept with the show
-  - [Over the API](26-presentations.md#over-the-api) — `PresentationGo`, `presentation` in the state
+  - [Over the API](26-presentations.md#over-the-api) — `StartTalk`, `AddTalks`, `PresentationGo`, `slides` and `presentation` in the state
 
 Parts III–VI are the engine underneath, from Varda, with Nida's additions.
 

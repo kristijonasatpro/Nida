@@ -1201,9 +1201,52 @@ pub struct OutputWindow {
     /// frame was shown; nothing else does).
     #[cfg(target_os = "macos")]
     unshown: super::on_screen::Unshown,
+    /// Whether its screen says what it shows, as found since it was made or
+    /// put on that screen.
+    #[cfg(target_os = "macos")]
+    screen_says: ScreenSays,
     /// The window is to be made again, and why: the main thread does it
     /// (`VardaApp::reopen_unshown_outputs`).
     pub reopen: Option<Reopen>,
+}
+
+/// Whether an output's screen says which of its frames it showed — Metal
+/// tells when a frame was shown — as found since the window was made or put
+/// on that screen. A `DisplayLink`, `AirPlay` or Sidecar screen shows the
+/// frames but never says so.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenSays {
+    /// Frames said shown so far, fewer than [`SAYS_FRAMES`]: watched for
+    /// going unshown, not yet known to say.
+    Counting(u32),
+    /// A second's frames said shown, or more: it says. Watched for going
+    /// unshown.
+    Yes,
+    /// Made again, it still said too few shown: it never says (a screen at
+    /// another rate than the show's said none either, 2026-10-26). Not
+    /// watched — made again for that, each time would only blink it — till
+    /// it is put on another screen.
+    Never,
+}
+
+/// Frames said shown that tell a screen says what it shows: a second's at
+/// 60 a second. A few said shown as a window starts, then none, is not.
+#[cfg(target_os = "macos")]
+const SAYS_FRAMES: u32 = 60;
+
+#[cfg(target_os = "macos")]
+impl ScreenSays {
+    /// As it stands once Metal's report of when frames were shown (`shown`,
+    /// 0 for one never shown) is taken.
+    fn with_shown(self, shown: &[f64]) -> Self {
+        let said = u32::try_from(shown.iter().filter(|&&at| at > 0.0).count()).unwrap_or(u32::MAX);
+        match self {
+            Self::Counting(n) if n.saturating_add(said) >= SAYS_FRAMES => Self::Yes,
+            Self::Counting(n) => Self::Counting(n.saturating_add(said)),
+            other => other,
+        }
+    }
 }
 
 /// Why an output's window is to be made again.
@@ -1371,6 +1414,8 @@ impl OutputWindow {
             on_screen: super::on_screen::OnScreen::default(),
             #[cfg(target_os = "macos")]
             unshown: super::on_screen::Unshown::new(std::time::Instant::now(), 0),
+            #[cfg(target_os = "macos")]
+            screen_says: ScreenSays::Counting(0),
             reopen: None,
             refresh: None,
             screen: None,
@@ -1707,7 +1752,12 @@ impl OutputWindow {
         // macOS can still call it visible; made again, it only took the
         // keyboard from the control window (a laptop, 2026-10-06).
         #[cfg(target_os = "macos")]
+        {
+            self.screen_says = self.screen_says.with_shown(&shown);
+        }
+        #[cfg(target_os = "macos")]
         if self.covering_screen
+            && self.screen_says != ScreenSays::Never
             && self
                 .unshown
                 .note(std::time::Instant::now(), self.presents, &shown)
@@ -1922,6 +1972,23 @@ impl OutputWindow {
     /// all — covered, minimised, on a sleeping screen — as macOS says now
     /// (main thread). Then its surface is told so, and the window is watched
     /// afresh rather than made again.
+    /// Whether a second's frames of it have been said shown since it was made
+    /// or put on its screen: its screen says what it shows (see
+    /// [`ScreenSays`]).
+    #[cfg(target_os = "macos")]
+    pub fn shown_here(&self) -> bool {
+        self.screen_says == ScreenSays::Yes
+    }
+
+    /// Stop watching its frames for going unshown, and making it again for
+    /// that: its screen never says what it shows. Watched again once it is
+    /// put on another screen.
+    #[cfg(target_os = "macos")]
+    pub fn stop_watching_unshown(&mut self) {
+        self.screen_says = ScreenSays::Never;
+        self.reopen = None;
+    }
+
     #[cfg(target_os = "macos")]
     pub fn unshown_because_hidden(&mut self) -> bool {
         let Some(window) = self.window.get() else {
@@ -2006,8 +2073,10 @@ impl OutputWindow {
     fn cover_screen(&mut self, monitor: Option<winit::monitor::MonitorHandle>) {
         self.covering_screen = true;
         // Watched afresh: what went unshown while it was a plain window says
-        // nothing about its screen.
+        // nothing about its screen — nor about this one whether another said
+        // what it showed.
         self.unshown = super::on_screen::Unshown::new(std::time::Instant::now(), self.presents);
+        self.screen_says = ScreenSays::Counting(0);
         let name = self.name.clone();
         self.window.on_main(move |window| {
             let Some(monitor) = monitor.or_else(|| window.current_monitor()) else {
@@ -3182,6 +3251,22 @@ mod macos_window {
 
 #[cfg(test)]
 mod tests {
+    /// A screen says what it shows once a second's frames are said shown —
+    /// a few as the window starts, then none, do not tell — and one found
+    /// never to say stays so whatever comes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_screen_says_what_it_shows_after_a_seconds_frames() {
+        use super::{ScreenSays, SAYS_FRAMES};
+        let some = ScreenSays::Counting(0).with_shown(&[0.0, 12.5, 12.52, 0.0]);
+        assert_eq!(some, ScreenSays::Counting(2), "two said shown: not yet");
+        let none = some.with_shown(&[0.0; 40]);
+        assert_eq!(none, ScreenSays::Counting(2), "then none");
+        let shown: Vec<f64> = (0..SAYS_FRAMES).map(|i| 13.0 + f64::from(i) / 60.0).collect();
+        assert_eq!(none.with_shown(&shown), ScreenSays::Yes, "a second's");
+        assert_eq!(ScreenSays::Never.with_shown(&shown), ScreenSays::Never, "stays");
+    }
+
     /// A picture a frame on its way to the screen holds is never drawn into
     /// again until the frame lets it go; there are never more than a frame
     /// waiting, one presented and one drawn need; and a window of another

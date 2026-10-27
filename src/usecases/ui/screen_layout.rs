@@ -35,6 +35,9 @@ pub enum Pane {
     Switcher,
     /// The rundown: the show's steps in order, each taken with one press.
     Rundown,
+    /// The Presentations panel: a Slides input's talks in running order,
+    /// each started with one press.
+    Presentations,
     /// The audio mixer.
     Audio,
     /// Whatever is selected: a deck's settings, a channel's or the master's
@@ -49,7 +52,7 @@ pub enum Pane {
 }
 
 impl Pane {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Library,
         Self::Channels,
         Self::Layers,
@@ -58,6 +61,7 @@ impl Pane {
         Self::Output,
         Self::Switcher,
         Self::Rundown,
+        Self::Presentations,
         Self::Audio,
         Self::Details,
         Self::Setup,
@@ -74,6 +78,7 @@ impl Pane {
             Self::Output => "Main Output",
             Self::Switcher => "Switcher",
             Self::Rundown => "Rundown",
+            Self::Presentations => "Presentations",
             Self::Audio => "Audio Mixer",
             Self::Details => "Properties",
             Self::Setup => "Setup",
@@ -93,6 +98,10 @@ impl Pane {
             Self::Output => "The Main output picture",
             Self::Switcher => "Buses: what each screen shows, Cut and Auto",
             Self::Rundown => "The show in order: steps taken with one press, and GO",
+            Self::Presentations => {
+                "The talks in running order — PowerPoint, PDF, web, clips — each started with \
+                 one press"
+            }
             Self::Audio => "Audio mixer: faders, meters, monitoring",
             Self::Details => "Settings of whatever is selected",
             Self::Setup => "Tonemap, modulation, MIDI, stage layout, outputs",
@@ -103,6 +112,22 @@ impl Pane {
     /// The panels that show the channels and their decks.
     pub fn is_desk(self) -> bool {
         matches!(self, Self::Channels | Self::Layers | Self::Inputs)
+    }
+
+    /// Whether the panel can be in a window of its own — on another screen,
+    /// say. Not those things are dragged into or out of (decks, effects,
+    /// the Library's): a drag reaches no further than its own window.
+    pub fn can_have_window(self) -> bool {
+        matches!(
+            self,
+            Self::Monitors
+                | Self::Output
+                | Self::Switcher
+                | Self::Rundown
+                | Self::Presentations
+                | Self::Audio
+                | Self::Timer(_)
+        )
     }
 }
 
@@ -179,8 +204,11 @@ impl Builtin {
                 tree.split_below(center, 0.78, vec![Pane::Details]);
                 // The switcher and the audio mixer both in view, as they were
                 // stacked in the old right panel; setup behind the mixer.
-                let [_, tools] =
-                    tree.split_below(right, 0.3, vec![Pane::Switcher, Pane::Rundown]);
+                let [_, tools] = tree.split_below(
+                    right,
+                    0.3,
+                    vec![Pane::Switcher, Pane::Rundown, Pane::Presentations],
+                );
                 tree.split_below(tools, 0.55, vec![Pane::Audio, Pane::Setup]);
                 dock
             }
@@ -195,6 +223,7 @@ impl Builtin {
                         Pane::Audio,
                         Pane::Switcher,
                         Pane::Rundown,
+                        Pane::Presentations,
                         Pane::Details,
                         Pane::Library,
                         Pane::Setup,
@@ -214,6 +243,7 @@ impl Builtin {
                         Pane::Library,
                         Pane::Switcher,
                         Pane::Rundown,
+                        Pane::Presentations,
                         Pane::Audio,
                         Pane::Setup,
                     ],
@@ -240,6 +270,35 @@ pub struct ScreenLayout {
     /// own), [`NAMING`] since.
     #[serde(default)]
     pub naming: u32,
+    /// Panels in windows of their own — on another screen, say — in the
+    /// order they were opened. A layout chosen, or reset to, puts in windows
+    /// the panels it has in them — a saved one, where they were; a built-in
+    /// none — and the others back in the dock.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<PaneWindow>,
+}
+
+/// A panel in a window of its own rather than in the dock: closing the
+/// window puts it back.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct PaneWindow {
+    pub pane: Pane,
+    /// Where the window was last, in points of the screens' space: its
+    /// frame's top-left corner, and the size inside it. None till it has
+    /// been on screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rect: Option<[f32; 4]>,
+    /// A layout chosen, or reset to, wants the window put at `rect` — open
+    /// already, it is moved there. Asked, not kept: not saved, and not part
+    /// of the layout's sameness.
+    #[serde(skip)]
+    pub place: bool,
+}
+
+impl PartialEq for PaneWindow {
+    fn eq(&self, other: &Self) -> bool {
+        self.pane == other.pane && self.rect == other.rect
+    }
 }
 
 /// The built-ins' names layouts are written under now (see
@@ -259,12 +318,116 @@ impl ScreenLayout {
             dock: builtin.dock(),
             locked: false,
             naming: NAMING,
+            windows: Vec::new(),
         }
     }
 
-    /// Whether a panel is anywhere in the arrangement.
+    /// Whether a panel is anywhere in the arrangement: in the dock, or in a
+    /// window of its own.
     pub fn has(&self, pane: Pane) -> bool {
-        has_pane(&self.dock, pane)
+        has_pane(&self.dock, pane) || self.in_window(pane)
+    }
+
+    /// Whether a panel is in a window of its own.
+    pub fn in_window(&self, pane: Pane) -> bool {
+        self.windows.iter().any(|w| w.pane == pane)
+    }
+
+    /// Move a panel out of the dock into a window of its own — opened, when
+    /// it was not open at all — if it can have one.
+    pub fn open_in_window(&mut self, pane: Pane) {
+        if !pane.can_have_window() {
+            return;
+        }
+        remove_pane(&mut self.dock, pane);
+        if !self.in_window(pane) {
+            self.windows.push(PaneWindow {
+                pane,
+                rect: None,
+                place: false,
+            });
+        }
+    }
+
+    /// Put a panel in a window of its own back in the dock, where it is
+    /// most likely wanted (see [`add_pane`]).
+    pub fn put_back(&mut self, pane: Pane) {
+        if self.in_window(pane) {
+            self.windows.retain(|w| w.pane != pane);
+            add_pane(&mut self.dock, pane);
+        }
+    }
+
+    /// Open a panel in the dock, unless it is open already (in a window too).
+    pub fn open(&mut self, pane: Pane) {
+        if !self.in_window(pane) {
+            add_pane(&mut self.dock, pane);
+        }
+    }
+
+    /// Close a panel wherever it is, its window with it. Returns whether it
+    /// was open.
+    pub fn close(&mut self, pane: Pane) -> bool {
+        let windowed = self.in_window(pane);
+        self.windows.retain(|w| w.pane != pane);
+        remove_pane(&mut self.dock, pane) || windowed
+    }
+
+    /// Open a panel that is closed; close one that is open.
+    pub fn toggle(&mut self, pane: Pane) {
+        if !self.close(pane) {
+            self.open(pane);
+        }
+    }
+
+    /// Arranged as a layout has it — chosen, or reset to: its dock, and its
+    /// panels in windows of their own where it had them (a built-in has
+    /// none). A panel in a window now that the layout does not have in one
+    /// goes back to the dock as the layout has it — or closes, if the layout
+    /// has it nowhere.
+    pub fn arrange(&mut self, dock: DockState<Pane>, windows: &[PaneWindow]) {
+        let mut seen = std::collections::HashSet::new();
+        self.windows = windows
+            .iter()
+            .filter(|w| w.pane.can_have_window() && seen.insert(w.pane))
+            .map(|w| PaneWindow { place: true, ..*w })
+            .collect();
+        self.dock = self.without_windows(dock);
+        // A panel the layout has in a window that can have none — a later
+        // Nida's choice — goes in the dock, not lost.
+        for window in windows {
+            if !window.pane.can_have_window() {
+                add_pane(&mut self.dock, window.pane);
+            }
+        }
+    }
+
+    /// Whether the arrangement is as a layout has it: its dock, and the
+    /// same panels in windows of their own — wherever the windows are now.
+    pub fn arranged_as(&self, dock: &DockState<Pane>, windows: &[PaneWindow]) -> bool {
+        let panes = |windows: &[PaneWindow]| -> std::collections::HashSet<Pane> {
+            windows
+                .iter()
+                .map(|w| w.pane)
+                .filter(|pane| pane.can_have_window())
+                .collect()
+        };
+        let mut theirs = dock.clone();
+        for window in windows {
+            if window.pane.can_have_window() {
+                remove_pane(&mut theirs, window.pane);
+            } else {
+                add_pane(&mut theirs, window.pane);
+            }
+        }
+        panes(&self.windows) == panes(windows) && same_arrangement(&self.dock, &theirs)
+    }
+
+    fn without_windows(&self, mut dock: DockState<Pane>) -> DockState<Pane> {
+        for window in &self.windows {
+            remove_pane(&mut dock, window.pane);
+        }
+        dock
     }
 
     /// Made safe to show, however it was written: a built-in goes by its name
@@ -284,14 +447,37 @@ impl ScreenLayout {
             self.naming = NAMING;
         }
         dedupe(&mut self.dock);
+        // A panel in one window, and nowhere else; a place that is not one
+        // (a file edited by hand) forgotten; a panel that can have no
+        // window (a later Nida's choice) put in the dock.
+        let mut seen = std::collections::HashSet::new();
+        self.windows.retain(|w| seen.insert(w.pane));
+        for window in std::mem::take(&mut self.windows) {
+            if window.pane.can_have_window() {
+                self.windows.push(window);
+            } else {
+                add_pane(&mut self.dock, window.pane);
+            }
+        }
+        for window in &mut self.windows {
+            remove_pane(&mut self.dock, window.pane);
+            if window
+                .rect
+                .is_some_and(|[x, y, w, h]| ![x, y, w, h].iter().all(|v| v.is_finite()) || w < 1.0 || h < 1.0)
+            {
+                window.rect = None;
+            }
+        }
         if !is_drawable(&self.dock) {
             log::warn!(
                 "Screen layout \"{}\" is damaged — using Classic instead",
                 self.name
             );
-            let locked = self.locked;
+            let (locked, windows) = (self.locked, std::mem::take(&mut self.windows));
             self = Self::builtin(Builtin::Classic);
             self.locked = locked;
+            let dock = self.dock.clone();
+            self.arrange(dock, &windows);
         }
         self
     }
@@ -303,6 +489,10 @@ pub struct SavedLayout {
     pub name: String,
     #[serde(with = "portable_dock")]
     pub dock: DockState<Pane>,
+    /// The panels it has in windows of their own, and where: a layout for
+    /// two screens. None in a layout saved before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<PaneWindow>,
     /// The name it was saved under before a built-in took it, which shows
     /// from then still give (see [`SavedLayoutStore::reconnect`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -414,8 +604,13 @@ impl SavedLayoutStore {
     ///
     /// A message for the operator if the name won't do or the file can't be
     /// written; nothing changes then.
-    pub fn save_as(&mut self, name: &str, dock: &DockState<Pane>) -> Result<String, String> {
-        self.save_as_with(name, dock, |path, text| write_now(path, &text))
+    pub fn save_as(
+        &mut self,
+        name: &str,
+        dock: &DockState<Pane>,
+        windows: &[PaneWindow],
+    ) -> Result<String, String> {
+        self.save_as_with(name, dock, windows, |path, text| write_now(path, &text))
     }
 
     /// As [`Self::save_as`], the file handed to `write` — the show's writer,
@@ -429,11 +624,12 @@ impl SavedLayoutStore {
         &mut self,
         name: &str,
         dock: &DockState<Pane>,
+        windows: &[PaneWindow],
         write: impl FnOnce(&Path, String) -> Result<(), String>,
     ) -> Result<String, String> {
         let name = valid_name(name)?.to_string();
         let mut layouts = self.layouts.as_ref().clone();
-        upsert(&mut layouts, &name, dock.clone());
+        upsert(&mut layouts, &name, dock.clone(), windows.to_vec());
         self.write(layouts, write)?;
         Ok(name)
     }
@@ -613,20 +809,27 @@ pub fn valid_name(name: &str) -> Result<&str, String> {
     Ok(name)
 }
 
-/// Save `dock` as `name`, replacing a saved layout of the same name (ignoring
-/// case). Returns whether one was replaced.
-pub fn upsert(layouts: &mut Vec<SavedLayout>, name: &str, dock: DockState<Pane>) -> bool {
+/// Save `dock`, with the panels in `windows`, as `name`, replacing a saved
+/// layout of the same name (ignoring case). Returns whether one was replaced.
+pub fn upsert(
+    layouts: &mut Vec<SavedLayout>,
+    name: &str,
+    dock: DockState<Pane>,
+    windows: Vec<PaneWindow>,
+) -> bool {
     if let Some(existing) = layouts
         .iter_mut()
         .find(|l| l.name.eq_ignore_ascii_case(name))
     {
         existing.name = name.to_string();
         existing.dock = dock;
+        existing.windows = windows;
         true
     } else {
         layouts.push(SavedLayout {
             name: name.to_string(),
             dock,
+            windows,
             was: None,
         });
         false
@@ -686,6 +889,7 @@ pub fn add_pane(dock: &mut DockState<Pane>, pane: Pane) {
                 &[
                     Pane::Switcher,
                     Pane::Rundown,
+                    Pane::Presentations,
                     Pane::Audio,
                     Pane::Setup,
                     Pane::Library,
@@ -821,6 +1025,157 @@ mod tests {
         dock.iter_all_tabs().map(|(_, p)| *p).collect()
     }
 
+    /// A panel goes into a window of its own and back: out of the dock and
+    /// into it again, open all the while. One things are dragged into or out
+    /// of stays in the dock.
+    #[test]
+    fn a_panel_goes_into_a_window_of_its_own_and_back() {
+        let mut screen = ScreenLayout::builtin(Builtin::Broadcast);
+        assert!(has_pane(&screen.dock, Pane::Switcher));
+        screen.open_in_window(Pane::Switcher);
+        assert!(screen.in_window(Pane::Switcher) && screen.has(Pane::Switcher));
+        assert!(!has_pane(&screen.dock, Pane::Switcher), "not in the dock too");
+        screen.open_in_window(Pane::Switcher);
+        assert_eq!(screen.windows.len(), 1, "one window for it");
+        screen.open(Pane::Switcher);
+        assert!(!has_pane(&screen.dock, Pane::Switcher), "open already, in its window");
+        screen.put_back(Pane::Switcher);
+        assert!(!screen.in_window(Pane::Switcher));
+        assert!(has_pane(&screen.dock, Pane::Switcher), "back in the dock");
+
+        // A desk takes decks dragged in: no window for it.
+        screen.open_in_window(Pane::Inputs);
+        assert!(!screen.in_window(Pane::Inputs) && has_pane(&screen.dock, Pane::Inputs));
+
+        // Closed, its window goes with it; toggled in its window, closed;
+        // toggled closed, opened in the dock.
+        screen.open_in_window(Pane::Audio);
+        assert!(screen.close(Pane::Audio));
+        assert!(!screen.has(Pane::Audio) && screen.windows.is_empty());
+        assert!(!screen.close(Pane::Audio), "closed already");
+        screen.toggle(Pane::Audio);
+        assert!(has_pane(&screen.dock, Pane::Audio) && !screen.in_window(Pane::Audio));
+        screen.open_in_window(Pane::Audio);
+        screen.toggle(Pane::Audio);
+        assert!(!screen.has(Pane::Audio));
+    }
+
+    /// A built-in layout chosen, or reset to, puts the panels in windows of
+    /// their own back in the dock as it has them. A layout saved with panels
+    /// in windows — one for two screens — keeps them, where they were: chosen,
+    /// those panels go to their windows and the others back. Which panels
+    /// are in windows counts in whether the arrangement is still the layout;
+    /// where the windows are does not.
+    #[test]
+    fn a_built_in_layout_puts_the_windows_back_and_a_saved_one_keeps_its_own() {
+        let mut screen = ScreenLayout::builtin(Builtin::Classic);
+        screen.open_in_window(Pane::Audio);
+        assert!(!screen.arranged_as(&Builtin::Classic.dock(), &[]), "changed");
+        screen.arrange(Builtin::Broadcast.dock(), &[]);
+        assert!(screen.windows.is_empty(), "back in the dock");
+        assert!(has_pane(&screen.dock, Pane::Audio));
+        assert!(screen.arranged_as(&Builtin::Broadcast.dock(), &[]));
+
+        // "Two screens": Audio and Switcher in windows, where they were.
+        screen.open_in_window(Pane::Audio);
+        screen.open_in_window(Pane::Switcher);
+        screen.windows[0].rect = Some([2000.0, 100.0, 600.0, 400.0]);
+        let (dock, windows) = (screen.dock.clone(), screen.windows.clone());
+        screen.arrange(Builtin::Classic.dock(), &[]);
+        screen.arrange(dock.clone(), &windows);
+        assert_eq!(screen.windows, windows, "in their windows again, where they were");
+        assert!(!has_pane(&screen.dock, Pane::Audio) && !has_pane(&screen.dock, Pane::Switcher));
+        assert!(screen.arranged_as(&dock, &windows));
+        // A window moved is still the layout; a panel put back is not.
+        screen.windows[0].rect = Some([10.0, 10.0, 600.0, 400.0]);
+        assert!(screen.arranged_as(&dock, &windows));
+        screen.put_back(Pane::Switcher);
+        assert!(!screen.arranged_as(&dock, &windows));
+        // Chosen, each window is asked to go where the layout keeps it.
+        screen.arrange(dock.clone(), &windows);
+        assert!(screen.windows.iter().all(|w| w.place));
+
+        // A panel the layout has in a window that can have none goes in the
+        // dock — not lost — and the layout still reads as itself.
+        let library = [PaneWindow {
+            pane: Pane::Library,
+            rect: None,
+            place: false,
+        }];
+        let mut no_library = Builtin::Classic.dock();
+        remove_pane(&mut no_library, Pane::Library);
+        screen.arrange(no_library.clone(), &library);
+        assert!(screen.windows.is_empty());
+        assert!(has_pane(&screen.dock, Pane::Library), "in the dock, not lost");
+        assert!(screen.arranged_as(&no_library, &library));
+    }
+
+    /// Windows read from a show: a panel in one window only, and not in the
+    /// dock too; a place that is not one forgotten; a panel that can have
+    /// no window put in the dock. Written and read back as they were; a show
+    /// from before has none.
+    #[test]
+    fn a_shows_panel_windows_are_made_safe() {
+        let mut layout = ScreenLayout::builtin(Builtin::Broadcast);
+        let switcher = PaneWindow {
+            pane: Pane::Switcher,
+            rect: Some([10.0, 20.0, 800.0, 400.0]),
+            place: false,
+        };
+        layout.windows = vec![
+            switcher,
+            PaneWindow {
+                pane: Pane::Switcher,
+                rect: None,
+                place: false,
+            },
+            PaneWindow {
+                pane: Pane::Audio,
+                rect: Some([f32::NAN, 0.0, 10.0, 10.0]),
+                place: false,
+            },
+            PaneWindow {
+                pane: Pane::Rundown,
+                rect: Some([0.0, 0.0, 0.0, 300.0]),
+                place: false,
+            },
+            PaneWindow {
+                pane: Pane::Setup,
+                rect: None,
+                place: false,
+            },
+        ];
+        remove_pane(&mut layout.dock, Pane::Setup);
+        let layout = layout.sanitized();
+        let audio = PaneWindow {
+            pane: Pane::Audio,
+            rect: None,
+            place: false,
+        };
+        let rundown = PaneWindow {
+            pane: Pane::Rundown,
+            rect: None,
+            place: false,
+        };
+        assert_eq!(layout.windows, vec![switcher, audio, rundown]);
+        assert!(!has_pane(&layout.dock, Pane::Switcher), "in its window only");
+        assert!(has_pane(&layout.dock, Pane::Setup), "no window for it: in the dock");
+
+        let text = serde_json::to_string(&layout).unwrap();
+        let back: ScreenLayout = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.windows, layout.windows);
+        let mut before: serde_json::Value = serde_json::from_str(&text).unwrap();
+        before.as_object_mut().unwrap().remove("windows");
+        let before: ScreenLayout = serde_json::from_value(before).unwrap();
+        assert!(before.windows.is_empty());
+        assert!(
+            !serde_json::to_string(&ScreenLayout::default())
+                .unwrap()
+                .contains("windows"),
+            "none: not written"
+        );
+    }
+
     #[test]
     fn each_builtin_has_a_desk_and_no_panel_twice() {
         for builtin in Builtin::ALL {
@@ -898,6 +1253,7 @@ mod tests {
             layouts: vec![SavedLayout {
                 name: "broadcast".into(),
                 dock: mine.clone(),
+                windows: Vec::new(),
                 was: None,
             }],
         };
@@ -908,6 +1264,7 @@ mod tests {
                 dock: dock.clone(),
                 locked: false,
                 naming: 0,
+                windows: Vec::new(),
             }
             .sanitized()
         };
@@ -924,7 +1281,7 @@ mod tests {
         store.reconnect(&mut show);
         assert_eq!(show.name, "broadcast (saved)");
 
-        store.save_as("Other", &Builtin::Vj.dock()).unwrap();
+        store.save_as("Other", &Builtin::Vj.dock(), &[]).unwrap();
         let store = SavedLayoutStore::open(path);
         let mut show = old_show(&mine);
         store.reconnect(&mut show);
@@ -944,6 +1301,7 @@ mod tests {
             dock: mine,
             locked: false,
             naming: 0,
+            windows: Vec::new(),
         }
         .sanitized();
         store.reconnect(&mut on_vmix);
@@ -958,6 +1316,7 @@ mod tests {
         let saved = |name: &str| SavedLayout {
             name: name.into(),
             dock: Builtin::Classic.dock(),
+            windows: Vec::new(),
             was: None,
         };
         let file = SavedFile {
@@ -1050,6 +1409,7 @@ mod tests {
             dock,
             locked: false,
             naming: NAMING,
+            windows: Vec::new(),
         }
         .sanitized();
         let outputs = panes(&layout.dock)
@@ -1076,6 +1436,7 @@ mod tests {
             dock,
             locked: true,
             naming: NAMING,
+            windows: Vec::new(),
         }
         .sanitized();
         assert_eq!(layout.name, "Classic");
@@ -1095,8 +1456,8 @@ mod tests {
     #[test]
     fn saving_a_name_again_replaces_it() {
         let mut saved = Vec::new();
-        assert!(!upsert(&mut saved, "Show", Builtin::Broadcast.dock()));
-        assert!(upsert(&mut saved, "show", Builtin::Vj.dock()));
+        assert!(!upsert(&mut saved, "Show", Builtin::Broadcast.dock(), Vec::new()));
+        assert!(upsert(&mut saved, "show", Builtin::Vj.dock(), Vec::new()));
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].name, "show");
         assert!(same_arrangement(&saved[0].dock, &Builtin::Vj.dock()));
@@ -1115,6 +1476,7 @@ mod tests {
         let saved = vec![SavedLayout {
             name: "Conference".into(),
             dock,
+            windows: Vec::new(),
             was: None,
         }];
         store_saved(&path, &saved).unwrap();
@@ -1130,10 +1492,10 @@ mod tests {
         let path = dir.path().join("layouts.json");
         let mut store = SavedLayoutStore::open(path.clone());
         assert_eq!(
-            store.save_as("  Show day ", &Builtin::Broadcast.dock()),
+            store.save_as("  Show day ", &Builtin::Broadcast.dock(), &[]),
             Ok("Show day".to_string())
         );
-        assert!(store.save_as("VJ", &Builtin::Broadcast.dock()).is_err());
+        assert!(store.save_as("VJ", &Builtin::Broadcast.dock(), &[]).is_err());
         assert_eq!(SavedLayoutStore::open(path.clone()).layouts().len(), 1);
         assert!(store.delete("show day").is_ok());
         assert!(store.delete("show day").is_err(), "already gone");
@@ -1148,7 +1510,7 @@ mod tests {
         let path = dir.path().join("layouts.json");
         let mut store = SavedLayoutStore::open(path.clone());
         let mut handed = None;
-        let saved = store.save_as_with("Show day", &Builtin::Broadcast.dock(), |to, text| {
+        let saved = store.save_as_with("Show day", &Builtin::Broadcast.dock(), &[], |to, text| {
             handed = Some((to.to_path_buf(), text));
             Ok(())
         });
@@ -1186,4 +1548,35 @@ mod tests {
         assert!(back.locked);
         assert!(same_arrangement(&back.dock, &layout.dock));
     }
+    /// A layout saved with panels in windows of their own keeps them, where
+    /// they were, in the file; one saved before has none.
+    #[test]
+    fn a_saved_layout_keeps_its_windows_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layouts.json");
+        let mut store = SavedLayoutStore::open(path.clone());
+        let windows = [PaneWindow {
+            pane: Pane::Audio,
+            rect: Some([2000.0, 100.0, 600.0, 400.0]),
+            place: false,
+        }];
+        let mut dock = Builtin::Classic.dock();
+        remove_pane(&mut dock, Pane::Audio);
+        store.save_as("Two screens", &dock, &windows).unwrap();
+        let layouts = SavedLayoutStore::open(path).layouts();
+        let saved = layouts.iter().find(|l| l.name == "Two screens").unwrap();
+        assert_eq!(saved.windows, windows);
+        let old: SavedLayout = serde_json::from_str(
+            &serde_json::to_string(&SavedLayout {
+                windows: Vec::new(),
+                ..saved.clone()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(old.windows.is_empty());
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("windows"), "none written when none: {text}");
+    }
 }
+

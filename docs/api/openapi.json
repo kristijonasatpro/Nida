@@ -9202,6 +9202,53 @@
         }
       }
     },
+    "/api/rundown/steps/{step_uuid}/at": {
+      "put": {
+        "tags": [
+          "Rundown"
+        ],
+        "operationId": "set_at",
+        "parameters": [
+          {
+            "name": "step_uuid",
+            "in": "path",
+            "description": "Step UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StepAtBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a time of day"
+          },
+          "404": {
+            "description": "No such step"
+          }
+        }
+      }
+    },
     "/api/rundown/steps/{step_uuid}/capture": {
       "post": {
         "tags": [
@@ -9513,6 +9560,118 @@
           },
           "404": {
             "description": "No such step or deck"
+          }
+        }
+      }
+    },
+    "/api/rundown/steps/{step_uuid}/plays/{deck_uuid}/timer": {
+      "put": {
+        "tags": [
+          "Rundown"
+        ],
+        "operationId": "set_timer",
+        "parameters": [
+          {
+            "name": "step_uuid",
+            "in": "path",
+            "description": "Step UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "deck_uuid",
+            "in": "path",
+            "description": "UUID of a timer deck the step starts",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StepTimerBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a timer the step starts, or a count down of no time"
+          },
+          "404": {
+            "description": "No such step"
+          }
+        }
+      }
+    },
+    "/api/rundown/steps/{step_uuid}/plays/{deck_uuid}/until-next": {
+      "put": {
+        "tags": [
+          "Rundown"
+        ],
+        "operationId": "set_until_next",
+        "parameters": [
+          {
+            "name": "step_uuid",
+            "in": "path",
+            "description": "Step UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "deck_uuid",
+            "in": "path",
+            "description": "UUID of a clip or playlist deck the step plays",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StepUntilNextBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a clip or playlist the step plays"
+          },
+          "404": {
+            "description": "No such step"
           }
         }
       }
@@ -16708,6 +16867,27 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "description": "A Slides input: a conference's presentations — PowerPoint decks,\nPDFs, web presentations, clips, pictures — in running order, one on\nat a time, each started with one press. `paths` are its talks' files.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "slides"
+                ]
+              },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
           }
         ],
         "description": "What a new input shows, for [`EngineCommand::AddInput`]: a live source,\nas vMix's Add Input window offers them. Files come in through the file\ndialog instead, a new input each."
@@ -18210,6 +18390,10 @@
                 "properties": {
                   "device": {
                     "type": "string"
+                  },
+                  "follow_show": {
+                    "type": "boolean",
+                    "description": "`mode` follows the show's rate — 1080p at it, or the nearest the\ndevice has — chosen again as it starts and as the rate changes;\noff, the format picked by hand stays. On unless said: one saved\nbefore had its format chosen from the show's rate as it was made."
                   },
                   "full_range": {
                     "type": "boolean",
@@ -19872,6 +20056,21 @@
           }
         }
       },
+      "StepAtBody": {
+        "type": "object",
+        "description": "The time of day a step is taken by itself at.",
+        "properties": {
+          "secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Seconds after midnight — 33300 for 9:15 — or `null` for none.",
+            "minimum": 0
+          }
+        }
+      },
       "StepChBody": {
         "type": "object",
         "required": [
@@ -20054,6 +20253,36 @@
             ],
             "format": "float",
             "description": "Seconds after the step is taken (more than none, an hour at most; no\nsooner than the step's own fade is done) — or `null` to wait for GO."
+          }
+        }
+      },
+      "StepTimerBody": {
+        "type": "object",
+        "description": "How a step sets a timer it starts.",
+        "properties": {
+          "timer": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimerSet",
+                "description": "`{\"down\": {\"secs\": 900}}` — down from 15 minutes — or `\"up\"`; `null`\nfor as the timer is set."
+              }
+            ]
+          }
+        }
+      },
+      "StepUntilNextBody": {
+        "type": "object",
+        "description": "Whether a clip or playlist a step plays is faded out at the next step.",
+        "required": [
+          "on"
+        ],
+        "properties": {
+          "on": {
+            "type": "boolean",
+            "description": "`true`: faded out — its sound over the next step's fade — and\nstopped, back at its beginning, when another step is taken."
           }
         }
       },
@@ -20699,6 +20928,41 @@
           "count_up",
           "clock"
         ]
+      },
+      "TimerSet": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Down from this many seconds.",
+            "required": [
+              "down"
+            ],
+            "properties": {
+              "down": {
+                "type": "object",
+                "description": "Down from this many seconds.",
+                "required": [
+                  "secs"
+                ],
+                "properties": {
+                  "secs": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "string",
+            "description": "Up from zero.",
+            "enum": [
+              "up"
+            ]
+          }
+        ],
+        "description": "How a step sets a timer it starts: counting down from a length of its\nown, or up — a talk of 15 minutes, the next of 20, a panel counted up."
       },
       "TimerSettings": {
         "type": "object",

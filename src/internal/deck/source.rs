@@ -444,6 +444,7 @@ impl Deck {
             drawn_visible: None,
             drawn_share: 1.0,
             placed: None,
+            frames_uploaded: 0,
             render_scale: super::DeckRenderScale::Full,
             master_size: (width, height),
         })
@@ -796,6 +797,52 @@ impl Deck {
             None,
             source_name,
             source_path_str,
+            width,
+            height,
+        )
+    }
+
+    /// A picture deck of `rgba`, named `name`, its file `path` (a PDF
+    /// talk's page is put in it as drawn).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blit pipeline cannot be created.
+    pub fn new_from_pixels(
+        context: &GpuContext,
+        rgba: &image::RgbaImage,
+        name: String,
+        path: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        Self::new_image_deck(context, rgba, None, name, path.to_string(), width, height)
+    }
+
+    /// A Slides layer (see [`super::slides`]): `talks` in running order,
+    /// nothing on — or `resume` started at once, a saved show opened.
+    pub fn new_slides(
+        context: &GpuContext,
+        talks: Vec<crate::engine::value::slides::Talk>,
+        settings: crate::engine::value::slides::SlidesSettings,
+        resume: Option<super::slides::Resume>,
+        next_pick: Option<String>,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let slides = super::slides::Slides::new(
+            context,
+            talks,
+            settings,
+            (width, height),
+            resume,
+            next_pick,
+        );
+        Self::build_media_deck(
+            context,
+            "📽 Slides".to_string(),
+            None,
+            DeckSource::Slides(Box::new(slides)),
             width,
             height,
         )
@@ -1211,6 +1258,7 @@ impl Deck {
             drawn_visible: None,
             drawn_share: 1.0,
             placed: None,
+            frames_uploaded: 0,
             render_scale: super::DeckRenderScale::Full,
             master_size: (width, height),
         }
@@ -1568,6 +1616,7 @@ impl Deck {
             drawn_visible: None,
             drawn_share: 1.0,
             placed: None,
+            frames_uploaded: 0,
             render_scale: super::DeckRenderScale::Full,
             master_size: (width, height),
         })

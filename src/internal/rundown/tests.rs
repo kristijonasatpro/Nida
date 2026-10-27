@@ -513,7 +513,7 @@ fn a_step_sets_each_thing_once() {
     rundown.set_play(a, "sting", Some(PlayAction::Pause));
     assert_eq!(
         rundown.step(a).unwrap().plays,
-        [PlaySet { deck: "sting".into(), action: PlayAction::Pause }]
+        [PlaySet::new("sting", PlayAction::Pause)]
     );
     assert!(!rundown.step(a).unwrap().is_empty());
     rundown.set_play(a, "sting", None);
@@ -555,7 +555,7 @@ fn steps_let_go_of_what_is_deleted() {
     assert_eq!(rundown.forget_source("sting"), ["A", "B"]);
     let step = rundown.step(a).unwrap();
     assert_eq!(step.screen_sets(), [("middle".to_string(), ch("logo"))]);
-    assert_eq!(step.plays, [PlaySet { deck: "music".into(), action: PlayAction::Stop }]);
+    assert_eq!(step.plays, [PlaySet::new("music", PlayAction::Stop)]);
     assert_eq!(rundown.step(&ids[1]).unwrap().main, None);
 
     assert!(rundown.forget_bus("middle"));
@@ -680,4 +680,106 @@ fn a_new_step_is_named_by_the_first_letter_free() {
     let letters: Vec<String> = ('A'..='Z').map(String::from).collect();
     let all: Vec<&str> = letters.iter().map(String::as_str).collect();
     assert_eq!(new_name(&all), "Step 27");
+}
+
+/// A step's time of day: due as the clock comes to it — while it is the
+/// step GO takes next, not held, and no more than a minute late — across
+/// midnight too. Hold holds it till a step is taken, it is made next again
+/// or its time is changed.
+#[test]
+fn a_step_is_due_at_its_time_of_day_while_it_is_next() {
+    let (mut rundown, [a, b, _, _]) = abcd();
+    let nine = 9 * 3600;
+    assert!(rundown.set_at(&a, Some(nine)));
+    assert!(rundown.set_at(&b, Some(nine + 900)));
+    let at = |secs: u32| f64::from(secs);
+    let due = |rundown: &Rundown, was: f64, now: f64| rundown.due_at(was, now).map(|s| s.uuid.clone());
+
+    // A is next: due as the clock comes to 9:00 — not before, once, and not
+    // by a Mac waking five minutes after it.
+    assert_eq!(due(&rundown, at(nine) - 1.0, at(nine) - 0.5), None, "not yet");
+    assert_eq!(due(&rundown, at(nine) - 0.5, at(nine) + 0.01), Some(a.clone()));
+    assert_eq!(due(&rundown, at(nine) + 0.01, at(nine) + 0.02), None, "once");
+    assert_eq!(due(&rundown, at(nine) - 60.0, at(nine) + 300.0), None, "long after");
+    // B is not due while A is next.
+    assert_eq!(due(&rundown, at(nine + 899), at(nine + 901)), None);
+
+    // A taken: B is next, due at 9:15.
+    assert!(rundown.taken(&a, true, T0, 0.0));
+    assert_eq!(due(&rundown, at(nine + 899), at(nine + 900)), Some(b.clone()));
+    // Held: not due, till it is made next again.
+    assert!(rundown.hold());
+    assert_eq!(rundown.at_held(), Some(b.as_str()));
+    assert_eq!(due(&rundown, at(nine + 899), at(nine + 900)), None, "held");
+    assert!(rundown.set_next(&b));
+    assert_eq!(rundown.at_held(), None);
+    assert_eq!(due(&rundown, at(nine + 899), at(nine + 900)), Some(b.clone()));
+    // Its time changed lets a hold go too; a step taken does.
+    assert!(rundown.hold());
+    assert!(rundown.set_at(&b, Some(nine + 1800)));
+    assert_eq!(rundown.at_held(), None);
+    assert!(rundown.hold());
+    assert!(rundown.taken(&a, false, T0, 0.0));
+    assert_eq!(rundown.at_held(), None);
+
+    // Across midnight: at 00:00:30, due from 23:59:59 to 00:00:31.
+    assert!(rundown.set_at(&b, Some(30)));
+    assert_eq!(due(&rundown, 86_399.0, 31.0), Some(b.clone()));
+    // Due, it is taken as a wait run out is: now, faded.
+    assert!(rundown.start_at(&b, T0));
+    let follow = rundown.due(T0).expect("due now");
+    assert_eq!(follow.to, b);
+    assert!(follow.fade);
+    // A time past the day is none.
+    assert!(rundown.set_at(&a, Some(DAY_SECS)));
+    assert_eq!(rundown.step(&a).unwrap().at_secs, None);
+}
+
+/// What a step plays till the next step, and how it sets a timer it
+/// starts: kept on the step's entry for it — only one it has — through a
+/// change of action, saved, and read as none from a file without them.
+#[test]
+fn a_steps_play_keeps_its_fade_out_and_its_timer() {
+    let (mut rundown, [a, _, _, _]) = abcd();
+    assert!(!rundown.set_until_next(&a, "music", true), "not one the step plays");
+    assert!(!rundown.set_timer(&a, "clock", Some(TimerSet::Up)));
+    rundown.set_play(&a, "music", Some(PlayAction::Start));
+    rundown.set_play(&a, "clock", Some(PlayAction::Start));
+    assert!(rundown.set_until_next(&a, "music", true));
+    assert!(rundown.set_timer(&a, "clock", Some(TimerSet::Down { secs: 0 })));
+    let plays = &rundown.step(&a).unwrap().plays;
+    assert!(plays[0].until_next);
+    assert_eq!(plays[1].timer, Some(TimerSet::Down { secs: 1 }), "a second at least");
+
+    rundown.set_play(&a, "music", Some(PlayAction::Resume));
+    assert!(rundown.step(&a).unwrap().plays[0].until_next, "kept");
+
+    let json = serde_json::to_string(&rundown.to_config()).unwrap();
+    let back = Rundown::from_config(serde_json::from_str(&json).unwrap());
+    assert_eq!(back.step(&a).unwrap().plays, rundown.step(&a).unwrap().plays);
+    let old: PlaySet = serde_json::from_str(r#"{"deck":"d","action":"start"}"#).unwrap();
+    assert_eq!(old, PlaySet::new("d", PlayAction::Start));
+    let up: PlaySet =
+        serde_json::from_str(r#"{"deck":"d","action":"start","timer":"up"}"#).unwrap();
+    assert_eq!(up.timer, Some(TimerSet::Up));
+    let down: PlaySet =
+        serde_json::from_str(r#"{"deck":"d","action":"start","timer":{"down":{"secs":900}}}"#)
+            .unwrap();
+    assert_eq!(down.timer, Some(TimerSet::Down { secs: 900 }));
+}
+
+/// The clock set back, or summer time ending, takes no step whose time it
+/// reads again; midnight does, even for a time just before it.
+#[test]
+fn only_midnight_is_a_step_back_of_the_clock_that_takes_a_step() {
+    let (mut rundown, [a, _, _, _]) = abcd();
+    assert!(rundown.set_at(&a, Some(9 * 3600)));
+    // From 10:00:05 back to 09:00:10: no forward crossing of 9:00.
+    assert!(rundown.due_at(36_005.0, 32_410.0).is_none(), "set back");
+    // From 09:00:30 back to 09:00:10 — a nudge back — neither.
+    assert!(rundown.due_at(32_430.0, 32_410.0).is_none(), "nudged back");
+    // A step at 23:59:59: due from 23:59:58.8 to 00:00:00.1.
+    assert!(rundown.set_at(&a, Some(DAY_SECS - 1)));
+    assert!(rundown.due_at(86_398.8, 0.1).is_some(), "just before midnight");
+    assert!(rundown.due_at(86_399.5, 0.1).is_none(), "already past it");
 }

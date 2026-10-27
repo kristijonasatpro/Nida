@@ -12,6 +12,8 @@ use winit::window::WindowAttributes;
 pub const MAIN: &str = "nida";
 /// Every output window.
 pub const OUTPUT: &str = "nida-output";
+/// A panel in a window of its own.
+pub const PANEL: &str = "nida-panel";
 /// The interactive HTML window.
 #[cfg(feature = "html")]
 pub const INTERACTIVE: &str = "nida-interactive";

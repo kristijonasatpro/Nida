@@ -741,13 +741,22 @@ pub(super) fn render_selected_deck_detail(
     // Horizontal columns: Preview | Generator | Effect 1 | Effect 2 | ... | Add Effect
     egui::ScrollArea::horizontal().id_salt("selected_deck_hscroll").show(ui, |ui| {
         ui.horizontal_top(|ui| {
-            // Column 0: the channel the deck is in, every layer composited —
-            // not the deck alone, so a change to any deck is judged against
-            // the result. The deck alone is in its Adjust window. Scales with
-            // the bottom bar's height, with the visible panel width as the
-            // other bound so an ultra-wide project cannot produce a column
-            // wider than the bar it sits in.
-            if let Some(&tex_id) = data.channel_preview_textures.get(&ch_idx) {
+            // Column 0: the deck picked, its own picture — the file, not the
+            // whole input it is in — else, with no picture of its own yet,
+            // the channel's, every layer composited. Scales with the bottom
+            // bar's height, with the visible panel width as the other bound
+            // so an ultra-wide project cannot produce a column wider than the
+            // bar it sits in.
+            let picture = data
+                .deck_preview_textures
+                .get(&deck.uuid)
+                .map(|&tex| (tex, deck.name.as_str()))
+                .or_else(|| {
+                    data.channel_preview_textures
+                        .get(&ch_idx)
+                        .map(|&tex| (tex, ch.name.as_str()))
+                });
+            if let Some((tex_id, name)) = picture {
                 let available_height = ui.available_height() - 12.0; // margin
                 let preview = super::utils::preview_size(
                     egui::vec2(
@@ -758,7 +767,7 @@ pub(super) fn render_selected_deck_detail(
                     data.render_width,
                     data.render_height,
                 );
-                channel_result_preview(ui, tex_id, preview, &ch.name, accent);
+                channel_result_preview(ui, tex_id, preview, name, accent);
                 ui.separator();
             }
             render_take_frame(ui, &ch.uuid, data, actions);
@@ -859,6 +868,22 @@ pub(super) fn render_selected_deck_detail(
                         ui.set_max_width(280.0);
                         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                             render_playback_controls(ui, deck, vp, data, actions);
+                        });
+                    });
+                ui.separator();
+            }
+
+            // Column: a Slides input's talk on and what comes next
+            if let Some(ref slides) = deck.slides {
+                egui::Frame::default()
+                    .inner_margin(6.0)
+                    .corner_radius(4.0)
+                    .fill(ui.visuals().faint_bg_color)
+                    .show(ui, |ui| {
+                        ui.set_min_width(180.0);
+                        ui.set_max_width(280.0);
+                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            super::slides::render_deck_column(ui, data, deck, slides, actions);
                         });
                     });
                 ui.separator();
@@ -1827,13 +1852,22 @@ pub(super) fn render_playback_controls(
         duration
     };
     let has_range = vp.in_point > 0.0 || vp.out_point > 0.0;
+    // Each slider stops a frame short of the other point: In stays before
+    // Out (one put within half a frame of it, or past it, lets it go).
+    let frame = if vp.frame_rate > 0.0 {
+        1.0 / vp.frame_rate
+    } else {
+        1.0 / 30.0
+    };
+    let in_most = (effective_out - frame).clamp(0.0, duration);
+    let out_least = (vp.in_point + frame).clamp(0.0, duration);
 
     // In-point
     let mut in_pt = vp.in_point as f32;
     ui.horizontal(|ui| {
         ui.label("In:");
         let resp = ui.add(
-            egui::Slider::new(&mut in_pt, 0.0..=duration as f32)
+            egui::Slider::new(&mut in_pt, 0.0..=in_most as f32)
                 .show_value(false)
                 .trailing_fill(true),
         );
@@ -1850,7 +1884,9 @@ pub(super) fn render_playback_controls(
             data,
             actions,
         );
-        ui.label(format_time(f64::from(in_pt)));
+        // The clip's own In, not the slider's: the slider stops a frame
+        // short of the Out, the clip only half a frame.
+        ui.label(format_time(vp.in_point));
     });
 
     // Out-point
@@ -1858,7 +1894,7 @@ pub(super) fn render_playback_controls(
     ui.horizontal(|ui| {
         ui.label("Out:");
         let resp = ui.add(
-            egui::Slider::new(&mut out_pt, 0.0..=duration as f32)
+            egui::Slider::new(&mut out_pt, out_least as f32..=duration as f32)
                 .show_value(false)
                 .trailing_fill(true),
         );
@@ -1875,7 +1911,7 @@ pub(super) fn render_playback_controls(
             data,
             actions,
         );
-        ui.label(format_time(f64::from(out_pt)));
+        ui.label(format_time(effective_out));
     });
 
     // Set from current / clear buttons
@@ -2574,16 +2610,23 @@ mod tests {
             .collect()
     }
 
+    /// The file picked in an input shows its own picture, not the whole
+    /// input; with no picture of its own yet, the input's.
     #[test]
-    fn a_selected_deck_shows_its_channel_result_not_itself() {
+    fn a_selected_deck_shows_its_own_picture_not_its_channels() {
         let data = ch_b_deck_selected();
+        let deck = data.channels[1].decks[0].name.clone();
         let mut actions = UIActions::new();
         let h = harness(&data, &mut actions);
+        h.get_by_label(&format!("{deck} result"));
+        assert!(h.query_by_label("Ch B result").is_none(), "not the whole input");
+        drop(h);
+
+        let mut none_yet = ch_b_deck_selected();
+        none_yet.deck_preview_textures.clear();
+        let mut actions = UIActions::new();
+        let h = harness(&none_yet, &mut actions);
         h.get_by_label("Ch B result");
-        assert!(
-            h.query_by_label("test_generator_c result").is_none(),
-            "the bottom preview stays on the channel whichever deck is picked"
-        );
     }
 
     #[test]

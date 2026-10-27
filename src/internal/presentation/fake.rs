@@ -45,6 +45,9 @@ struct FakeState {
     captured: Vec<u64>,
     /// Times Nida asked to be in front again.
     refocused: u32,
+    /// Hidden (⌘H), and how many times Nida showed it again.
+    hidden: bool,
+    unhidden: u32,
     /// macOS refusing Nida the screen: no windows listed.
     no_screen_recording: bool,
     /// Slides with a video, and the video's shape.
@@ -57,6 +60,8 @@ struct FakeState {
     video_looks: u32,
     /// Times the video was asked of at all.
     video_reads: u32,
+    /// Its PDFs saved cut short: no PDF that opens.
+    broken_pdfs: bool,
 }
 
 impl FakePowerPoint {
@@ -110,6 +115,23 @@ impl FakePowerPoint {
     /// macOS refusing Nida control of PowerPoint, or allowing it again.
     pub fn refuse(&self, refuse: bool) {
         self.state().refuse = refuse;
+    }
+
+    /// Its PDFs saved cut short from now on, as when PowerPoint is stopped
+    /// mid-save: files that do not open as PDFs.
+    pub fn save_broken_pdfs(&self) {
+        self.state().broken_pdfs = true;
+    }
+
+    /// The deck's show started in PowerPoint itself, by hand: Nida was not
+    /// asked.
+    pub fn play_by_hand(&self) {
+        let mut s = self.state();
+        s.running = true;
+        s.open = true;
+        s.showing = true;
+        s.slide = 1;
+        s.ended = false;
     }
 
     /// macOS refusing Nida the screen (no Screen Recording), or allowing it.
@@ -237,6 +259,17 @@ impl FakePowerPoint {
         self.state().refocused
     }
 
+    /// PowerPoint hidden (⌘H) by hand.
+    pub fn hide(&self) {
+        self.state().hidden = true;
+    }
+
+    /// Whether it is hidden, and how many times Nida showed it again.
+    pub fn hidden(&self) -> (bool, u32) {
+        let s = self.state();
+        (s.hidden, s.unhidden)
+    }
+
     /// PowerPoint quit (or the deck closed there).
     pub fn quit(&self) {
         let mut s = self.state();
@@ -298,6 +331,32 @@ impl FakePowerPoint {
     }
 }
 
+/// Where a script saves its deck as a PDF (`save thePres in (POSIX file
+/// "…") as save as PDF`), when it does.
+fn pdf_out(script: &str) -> Option<PathBuf> {
+    if !script.contains("as save as PDF") {
+        return None;
+    }
+    let key = "save thePres in (POSIX file \"";
+    let at = script.find(key)? + key.len();
+    let end = script[at..].find('"')?;
+    Some(PathBuf::from(&script[at..at + end]))
+}
+
+/// The deck saved as a PDF of `slides` pages at `out`, as PowerPoint would:
+/// `saved`.
+fn save_pdf(out: &Path, slides: u32) -> Result<String, ScriptError> {
+    std::fs::write(out, super::pdf::sample_pdf(slides))
+        .map_err(|e| ScriptError::Failed(format!("saving a PDF: {e}")))?;
+    Ok("saved".into())
+}
+
+/// Whether `script` only counts PowerPoint's slide shows (see
+/// `scripts::slide_shows`).
+fn counts_slide_shows(script: &str) -> bool {
+    script.contains("count of slide show windows") && pdf_out(script).is_none()
+}
+
 /// The number after `key` in `script`.
 fn number(script: &str, key: &str) -> Option<i32> {
     let at = script.find(key)? + key.len();
@@ -309,6 +368,12 @@ impl Runner for FakePowerPoint {
         let mut s = self.state();
         if s.refuse {
             return Err(ScriptError::NotAllowed);
+        }
+        if counts_slide_shows(script) {
+            if !s.running {
+                return Ok("notrunning".into());
+            }
+            return Ok(format!("shows\t{}", u32::from(s.showing)));
         }
         if s.running && s.open && s.opening_reads == 0 {
             if script.contains("run slide show") {
@@ -352,6 +417,10 @@ impl Runner for FakePowerPoint {
                     s.steps.push("previous".into());
                     s.ended = false;
                     s.slide = s.slide.saturating_sub(1).max(1);
+                } else if script.contains("go to first slide") {
+                    s.steps.push("first".into());
+                    s.ended = false;
+                    s.slide = 1;
                 } else if script.contains("to slide show state black screen") {
                     s.black = true;
                 } else if script.contains("to slide show state running") {
@@ -368,6 +437,20 @@ impl Runner for FakePowerPoint {
                 s.closed = true;
                 return Ok("closed".into());
             }
+            if let Some(out) = pdf_out(script) {
+                if s.showing {
+                    return Ok("showing".into());
+                }
+                if s.broken_pdfs {
+                    std::fs::write(&out, b"%PDF-1.4\n1 0 obj << /Type")
+                        .map_err(|e| ScriptError::Failed(format!("saving a PDF: {e}")))?;
+                    return Ok("saved".into());
+                }
+                return save_pdf(&out, s.slides);
+            }
+        }
+        if pdf_out(script).is_some() {
+            return Ok(if s.running { "nopres" } else { "notrunning" }.into());
         }
         if script.contains("return stepOf(thePres)") {
             return Ok(Self::step_line(&mut s));
@@ -388,6 +471,16 @@ impl Runner for FakePowerPoint {
 
     fn refocus(&self) {
         self.state().refocused += 1;
+    }
+
+    fn unhide(&self) -> bool {
+        let mut s = self.state();
+        let was = s.hidden;
+        s.hidden = false;
+        if was {
+            s.unhidden += 1;
+        }
+        was
     }
 }
 
@@ -443,6 +536,292 @@ impl WindowFinder for FakeWindows {
         config: &CaptureConfig,
     ) -> Result<Box<dyn ScreenCaptureBackend>, String> {
         self.ppt.state().captured.push(target.platform_id);
+        Ok(Box::new(MockBackend::new(
+            target.label.clone(),
+            target.width,
+            target.height,
+            config.clone(),
+        )))
+    }
+}
+
+/// A stand-in PowerPoint with several decks open at once, told apart by
+/// their file names — as a Slides input's talks have them: the talk on
+/// playing its show, the next opened ahead. Each deck's show has a window
+/// of its own, listed while it plays.
+#[derive(Clone, Default)]
+pub struct FakeDecks {
+    state: Arc<Mutex<DecksState>>,
+}
+
+#[derive(Default)]
+struct DecksState {
+    running: bool,
+    /// Slides in each deck opened.
+    slides: u32,
+    decks: std::collections::BTreeMap<String, FakeDeck>,
+    next_window: u64,
+    /// What was done, in order: `open a.pptx`, `show a.pptx`, `next
+    /// a.pptx`, `end a.pptx`, `close a.pptx`.
+    log: Vec<String>,
+    hidden: bool,
+    unhidden: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FakeDeck {
+    showing: bool,
+    slide: u32,
+    slides: u32,
+    ended: bool,
+    window: (i32, i32),
+    at: (i32, i32),
+    window_id: u64,
+}
+
+impl FakeDecks {
+    /// Not running yet; each deck opened has `slides` slides.
+    #[must_use]
+    pub fn with_slides(slides: u32) -> Self {
+        let fake = Self::default();
+        fake.state().slides = slides;
+        fake
+    }
+
+    fn state(&self) -> MutexGuard<'_, DecksState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// What was done to the decks, in order.
+    #[must_use]
+    pub fn log(&self) -> Vec<String> {
+        self.state().log.clone()
+    }
+
+    /// The deck `file` open, its show started in PowerPoint itself, by
+    /// hand: Nida was not asked.
+    pub fn play_by_hand(&self, file: &str) {
+        let mut s = self.state();
+        s.running = true;
+        let slides = s.slides.max(1);
+        s.decks.insert(
+            file.to_string(),
+            FakeDeck {
+                showing: true,
+                slide: 1,
+                slides,
+                ..FakeDeck::default()
+            },
+        );
+        s.log.push(format!("show {file} by hand"));
+    }
+
+    /// The decks open, by file name: whether each plays its show, and its
+    /// slide.
+    #[must_use]
+    pub fn decks(&self) -> Vec<(String, bool, u32)> {
+        self.state()
+            .decks
+            .iter()
+            .map(|(name, d)| (name.clone(), d.showing, d.slide))
+            .collect()
+    }
+
+    /// PowerPoint hidden (⌘H) by hand.
+    pub fn hide(&self) {
+        self.state().hidden = true;
+    }
+
+    /// Whether it is hidden, and how many times Nida showed it again.
+    #[must_use]
+    pub fn hidden(&self) -> (bool, u32) {
+        let s = self.state();
+        (s.hidden, s.unhidden)
+    }
+
+    /// The windows on screen with this PowerPoint's.
+    #[must_use]
+    pub fn windows(&self) -> FakeDeckWindows {
+        FakeDeckWindows { ppt: self.clone() }
+    }
+
+    fn line(deck: &FakeDeck) -> String {
+        if !deck.showing {
+            return format!("noshow\t{}", deck.slides);
+        }
+        let screen = if deck.ended { "done" } else { "running" };
+        format!(
+            "show\t{}\t{}\t{}\t{screen}\t{}\t{}\t{}\t{}\twindow",
+            deck.slide, deck.slide, deck.slides, deck.at.0, deck.at.1, deck.window.0, deck.window.1
+        )
+    }
+}
+
+/// The file name a script finds its deck by (`set theFile to "a.pptx"`).
+fn file_of(script: &str) -> Option<String> {
+    let at = script.find("set theFile to \"")? + "set theFile to \"".len();
+    let end = script[at..].find('"')?;
+    Some(script[at..at + end].to_string())
+}
+
+impl Runner for FakeDecks {
+    fn run(&self, script: &str, _timeout: Duration) -> Result<String, ScriptError> {
+        let mut s = self.state();
+        if !s.running {
+            return Ok("notrunning".into());
+        }
+        let shows = s.decks.values().filter(|d| d.showing).count();
+        if counts_slide_shows(script) {
+            return Ok(format!("shows\t{shows}"));
+        }
+        let Some(file) = file_of(script) else {
+            return Ok("nopres".into());
+        };
+        let next_window = s.next_window + 1;
+        let mut log = Vec::new();
+        let mut took_window = false;
+        let Some(deck) = s.decks.get_mut(&file) else {
+            return Ok("nopres".into());
+        };
+        if script.contains("run slide show") {
+            deck.showing = true;
+            deck.slide = 1;
+            deck.ended = false;
+            deck.window_id = next_window;
+            took_window = true;
+            log.push(format!("show {file}"));
+        }
+        if let (Some(left), Some(top)) = (
+            number(script, "set left position of theWindow to"),
+            number(script, "set top of theWindow to"),
+        ) {
+            deck.at = (left, top);
+        }
+        if let (Some(w), Some(h)) = (
+            number(script, "set width of theWindow to"),
+            number(script, "set height of theWindow to"),
+        ) {
+            deck.window = (w, h);
+        }
+        let walked = number(script, "set theTarget to");
+        if let (Some(n), true) = (walked, deck.showing) {
+            deck.slide = u32::try_from(n).unwrap_or(1).clamp(1, deck.slides.max(1));
+            log.push(format!("to {} {file}", deck.slide));
+        }
+        if deck.showing && walked.is_none() {
+            if script.contains("go to next slide") {
+                log.push(format!("next {file}"));
+                if deck.slide == deck.slides {
+                    deck.ended = true;
+                } else {
+                    deck.slide += 1;
+                }
+            } else if script.contains("go to previous slide") {
+                log.push(format!("previous {file}"));
+                deck.ended = false;
+                deck.slide = deck.slide.saturating_sub(1).max(1);
+            } else if script.contains("go to first slide") {
+                log.push(format!("first {file}"));
+                deck.ended = false;
+                deck.slide = 1;
+            }
+        }
+        if script.contains("exit slide show") && deck.showing {
+            deck.showing = false;
+            log.push(format!("end {file}"));
+        }
+        if let Some(out) = pdf_out(script) {
+            if shows > 0 {
+                return Ok("showing".into());
+            }
+            let slides = deck.slides;
+            s.log.push(format!("save pdf {file}"));
+            return save_pdf(&out, slides);
+        }
+        let closed = script.contains("close thePres saving no");
+        let step = script.contains("return stepOf(thePres)");
+        let reply = if step && deck.showing {
+            let screen = if deck.ended { "done" } else { "running" };
+            let position = if deck.ended {
+                deck.slides + 1
+            } else {
+                deck.slide
+            };
+            format!("step\t{}\t{position}\t{screen}", deck.slide)
+        } else {
+            Self::line(deck)
+        };
+        if took_window {
+            s.next_window = next_window;
+        }
+        if closed {
+            s.decks.remove(&file);
+            log.push(format!("close {file}"));
+        }
+        s.log.extend(log);
+        if closed {
+            return Ok("closed".into());
+        }
+        Ok(reply)
+    }
+
+    fn open(&self, path: &Path) -> Result<(), ScriptError> {
+        let mut s = self.state();
+        s.running = true;
+        let file = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let slides = s.slides.max(1);
+        s.decks.entry(file.clone()).or_insert(FakeDeck {
+            slides,
+            ..FakeDeck::default()
+        });
+        s.log.push(format!("open {file}"));
+        Ok(())
+    }
+
+    fn unhide(&self) -> bool {
+        let mut s = self.state();
+        let was = s.hidden;
+        s.hidden = false;
+        if was {
+            s.unhidden += 1;
+        }
+        was
+    }
+}
+
+/// The show windows of a [`FakeDecks`], one for each deck playing its show.
+#[derive(Clone)]
+pub struct FakeDeckWindows {
+    ppt: FakeDecks,
+}
+
+impl WindowFinder for FakeDeckWindows {
+    fn windows(&self) -> Result<Vec<CaptureTargetInfo>, String> {
+        let s = self.ppt.state();
+        Ok(s.decks
+            .iter()
+            .filter(|(_, d)| d.showing)
+            .map(|(file, d)| {
+                window_numbered(
+                    &format!("PowerPoint Slide Show - {file}"),
+                    u32::try_from(d.window.0).unwrap_or(0),
+                    u32::try_from(d.window.1).unwrap_or(0),
+                    1000 + d.window_id,
+                )
+            })
+            .collect())
+    }
+
+    fn open(
+        &self,
+        target: &CaptureTargetInfo,
+        config: &CaptureConfig,
+    ) -> Result<Box<dyn ScreenCaptureBackend>, String> {
         Ok(Box::new(MockBackend::new(
             target.label.clone(),
             target.width,

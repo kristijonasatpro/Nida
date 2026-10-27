@@ -170,8 +170,34 @@ impl VardaApp {
             let name = window.name.clone();
             let calibration_mode = window.calibration_mode;
             let before = self.output.reopened.get(&uuid).copied();
-            if why == Reopen::Unshown && before.is_some_and(|r| now < r.next_allowed()) {
-                continue;
+            #[cfg(target_os = "macos")]
+            let shown_here = window.shown_here();
+            #[cfg(not(target_os = "macos"))]
+            let shown_here = true;
+            if why == Reopen::Unshown {
+                match unshown_action(before, shown_here, now) {
+                    UnshownAction::MakeAgain => {}
+                    UnshownAction::Wait => continue,
+                    UnshownAction::GiveUp => {
+                        #[cfg(target_os = "macos")]
+                        window.stop_watching_unshown();
+                        log::warn!(
+                            "Output '{name}': its screen says none of its frames were shown, made \
+                             again or not — a screen that never says (DisplayLink, AirPlay, \
+                             Sidecar): not made again for that"
+                        );
+                        self.session.notifications.notify_once(
+                            format!("output_unreported:{uuid}"),
+                            crate::notifications::NotificationLevel::Info,
+                            format!(
+                                "Output '{name}' is on a screen that does not say what it shows \
+                                 (a DisplayLink or AirPlay screen): Nida no longer makes its \
+                                 window again"
+                            ),
+                        );
+                        continue;
+                    }
+                }
             }
             let config = crate::persistence::output_config(&self.output.outputs[at]);
             if let UnifiedOutput::Window(old) = self.output.outputs.remove(at) {
@@ -836,6 +862,10 @@ fn screen_gone(
 pub(crate) struct Reopened {
     at: std::time::Instant,
     again: u32,
+    /// When the remakes counted in `lately` began, and how many: those
+    /// within [`REMAKES_LATELY`] of each other.
+    since: std::time::Instant,
+    lately: u32,
 }
 
 impl Reopened {
@@ -845,7 +875,24 @@ impl Reopened {
             Some(b) if now.saturating_duration_since(b.at) < REOPEN_SOON => b.again + 1,
             _ => 0,
         };
-        Self { at: now, again }
+        let (since, lately) = match before {
+            Some(b) if now.saturating_duration_since(b.since) < REMAKES_LATELY => {
+                (b.since, b.lately + 1)
+            }
+            _ => (now, 1),
+        };
+        Self {
+            at: now,
+            again,
+            since,
+            lately,
+        }
+    }
+
+    /// Made again [`MOST_REMAKES`] times within [`REMAKES_LATELY`]: making
+    /// it again does not keep it showing.
+    fn too_often(&self, now: std::time::Instant) -> bool {
+        self.lately >= MOST_REMAKES && now.saturating_duration_since(self.since) < REMAKES_LATELY
     }
 
     /// The soonest the window may be made again: a second later, doubled for
@@ -856,14 +903,111 @@ impl Reopened {
     }
 }
 
+/// What becomes of an output whose frames went unshown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnshownAction {
+    /// Its window is made again.
+    MakeAgain,
+    /// Not yet: it was made again a moment ago.
+    Wait,
+    /// Never again for that: made again a moment ago, the window made then
+    /// has shown too few frames said shown — its screen never says what it
+    /// shows (a `DisplayLink`, `AirPlay` or Sidecar screen) — or made again
+    /// too often lately: making it again only blinks it.
+    GiveUp,
+}
+
+/// [`UnshownAction`] for an output last made again for this at `before`, a
+/// second's frames of it said shown since it was made or put on its screen
+/// or not (`shown_here`), at `now`. Only a remake of a moment ago — the one
+/// that made this window — tells about its screen: one long ago, or before
+/// the output moved, does not.
+pub(crate) fn unshown_action(
+    before: Option<Reopened>,
+    shown_here: bool,
+    now: std::time::Instant,
+) -> UnshownAction {
+    match before {
+        Some(b) if !shown_here && now.saturating_duration_since(b.at) < REOPEN_SOON => {
+            UnshownAction::GiveUp
+        }
+        Some(b) if b.too_often(now) => UnshownAction::GiveUp,
+        Some(b) if now < b.next_allowed() => UnshownAction::Wait,
+        _ => UnshownAction::MakeAgain,
+    }
+}
+
 /// Made again within this of the time before, an output waits longer.
 const REOPEN_SOON: std::time::Duration = std::time::Duration::from_secs(30);
+/// An output made again this many times within [`REMAKES_LATELY`] is not
+/// made again for its frames going unshown: a screen that says what it
+/// shows only now and then would blink it for ever.
+const MOST_REMAKES: u32 = 3;
+/// See [`MOST_REMAKES`].
+const REMAKES_LATELY: std::time::Duration = std::time::Duration::from_secs(300);
 /// The longest an output waits before being made again.
 const REOPEN_WAIT_MOST: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(test)]
 mod tests {
     use super::default_output_window_size;
+
+    /// An output whose frames go unshown is made again — the Stage Manager
+    /// case: its screen took them and showed none, till the window was made
+    /// again — then waits before the next time. Made again once and still
+    /// showing not one frame, its screen never says what it shows (a
+    /// `DisplayLink` screen): it is never made again for that, as each time
+    /// only blinks it.
+    #[test]
+    fn an_output_whose_screen_never_says_what_it_shows_is_made_again_once() {
+        use super::{unshown_action, Reopened, UnshownAction};
+        let secs = std::time::Duration::from_secs;
+        let now = std::time::Instant::now();
+        assert_eq!(unshown_action(None, false, now), UnshownAction::MakeAgain, "the first time");
+        assert_eq!(unshown_action(None, true, now), UnshownAction::MakeAgain);
+        let once = Reopened::after(None, now);
+        let soon = now + std::time::Duration::from_millis(500);
+        assert_eq!(unshown_action(Some(once), true, soon), UnshownAction::Wait, "it showed: wait");
+        let later = now + secs(5);
+        assert_eq!(unshown_action(Some(once), true, later), UnshownAction::MakeAgain);
+        assert_eq!(unshown_action(Some(once), false, soon), UnshownAction::GiveUp, "none shown");
+        assert_eq!(unshown_action(Some(once), false, later), UnshownAction::GiveUp);
+        // A remake long ago, or before the output moved, tells nothing of
+        // this window: made again (once more).
+        let long_ago = now + secs(3600);
+        assert_eq!(unshown_action(Some(once), false, long_ago), UnshownAction::MakeAgain);
+    }
+
+    /// A screen that says what it shows only now and then — a second's
+    /// frames said shown, then none, each time — is made again three times
+    /// in five minutes at most, then left alone: not blinked for ever.
+    #[test]
+    fn an_output_made_again_too_often_lately_is_left_alone() {
+        use super::{unshown_action, Reopened, UnshownAction};
+        let secs = std::time::Duration::from_secs;
+        let start = std::time::Instant::now();
+        let mut record = None;
+        let mut made = 0;
+        for minute in 0..30_u64 {
+            let now = start + secs(minute * 20);
+            match unshown_action(record, true, now) {
+                UnshownAction::MakeAgain => {
+                    record = Some(Reopened::after(record, now));
+                    made += 1;
+                }
+                UnshownAction::Wait => {}
+                UnshownAction::GiveUp => break,
+            }
+        }
+        assert_eq!(made, 3, "three times, then left alone");
+        // Spread over more than five minutes, each one cured it.
+        let mut record = None;
+        for hour in 0..5_u64 {
+            let now = start + secs(hour * 3600);
+            assert_eq!(unshown_action(record, true, now), UnshownAction::MakeAgain);
+            record = Some(Reopened::after(record, now));
+        }
+    }
 
     /// An output that lost its screen goes back to that screen only, not to
     /// another that took its name; one waiting since the show opened goes by

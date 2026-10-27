@@ -168,7 +168,7 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                         if resp.double_clicked() {
                             if let Some(ch) = data.channels.first() {
                                 actions.session.shader_to_add = Some((
-                                    crate::usecases::ui::DeckPlace::end_of(ch.uuid.clone()),
+                                    crate::usecases::ui::DeckPlace::back_of(ch.uuid.clone()),
                                     *gen_idx,
                                 ));
                             }

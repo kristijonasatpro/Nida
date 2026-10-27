@@ -381,10 +381,7 @@ fn snapshot_rundown_panel_and_step_window() {
                         channel: "cc000001".into(),
                         on: true,
                     }],
-                    plays: vec![PlaySet {
-                        deck: sting,
-                        action: PlayAction::Start,
-                    }],
+                    plays: vec![PlaySet::new(sting, PlayAction::Start)],
                     then_secs: Some(4.0),
                     ..Step::new("")
                 },
@@ -408,6 +405,7 @@ fn snapshot_rundown_panel_and_step_window() {
             secs_left: 2.6,
             fade: true,
         }),
+        at_held: None,
     };
     // The wait repaints the panel, so it never settles: stepped instead.
     let Some(mut harness) = unsettled_snapshot_harness(data) else {
@@ -971,4 +969,104 @@ fn snapshot_audio_processing_bus() {
         harness.run();
     }
     harness.snapshot("audio_processing_bus");
+}
+
+/// The Presentations panel: a day's talks in running order — a PowerPoint
+/// deck on air at slide 3 with its notes, a PDF next and ready, a web
+/// presentation, a speaker's clip, a break picture, and one whose file has
+/// gone.
+#[test]
+fn snapshot_presentations_panel() {
+    use varda::engine::value::presentation::{
+        PlaysOn, PresentationSnapshot, PresentationStatus, Screen,
+    };
+    use varda::engine::value::slides::{
+        SlidesSettings, SlidesSnapshot, TalkKind, TalkSnapshot, TalkState,
+    };
+    use varda::usecases::ui::screen_layout::{Builtin, Pane, ScreenLayout};
+    let mut data = UIData::test_fixture();
+    data.screen = ScreenLayout::builtin(Builtin::Broadcast);
+    let tab = data
+        .screen
+        .dock
+        .find_tab(&Pane::Presentations)
+        .expect("the tab");
+    data.screen
+        .dock
+        .set_active_tab(tab)
+        .expect("brought to the front");
+    data.channels[1].name = "Slides".into();
+    data.channels[1].on_air = Some("Main".into());
+    let talk = |id: &str, name: &str, kind: TalkKind, state: TalkState| TalkSnapshot {
+        id: id.into(),
+        name: name.into(),
+        given_name: name.into(),
+        path: format!("/Talks/{id}"),
+        kind: Some(kind),
+        state,
+        message: None,
+        missing: false,
+        position: None,
+        shown: None,
+        presentation: None,
+        clip: None,
+        warnings: Vec::new(),
+        pictures: false,
+    };
+    let mut keynote = talk("t1", "Opening — keynote", TalkKind::PowerPoint, TalkState::Live);
+    keynote.position = Some(3);
+    keynote.shown = Some(22);
+    keynote.presentation = Some(PresentationSnapshot {
+        path: "/Talks/keynote.pptx".into(),
+        status: PresentationStatus::Showing,
+        message: None,
+        slide: Some(3),
+        slides: Some(24),
+        position: Some(3),
+        shown: Some(22),
+        screen: Screen::Slide,
+        title: Some("Where we are".into()),
+        notes: "Thank the organisers. Ask who came by train.".into(),
+        next_slide: Some(4),
+        next_title: Some("Results".into()),
+        plays_on: PlaysOn::Auto,
+        playing_on: None,
+        slide_pixels: None,
+        video: None,
+    });
+    let mut results = talk("t2", "Ona J. — results", TalkKind::Pdf, TalkState::Ready);
+    results.shown = Some(31);
+    let mut gone = talk("t6", "Late slides", TalkKind::PowerPoint, TalkState::Failed);
+    gone.missing = true;
+    gone.message = Some("Its file is not there".into());
+    data.channels[1].decks[0].slides = Some(SlidesSnapshot {
+        on: Some(keynote.clone()),
+        screen: Screen::Slide,
+        talks: vec![
+            keynote,
+            results,
+            TalkSnapshot {
+                warnings: vec![
+                    "needs the internet when shown — it loads from cdn.jsdelivr.net".into(),
+                ],
+                ..talk("t3", "Panel — AI demo", TalkKind::Web, TalkState::Waiting)
+            },
+            talk("t4", "Demo video", TalkKind::Clip, TalkState::Waiting),
+            talk("t5", "Coffee break", TalkKind::Picture, TalkState::Waiting),
+            gone,
+        ],
+        settings: SlidesSettings::default(),
+        live: Some(0),
+        starting: None,
+        next: Some(1),
+        next_picked: false,
+        previous: None,
+        talk_secs: Some(754.0),
+        making_pictures: 0,
+    });
+    let Some(mut harness) = unsettled_snapshot_harness(data) else {
+        return;
+    };
+    harness.run_steps(4);
+    harness.snapshot("presentations_panel");
 }

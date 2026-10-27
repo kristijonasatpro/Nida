@@ -142,6 +142,13 @@ pub enum InputSource {
     PresenterView {
         deck_uuid: String,
     },
+    /// A Slides input: a conference's presentations — PowerPoint decks,
+    /// PDFs, web presentations, clips, pictures — in running order, one on
+    /// at a time, each started with one press. `paths` are its talks' files.
+    Slides {
+        #[serde(default)]
+        paths: Vec<String>,
+    },
 }
 
 impl InputSource {
@@ -209,6 +216,11 @@ impl InputSource {
             Self::PresenterView { deck_uuid } => EngineCommand::AddPresenterDeck {
                 channel_uuid,
                 deck_uuid,
+            },
+            Self::Slides { paths } => EngineCommand::AddSlidesDeck {
+                channel_uuid,
+                paths,
+                settings: None,
             },
         }
     }
@@ -549,10 +561,14 @@ pub enum EngineCommand {
         deck_uuid: String,
         mode: crate::engine::value::video::LoopMode,
     },
+    /// The clip's in-point, seconds; one at or past its out-point lets the
+    /// out-point go (played to the end).
     VideoSetInPoint {
         deck_uuid: String,
         secs: f64,
     },
+    /// The clip's out-point, seconds (0: none, played to the end); one at or
+    /// before its in-point lets the in-point go (played from the start).
     VideoSetOutPoint {
         deck_uuid: String,
         secs: f64,
@@ -603,6 +619,98 @@ pub enum EngineCommand {
     ShowPlaylistItem {
         deck_uuid: String,
         index: usize,
+    },
+
+    // ── Slides ───────────────────────────────────────────────────
+    /// Add a Slides layer: `paths`' files as talks in running order,
+    /// nothing on yet.
+    AddSlidesDeck {
+        channel_uuid: String,
+        #[serde(default)]
+        paths: Vec<String>,
+        #[serde(default)]
+        settings: Option<crate::engine::value::slides::SlidesSettings>,
+    },
+    /// A Slides layer's talks, all of them: added, taken out, moved,
+    /// renamed, given another file. The talk on stays on.
+    SetSlidesTalks {
+        deck_uuid: String,
+        talks: Vec<crate::engine::value::slides::Talk>,
+    },
+    /// Add the files at `paths` as talks: at place `at` in the list, else
+    /// at its end. Without a `deck_uuid`, to the show's first Slides input,
+    /// made on a new input when there is none.
+    AddTalks {
+        #[serde(default)]
+        deck_uuid: Option<String>,
+        paths: Vec<String>,
+        #[serde(default)]
+        at: Option<usize>,
+    },
+    /// One talk renamed (`""` for its file's name), or given another file
+    /// — it keeps its place, its name and its id; the talk on plays its new
+    /// file once started again. A field left out stays as it is.
+    EditTalk {
+        deck_uuid: String,
+        talk_id: String,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        path: Option<String>,
+    },
+    /// One talk moved to place `to` in the running order (from 0).
+    MoveTalk {
+        deck_uuid: String,
+        talk_id: String,
+        to: usize,
+    },
+    /// One talk taken out of the running order; the talk on stays on.
+    RemoveTalk {
+        deck_uuid: String,
+        talk_id: String,
+    },
+    /// How a Slides input goes from one talk to the next, and where its
+    /// PowerPoint shows play.
+    SetSlidesSettings {
+        deck_uuid: String,
+        settings: crate::engine::value::slides::SlidesSettings,
+    },
+    /// Start a talk: `"next"`, `"previous"` or `{"id": "…"}`. What is on
+    /// stays until its picture is there. Without a `deck_uuid`, the Slides
+    /// input on air, else the one started last, else the first.
+    StartTalk {
+        #[serde(default)]
+        deck_uuid: Option<String>,
+        to: crate::engine::value::slides::TalkRef,
+    },
+    /// The talk Start next takes, picked by hand; `null` for the talk
+    /// after the one on.
+    SetNextTalk {
+        deck_uuid: String,
+        #[serde(default)]
+        talk_id: Option<String>,
+    },
+    /// Look the talks' files over again — a Slides input's, or every one's
+    /// — for what may go wrong in the show: a video a deck links to not
+    /// there, fonts this Mac lacks, a talk of another shape, a page that
+    /// needs the internet. A talk is looked over as it is added and when its
+    /// file changes; this is for what changes no talk's file (a video copied
+    /// beside its deck, a font installed). What is found is each talk's
+    /// `warnings` in the state.
+    CheckTalks {
+        #[serde(default)]
+        deck_uuid: Option<String>,
+    },
+    /// Have PowerPoint save the PowerPoint talks of a Slides input — or of
+    /// every one — as slide pictures (a PDF each, in Nida's folder for them)
+    /// for the presenter view's next slide: those without them as their
+    /// files are now. Refused while a PowerPoint talk is on: the first time,
+    /// PowerPoint asks for access to that folder (Grant Access) and holds
+    /// its show till answered. What is made is each talk's `pictures` in the
+    /// state.
+    MakeSlidePictures {
+        #[serde(default)]
+        deck_uuid: Option<String>,
     },
 
     // ── Timers ───────────────────────────────────────────────────
@@ -2066,12 +2174,33 @@ pub enum EngineCommand {
         deck_uuid: String,
         action: Option<crate::rundown::PlayAction>,
     },
+    /// Whether a clip or playlist a step starts or carries on is faded out —
+    /// its sound over the next step's fade — and stopped when another step
+    /// is taken.
+    SetRundownUntilNext {
+        uuid: String,
+        deck_uuid: String,
+        on: bool,
+    },
+    /// How a step sets a timer it starts: counting down from a length of its
+    /// own, or up — or, with `None`, as the timer is set.
+    SetRundownTimer {
+        uuid: String,
+        deck_uuid: String,
+        timer: Option<crate::rundown::TimerSet>,
+    },
     /// How many seconds after a step is taken the next is taken by itself
     /// (more than none, an hour at most) — or, with `None`, not until the
     /// operator says.
     SetRundownThen {
         uuid: String,
         secs: Option<f32>,
+    },
+    /// The time of day a step is taken by itself at while GO would take it
+    /// next, seconds after midnight — or, with `None`, not.
+    SetRundownAt {
+        uuid: String,
+        at_secs: Option<u32>,
     },
     /// Make a step what is on now, for the parts it sets: the buses it
     /// lists, and Main and the overlays if it sets them.

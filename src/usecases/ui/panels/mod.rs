@@ -14,6 +14,7 @@ mod deck_adjust;
 mod deck_detail;
 mod dnd;
 mod dock;
+pub use dock::window_viewport;
 mod effects;
 mod file_drop;
 mod inputs;
@@ -40,6 +41,7 @@ mod right_panel;
 mod rundown;
 mod screens;
 mod sequence;
+mod slides;
 mod show_menu;
 mod stage;
 mod stream;
@@ -69,31 +71,85 @@ use popovers::{
 fn begin_drop_target_frame(ctx: &egui::Context, data: &UIData) {
     ctx.memory_mut(|m| {
         for ch_idx in 0..=data.channels.len() {
+            m.data.remove::<Vec<DropArea>>(drop_rects_id(ch_idx));
             m.data
-                .remove::<egui::Rect>(egui::Id::new("ch_drop_rect").with(ch_idx));
-            m.data
-                .remove::<insertion::Cards>(egui::Id::new("deck_card_rects").with(ch_idx));
+                .remove::<Vec<insertion::Stack>>(insertion::stacks_id(ch_idx));
         }
         for side in 0..2 {
             m.data
                 .remove::<egui::Rect>(egui::Id::new("new_ch_drop_rect").with(side));
         }
         m.data
-            .remove::<(usize, egui::Rect)>(channel_settings::drop_window_id());
+            .remove::<(usize, egui::Rect, egui::LayerId)>(channel_settings::drop_window_id());
     });
 }
 
-/// The input settings window, if `pos` is over it: its channel and rect.
-pub(super) fn drop_window_at(ctx: &egui::Context, pos: egui::Pos2) -> Option<(usize, egui::Rect)> {
-    ctx.memory(|m| {
-        m.data
-            .get_temp::<(usize, egui::Rect)>(channel_settings::drop_window_id())
-    })
-    .filter(|(_, rect)| rect.contains(pos))
+fn drop_rects_id(ch_idx: usize) -> egui::Id {
+    egui::Id::new("ch_drop_rect").with(ch_idx)
 }
 
-/// The channel under `pos` for a drop: the input settings window first, as
-/// it is drawn over the channel views, then each channel's drop area.
+/// Where one view of a channel takes drops this frame: the part of it in
+/// sight, and the layer it is drawn in.
+pub(super) type DropArea = (egui::Rect, egui::LayerId);
+
+/// Record that channel `ch_idx` takes drops in `rect` this frame: one of its
+/// views, drawn by `ui` — only what of it is in sight (a row scrolled half
+/// out of its panel does not reach over the next one). Another view of it —
+/// Channels and Inputs side by side — adds its own, and a drop on either
+/// goes to it.
+pub(super) fn publish_drop_rect(ui: &egui::Ui, ch_idx: usize, rect: egui::Rect) {
+    publish_drop_area(ui.ctx(), ch_idx, (rect.intersect(ui.clip_rect()), ui.layer_id()));
+}
+
+fn publish_drop_area(ctx: &egui::Context, ch_idx: usize, area: DropArea) {
+    if !area.0.is_positive() {
+        return;
+    }
+    ctx.memory_mut(|m| {
+        let areas = m
+            .data
+            .get_temp_mut_or_default::<Vec<DropArea>>(drop_rects_id(ch_idx));
+        if !areas.contains(&area) {
+            areas.push(area);
+        }
+    });
+}
+
+/// Where channel `ch_idx` takes drops this frame: each of its views'.
+pub(super) fn drop_areas(ctx: &egui::Context, ch_idx: usize) -> Vec<DropArea> {
+    ctx.memory(|m| m.data.get_temp::<Vec<DropArea>>(drop_rects_id(ch_idx)))
+        .unwrap_or_default()
+}
+
+/// The rects of [`drop_areas`].
+pub(super) fn drop_rects(ctx: &egui::Context, ch_idx: usize) -> Vec<egui::Rect> {
+    drop_areas(ctx, ch_idx).into_iter().map(|(rect, _)| rect).collect()
+}
+
+/// What is in front at `pos` for a drop: the layer drawn on top there — a
+/// floating window over the panels, the panels themselves — looked through
+/// where a drag's own picture or a tooltip lies on top; `None` off them all.
+/// Only that layer's targets take the drop: one with none there (the Stream
+/// window, say) lets nothing beneath it have it.
+pub(super) fn front_layer(ctx: &egui::Context, pos: egui::Pos2) -> Option<egui::LayerId> {
+    ctx.layer_id_at(pos)
+        .filter(|l| !matches!(l.order, egui::Order::Tooltip | egui::Order::Debug))
+}
+
+/// The input settings window, if `pos` is over it and nothing is in front of
+/// it there: its channel and rect.
+pub(super) fn drop_window_at(ctx: &egui::Context, pos: egui::Pos2) -> Option<(usize, egui::Rect)> {
+    let (ch_idx, rect, layer) = ctx.memory(|m| {
+        m.data
+            .get_temp::<(usize, egui::Rect, egui::LayerId)>(channel_settings::drop_window_id())
+    })?;
+    (rect.contains(pos) && front_layer(ctx, pos).is_none_or(|front| front == layer))
+        .then_some((ch_idx, rect))
+}
+
+/// The channel under `pos` for a drop: the input settings window when it is
+/// in front there, else the channel whose view is — of the layer in front at
+/// `pos`, none if that layer has none there.
 pub(super) fn drop_channel_at(
     ctx: &egui::Context,
     pos: egui::Pos2,
@@ -102,12 +158,11 @@ pub(super) fn drop_channel_at(
     if let Some((ch_idx, _)) = drop_window_at(ctx, pos).filter(|(i, _)| *i < channels) {
         return Some(ch_idx);
     }
+    let front = front_layer(ctx, pos);
     (0..channels).find(|&ch_idx| {
-        ctx.memory(|m| {
-            m.data
-                .get_temp::<egui::Rect>(egui::Id::new("ch_drop_rect").with(ch_idx))
-        })
-        .is_some_and(|rect| rect.contains(pos))
+        drop_areas(ctx, ch_idx)
+            .iter()
+            .any(|(r, l)| r.contains(pos) && front.is_none_or(|front| *l == front))
     })
 }
 
@@ -135,6 +190,22 @@ fn consume(ctx: &egui::Context, combo: &crate::keymap::KeyCombo) {
     ctx.input_mut(|i| i.consume_key(modifiers, key));
 }
 
+/// The show's keys acted on before any panel draws in the window drawn —
+/// `ui`'s viewport: the main window's, or a panel's window of its own, on
+/// its own keys: Main mode's takes (Space / Enter), the Rundown's GO, the
+/// clicker's. The keys are consumed — held, as they repeat, too — so a
+/// button or checkbox that still has keyboard focus does not also act on
+/// them. Returns whether a text field was being typed into as the frame
+/// began: Enter finishing a name takes the field's focus away while the
+/// panels draw, before the keymap is looked at ([`keymap_shortcuts`]).
+pub(super) fn shortcuts_first(ui: &egui::Ui, data: &UIData, actions: &mut UIActions) -> bool {
+    let was_typing = typing(ui.ctx());
+    take_to_main_shortcuts(ui, data, actions);
+    rundown::go_shortcut(ui, data, actions);
+    presentation::clicker_shortcuts(ui, data, actions);
+    was_typing
+}
+
 /// Space cuts and Enter fades the selected channel to Main — or whatever keys
 /// the keymap binds to those actions — in Main mode, when no text field is
 /// being typed into.
@@ -147,14 +218,88 @@ fn take_to_main_shortcuts(ui: &egui::Ui, data: &UIData, actions: &mut UIActions)
     {
         return;
     }
-    for combo in crate::usecases::ui::keyboard::collect_pressed_keys(ui.ctx()) {
+    for (combo, repeat) in crate::usecases::ui::keyboard::collect_key_downs(ui.ctx()) {
         let fade = match data.keymap_bindings.get(&combo) {
             Some(KeyTarget::Action(ActionId::CutToMain)) => false,
             Some(KeyTarget::Action(ActionId::FadeToMain)) => true,
             _ => continue,
         };
         consume(ui.ctx(), &combo);
-        main_desk::take_next(data, actions, fade);
+        if !repeat {
+            main_desk::take_next(data, actions, fade);
+        }
+    }
+}
+
+/// The keymap's shortcuts pressed this frame (see `crate::keymap`) in the
+/// window drawn — `ui`'s viewport: the main window's, or a panel's window of
+/// its own, on its own keys and its own text field (see
+/// `dock::render_window`). `was_typing`: a text field was typed into as the
+/// frame began there.
+pub(super) fn keymap_shortcuts(ui: &egui::Ui, data: &UIData, actions: &mut UIActions, was_typing: bool) {
+    use crate::keymap::{ActionId, KeyTarget};
+    use crate::usecases::ui::keyboard::collect_pressed_keys;
+    let pressed = collect_pressed_keys(ui.ctx());
+
+    if data.keyboard_learn_active {
+        // In learn mode: intercept key presses for binding, don't dispatch normally
+        if let Some(combo) = pressed.first() {
+            actions.session.keyboard_learn_bind = Some(combo.clone());
+        }
+    } else {
+        // Normal dispatch: look up each pressed key in the keymap
+        for combo in &pressed {
+            // A letter typed into a name is a letter: no key without ⌘
+            // acts while a text field is typed into — one learned for a
+            // layer's opacity or a mute changed the show as a name was
+            // typed — nor the Enter that finishes it.
+            if !combo.command && (was_typing || typing(ui.ctx())) {
+                continue;
+            }
+            if let Some(target) = data.keymap_bindings.get(combo) {
+                match target {
+                    KeyTarget::Action(ActionId::Undo) => actions.session.undo_requested = true,
+                    KeyTarget::Action(ActionId::Redo) => actions.session.redo_requested = true,
+                    KeyTarget::Action(ActionId::Save) => actions.session.save_requested = true,
+                    KeyTarget::Action(ActionId::ToggleLibrary) => {
+                        if !ui.egui_wants_keyboard_input() {
+                            actions.session.toggle_library_panel = true;
+                        }
+                    }
+                    KeyTarget::Action(ActionId::ToggleStageEditor) => {
+                        actions.session.toggle_stage_editor = true;
+                    }
+                    KeyTarget::Action(ActionId::ToggleMidiLearn) => {
+                        actions.session.midi_learn_toggle = true;
+                    }
+                    KeyTarget::Action(ActionId::ToggleKeyboardLearn) => {
+                        actions.session.keyboard_learn_toggle = true;
+                    }
+                    KeyTarget::Action(
+                        id @ (ActionId::Copy | ActionId::Paste | ActionId::Duplicate),
+                    ) => {
+                        // Never into a text field, never over an automation
+                        // lane (its own breakpoint clipboard), and never
+                        // while an arrangement slice selection is armed (its
+                        // slice clipboard wins). See
+                        // /spec/arrangement-selection.md § Copy.
+                        if !ui.egui_wants_keyboard_input()
+                            && !arrangement::a_lane_is_selected(ui.ctx())
+                            && !arrangement::selection_active(ui.ctx())
+                        {
+                            clipboard_menu::shortcut(*id, data, actions);
+                        }
+                    }
+                    KeyTarget::ParamPath(path) => {
+                        actions
+                            .commands
+                            .push(EngineCommand::ToggleParam { path: path.clone() });
+                    }
+                    // Stage-context actions are handled in stage.rs
+                    KeyTarget::Action(_) => {}
+                }
+            }
+        }
     }
 }
 
@@ -228,17 +373,7 @@ pub fn render_ui(ui: &mut egui::Ui, data: &UIData) -> UIActions {
     begin_fx_surface_frame(ui.ctx());
     begin_drop_target_frame(ui.ctx(), data);
 
-    // Whether a text field was being typed into as the frame began: Enter
-    // finishing a name takes the field's focus away while the panels draw,
-    // before the keymap below is looked at.
-    let was_typing = typing(ui.ctx());
-
-    // Main mode takes (Space / Enter), before any panel draws: the keys are
-    // consumed here, so a button or checkbox that still has keyboard focus
-    // does not also act on them.
-    take_to_main_shortcuts(ui, data, &mut actions);
-    rundown::go_shortcut(ui, data, &mut actions);
-    presentation::clicker_shortcuts(ui, data, &mut actions);
+    let was_typing = shortcuts_first(ui, data, &mut actions);
 
     // The panel arrangement this frame works on: the Layout menu and the
     // dock change it, and it goes back to the runner at the end.
@@ -542,12 +677,16 @@ pub fn render_ui(ui: &mut egui::Ui, data: &UIData) -> UIActions {
     // changes without moving that window.
     main_desk::swap_preview_after_take(ui.ctx(), data, &mut actions);
     rename::render_rename(ui.ctx(), data, &mut actions);
-    rundown::render_windows(ui.ctx(), data, &mut actions);
+    // A Rundown in a window of its own opens its step windows there.
+    if !screen.in_window(crate::usecases::ui::screen_layout::Pane::Rundown) {
+        rundown::render_windows(ui.ctx(), data, &mut actions);
+    }
     led::render_led_window(ui.ctx(), data, &mut actions);
     screens::render_screens_window(ui.ctx(), data, &mut actions);
     add_input::render_add_input(ui.ctx(), data, &mut actions);
     playlist::render_playlist_window(ui.ctx(), data, &mut actions);
     presentation::take_chosen(ui.ctx(), &mut actions);
+    slides::take_chosen_files(ui.ctx(), &mut actions);
     timer::render_timer_window(ui.ctx(), data, &mut actions);
 
     // === STREAM: the top bar's STREAM button opens it ===
@@ -573,86 +712,18 @@ pub fn render_ui(ui: &mut egui::Ui, data: &UIData) -> UIActions {
     handle_midi_learn_popup(ui, data, &mut actions);
 
     // === KEYBOARD SHORTCUTS (data-driven via keymap) ===
-    {
-        use crate::keymap::{ActionId, KeyTarget};
-        use crate::usecases::ui::keyboard::collect_pressed_keys;
-        let pressed = collect_pressed_keys(ui.ctx());
-
-        if data.keyboard_learn_active {
-            // In learn mode: intercept key presses for binding, don't dispatch normally
-            if let Some(combo) = pressed.first() {
-                actions.session.keyboard_learn_bind = Some(combo.clone());
-            }
-        } else {
-            // Normal dispatch: look up each pressed key in the keymap
-            for combo in &pressed {
-                // A letter typed into a name is a letter: no key without ⌘
-                // acts while a text field is typed into — one learned for a
-                // layer's opacity or a mute changed the show as a name was
-                // typed — nor the Enter that finishes it.
-                if !combo.command && (was_typing || typing(ui.ctx())) {
-                    continue;
-                }
-                if let Some(target) = data.keymap_bindings.get(combo) {
-                    match target {
-                        KeyTarget::Action(ActionId::Undo) => actions.session.undo_requested = true,
-                        KeyTarget::Action(ActionId::Redo) => actions.session.redo_requested = true,
-                        KeyTarget::Action(ActionId::Save) => actions.session.save_requested = true,
-                        KeyTarget::Action(ActionId::ToggleLibrary) => {
-                            if !ui.egui_wants_keyboard_input() {
-                                actions.session.toggle_library_panel = true;
-                            }
-                        }
-                        KeyTarget::Action(ActionId::ToggleStageEditor) => {
-                            actions.session.toggle_stage_editor = true;
-                        }
-                        KeyTarget::Action(ActionId::ToggleMidiLearn) => {
-                            actions.session.midi_learn_toggle = true;
-                        }
-                        KeyTarget::Action(ActionId::ToggleKeyboardLearn) => {
-                            actions.session.keyboard_learn_toggle = true;
-                        }
-                        KeyTarget::Action(
-                            id @ (ActionId::Copy | ActionId::Paste | ActionId::Duplicate),
-                        ) => {
-                            // Never into a text field, never over an automation
-                            // lane (its own breakpoint clipboard), and never
-                            // while an arrangement slice selection is armed (its
-                            // slice clipboard wins). See
-                            // /spec/arrangement-selection.md § Copy.
-                            if !ui.egui_wants_keyboard_input()
-                                && !arrangement::a_lane_is_selected(ui.ctx())
-                                && !arrangement::selection_active(ui.ctx())
-                            {
-                                clipboard_menu::shortcut(*id, data, &mut actions);
-                            }
-                        }
-                        KeyTarget::ParamPath(path) => {
-                            actions
-                                .commands
-                                .push(EngineCommand::ToggleParam { path: path.clone() });
-                        }
-                        // Stage-context actions are handled in stage.rs
-                        KeyTarget::Action(_) => {}
-                    }
-                }
-            }
-        }
-    }
+    keymap_shortcuts(ui, data, &mut actions, was_typing);
 
     // L (or its binding) opens and closes the Library panel, wherever the
     // layout keeps it.
     if actions.session.toggle_library_panel {
-        crate::usecases::ui::screen_layout::toggle_pane(
-            &mut screen.dock,
-            crate::usecases::ui::screen_layout::Pane::Library,
-        );
+        screen.toggle(crate::usecases::ui::screen_layout::Pane::Library);
     }
     for (pane, open) in std::mem::take(&mut actions.session.panel_requests) {
         if open {
-            crate::usecases::ui::screen_layout::add_pane(&mut screen.dock, pane);
+            screen.open(pane);
         } else {
-            crate::usecases::ui::screen_layout::remove_pane(&mut screen.dock, pane);
+            screen.close(pane);
         }
     }
     actions.session.screen_layout = Some(screen);
@@ -1074,9 +1145,7 @@ mod tests {
             });
         harness.run();
         let drop_area = |harness: &egui_kittest::Harness<'_>| -> Option<egui::Rect> {
-            harness
-                .ctx
-                .memory(|m| m.data.get_temp(egui::Id::new("ch_drop_rect").with(0_usize)))
+            drop_rects(&harness.ctx, 0).first().copied()
         };
         assert!(
             drop_area(&harness).is_some(),
@@ -1087,9 +1156,127 @@ mod tests {
             dock: egui_dock::DockState::new(vec![Pane::Library]),
             locked: false,
             naming: crate::usecases::ui::screen_layout::NAMING,
+            windows: Vec::new(),
         };
         harness.run();
         assert!(drop_area(&harness).is_none(), "{:?}", drop_area(&harness));
+    }
+
+    /// A channel shown in two views side by side — Channels and Inputs —
+    /// takes drops in either, whichever was drawn last.
+    #[test]
+    fn a_channel_in_two_views_takes_drops_in_both() {
+        let ctx = egui::Context::default();
+        let column = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(300.0, 600.0));
+        let tile = egui::Rect::from_min_size(egui::pos2(400.0, 0.0), egui::vec2(300.0, 200.0));
+        let layer = egui::LayerId::background();
+        publish_drop_area(&ctx, 0, (column, layer));
+        publish_drop_area(&ctx, 0, (tile, layer));
+        assert_eq!(drop_channel_at(&ctx, egui::pos2(100.0, 300.0), 1), Some(0), "its column");
+        assert_eq!(drop_channel_at(&ctx, egui::pos2(500.0, 100.0), 1), Some(0), "its tile");
+        assert_eq!(drop_channel_at(&ctx, egui::pos2(350.0, 100.0), 1), None, "between");
+    }
+
+    /// A view scrolled half out of its panel takes drops only where it is in
+    /// sight: its hidden part does not reach over the next panel. Of views
+    /// one over another — a floating window over the panels — a drop goes to
+    /// the channel of the one in front, and between that view's cards only.
+    #[test]
+    fn a_drop_goes_to_the_view_in_sight_and_in_front() {
+        let ctx = egui::Context::default();
+        let column = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 600.0));
+        let window = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(200.0, 150.0));
+        // Two frames: a window new on screen is seen from its second.
+        for _ in 0..2 {
+            let mut drawn = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.set_clip_rect(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 600.0)));
+                    publish_drop_rect(ui, 0, column);
+                    let cards: insertion::Cards = vec![
+                        ("deck0".into(), egui::Rect::from_min_max(egui::pos2(10.0, 120.0), egui::pos2(390.0, 200.0))),
+                        ("deck1".into(), egui::Rect::from_min_max(egui::pos2(10.0, 210.0), egui::pos2(390.0, 290.0))),
+                    ];
+                    insertion::publish_cards(ui, 0, cards, column);
+                });
+                egui::Area::new(egui::Id::new("floating"))
+                    .fixed_pos(window.min)
+                    .show(ui.ctx(), |ui| {
+                        // Ch 0's view at its left, Ch 1's beside it.
+                        let (rect, _) = ui.allocate_exact_size(window.size(), egui::Sense::hover());
+                        let split = rect.left() + 50.0;
+                        publish_drop_rect(ui, 0, egui::Rect::from_min_max(rect.min, egui::pos2(split, rect.bottom())));
+                        publish_drop_rect(ui, 1, egui::Rect::from_min_max(egui::pos2(split, rect.top()), rect.max));
+                    });
+            });
+            drawn.textures_delta.clear();
+        }
+        assert_eq!(drop_rects(&ctx, 0).first().map(egui::Rect::right), Some(400.0), "in sight only");
+        assert_eq!(drop_channel_at(&ctx, egui::pos2(500.0, 300.0), 2), None, "the hidden part");
+        assert_eq!(drop_channel_at(&ctx, egui::pos2(350.0, 400.0), 2), Some(0), "the column");
+        assert_eq!(drop_channel_at(&ctx, egui::pos2(250.0, 200.0), 2), Some(1), "the window in front");
+        // Ch 0's own view in the window, over its column's cards: no spot
+        // between cards it does not show.
+        let over = egui::pos2(120.0, 215.0);
+        assert!(window.contains(over));
+        assert_eq!(drop_channel_at(&ctx, over, 2), Some(0));
+        assert_eq!(insertion::insertion_at(&ctx, 0, over).line, None);
+        assert!(insertion::insertion_at(&ctx, 0, egui::pos2(350.0, 215.0)).line.is_some());
+    }
+
+    /// A window in front with no drop target there — the Stream window over
+    /// a channel's column — lets nothing beneath it have the drop: no channel,
+    /// and no spot between the cards it hides. The input settings window,
+    /// with another window in front of it, takes none there either.
+    #[test]
+    fn a_window_in_front_without_a_target_lets_nothing_beneath_have_the_drop() {
+        let ctx = egui::Context::default();
+        let column = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 600.0));
+        let stream = egui::Rect::from_min_size(egui::pos2(50.0, 50.0), egui::vec2(200.0, 200.0));
+        let settings = egui::Rect::from_min_size(egui::pos2(500.0, 0.0), egui::vec2(300.0, 300.0));
+        for _ in 0..2 {
+            let mut drawn = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    publish_drop_rect(ui, 0, column);
+                    let cards: insertion::Cards = vec![(
+                        "deck0".into(),
+                        egui::Rect::from_min_max(egui::pos2(10.0, 60.0), egui::pos2(390.0, 140.0)),
+                    )];
+                    insertion::publish_cards(ui, 0, cards, column);
+                });
+                // The settings window of Ch 1, and a target-less window (the
+                // Stream window) over both Ch 0's column and the settings.
+                let on = egui::Area::new(egui::Id::new("settings"))
+                    .fixed_pos(settings.min)
+                    .show(ui.ctx(), |ui| {
+                        let _ = ui.allocate_exact_size(settings.size(), egui::Sense::hover());
+                    })
+                    .response
+                    .layer_id;
+                ui.ctx().memory_mut(|m| {
+                    m.data
+                        .insert_temp(channel_settings::drop_window_id(), (1_usize, settings, on));
+                });
+                egui::Area::new(egui::Id::new("stream"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(stream.min)
+                    .show(ui.ctx(), |ui| {
+                        let _ = ui.allocate_exact_size(stream.size(), egui::Sense::hover());
+                    });
+                egui::Area::new(egui::Id::new("over settings"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(700.0, 200.0))
+                    .show(ui.ctx(), |ui| {
+                        let _ = ui.allocate_exact_size(egui::vec2(80.0, 80.0), egui::Sense::hover());
+                    });
+            });
+            drawn.textures_delta.clear();
+        }
+        let under_stream = egui::pos2(100.0, 62.0);
+        assert_eq!(drop_channel_at(&ctx, under_stream, 2), None, "the Stream window's");
+        assert_eq!(insertion::insertion_at(&ctx, 0, under_stream).line, None, "no hidden spot");
+        assert_eq!(drop_channel_at(&ctx, egui::pos2(300.0, 400.0), 2), Some(0), "the column");
+        assert_eq!(drop_channel_at(&ctx, egui::pos2(600.0, 100.0), 2), Some(1), "the settings");
+        assert_eq!(drop_channel_at(&ctx, egui::pos2(720.0, 220.0), 2), None, "a window over it");
     }
 
     /// The input settings window is drawn over the channel views, so a drop
@@ -1099,11 +1286,13 @@ mod tests {
         let ctx = egui::Context::default();
         let whole = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
         let window = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(300.0, 200.0));
+        publish_drop_area(&ctx, 0, (whole, egui::LayerId::background()));
         ctx.memory_mut(|m| {
             m.data
-                .insert_temp(egui::Id::new("ch_drop_rect").with(0_usize), whole);
-            m.data
-                .insert_temp(channel_settings::drop_window_id(), (1_usize, window));
+                .insert_temp(
+                    channel_settings::drop_window_id(),
+                    (1_usize, window, egui::LayerId::background()),
+                );
         });
         assert_eq!(drop_channel_at(&ctx, egui::pos2(200.0, 200.0), 2), Some(1));
         assert_eq!(drop_channel_at(&ctx, egui::pos2(600.0, 500.0), 2), Some(0));

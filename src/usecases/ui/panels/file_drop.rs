@@ -5,7 +5,8 @@
 //! order they were dropped:
 //!
 //! - over a channel — its tile, column or settings window — they are layers
-//!   in it;
+//!   in it: between the two cards in its column they are dropped between,
+//!   else behind its layers, so what it shows (on air perhaps) stays;
 //! - anywhere else — the empty tile, a "Drop here to add channel" zone, or
 //!   nothing — each is an input of its own, as Add Input makes them.
 //!
@@ -16,10 +17,47 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use super::super::{DeckPlace, UIActions, UIData};
+use super::super::{UIActions, UIData};
 use super::insertion::insertion_at;
 use crate::deck::media::{expand_folders, MediaKind};
+use crate::engine::value::slides::TalkKind;
 use crate::engine::EngineCommand;
+
+/// The files hovering over the window this frame, and those dropped on it.
+fn files(ctx: &egui::Context) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    ctx.input(|i| {
+        let hovered = i.raw.hovered_files.iter().filter_map(|f| f.path.clone());
+        let dropped = i.raw.dropped_files.iter().map(|f| f.path().to_path_buf());
+        (hovered.collect(), dropped.collect())
+    })
+}
+
+/// Where the pointer is, when reported this frame: a stale place from before
+/// the drag would aim the files at wherever the mouse last was.
+fn fresh_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
+    ctx.input(|i| {
+        i.events
+            .iter()
+            .any(|e| matches!(e, egui::Event::PointerMoved(_)))
+            .then(|| i.pointer.latest_pos())
+            .flatten()
+    })
+}
+
+/// Files dragged onto a panel's window of its own: the Presentations panel
+/// there takes them, as in the main window — no other panel that can have a
+/// window takes files.
+pub(super) fn handle_window_file_drop(ui: &egui::Ui, actions: &mut UIActions) {
+    let ctx = ui.ctx();
+    let (hovered, dropped) = files(ctx);
+    if hovered.is_empty() && dropped.is_empty() {
+        return;
+    }
+    let pos = fresh_pointer(ctx);
+    if super::slides::take_drop(ctx, pos, hovered.len(), &dropped, actions) {
+        ctx.request_repaint();
+    }
+}
 
 /// Where dropped files will land.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,37 +70,18 @@ enum Target {
 
 pub(super) fn handle_file_drop(ui: &egui::Ui, data: &UIData, actions: &mut UIActions) {
     let ctx = ui.ctx();
-
-    let hovered: Vec<PathBuf> = ctx.input(|i| {
-        i.raw
-            .hovered_files
-            .iter()
-            .filter_map(|f| f.path.clone())
-            .collect()
-    });
-    let dropped: Vec<PathBuf> = ctx.input(|i| {
-        i.raw
-            .dropped_files
-            .iter()
-            .map(|f| f.path().to_path_buf())
-            .collect()
-    });
+    let (hovered, dropped) = files(ctx);
     if hovered.is_empty() && dropped.is_empty() {
         return;
     }
-
-    // Only a position reported this frame counts: a stale one from before
-    // the drag would aim the files at wherever the mouse last was.
-    let fresh = ctx.input(|i| {
-        i.events
-            .iter()
-            .any(|e| matches!(e, egui::Event::PointerMoved(_)))
-    });
-    let pos = if fresh {
-        ctx.input(|i| i.pointer.latest_pos())
-    } else {
-        None
-    };
+    let pos = fresh_pointer(ctx);
+    // On the Presentations panel: talks in its running order.
+    // Files counted as hovered, folders not looked into: a large folder on a
+    // slow drive would hold the window each frame of the drag.
+    if super::slides::take_drop(ctx, pos, hovered.len(), &dropped, actions) {
+        ctx.request_repaint();
+        return;
+    }
     // On a playlist's window: into its list.
     if super::playlist::take_drop(
         ctx,
@@ -85,18 +104,32 @@ pub(super) fn handle_file_drop(ui: &egui::Ui, data: &UIData, actions: &mut UIAct
         return;
     }
     let files = expand_folders(&dropped);
-    // A PowerPoint deck is an input of its own, wherever it lands.
-    let (decks, files): (Vec<PathBuf>, Vec<PathBuf>) = files
-        .into_iter()
-        .partition(|f| cfg!(target_os = "macos") && super::presentation::is_deck(f));
-    for deck in decks {
-        log::info!("PowerPoint deck dropped: {}", deck.display());
-        actions.commands.push(EngineCommand::AddInput {
-            source: crate::engine::InputSource::PowerPoint {
-                path: deck.to_string_lossy().into_owned(),
-            },
-            name: None,
-            audio: None,
+    // On a Slides input: every file it plays is a talk of it.
+    let slides_here = match target {
+        Target::Channel(i) => data
+            .channels
+            .get(i)
+            .and_then(super::slides::of_channel)
+            .map(|(deck, _)| deck.uuid.clone()),
+        Target::NewInputs => None,
+    };
+    // Presentations — PowerPoint decks, PDFs, web pages — go to the running
+    // order wherever they land: the Slides input they are dropped on, else
+    // the show's first, made when there is none.
+    let (talks, files): (Vec<PathBuf>, Vec<PathBuf>) = files.into_iter().partition(|f| {
+        let kind = TalkKind::of(&f.to_string_lossy());
+        (cfg!(target_os = "macos") && is_presentation(kind))
+            || (slides_here.is_some() && super::slides::plays_here(kind))
+    });
+    if !talks.is_empty() {
+        log::info!("{} talk(s) dropped -> Slides", talks.len());
+        actions.commands.push(EngineCommand::AddTalks {
+            deck_uuid: slides_here,
+            paths: talks
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            at: None,
         });
     }
     if files.is_empty() {
@@ -106,26 +139,27 @@ pub(super) fn handle_file_drop(ui: &egui::Ui, data: &UIData, actions: &mut UIAct
     match target {
         Target::Channel(i) => {
             if let Some(ch) = data.channels.get(i) {
-                // Between the cards under the pointer; when not pointing at
-                // one, after its last deck. On the input settings window, a
-                // new layer goes on top.
-                let before_deck_uuid = match pos {
-                    Some(p) if super::drop_window_at(ctx, p).is_none() => {
-                        insertion_at(ctx, i, p).before
-                    }
-                    _ => None,
-                };
+                // Between the cards under the pointer; anywhere else on the
+                // channel — its tile, its settings window — behind its
+                // layers, so what it shows on air stays.
+                let on_window = pos.is_some_and(|p| super::drop_window_at(ctx, p).is_some());
+                let between = super::insertion::place_at(ctx, i, pos, on_window);
                 actions.session.files_to_add.push((
-                    DeckPlace {
-                        channel_uuid: ch.uuid.clone(),
-                        before_deck_uuid,
-                    },
+                    super::insertion::deck_place(ch.uuid.clone(), between),
                     files,
                 ));
             }
         }
         Target::NewInputs => actions.session.files_as_inputs.extend(files),
     }
+}
+
+/// A PowerPoint deck, a PDF or a web page: a talk, wherever it is dropped.
+fn is_presentation(kind: Option<TalkKind>) -> bool {
+    matches!(
+        kind,
+        Some(TalkKind::PowerPoint | TalkKind::Pdf | TalkKind::Web)
+    )
 }
 
 fn resolve_target(ctx: &egui::Context, data: &UIData, pos: Option<egui::Pos2>) -> Target {
@@ -149,7 +183,7 @@ fn describe(files: &[PathBuf]) -> (String, usize) {
     let (mut images, mut videos, mut sounds, mut shaders, mut other) = (0, 0, 0, 0, 0);
     let mut decks = 0;
     for f in files {
-        if cfg!(target_os = "macos") && super::presentation::is_deck(f) {
+        if cfg!(target_os = "macos") && is_presentation(TalkKind::of(&f.to_string_lossy())) {
             decks += 1;
             continue;
         }
@@ -177,11 +211,11 @@ fn describe(files: &[PathBuf]) -> (String, usize) {
         parts.push(plural(shaders, "shader", "shaders"));
     }
     if decks > 0 {
-        // Each a new input of its own, wherever it lands.
+        // Talks of the Slides input, wherever they land.
         parts.push(plural(
             decks,
-            "PowerPoint deck (new input)",
-            "PowerPoint decks (new inputs)",
+            "presentation (a talk in Slides)",
+            "presentations (talks in Slides)",
         ));
     }
     (parts.join(", "), other)
@@ -225,10 +259,12 @@ fn paint_hover(
     let window = pos.and_then(|p| super::drop_window_at(ctx, p));
     let rect = match target {
         Target::Channel(i) if window.is_some_and(|(w, _)| w == i) => window.map(|(_, r)| r),
-        Target::Channel(i) => ctx.memory(|m| {
-            m.data
-                .get_temp::<egui::Rect>(egui::Id::new("ch_drop_rect").with(i))
-        }),
+        // The view of the channel the files are over, of those it is in.
+        Target::Channel(i) => {
+            let rects = super::drop_rects(ctx, i);
+            pos.and_then(|p| rects.iter().find(|r| r.contains(p)).copied())
+                .or_else(|| rects.first().copied())
+        }
         Target::NewInputs => pos.and_then(|p| new_channel_zone_at(ctx, p)),
     };
     if let Some(rect) = rect {
@@ -275,6 +311,7 @@ fn paint_hover(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usecases::ui::DeckPlace;
 
     #[derive(Debug)]
     struct Dropped(PathBuf);
@@ -337,18 +374,13 @@ mod tests {
     }
 
     fn channel_rect(data: &UIData, ch_idx: usize) -> egui::Rect {
-        let mut rect = None;
         let mut harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(1600.0, 900.0))
             .build_ui(|ui| {
                 super::super::render_ui(ui, data);
             });
         harness.run();
-        harness.ctx.memory(|m| {
-            rect = m
-                .data
-                .get_temp::<egui::Rect>(egui::Id::new("ch_drop_rect").with(ch_idx));
-        });
+        let rect = super::super::drop_rects(&harness.ctx, ch_idx).first().copied();
         rect.expect("the channel column publishes its rect")
     }
 
@@ -370,12 +402,34 @@ mod tests {
                     channel_uuid: "cb000001".to_string(),
                     // Below both of Ch B's cards: behind them, at the back.
                     before_deck_uuid: Some(data.channels[1].decks[0].uuid.clone()),
+                    back: false,
                 },
                 vec![
                     PathBuf::from("/show/slide 1.png"),
                     PathBuf::from("/show/intro.mov"),
                     PathBuf::from("/show/slide 2.png"),
                 ]
+            )]
+        );
+    }
+
+    /// Dropped on a channel away from its cards — its header, its tile — the
+    /// files go behind its layers, not in front: what it shows, on air
+    /// perhaps, stays.
+    #[test]
+    fn files_dropped_on_a_channel_away_from_its_cards_go_behind_its_layers() {
+        let data = UIData::test_fixture();
+        let column = channel_rect(&data, 0);
+        let cards = card_rects(&data, 0);
+        let top_card = cards.first().expect("Ch A has cards").1;
+        let header = egui::pos2(column.center().x, column.top() + 4.0);
+        assert!(header.y < top_card.top() - 8.0, "precondition: above its cards");
+        let (actions, _) = drop_at(&data, &["/show/logo.png"], Some(header));
+        assert_eq!(
+            actions.session.files_to_add,
+            [(
+                DeckPlace::back_of("ca000001"),
+                vec![PathBuf::from("/show/logo.png")]
             )]
         );
     }
@@ -390,11 +444,13 @@ mod tests {
         harness
             .ctx
             .memory(|m| {
-                m.data.get_temp::<super::super::insertion::Cards>(
-                    egui::Id::new("deck_card_rects").with(ch_idx),
+                m.data.get_temp::<Vec<super::super::insertion::Stack>>(
+                    super::super::insertion::stacks_id(ch_idx),
                 )
             })
+            .and_then(|stacks| stacks.into_iter().next())
             .expect("the column publishes its cards")
+            .cards
     }
 
     #[test]
@@ -417,6 +473,7 @@ mod tests {
                 DeckPlace {
                     channel_uuid: "ca000001".to_string(),
                     before_deck_uuid: Some(cards[0].0.clone()),
+                    back: false,
                 },
                 vec![PathBuf::from("/show/lower third.png")]
             )]
@@ -429,7 +486,7 @@ mod tests {
     fn files_dropped_on_nothing_are_an_input_each() {
         let mut data = UIData::test_fixture();
         data.selected_deck = Some((1, 0));
-        let files = ["/show/logo.png", "/show/intro.mov", "/show/notes.pdf"];
+        let files = ["/show/logo.png", "/show/intro.mov", "/show/notes.txt"];
         let (actions, label) = drop_at(&data, &files, None);
         assert_eq!(
             label,
@@ -440,6 +497,30 @@ mod tests {
             actions.session.files_as_inputs,
             files.map(PathBuf::from),
             "in the order dropped; the runner says what it cannot use"
+        );
+    }
+
+    /// PowerPoint decks, PDFs and web pages are talks of the Slides input,
+    /// wherever they land; clips and pictures beside them are inputs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn presentations_dropped_anywhere_are_talks_of_the_slides_input() {
+        let data = UIData::test_fixture();
+        let files = [
+            "/show/keynote.pptx",
+            "/show/logo.png",
+            "/show/paper.pdf",
+            "/show/deck.html",
+        ];
+        let (actions, label) = drop_at(&data, &files, None);
+        assert!(label.contains("3 presentations (talks in Slides)"), "{label}");
+        assert_eq!(
+            format!("{:?}", actions.commands),
+            r#"[AddTalks { deck_uuid: None, paths: ["/show/keynote.pptx", "/show/paper.pdf", "/show/deck.html"], at: None }]"#
+        );
+        assert_eq!(
+            actions.session.files_as_inputs,
+            vec![PathBuf::from("/show/logo.png")]
         );
     }
 

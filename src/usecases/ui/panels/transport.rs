@@ -399,20 +399,32 @@ fn bar(ui: &mut egui::Ui, vp: &VideoPlaybackUI, width: f32) -> Option<f64> {
         ui.allocate_exact_size(egui::vec2(width, BAR_HEIGHT), egui::Sense::click_and_drag());
     let duration = vp.duration.max(1e-6);
     let x_of = |secs: f64| {
-        let f = (secs / duration).clamp(0.0, 1.0) as f32;
+        let f = if secs.is_finite() {
+            (secs / duration).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
         rect.left() + f * rect.width()
+    };
+    // In and out the wrong way round — put so by a learned control or the
+    // API, or kept so by an older show — nothing is kept between them.
+    let start = if vp.in_point.is_finite() {
+        vp.in_point
+    } else {
+        0.0
     };
     let out = if vp.out_point > 0.0 {
         vp.out_point
     } else {
         vp.duration
-    };
+    }
+    .max(start);
     let painter = ui.painter();
     painter.rect_filled(rect, 3.0, TRACK);
-    let kept = egui::Rect::from_x_y_ranges(x_of(vp.in_point)..=x_of(out), rect.y_range());
+    let kept = egui::Rect::from_x_y_ranges(x_of(start)..=x_of(out), rect.y_range());
     painter.rect_filled(kept, 3.0, KEPT);
     let played = egui::Rect::from_x_y_ranges(
-        x_of(vp.in_point)..=x_of(vp.position.clamp(vp.in_point, out)),
+        x_of(start)..=x_of(vp.position.clamp(start, out)),
         rect.shrink2(egui::vec2(0.0, 4.0)).y_range(),
     );
     painter.rect_filled(played, 2.0, PLAYED);
@@ -519,6 +531,31 @@ mod tile_tests {
             phase: crate::channel::DeckTransitionPhase::Inactive,
         });
         assert_eq!(top(&ch), Some(lower), "the upper one waits its turn");
+    }
+
+    /// In and out the wrong way round — an In put past the Out by a learned
+    /// control or the API, or one from an older show — the bar is drawn all
+    /// the same, the playhead where it is: it took Nida down.
+    #[test]
+    fn the_bar_draws_with_in_and_out_the_wrong_way_round() {
+        let deck = UIData::test_fixture().channels[1].decks[0].clone();
+        for (in_point, out_point, position) in [
+            (40.0, 30.0, 35.0),
+            (40.0, 30.0, 50.0),
+            (30.0, 30.0, 10.0),
+            (f64::NAN, 30.0, 10.0),
+        ] {
+            let mut vp = clip(false);
+            vp.in_point = in_point;
+            vp.out_point = out_point;
+            vp.position = position;
+            let deck = deck.clone();
+            let mut harness = egui_kittest::Harness::new_ui(move |ui| {
+                render_transport(ui, Some((&deck, &vp)), false, 400.0, &mut UIActions::new());
+            });
+            harness.run();
+            harness.get_by_label("Playhead");
+        }
     }
 
     /// A sound's name stays above the controls, raised over another row.

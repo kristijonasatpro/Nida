@@ -31,7 +31,6 @@ const FONT: &str = "'Helvetica Neue', Helvetica, Arial, sans-serif";
 pub struct Words {
     /// "3 / 22", or what the show waits on.
     pub position: String,
-    pub title: String,
     pub notes: String,
     /// "Next: 4 · Results", "Last slide".
     pub next: String,
@@ -62,6 +61,7 @@ impl Words {
         };
         let banner = match (p.status, p.screen) {
             (PresentationStatus::Opening, _) => "Opening in PowerPoint…".into(),
+            (PresentationStatus::Ready, _) => "Ready — not started".into(),
             (PresentationStatus::Failed | PresentationStatus::NoWindow, _) => {
                 p.message.clone().unwrap_or_else(|| "PowerPoint".into())
             }
@@ -72,7 +72,6 @@ impl Words {
         };
         Self {
             position,
-            title: p.title.clone().unwrap_or_default(),
             notes: p.notes.clone(),
             next,
             banner,
@@ -91,21 +90,40 @@ pub struct Rect {
 
 /// Where everything goes on a `frame`: the bar — where the show is, the
 /// clocks — across the top or the foot, the slide down the left in its own
-/// shape, what comes next under it, the notes down the right.
+/// shape, what comes next under it — or its picture at the head of the right
+/// column, the line under that — the notes down the right.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Layout {
     /// The bar's top, and its height.
     pub bar_y: f32,
     pub bar: f32,
     pub slide: Rect,
+    /// The next slide's picture, when it has one.
+    pub next: Option<Rect>,
+    /// The line saying what comes next: under the slide, or its picture.
     pub next_baseline: f32,
     pub notes: Rect,
 }
 
 /// The layout for a `frame`, the slide `aspect` (width over height) wide,
-/// as `settings` has it.
+/// as `settings` has it, what comes next said in a line.
 #[must_use]
 pub fn layout(frame: (u32, u32), aspect: f32, settings: &PresenterLayout) -> Layout {
+    layout_for(frame, aspect, settings, false)
+}
+
+/// The line under the next slide's picture, of the frame's height.
+const NEXT_CAPTION: f32 = 0.035;
+
+/// [`layout`], with the next slide's picture at the head of the right column
+/// when `picture` — and what comes next is wanted.
+#[must_use]
+pub fn layout_for(
+    frame: (u32, u32),
+    aspect: f32,
+    settings: &PresenterLayout,
+    picture: bool,
+) -> Layout {
     #[allow(clippy::cast_precision_loss)]
     let (w, h) = (frame.0.max(1) as f32, frame.1.max(1) as f32);
     let aspect = if aspect.is_finite() && aspect > 0.1 {
@@ -122,8 +140,9 @@ pub fn layout(frame: (u32, u32), aspect: f32, settings: &PresenterLayout) -> Lay
         ClocksAt::Bottom => (h - bar, 0.0, h - bar),
     };
     let column = settings.slide_share * w;
-    // Room under the slide for what comes next, when it is said.
-    let below = if settings.next {
+    let picture = picture && settings.next;
+    // Room under the slide for what comes next, when it is said there.
+    let below = if settings.next && !picture {
         0.09 * h * settings.next_size
     } else {
         0.0
@@ -144,15 +163,50 @@ pub fn layout(frame: (u32, u32), aspect: f32, settings: &PresenterLayout) -> Lay
         h: sh,
     };
     let notes_x = column + 0.5 * margin;
+    let notes_w = w - notes_x - margin;
+    if picture {
+        // The next slide's picture at the head of the right column, as wide
+        // as asked — all of it at 1, no taller than half of it — the line
+        // under it, the notes under that.
+        let share = settings.next_size.clamp(0.35, 1.0);
+        let (mut pw, mut ph) = (notes_w * share, notes_w * share / aspect);
+        let most = 0.5 * (bottom - top - 2.0 * margin);
+        if ph > most {
+            (pw, ph) = (most * aspect, most);
+        }
+        let next = Rect {
+            x: notes_x,
+            y: top + margin,
+            w: pw.max(1.0),
+            h: ph.max(1.0),
+        };
+        let caption = NEXT_CAPTION * h;
+        let next_baseline = next.y + next.h + 1.3 * caption;
+        let notes_y = next_baseline + 0.6 * caption;
+        return Layout {
+            bar_y,
+            bar,
+            slide,
+            next: Some(next),
+            next_baseline,
+            notes: Rect {
+                x: notes_x,
+                y: notes_y,
+                w: notes_w,
+                h: (bottom - margin - notes_y).max(0.0),
+            },
+        };
+    }
     Layout {
         bar_y,
         bar,
         slide,
+        next: None,
         next_baseline: slide.y + sh + 0.065 * h * settings.next_size,
         notes: Rect {
             x: notes_x,
             y: top + margin,
-            w: w - notes_x - margin,
+            w: notes_w,
             h: bottom - top - 2.0 * margin,
         },
     }
@@ -168,6 +222,8 @@ struct PanelSpec {
     /// The slide's shape, in thousandths.
     aspect_milli: u32,
     layout: PresenterLayout,
+    /// Room for the next slide's picture: the talk has them.
+    picture: bool,
 }
 
 struct Face {
@@ -270,6 +326,7 @@ fn break_word(
     word: &str,
     size: f32,
     width: f32,
+    bold: bool,
     widths: &mut Widths,
     fonts: &Arc<usvg::fontdb::Database>,
 ) -> Vec<String> {
@@ -278,7 +335,7 @@ fn break_word(
     for c in word.chars() {
         let mut longer = piece.clone();
         longer.push(c);
-        if !piece.is_empty() && widths.of(&longer, size, false, fonts) > width {
+        if !piece.is_empty() && widths.of(&longer, size, bold, fonts) > width {
             pieces.push(std::mem::take(&mut piece));
             piece.push(c);
         } else {
@@ -291,28 +348,30 @@ fn break_word(
     pieces
 }
 
-/// `text` broken into lines no wider than `width` at `size`: its own lines
-/// kept, words moved down whole — a word wider than a line cut to fit.
+/// `text` broken into lines no wider than `width` at `size`, in bold or not
+/// (as it is drawn): its own lines kept, words moved down whole — a word
+/// wider than a line cut to fit.
 fn wrap(
     text: &str,
     size: f32,
     width: f32,
+    bold: bool,
     widths: &mut Widths,
     fonts: &Arc<usvg::fontdb::Database>,
 ) -> Vec<String> {
-    let space = widths.of(" ", size, false, fonts);
+    let space = widths.of(" ", size, bold, fonts);
     let mut lines = Vec::new();
     for paragraph in text.lines() {
         let mut line = String::new();
         let mut used = 0.0;
         for word in paragraph.split_whitespace() {
-            let pieces = if widths.of(word, size, false, fonts) > width {
-                break_word(word, size, width, widths, fonts)
+            let pieces = if widths.of(word, size, bold, fonts) > width {
+                break_word(word, size, width, bold, widths, fonts)
             } else {
                 vec![word.to_string()]
             };
             for piece in pieces {
-                let w = widths.of(&piece, size, false, fonts);
+                let w = widths.of(&piece, size, bold, fonts);
                 if !line.is_empty() && used + space + w > width {
                     lines.push(std::mem::take(&mut line));
                     used = 0.0;
@@ -331,6 +390,54 @@ fn wrap(
         lines.pop();
     }
     lines
+}
+
+/// [`wrap`], `most` lines at most: the last of them ending in "…" when more
+/// was left out — words coming off its end until the "…" fits too, then
+/// characters, from a piece of a long address.
+fn wrap_at_most(
+    text: &str,
+    size: f32,
+    width: f32,
+    bold: bool,
+    most: usize,
+    widths: &mut Widths,
+    fonts: &Arc<usvg::fontdb::Database>,
+) -> Vec<String> {
+    let lines = wrap(text, size, width, bold, widths, fonts);
+    if lines.len() <= most {
+        return lines;
+    }
+    let mut kept: Vec<String> = lines.into_iter().take(most).collect();
+    if let Some(last) = kept.last_mut() {
+        *last = with_ellipsis(last, size, width, bold, widths, fonts);
+    }
+    kept
+}
+
+/// `line` with "…" at its end, no wider than `width`: words come off its
+/// end until it fits, then characters.
+fn with_ellipsis(
+    line: &str,
+    size: f32,
+    width: f32,
+    bold: bool,
+    widths: &mut Widths,
+    fonts: &Arc<usvg::fontdb::Database>,
+) -> String {
+    let mut line = line.to_string();
+    loop {
+        let cut = format!("{line} …");
+        if line.is_empty() || widths.of(&cut, size, bold, fonts) <= width {
+            return cut.trim_start().to_string();
+        }
+        match line.rfind(' ') {
+            Some(at) => line.truncate(at),
+            None => {
+                line.pop();
+            }
+        }
+    }
 }
 
 /// The notes set to fill their column: the largest size, from a comfortable
@@ -373,7 +480,7 @@ fn fit_notes(
     let mut size = 0.048 * frame_h;
     let smallest = 0.026 * frame_h;
     loop {
-        let lines = wrap(notes, size, rect.w, widths, fonts);
+        let lines = wrap(notes, size, rect.w, false, widths, fonts);
         #[allow(clippy::cast_precision_loss)]
         let fits = (lines.len() as f32) * size * 1.3 <= rect.h;
         if fits {
@@ -384,21 +491,7 @@ fn fit_notes(
             let room = (rect.h / (size * 1.3)).floor().max(1.0) as usize;
             let mut kept: Vec<String> = lines.into_iter().take(room).collect();
             if let Some(last) = kept.last_mut() {
-                // The "…" fits too: words come off the end until it does —
-                // then characters, from a piece of a long address.
-                loop {
-                    let cut = format!("{last} …");
-                    if last.is_empty() || widths.of(&cut, size, false, fonts) <= rect.w {
-                        *last = cut.trim_start().to_string();
-                        break;
-                    }
-                    match last.rfind(' ') {
-                        Some(at) => last.truncate(at),
-                        None => {
-                            last.pop();
-                        }
-                    }
-                }
+                *last = with_ellipsis(last, size, rect.w, false, widths, fonts);
             }
             return (size, kept);
         }
@@ -471,7 +564,12 @@ fn panel_svg(
     #[allow(clippy::cast_precision_loss)]
     let (wide, high) = (fw as f32, fh as f32);
     #[allow(clippy::cast_precision_loss)]
-    let at = layout(spec.frame, spec.aspect_milli as f32 / 1000.0, &spec.layout);
+    let at = layout_for(
+        spec.frame,
+        spec.aspect_milli as f32 / 1000.0,
+        &spec.layout,
+        spec.picture,
+    );
     let settings = spec.layout.sanitized();
     let margin = 0.025 * high;
     let mut svg = String::new();
@@ -548,10 +646,7 @@ fn panel_svg(
     if !spec.words.banner.is_empty() {
         // Two lines and their strip within the slide, however narrow.
         let size = (0.045 * high).min(slide.h / 3.2);
-        let lines: Vec<String> = wrap(&spec.words.banner, size, slide.w * 0.9, widths, fonts)
-            .into_iter()
-            .take(2)
-            .collect();
+        let lines = wrap_at_most(&spec.words.banner, size, slide.w * 0.9, true, 2, widths, fonts);
         #[allow(clippy::cast_precision_loss)]
         let strip_h = size * (1.3 * lines.len().max(1) as f32 + 0.5);
         let strip = Rect {
@@ -581,9 +676,38 @@ fn panel_svg(
         }
         banner = Some(strip);
     }
-    // What comes next, under the slide, when it is wanted: no wider than
-    // the room up to the notes.
-    if settings.next {
+    // What comes next, when it is wanted: its picture's place — dark, the
+    // picture drawn over it — and the line under it, no wider than the
+    // column; else the line under the slide, no wider than the room up to
+    // the notes.
+    if let Some(next) = at.next {
+        let _ = write!(
+            svg,
+            r##"<rect x="{}" y="{}" width="{}" height="{}" fill="#000000" stroke="#3a3a3a" stroke-width="{}"/>"##,
+            next.x,
+            next.y,
+            next.w,
+            next.h,
+            (0.002 * high).max(1.0)
+        );
+        let (size, line) = fit_line(
+            &spec.words.next,
+            NEXT_CAPTION * high,
+            at.notes.w.max(1.0),
+            widths,
+            fonts,
+        );
+        text(
+            &mut svg,
+            next.x,
+            at.next_baseline,
+            size,
+            DIM,
+            "start",
+            false,
+            &line,
+        );
+    } else if settings.next {
         let room = (at.notes.x - slide.x - margin).max(1.0);
         let (size, line) = fit_line(
             &spec.words.next,
@@ -603,34 +727,14 @@ fn panel_svg(
             &line,
         );
     }
-    // The notes, with the slide's title over them.
+    // The slide's notes, only when there are some: no heading over them, no
+    // word in place of notes that are not there, nor the slide's title — the
+    // slide shows it.
     let column = at.notes;
-    let label = 0.028 * high;
-    text(
-        &mut svg,
-        column.x,
-        column.y + label,
-        label,
-        DIM,
-        "start",
-        true,
-        "NOTES",
-    );
-    let mut top = column.y + label * 1.8;
-    if !spec.words.title.is_empty() {
-        let size = 0.04 * high;
-        let title = wrap(&spec.words.title, size, column.w, widths, fonts);
-        for line in title.iter().take(2) {
-            top += size * 1.15;
-            text(&mut svg, column.x, top, size, ACCENT, "start", true, line);
-        }
-        top += size * 0.5;
-    }
+    let mut top = column.y;
     let notes_rect = Rect {
-        x: column.x,
-        y: top,
-        w: column.w,
-        h: (column.y + column.h - top).max(0.0),
+        h: column.h.max(0.0),
+        ..column
     };
     let (size, lines) = match notes_cache {
         Some((notes, rect, scale, size, lines))
@@ -658,18 +762,6 @@ fn panel_svg(
             (size, lines)
         }
     };
-    if lines.is_empty() {
-        text(
-            &mut svg,
-            column.x,
-            top + 0.04 * high,
-            0.035 * high,
-            DIM,
-            "start",
-            false,
-            "No notes",
-        );
-    }
     for line in &lines {
         top += size * 1.3;
         text(
@@ -767,19 +859,66 @@ pub struct Presenter {
     started: Option<Instant>,
     /// Its clocks, what comes next, and the sizes of slide and notes.
     layout: PresenterLayout,
-    /// The layout, slide shape and size of the panel shown: the live slide
-    /// goes where its placeholder is — scaled with the panel when the
-    /// master's size has changed — until a panel drawn anew comes.
-    shown: Option<(PresenterLayout, f32, (u32, u32))>,
+    /// The layout, slide shape, size and room for the next slide's picture
+    /// of the panel shown: the live slide goes where its placeholder is —
+    /// scaled with the panel when the master's size has changed — until a
+    /// panel drawn anew comes.
+    shown: Option<(PresenterLayout, f32, (u32, u32), bool)>,
     panel_blit: BlitPipeline,
     slide_blit: BlitPipeline,
+    next_blit: BlitPipeline,
     panel: Option<Face>,
     asked: Option<PanelSpec>,
     painter: Painter,
     /// The PowerPoint input's live picture and its size, handed over each
     /// frame by the render loop.
     pub slide: Option<(wgpu::TextureView, (u32, u32))>,
+    /// The next slide's pictures: where they are drawn from, and what is
+    /// drawn and shown of them.
+    next: NextPictures,
 }
+
+/// Where the next slide's pictures come from: a PDF, as the talk on plays
+/// it — the talk, the file, and the file's size and time, so a file put in
+/// its place, or the same file for another talk, is opened afresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NextSource {
+    pub talk: String,
+    pub path: std::path::PathBuf,
+    pub stamp: Option<(u64, std::time::SystemTime)>,
+}
+
+/// The next slide's pictures: the pages of a PDF — a PDF talk's own —
+/// drawn on a thread at their place's size, the next one shown.
+#[derive(Default)]
+struct NextPictures {
+    /// Where they come from: room is made for them while there is one.
+    source: Option<NextSource>,
+    /// The page that comes next, when one does.
+    page: Option<u32>,
+    /// The drawer for a source; `None` in it when the file would not open —
+    /// opened again only for another source.
+    drawer: Option<(NextSource, Option<crate::presentation::pdf::PdfDrawer>)>,
+    /// The pages last asked for, and the size.
+    asked: Option<(u32, (u32, u32))>,
+    /// Pages drawn at the size asked, kept for the next step or two.
+    drawn: Vec<(u32, (u32, u32), image::RgbaImage)>,
+    /// The picture shown.
+    face: Option<NextFace>,
+}
+
+/// The next slide's picture shown: its page, the size it was asked at and
+/// the size it came (its shape kept within it), its texture.
+struct NextFace {
+    page: u32,
+    asked: (u32, u32),
+    size: (u32, u32),
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+/// Pages kept drawn for the next slide's picture.
+const NEXT_KEPT: usize = 3;
 
 impl Presenter {
     /// A presenter view of the PowerPoint input whose layer is `follows`.
@@ -798,11 +937,33 @@ impl Presenter {
             shown: None,
             panel_blit: BlitPipeline::new(&context.device, context.compositing_format)?,
             slide_blit: BlitPipeline::new(&context.device, context.compositing_format)?,
+            next_blit: BlitPipeline::new(&context.device, context.compositing_format)?,
             panel: None,
             asked: None,
             painter: Painter::start(),
             slide: None,
+            next: NextPictures::default(),
         })
+    }
+
+    /// Where the next slide's pictures come from — a PDF, its pages — and
+    /// the page that comes next; `None` when the talk has none (they are not
+    /// drawn, and what comes next is said in a line).
+    pub fn set_next_picture(&mut self, source: Option<NextSource>, page: Option<u32>) {
+        self.next.source = source;
+        self.next.page = page;
+    }
+
+    /// The page the next slide's picture shows, once drawn.
+    #[must_use]
+    pub fn next_picture(&self) -> Option<u32> {
+        let page = self.next.face.as_ref()?.page;
+        (self.next.page == Some(page) && self.has_picture()).then_some(page)
+    }
+
+    /// Room is made for the next slide's picture.
+    fn has_picture(&self) -> bool {
+        self.layout.next && self.next.source.is_some()
     }
 
     #[must_use]
@@ -832,25 +993,40 @@ impl Presenter {
     /// Where the live slide goes: where the panel shown left room for it —
     /// as now laid out until that is drawn.
     fn slide_rect(&self) -> Rect {
-        match self.shown {
-            Some((settings, aspect, painted)) => {
-                // The panel is drawn at `painted` and stretched over the
-                // frame: its placeholder, stretched with it.
-                let slide = layout(painted, aspect, &settings).slide;
-                #[allow(clippy::cast_precision_loss)]
-                let (kx, ky) = (
-                    self.frame.0.max(1) as f32 / painted.0.max(1) as f32,
-                    self.frame.1.max(1) as f32 / painted.1.max(1) as f32,
-                );
-                Rect {
-                    x: slide.x * kx,
-                    y: slide.y * ky,
-                    w: slide.w * kx,
-                    h: slide.h * ky,
-                }
-            }
-            None => layout(self.frame, self.aspect(), &self.layout).slide,
-        }
+        self.placed(|at| Some(at.slide))
+            .unwrap_or_else(|| layout(self.frame, self.aspect(), &self.layout).slide)
+    }
+
+    /// Where the next slide's picture goes, likewise; `None` when the panel
+    /// shown has no room for it.
+    fn next_rect(&self) -> Option<Rect> {
+        self.placed(|at| at.next)
+    }
+
+    /// A place `of` the panel shown, in the frame's pixels: the panel is
+    /// drawn at its own size and stretched over the frame, its places with
+    /// it. As now laid out until one is drawn.
+    fn placed(&self, of: impl Fn(&Layout) -> Option<Rect>) -> Option<Rect> {
+        let Some((settings, aspect, painted, picture)) = self.shown else {
+            return of(&layout_for(
+                self.frame,
+                self.aspect(),
+                &self.layout,
+                self.has_picture(),
+            ));
+        };
+        let rect = of(&layout_for(painted, aspect, &settings, picture))?;
+        #[allow(clippy::cast_precision_loss)]
+        let (kx, ky) = (
+            self.frame.0.max(1) as f32 / painted.0.max(1) as f32,
+            self.frame.1.max(1) as f32 / painted.1.max(1) as f32,
+        );
+        Some(Rect {
+            x: rect.x * kx,
+            y: rect.y * ky,
+            w: rect.w * kx,
+            h: rect.h * ky,
+        })
     }
 
     /// How it is laid out (see [`PresenterLayout`]).
@@ -889,6 +1065,7 @@ impl Presenter {
         let frame = panel_size(self.frame);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let aspect_milli = (self.aspect() * 1000.0).round() as u32;
+        let picture = self.has_picture();
         // Compared field by field: nothing is copied while nothing changes.
         let same = self.asked.as_ref().is_some_and(|a| {
             a.words == self.words
@@ -897,6 +1074,7 @@ impl Presenter {
                 && a.frame == frame
                 && a.aspect_milli == aspect_milli
                 && a.layout == self.layout
+                && a.picture == picture
         });
         if !same {
             let spec = PanelSpec {
@@ -906,6 +1084,7 @@ impl Presenter {
                 frame,
                 aspect_milli,
                 layout: self.layout,
+                picture,
             };
             self.painter.ask(spec.clone());
             self.asked = Some(spec);
@@ -913,9 +1092,110 @@ impl Presenter {
         if let Some((spec, drawing)) = self.painter.take() {
             #[allow(clippy::cast_precision_loss)]
             let aspect = spec.aspect_milli as f32 / 1000.0;
-            self.shown = drawing.as_ref().map(|_| (spec.layout, aspect, spec.frame));
+            self.shown = drawing
+                .as_ref()
+                .map(|_| (spec.layout, aspect, spec.frame, spec.picture));
             self.show(drawing);
         }
+        self.draw_next();
+    }
+
+    /// The next slide's picture: its pages drawn on a thread at its place's
+    /// size — the next one first, the one after it then, for the step after
+    /// — and the next one shown once drawn.
+    fn draw_next(&mut self) {
+        let on = self.layout.next;
+        let next = &mut self.next;
+        let wanted = next.source.as_ref().filter(|_| on);
+        match (wanted, &next.drawer) {
+            (Some(source), Some((open, _))) if open == source => {}
+            (Some(source), _) => {
+                let source = source.clone();
+                let drawer = crate::presentation::pdf::PdfDrawer::open(source.path.clone());
+                next.drawer = Some((source, Some(drawer)));
+                next.asked = None;
+                next.drawn.clear();
+                next.face = None;
+            }
+            (None, None) => return,
+            (None, Some(_)) => {
+                next.drawer = None;
+                next.asked = None;
+                next.drawn.clear();
+                next.face = None;
+                return;
+            }
+        }
+        let Some((source, Some(drawer))) = &next.drawer else {
+            return;
+        };
+        for event in drawer.poll() {
+            match event {
+                crate::presentation::pdf::PdfEvent::Drawn { page, size, image } => {
+                    next.drawn.retain(|(p, s, _)| *p != page && *s == size);
+                    next.drawn.push((page, size, image));
+                    if next.drawn.len() > NEXT_KEPT {
+                        next.drawn.remove(0);
+                    }
+                }
+                crate::presentation::pdf::PdfEvent::Failed(why) => {
+                    log::warn!(
+                        "Presenter view: no next slide's picture from {}: {why}",
+                        source.path.display()
+                    );
+                    let source = source.clone();
+                    next.drawer = Some((source, None));
+                    next.face = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let Some(rect) = self.next_rect() else {
+            return;
+        };
+        let next = &mut self.next;
+        let Some(page) = next.page else {
+            next.face = None;
+            return;
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let size = (
+            (rect.w.round() as u32).clamp(1, 4096),
+            (rect.h.round() as u32).clamp(1, 4096),
+        );
+        if next.asked != Some((page, size)) {
+            if let Some((_, Some(drawer))) = &next.drawer {
+                drawer.want(vec![page, page + 1], size);
+            }
+            next.asked = Some((page, size));
+        }
+        let shown = next
+            .face
+            .as_ref()
+            .is_some_and(|f| f.page == page && f.asked == size);
+        if shown {
+            return;
+        }
+        let Some((_, _, image)) = next
+            .drawn
+            .iter()
+            .find(|(p, s, _)| *p == page && *s == size)
+        else {
+            return;
+        };
+        let (texture, view) = super::source::upload_image_texture(&self.context, image);
+        let bind_group = self
+            .next_blit
+            .create_bind_group(&self.context.device, &view);
+        let drawn = image.dimensions();
+        self.next.face = Some(NextFace {
+            page,
+            asked: size,
+            size: drawn,
+            _texture: texture,
+            bind_group,
+        });
     }
 
     fn show(&mut self, drawing: Option<Drawing>) {
@@ -978,6 +1258,15 @@ impl Presenter {
                 self.slide_rect(),
             )
         });
+        // The next slide's picture — the page that comes next, not one from
+        // before a step — its shape kept, in the middle of its place.
+        let next = self
+            .next
+            .face
+            .as_ref()
+            .filter(|f| Some(f.page) == self.next.page && self.has_picture())
+            .zip(self.next_rect())
+            .map(|(face, place)| (face, fit(face.size, place)));
         let mut encoder =
             self.context
                 .device
@@ -1020,6 +1309,20 @@ impl Presenter {
                         .render_within(&mut pass, bind_group, Some(&[within]));
                 }
             }
+            if let Some((face, rect)) = &next {
+                #[allow(clippy::cast_precision_loss)]
+                let frame = (self.frame.0.max(1) as f32, self.frame.1.max(1) as f32);
+                self.next_blit.set_uv_transform(
+                    &self.context.queue,
+                    1.0,
+                    [frame.0 / rect.w, frame.1 / rect.h],
+                    [-rect.x / rect.w, -rect.y / rect.h],
+                );
+                if let Some(within) = scissor(*rect, self.frame, target) {
+                    self.next_blit
+                        .render_within(&mut pass, &face.bind_group, Some(&[within]));
+                }
+            }
             // The banner over the slide's foot: the panel's again, there.
             if let Some((face, strip)) = self
                 .panel
@@ -1049,6 +1352,21 @@ impl Presenter {
     /// The master's size changed: the panel is drawn again to suit.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.frame = (width.max(1), height.max(1));
+    }
+}
+
+/// A picture `size` big fitted within `place`, its shape kept, in its
+/// middle.
+#[allow(clippy::cast_precision_loss)]
+fn fit(size: (u32, u32), place: Rect) -> Rect {
+    let (w, h) = (size.0.max(1) as f32, size.1.max(1) as f32);
+    let k = (place.w / w).min(place.h / h);
+    let (fw, fh) = ((w * k).max(1.0), (h * k).max(1.0));
+    Rect {
+        x: place.x + (place.w - fw) / 2.0,
+        y: place.y + (place.h - fh) / 2.0,
+        w: fw,
+        h: fh,
     }
 }
 
@@ -1117,13 +1435,24 @@ mod tests {
 
     #[test]
     fn the_slide_keeps_its_shape_and_leaves_room_for_the_notes() {
-        for (frame, aspect) in [
+        let frames = [
             ((1920, 1080), 16.0 / 9.0),
             ((1920, 1080), 4.0 / 3.0),
             ((1280, 1024), 16.0 / 9.0),
             ((3840, 2160), 16.0 / 9.0),
-        ] {
-            let at = layout(frame, aspect, &PresenterLayout::default());
+        ];
+        for ((frame, aspect), clocks_at) in frames
+            .into_iter()
+            .flat_map(|f| [(f, ClocksAt::Top), (f, ClocksAt::Bottom)])
+        {
+            let at = layout(
+                frame,
+                aspect,
+                &PresenterLayout {
+                    clocks_at,
+                    ..PresenterLayout::default()
+                },
+            );
             #[allow(clippy::cast_precision_loss)]
             let (w, h) = (frame.0 as f32, frame.1 as f32);
             assert!(
@@ -1138,7 +1467,13 @@ mod tests {
                 at.notes.x + at.notes.w <= w && at.next_baseline <= h,
                 "{frame:?}"
             );
-            assert!(at.slide.y >= at.bar && at.slide.y + at.slide.h < at.next_baseline);
+            // Clear of the bar, wherever it is: under it, or the slide and
+            // its next line above it.
+            assert!(
+                at.slide.y >= at.bar_y + at.bar || at.next_baseline <= at.bar_y,
+                "{frame:?} {clocks_at:?}"
+            );
+            assert!(at.slide.y + at.slide.h < at.next_baseline, "{frame:?}");
             assert!(at.notes.w > 0.3 * w, "{frame:?}: notes too narrow");
         }
     }
@@ -1149,7 +1484,7 @@ mod tests {
         let mut widths = Widths::default();
         let notes = "Thank the organisers and the sponsors. Then the agenda, in three parts: \
                      what we found, what it means, and what we ask of you.\nPause for questions.";
-        let lines = wrap(notes, 40.0, 600.0, &mut widths, &fonts);
+        let lines = wrap(notes, 40.0, 600.0, false, &mut widths, &fonts);
         assert!(lines.len() >= 3, "{lines:?}");
         assert_eq!(
             lines.last().map(String::as_str),
@@ -1185,7 +1520,7 @@ mod tests {
         assert!(lines.last().is_some_and(|l| l.ends_with('…')));
     }
 
-    /// The bar at the foot, what comes next left out, a wider slide: the
+    /// The bar at the top, what comes next left out, a wider slide: the
     /// slide and the notes take the room as asked; a share beyond bounds is
     /// brought into them.
     #[test]
@@ -1194,15 +1529,20 @@ mod tests {
         let aspect = 16.0 / 9.0;
         let with = |settings: PresenterLayout| layout(frame, aspect, &settings);
         let default = with(PresenterLayout::default());
-        assert!(default.bar_y.abs() < f32::EPSILON, "the bar at the top");
+        assert!(
+            (default.bar_y - 972.0).abs() < 0.5,
+            "the bar at the foot: {}",
+            default.bar_y
+        );
+        assert!(default.notes.y + default.notes.h <= default.bar_y);
 
-        let foot = with(PresenterLayout {
-            clocks_at: ClocksAt::Bottom,
+        let top = with(PresenterLayout {
+            clocks_at: ClocksAt::Top,
             ..PresenterLayout::default()
         });
-        assert!((foot.bar_y - 972.0).abs() < 0.5, "{}", foot.bar_y);
-        assert!(foot.slide.y < default.slide.y, "the slide up top");
-        assert!(foot.notes.y + foot.notes.h <= foot.bar_y);
+        assert!(top.bar_y.abs() < f32::EPSILON, "the bar at the top");
+        assert!(top.slide.y > default.slide.y, "the slide under it");
+        assert!(top.notes.y >= top.bar + top.bar_y);
 
         let wide = with(PresenterLayout {
             slide_share: 0.8,
@@ -1230,6 +1570,177 @@ mod tests {
                 ..PresenterLayout::default()
             })
         );
+    }
+
+    /// A new presenter view shows the talk's clock at its foot, not the time
+    /// of day, and the next slide: its picture as wide as the notes' column.
+    #[test]
+    fn a_new_presenter_view_shows_the_talks_clock_at_its_foot_and_the_next_slide_across() {
+        let new = PresenterLayout::default();
+        assert!(new.timer && new.next && !new.clock, "{new:?}");
+        assert_eq!(new.clocks_at, ClocksAt::Bottom);
+        let at = layout_for((1920, 1080), 16.0 / 9.0, &new, true);
+        let next = at.next.expect("room for the picture");
+        assert!((next.w - at.notes.w).abs() < 0.5, "{next:?} in {:?}", at.notes);
+    }
+
+    /// With the next slide's picture: it heads the right column, as wide as
+    /// asked within it, the line under it and the notes under that; the
+    /// slide takes the room the line under it had.
+    #[test]
+    fn the_next_slides_picture_heads_the_right_column_and_the_notes_go_under_it() {
+        for (frame, aspect) in [
+            ((1920, 1080), 16.0 / 9.0),
+            ((1920, 1080), 4.0 / 3.0),
+            ((1280, 1024), 16.0 / 9.0),
+            ((1080, 1920), 16.0 / 9.0),
+        ] {
+            #[allow(clippy::cast_precision_loss)]
+            let (w, h) = (frame.0 as f32, frame.1 as f32);
+            let settings = PresenterLayout::default();
+            let at = layout_for(frame, aspect, &settings, true);
+            let next = at.next.expect("room for the picture");
+            assert!(next.x > at.slide.x + at.slide.w, "{frame:?}: beside the slide");
+            assert!(next.x + next.w <= w + 0.5 && (next.y - at.slide.y).abs() < 0.5);
+            assert!((next.w / next.h - aspect).abs() < 0.01, "{frame:?}: its shape");
+            assert!(at.next_baseline > next.y + next.h && at.notes.y > at.next_baseline);
+            assert!(at.notes.y + at.notes.h <= h && at.notes.h > 0.0, "{frame:?}");
+            let line = layout(frame, aspect, &settings);
+            assert!(at.slide.h >= line.slide.h, "{frame:?}: the line's room the slide's");
+            assert!(line.next.is_none());
+            // As wide as the column, or as tall as half the room under the
+            // bar at the foot — and no bigger asked bigger; smaller asked so.
+            assert!(
+                next.w >= at.notes.w - 0.5 || next.h >= 0.425 * h - 0.5,
+                "{frame:?}: {next:?} in {:?}",
+                at.notes
+            );
+            let sized = |next_size| {
+                layout_for(
+                    frame,
+                    aspect,
+                    &PresenterLayout {
+                        next_size,
+                        ..settings
+                    },
+                    true,
+                )
+                .next
+                .expect("room")
+            };
+            assert_eq!(sized(2.0), next, "{frame:?}");
+            assert!(sized(0.5).w < next.w, "{frame:?}");
+            let off = layout_for(
+                frame,
+                aspect,
+                &PresenterLayout {
+                    next: false,
+                    ..settings
+                },
+                true,
+            );
+            assert!(off.next.is_none(), "{frame:?}: what comes next switched off");
+        }
+    }
+
+    /// The picture's place is drawn dark — the picture goes over it — with
+    /// what comes next said under it.
+    #[test]
+    fn the_next_slides_place_is_dark_with_its_line_under_it() {
+        let fonts = super::super::svg::system_fonts();
+        let spec = PanelSpec {
+            words: Words::of(Some(&show())),
+            elapsed: "12:34".into(),
+            clock: "14:05".into(),
+            frame: (960, 540),
+            aspect_milli: 1778,
+            layout: PresenterLayout::default(),
+            picture: true,
+        };
+        let svg = panel_svg(&spec, &fonts, &mut Widths::default(), &mut None)
+            .expect("drawn")
+            .0;
+        assert!(svg.contains(&escape(&spec.words.next)));
+        let (image, _) = paint(&spec, &fonts, &mut Widths::default(), &mut None).expect("drawn");
+        let next = layout_for((960, 540), 1.778, &spec.layout, true)
+            .next
+            .expect("room");
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let inside = image.get_pixel(
+            (next.x + next.w / 2.0) as u32,
+            (next.y + next.h / 2.0) as u32,
+        );
+        assert_eq!(inside.0, [0, 0, 0, 255]);
+    }
+
+    /// The column has the slide's notes only — no heading over them, no
+    /// "No notes" when there are none, and never the slide's title, which
+    /// the slide shows.
+    #[test]
+    fn the_column_has_the_notes_only_never_the_slides_title() {
+        let fonts = super::super::svg::system_fonts();
+        let mut show = show();
+        show.title = Some("Į studentą orientuotas dėstymas".into());
+        let spec = |show: &PresentationSnapshot| PanelSpec {
+            words: Words::of(Some(show)),
+            elapsed: "12:34".into(),
+            clock: "14:05".into(),
+            frame: (1920, 1080),
+            aspect_milli: 1778,
+            layout: PresenterLayout::default(),
+            picture: true,
+        };
+        let svg = |show: &PresentationSnapshot| {
+            panel_svg(&spec(show), &fonts, &mut Widths::default(), &mut None)
+                .expect("drawn")
+                .0
+        };
+        let with_notes = svg(&show);
+        assert!(with_notes.contains("Thank the organisers."), "the notes");
+        assert!(!with_notes.contains("Į studentą"), "no title");
+        assert!(with_notes.contains(&escape(&spec(&show).words.next)));
+
+        show.notes = String::new();
+        let without = svg(&show);
+        assert!(!without.contains(">NOTES<"), "no heading");
+        assert!(!without.contains("No notes"), "no word for notes not there");
+        assert!(!without.contains("Į studentą"), "no title");
+    }
+
+    /// A long line drawn in bold — the banner over the slide — wraps within
+    /// its width as wide as it is drawn: as many lines as allowed at most,
+    /// the last ending in "…" when more is left out.
+    #[test]
+    fn a_long_bold_line_wraps_within_its_width_cut_with_an_ellipsis() {
+        let fonts = super::super::svg::system_fonts();
+        let title = "Į studentą orientuotas dėstymas: kaip pasitelkti dirbtinį intelektą \
+                     studentų mokymosi skatinimui (2 dalis), su pavyzdžiais ir užduotimis \
+                     kiekvienam seminarui";
+        let mut widths = Widths::default();
+        let column = 600.0;
+        let lines = wrap_at_most(title, 40.0, column, true, 3, &mut widths, &fonts);
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert!(widths.of(line, 40.0, true, &fonts) <= column + 0.5, "{line}");
+        }
+        assert!(lines[2].ends_with('…'), "{:?}", lines[2]);
+        let short = wrap_at_most("Results", 40.0, column, true, 3, &mut widths, &fonts);
+        assert_eq!(short, ["Results"]);
+    }
+
+    /// A picture of another shape sits in the middle of its place, whole.
+    #[test]
+    fn a_picture_is_fitted_into_its_place() {
+        let place = Rect {
+            x: 100.0,
+            y: 50.0,
+            w: 400.0,
+            h: 225.0,
+        };
+        let square = fit((300, 300), place);
+        assert!((square.w - 225.0).abs() < 0.01 && (square.h - 225.0).abs() < 0.01);
+        assert!((square.x - 187.5).abs() < 0.01 && (square.y - 50.0).abs() < 0.01);
+        assert_eq!(fit((1600, 900), place), place);
     }
 
     /// A line too wide for its room: smaller, down to half, then cut with
@@ -1268,6 +1779,7 @@ mod tests {
             frame: (1080, 1920),
             aspect_milli: 1778,
             layout: settings,
+            picture: false,
         };
         let (_, banner) = paint(&spec, &fonts, &mut Widths::default(), &mut None).expect("drawn");
         let slide = layout((1080, 1920), 1.778, &settings).slide;
@@ -1288,6 +1800,7 @@ mod tests {
                 frame: (960, 540),
                 aspect_milli: 1778,
                 layout,
+                picture: false,
             };
             panel_svg(&spec, &fonts, &mut Widths::default(), &mut None)
                 .expect("drawn")
@@ -1295,7 +1808,10 @@ mod tests {
         };
         let next = Words::of(Some(&show())).next;
         assert!(!next.is_empty());
-        let all = svg(PresenterLayout::default());
+        let all = svg(PresenterLayout {
+            clock: true,
+            ..PresenterLayout::default()
+        });
         assert!(all.contains(">12:34<") && all.contains(">14:05<"));
         assert!(all.contains(&escape(&next)));
         let none = svg(PresenterLayout {
@@ -1318,6 +1834,7 @@ mod tests {
             frame: (960, 540),
             aspect_milli: 1778,
             layout: PresenterLayout::default(),
+            picture: false,
         };
         let (image, banner) =
             paint(&spec, &fonts, &mut Widths::default(), &mut None).expect("drawn");
@@ -1351,6 +1868,7 @@ mod tests {
             &format!("See {url} after."),
             40.0,
             400.0,
+            false,
             &mut widths,
             &fonts,
         );
@@ -1394,6 +1912,7 @@ mod tests {
             frame: (960, 540),
             aspect_milli: 1778,
             layout: PresenterLayout::default(),
+            picture: false,
         };
         let (_, banner) = paint(&spec, &fonts, &mut Widths::default(), &mut None).expect("drawn");
         let strip = banner.expect("a banner strip");

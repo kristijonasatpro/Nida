@@ -199,6 +199,7 @@ pub(crate) mod tests {
                         screen_capture: None,
                         tap: None,
                         playlist: None,
+                        slides: None,
                         timer: None,
                         presentation: None,
                         presenter_of: None,

@@ -10,10 +10,54 @@
 use super::super::VardaApp;
 use crate::bus::{BusInputRef, Together, TogetherRejected};
 use crate::engine::value::render::OutputSource;
-use crate::engine::value::timer::TimerAction;
+use crate::engine::value::timer::{TimerAction, TimerMode};
 use crate::engine::{CommandResult, ErrorCode};
 use crate::mixer::{MainSource, MixMode};
-use crate::rundown::{OverlaySet, PlayAction, ScreenSet, Step};
+use crate::rundown::{OverlaySet, PlayAction, PlaySet, ScreenSet, Step, TimerSet};
+
+/// A clip or playlist a step is fading out: its sound goes down over the
+/// step's fade, then it is stopped or paused — and its sound is kept down a
+/// moment longer, so what its decoder had ready is not heard at full level.
+#[derive(Debug, Clone)]
+pub(crate) struct SoundFade {
+    /// Its deck, by UUID.
+    deck: String,
+    /// The frame-clock reading it started at, and how long it takes.
+    from: f64,
+    secs: f32,
+    /// Done at its end: stopped, back at the beginning, or paused.
+    then: PlayAction,
+    /// The level it starts from: full, or where an earlier fade of the same
+    /// sound had got to.
+    start: f32,
+    /// When it was stopped or paused: the sound is let go a moment after.
+    done_at: Option<f64>,
+}
+
+impl SoundFade {
+    /// Its level at `now`, 0 to 1.
+    fn level_at(&self, now: f64) -> f32 {
+        if self.done_at.is_some() {
+            return 0.0;
+        }
+        let gone = ((now - self.from) / f64::from(self.secs)).clamp(0.0, 1.0);
+        #[allow(clippy::cast_possible_truncation)]
+        let left = (1.0 - gone) as f32;
+        self.start * left
+    }
+}
+
+/// How long a sound faded out is kept down after it is stopped or paused.
+const QUIET_AFTER_SECS: f64 = 0.4;
+
+/// The clips and playlists `step` starts or carries on till the next step.
+fn till_next(step: &Step) -> Vec<String> {
+    step.plays
+        .iter()
+        .filter(|play| play.until_next && matches!(play.action, PlayAction::Start | PlayAction::Resume))
+        .map(|play| play.deck.clone())
+        .collect()
+}
 
 /// What stands in the way of taking a step.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -85,7 +129,7 @@ impl VardaApp {
         let deck = &self.mixer.channels()[ch].decks[dk].deck;
         // A timer counts whatever the timeline does with its picture.
         if let Some(timer) = deck.timer() {
-            return if timer.settings().mode.has_transport() {
+            return if timer.mode().has_transport() {
                 Ok(Runs::Timer)
             } else {
                 Err(format!("'{}' runs by the clock", deck.source_name()))
@@ -111,6 +155,21 @@ impl VardaApp {
             return Err(format!("'{}' follows the timeline", deck.source_name()));
         }
         Ok(if playlist { Runs::Playlist } else { Runs::Clip })
+    }
+
+    /// What a step does to a deck as `play` sets it: a timer it starts set
+    /// to count down or up is one it starts, whatever the timer shows now.
+    fn runs_for(&self, play: &PlaySet) -> Result<Runs, String> {
+        if play.timer.is_some() && play.action == PlayAction::Start && self.is_timer(&play.deck) {
+            return Ok(Runs::Timer);
+        }
+        self.runs(&play.deck)
+    }
+
+    /// Whether `deck` is a timer, whatever it shows.
+    fn is_timer(&self, deck: &str) -> bool {
+        self.resolve_deck(deck)
+            .is_ok_and(|(ch, dk)| self.mixer.channels()[ch].decks[dk].deck.timer().is_some())
     }
 
     /// What stands in the way of taking `step` now. Nothing is changed.
@@ -189,7 +248,7 @@ impl VardaApp {
             }
         }
         for play in &step.plays {
-            if let Err(why) = self.runs(&play.deck) {
+            if let Err(why) = self.runs_for(play) {
                 check.missing.push(why);
             }
         }
@@ -239,6 +298,7 @@ impl VardaApp {
                 secs_left: (follow.due - now).max(0.0) as f32,
                 fade: follow.fade,
             }),
+            at_held: rundown.at_held().map(str::to_string),
         }
     }
 
@@ -261,10 +321,17 @@ impl VardaApp {
         // a step that only starts a timer does not let it go. (A step that
         // starts the clip plays it itself; a hold only keeps Auto Play from
         // starting it, so it has nothing to undo.)
-        let held = self.clips_held_by(&step);
+        // What the step being left played till the next step, this one does
+        // not start or stop itself — stopped by this step, and held so as a
+        // clip this step stops itself is — and what is on air before
+        // anything moves, for the sound this step pauses or stops alone.
+        let leaving = self.played_till_next(&step);
+        let mut held = self.clips_held_by(&step);
+        held.extend(leaving.iter().filter_map(|deck| self.held_entry(deck)));
         self.clips_held
             .retain(|(uuid, _, _)| !held.iter().any(|(again, _, _)| again == uuid));
         self.clips_held.extend(held);
+        let on_air = self.on_air();
         // Read now, not at the top of the frame, and once: every bus starts
         // from this instant (see `cmd_bus_auto`).
         let now = self.frame_stats.now_secs();
@@ -301,9 +368,28 @@ impl VardaApp {
             // the step wants it already adds nothing.
             settle = settle.max(main.overlay_settle_secs(&overlay.channel));
         }
-        for play in &step.plays {
-            self.run_play(&play.deck, play.action);
+        let fade_secs = self.rundown.fade_secs();
+        for deck in leaving {
+            self.fade_out(&deck, now, fade.then_some(fade_secs), PlayAction::Stop);
         }
+        for play in &step.plays {
+            // Sound alone — a clip or playlist on no screen and not on Main,
+            // music — paused or stopped by a step faded to fades out with it,
+            // on from wherever an earlier fade of it has got to.
+            let alone = matches!(play.action, PlayAction::Pause | PlayAction::Stop)
+                && on_air.anywhere(&play.deck) <= 0.0
+                && matches!(self.runs(&play.deck), Ok(Runs::Clip | Runs::Playlist));
+            if alone {
+                self.fade_out(&play.deck, now, fade.then_some(fade_secs), play.action);
+            } else {
+                // Its own now: a fade an earlier step began on it is over.
+                self.rundown_fades.retain(|f| f.deck != play.deck);
+                self.run_play(play);
+            }
+        }
+        // What it plays till the next step, kept should it be removed
+        // before then.
+        self.rundown_till_next = till_next(&step);
         self.rundown.taken(uuid, fade, now, settle);
         log::info!(
             "Rundown: '{}' taken with a {}",
@@ -339,10 +425,153 @@ impl VardaApp {
             .collect()
     }
 
-    /// Start, carry on, pause or stop a clip, a playlist or a timer. One
-    /// that cannot be — [`Self::check_step`] has said so — is passed over.
-    fn run_play(&mut self, deck_uuid: &str, action: PlayAction) {
-        let Ok(runs) = self.runs(deck_uuid) else {
+    /// The clips and playlists the step taken last played till the next
+    /// step — started or carried on, with `until_next` — that `step` does
+    /// not start or stop itself: to be faded out and stopped as it is taken.
+    fn played_till_next(&self, step: &Step) -> Vec<String> {
+        let decks = match self.rundown.last().and_then(|last| self.rundown.step(last)) {
+            Some(left) => till_next(left),
+            // The step taken last removed since: what it played till the next
+            // step when it was taken still goes.
+            None => self.rundown_till_next.clone(),
+        };
+        decks
+            .into_iter()
+            .filter(|deck| !step.plays.iter().any(|own| &own.deck == deck))
+            .filter(|deck| matches!(self.runs(deck), Ok(Runs::Clip | Runs::Playlist)))
+            .collect()
+    }
+
+    /// The clip or playlist `deck` held from Auto Play for the next few
+    /// on-air updates, as a step that stops it holds it.
+    fn held_entry(&self, deck: &str) -> Option<(String, usize, u8)> {
+        let (ch, dk) = self.resolve_deck(deck).ok()?;
+        let identity = self.mixer.channels()[ch].decks[dk].deck.playback_identity()?;
+        Some((deck.to_string(), identity, HELD_FOR_UPDATES))
+    }
+
+    /// Fade a clip or playlist's sound out over `secs` from `now`, then do
+    /// `then` to it — at once with no fade.
+    fn fade_out(&mut self, deck: &str, now: f64, secs: Option<f32>, then: PlayAction) {
+        // On from where an earlier fade of it has got to — never back up.
+        let start = self
+            .rundown_fades
+            .iter()
+            .find(|f| f.deck == deck)
+            .map_or(1.0, |f| f.level_at(now));
+        self.rundown_fades.retain(|f| f.deck != deck);
+        match secs.filter(|secs| *secs > 0.0) {
+            Some(secs) if start > 0.0 => self.rundown_fades.push(SoundFade {
+                deck: deck.to_string(),
+                from: now,
+                secs,
+                then,
+                start,
+                done_at: None,
+            }),
+            _ => {
+                self.run_play(&PlaySet::new(deck, then));
+                // Down already: kept down a moment, as at a fade's end.
+                if start < 1.0 {
+                    self.rundown_fades.push(SoundFade {
+                        deck: deck.to_string(),
+                        from: now,
+                        secs: 1.0,
+                        then,
+                        start: 0.0,
+                        done_at: Some(now),
+                    });
+                }
+            }
+        }
+    }
+
+    /// The fades and the times of day of the show before: let go, so none
+    /// stops or turns down a deck of the show opening.
+    pub(crate) fn forget_rundown_live(&mut self) {
+        // What was fading out is stopped (or paused) now, as its fade would
+        // have — not back up to full while the next show loads, nor playing
+        // on should it not load.
+        let pending: Vec<PlaySet> = self
+            .rundown_fades
+            .iter()
+            .filter(|fade| fade.done_at.is_none())
+            .map(|fade| PlaySet::new(fade.deck.clone(), fade.then))
+            .collect();
+        for play in &pending {
+            self.run_play(play);
+        }
+        // Kept down a moment, as at a fade's end — what the decoders had
+        // ready not heard at full level — then let go by run_sound_fades;
+        // stopped already, they stop nothing of the show opening.
+        let now = self.frame_stats.now_secs();
+        for fade in &mut self.rundown_fades {
+            if fade.done_at.is_none() {
+                fade.done_at = Some(now);
+            }
+        }
+        self.rundown_till_next.clear();
+        self.rundown_day_was = None;
+        self.run_sound_fades(now);
+    }
+
+    /// A show's scene put in place: the fades kept down for the show before
+    /// are let go — its decks are gone, and the new ones, under the same
+    /// UUIDs it may be, are not to be turned down.
+    pub(crate) fn rundown_scene_replaced(&mut self) {
+        // The old show's sound sources retired — or bound to the new decks —
+        // first: their gates opened before, what they had buffered could be
+        // heard at full level.
+        self.update_audio_mix();
+        self.rundown_fades.clear();
+        self.audio_mix.set_step_fades(std::collections::HashMap::new());
+    }
+
+    /// Once a frame: the sounds being faded out turned down as far as their
+    /// fade has gone, stopped or paused at its end, and let go a moment
+    /// after.
+    fn run_sound_fades(&mut self, now: f64) {
+        // A deck deleted meanwhile is let go: its fade must not stop or
+        // turn down whatever comes back under its UUID.
+        let gone: Vec<String> = self
+            .rundown_fades
+            .iter()
+            .filter(|fade| self.resolve_deck(&fade.deck).is_err())
+            .map(|fade| fade.deck.clone())
+            .collect();
+        self.rundown_fades.retain(|fade| !gone.contains(&fade.deck));
+        let mut levels = std::collections::HashMap::new();
+        let mut done = Vec::new();
+        self.rundown_fades.retain_mut(|fade| {
+            if let Some(at) = fade.done_at {
+                if now - at >= QUIET_AFTER_SECS {
+                    return false;
+                }
+                levels.insert(fade.deck.clone(), 0.0);
+                return true;
+            }
+            let gone = (now - fade.from) / f64::from(fade.secs);
+            if gone >= 1.0 {
+                done.push(PlaySet::new(fade.deck.clone(), fade.then));
+                fade.done_at = Some(now);
+                levels.insert(fade.deck.clone(), 0.0);
+            } else {
+                levels.insert(fade.deck.clone(), fade.level_at(now));
+            }
+            true
+        });
+        for play in &done {
+            self.run_play(play);
+        }
+        self.audio_mix.set_step_fades(levels);
+    }
+
+    /// Start, carry on, pause or stop a clip, a playlist or a timer — a
+    /// timer started set as the step says. One that cannot be —
+    /// [`Self::check_step`] has said so — is passed over.
+    fn run_play(&mut self, play: &PlaySet) {
+        let (deck_uuid, action) = (play.deck.as_str(), play.action);
+        let Ok(runs) = self.runs_for(play) else {
             return;
         };
         match runs {
@@ -371,8 +600,23 @@ impl VardaApp {
                 });
             }
             Runs::Timer => {
+                let set = play.timer;
                 let _ = self.edit_timer(deck_uuid, |timer| match action {
                     PlayAction::Start => {
+                        // Counting down from this talk's length, or up.
+                        if let Some(set) = set {
+                            let mut settings = timer.settings().clone();
+                            match set {
+                                TimerSet::Down { secs } => {
+                                    settings.mode = TimerMode::Countdown;
+                                    settings.duration_secs = secs;
+                                }
+                                TimerSet::Up => settings.mode = TimerMode::CountUp,
+                            }
+                            // For this run: an undo, or the show saved, keeps
+                            // the timer as it is set.
+                            timer.run_as(settings);
+                        }
                         timer.control(TimerAction::Reset);
                         timer.control(TimerAction::Start);
                     }
@@ -396,7 +640,7 @@ impl VardaApp {
     /// Take a step by hand. The operator has stepped in, so a wait being
     /// counted out is over, taken or not.
     pub fn cmd_take_rundown_step(&mut self, uuid: &str, fade: bool) -> CommandResult {
-        self.rundown.hold();
+        self.rundown.drop_wait();
         let result = self.take_step(uuid, fade);
         self.tell_not_taken(&result);
         result
@@ -439,6 +683,38 @@ impl VardaApp {
     /// long as it. Refused for any other reason, or when the patience is up,
     /// it says so, the wait is over, and it is not tried again.
     pub(crate) fn advance_rundown(&mut self, now: f64) {
+        self.advance_rundown_by(now, crate::deck::timer::time_of_day());
+    }
+
+    /// [`Self::advance_rundown`], the time of day being `day` — seconds
+    /// after local midnight, read with `now`: the sounds being faded out
+    /// moved on, and a step whose time of day the clock has come to, while
+    /// `GO` would take it next, taken as a wait run out is.
+    pub(crate) fn advance_rundown_by(&mut self, now: f64, day: f64) {
+        self.run_sound_fades(now);
+        // The time read last, with the step next once that frame was done: a
+        // step made next since — by hand — has its time counted from now on.
+        let next = self.rundown.next().map(|step| step.uuid.clone());
+        if let Some((was, next_then)) = self.rundown_day_was.take() {
+            let due = self
+                .rundown
+                .due_at(was, day)
+                .filter(|_| next_then == next)
+                .map(|step| (step.uuid.clone(), step.name.clone()));
+            if let Some((uuid, name)) = due {
+                log::info!("Rundown: '{name}' is due at its time of day");
+                self.rundown.start_at(&uuid, now);
+            }
+        }
+        self.run_wait(now);
+        // Kept with the step next now — after what this frame took — so a
+        // step this frame made next goes by its time from here.
+        self.rundown_day_was = Some((day, self.rundown.next().map(|step| step.uuid.clone())));
+    }
+
+    /// A wait run out — a step going on by itself, or one due at its time of
+    /// day — takes the step it leads to.
+    fn run_wait(&mut self, now: f64) {
         let Some(follow) = self.rundown.due(now) else {
             return;
         };
@@ -451,7 +727,7 @@ impl VardaApp {
         if fade && landing && overdue < FOLLOW_PATIENCE_SECS {
             return;
         }
-        self.rundown.hold();
+        self.rundown.drop_wait();
         let result = self.take_step(&to, fade);
         self.tell_not_taken(&result);
     }
@@ -674,6 +950,55 @@ impl VardaApp {
         self.edited(uuid, |rundown| rundown.set_play(uuid, deck, action))
     }
 
+    /// Whether a clip or playlist a step starts or carries on is faded out
+    /// and stopped when another step is taken.
+    pub fn cmd_set_rundown_until_next(&mut self, uuid: &str, deck: &str, on: bool) -> CommandResult {
+        if self.rundown.step(uuid).is_none() {
+            return no_such_step(uuid);
+        }
+        if on && !matches!(self.runs(deck), Ok(Runs::Clip | Runs::Playlist)) {
+            return invalid("Only a clip or a playlist is faded out at the next step");
+        }
+        if self.rundown.set_until_next(uuid, deck, on) {
+            CommandResult::Ok
+        } else {
+            invalid("The step does not start or stop that")
+        }
+    }
+
+    /// How a step sets a timer it starts: down from a length of its own, or
+    /// up — or with `None` as the timer is set.
+    pub fn cmd_set_rundown_timer(
+        &mut self,
+        uuid: &str,
+        deck: &str,
+        timer: Option<TimerSet>,
+    ) -> CommandResult {
+        if self.rundown.step(uuid).is_none() {
+            return no_such_step(uuid);
+        }
+        if timer.is_some() && !self.is_timer(deck) {
+            return invalid("Only a timer is set so");
+        }
+        if matches!(timer, Some(TimerSet::Down { secs: 0 })) {
+            return invalid("A count down is longer than no time");
+        }
+        if self.rundown.set_timer(uuid, deck, timer) {
+            CommandResult::Ok
+        } else {
+            invalid("The step does not start or stop that timer")
+        }
+    }
+
+    /// The time of day a step is taken by itself at, seconds after
+    /// midnight, or with `None` not.
+    pub fn cmd_set_rundown_at(&mut self, uuid: &str, at_secs: Option<u32>) -> CommandResult {
+        if at_secs.is_some_and(|secs| secs >= crate::rundown::DAY_SECS) {
+            return invalid("A time of day is before midnight");
+        }
+        self.edited(uuid, |rundown| rundown.set_at(uuid, at_secs))
+    }
+
     /// How long after a step the next is taken by itself, or with `None`
     /// not until the operator says.
     pub fn cmd_set_rundown_then(&mut self, uuid: &str, secs: Option<f32>) -> CommandResult {
@@ -717,7 +1042,8 @@ impl VardaApp {
         self.edited(uuid, |rundown| rundown.set_next(uuid))
     }
 
-    /// Drop the wait of a step that goes on by itself.
+    /// Drop the wait of a step that goes on by itself, and hold the time of
+    /// day of the step next.
     pub fn cmd_rundown_hold(&mut self) -> CommandResult {
         if self.rundown.hold() {
             log::info!("Rundown: held — it goes on when the operator says");
@@ -743,6 +1069,10 @@ impl VardaApp {
     /// operator is told which — a step that has quietly stopped setting a
     /// screen is found out on air otherwise.
     pub(crate) fn rundown_forget_source(&mut self, uuid: &str) {
+        // Its fade let go at once, not on the next frame: a deck put back by
+        // an undo in the same breath is another decoder, not to be faded.
+        self.rundown_fades.retain(|fade| fade.deck != uuid);
+        self.rundown_till_next.retain(|deck| deck != uuid);
         let steps = self.rundown.forget_source(uuid);
         if !steps.is_empty() {
             let text = format!(
@@ -949,4 +1279,297 @@ mod tests {
         });
         assert!(matches!(refused, CommandResult::Err { .. }), "{refused:?}");
     }
+    /// A step at a time of day is taken as the clock comes to it while it is
+    /// next — faded, as GO takes it — and not while it is held.
+    #[test]
+    fn a_step_is_taken_at_its_time_of_day_and_not_while_held() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let (_, _, a) = step(&mut app);
+        let mut add = |name: &str| {
+            id(app.execute_command(EngineCommand::AddRundownStep {
+                name: name.into(),
+                buses: Some(vec![]),
+                main: false,
+            }))
+        };
+        let (b, c, e) = (add("C"), add("D"), add("E"));
+        let nine = 9 * 3600;
+        for (step, at) in [(&b, nine), (&c, nine + 120)] {
+            assert!(matches!(
+                app.execute_command(EngineCommand::SetRundownAt {
+                    uuid: step.clone(),
+                    at_secs: Some(at),
+                }),
+                CommandResult::Ok
+            ));
+        }
+        assert!(matches!(
+            app.execute_command(EngineCommand::TakeRundownStep {
+                uuid: a.clone(),
+                fade: false,
+            }),
+            CommandResult::Ok
+        ));
+        let now = app.frame_stats.now_secs();
+        app.advance_rundown_by(now, f64::from(nine) - 1.0);
+        assert_eq!(app.rundown.last(), Some(a.as_str()), "not yet");
+        app.advance_rundown_by(now + 0.5, f64::from(nine) + 0.2);
+        assert_eq!(app.rundown.last(), Some(b.as_str()), "taken at 9:00");
+
+        // D is next, at 9:02. A step taken by hand and refused — it starts a
+        // timer that shows the time of day — holds nothing: D goes at 9:02.
+        let (_, channel, refused) = step(&mut app);
+        let clock = id(app.execute_command(EngineCommand::AddTimerDeck {
+            channel_uuid: channel,
+            settings: None,
+        }));
+        assert!(matches!(
+            app.execute_command(EngineCommand::SetRundownPlay {
+                uuid: refused.clone(),
+                deck_uuid: clock.clone(),
+                action: Some(PlayAction::Start),
+            }),
+            CommandResult::Ok
+        ));
+        assert!(matches!(
+            app.execute_command(EngineCommand::SetTimerSettings {
+                deck_uuid: clock,
+                settings: crate::engine::value::timer::TimerSettings {
+                    mode: crate::engine::value::timer::TimerMode::Clock,
+                    ..Default::default()
+                },
+            }),
+            CommandResult::Ok
+        ));
+        assert!(matches!(
+            app.execute_command(EngineCommand::TakeRundownStep {
+                uuid: refused,
+                fade: false,
+            }),
+            CommandResult::Err { .. }
+        ));
+        app.advance_rundown_by(now + 1.0, f64::from(nine + 119));
+        app.advance_rundown_by(now + 1.5, f64::from(nine + 121));
+        assert_eq!(app.rundown.last(), Some(c.as_str()), "taken at 9:02");
+
+        // E is next, at 9:04: held, its time comes and goes without it.
+        assert!(matches!(
+            app.execute_command(EngineCommand::SetRundownAt {
+                uuid: e.clone(),
+                at_secs: Some(nine + 240),
+            }),
+            CommandResult::Ok
+        ));
+        assert!(matches!(
+            app.execute_command(EngineCommand::RundownHold),
+            CommandResult::Ok
+        ));
+        app.advance_rundown_by(now + 2.0, f64::from(nine + 239));
+        app.advance_rundown_by(now + 2.5, f64::from(nine + 241));
+        assert_eq!(app.rundown.last(), Some(c.as_str()), "held");
+        assert_eq!(app.rundown.next().map(|s| s.uuid.as_str()), Some(e.as_str()));
+    }
+    /// A playlist in the show, for the fades to fade.
+    fn playlist(app: &mut App) -> String {
+        let (_, channel, _) = step(app);
+        id(app.execute_command(EngineCommand::AddPlaylistDeck {
+            channel_uuid: channel,
+            items: vec![],
+            settings: None,
+        }))
+    }
+
+    fn fade(deck: &str, from: f64, secs: f32) -> super::SoundFade {
+        super::SoundFade {
+            deck: deck.into(),
+            from,
+            secs,
+            then: PlayAction::Stop,
+            start: 1.0,
+            done_at: None,
+        }
+    }
+
+    /// A sound faded out goes down with its fade, is stopped at its end and
+    /// kept down a moment after — what its decoder had ready not heard at
+    /// full level — then let go.
+    #[test]
+    fn a_sound_faded_out_is_kept_down_a_moment_after_it_stops() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let music = playlist(&mut app);
+        app.rundown_fades.push(fade(&music, 10.0, 2.0));
+        app.run_sound_fades(11.0);
+        let half = app.audio_mix.step_fade(&music).unwrap();
+        assert!((half - 0.5).abs() < 1e-6, "half way: {half}");
+        app.run_sound_fades(12.0);
+        assert_eq!(app.audio_mix.step_fade(&music), Some(0.0), "stopped, down");
+        assert!(app.rundown_fades[0].done_at.is_some());
+        app.run_sound_fades(12.0 + super::QUIET_AFTER_SECS * 0.5);
+        assert_eq!(app.audio_mix.step_fade(&music), Some(0.0), "still down");
+        app.run_sound_fades(12.0 + super::QUIET_AFTER_SECS + 0.01);
+        assert_eq!(app.audio_mix.step_fade(&music), None, "let go");
+        assert!(app.rundown_fades.is_empty());
+    }
+
+    /// A second fade of a sound already fading goes on from where the first
+    /// had got to — never back up to full.
+    #[test]
+    fn a_fade_over_a_fade_goes_on_from_where_it_was() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let music = playlist(&mut app);
+        app.rundown_fades.push(fade(&music, 10.0, 5.0));
+        app.fade_out(&music, 14.0, Some(1.0), PlayAction::Pause);
+        app.run_sound_fades(14.0);
+        let now = app.audio_mix.step_fade(&music).unwrap();
+        assert!((now - 0.2).abs() < 1e-5, "on from 0.2: {now}");
+        app.run_sound_fades(14.5);
+        let later = app.audio_mix.step_fade(&music).unwrap();
+        assert!((later - 0.1).abs() < 1e-5, "half of 0.2 later: {later}");
+    }
+
+    /// A deck deleted while it fades is let go — its fade does not turn down
+    /// or stop what comes back under its UUID — and a show opened lets go
+    /// of the fades of the one before.
+    #[test]
+    fn a_fade_is_let_go_with_its_deck_and_with_its_show() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let music = playlist(&mut app);
+        app.rundown_fades.push(fade(&music, 10.0, 5.0));
+        app.run_sound_fades(11.0);
+        assert!(app.audio_mix.step_fade(&music).is_some());
+        assert!(matches!(
+            app.execute_command(EngineCommand::RemoveDeck {
+                deck_uuid: music.clone(),
+            }),
+            CommandResult::Ok
+        ));
+        assert!(app.rundown_fades.is_empty(), "let go with its deck, at once");
+        app.run_sound_fades(11.5);
+        assert_eq!(app.audio_mix.step_fade(&music), None);
+
+        // A show opening stops what was fading out — as its fade would have
+        // — before letting go: here a timer counting, reset.
+        let (_, channel, _) = step(&mut app);
+        let timer = id(app.execute_command(EngineCommand::AddTimerDeck {
+            channel_uuid: channel,
+            settings: None,
+        }));
+        assert!(matches!(
+            app.execute_command(EngineCommand::ControlTimer {
+                deck_uuid: timer.clone(),
+                action: crate::engine::value::timer::TimerAction::Start,
+            }),
+            CommandResult::Ok
+        ));
+        let running = |app: &App| {
+            let (ch, dk) = app.resolve_deck(&timer).unwrap();
+            app.mixer.channels()[ch].decks[dk].deck.timer().unwrap().running()
+        };
+        assert!(running(&app));
+        app.rundown_fades.push(fade(&timer, 10.0, 5.0));
+        app.run_sound_fades(11.0);
+        app.forget_rundown_live();
+        assert!(!running(&app), "stopped as its fade would have");
+        assert_eq!(app.audio_mix.step_fade(&timer), Some(0.0), "kept down a moment");
+        assert!(app.rundown_fades.iter().all(|f| f.done_at.is_some()));
+        let later = app.frame_stats.now_secs() + super::QUIET_AFTER_SECS + 0.01;
+        app.run_sound_fades(later);
+        assert!(app.rundown_fades.is_empty(), "then let go");
+        assert_eq!(app.audio_mix.step_fade(&timer), None);
+        // Which a show opening does; once its scene is in place, nothing is
+        // kept down — its decks are new, under the same UUIDs here.
+        let layout = crate::usecases::ui::UILayoutState::default();
+        app.save_workspace(&layout).unwrap();
+        app.flush_saves();
+        app.rundown_fades.push(fade(&timer, 10.0, 5.0));
+        app.run_sound_fades(11.0);
+        let _ = app.load_workspace();
+        assert!(app.rundown_fades.is_empty(), "let go with its show");
+        assert_eq!(app.audio_mix.step_fade(&timer), None, "the new decks not kept down");
+    }
+
+    /// A step made next after the clock read its time — by GO takes this
+    /// next — is not taken by that time: its time is counted from when it
+    /// is next.
+    #[test]
+    fn a_step_made_next_after_its_time_is_not_taken_by_it() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let (_, _, a) = step(&mut app);
+        let b = id(app.execute_command(EngineCommand::AddRundownStep {
+            name: "C".into(),
+            buses: Some(vec![]),
+            main: false,
+        }));
+        let nine = 9 * 3600;
+        assert!(matches!(
+            app.execute_command(EngineCommand::SetRundownAt {
+                uuid: b.clone(),
+                at_secs: Some(nine),
+            }),
+            CommandResult::Ok
+        ));
+        // A next, read just before 9:00; B made next just after.
+        let now = app.frame_stats.now_secs();
+        app.advance_rundown_by(now, f64::from(nine) - 0.01);
+        assert_eq!(app.rundown.next().map(|s| s.uuid.clone()), Some(a));
+        assert!(matches!(
+            app.execute_command(EngineCommand::SetRundownNext { uuid: b.clone() }),
+            CommandResult::Ok
+        ));
+        app.advance_rundown_by(now + 0.1, f64::from(nine) + 0.02);
+        assert_eq!(app.rundown.last(), None, "not taken");
+    }
+    /// A step made next by a wait taken just before its time goes by its time
+    /// on the next frame: the time read is kept with the step next once the
+    /// frame is done.
+    #[test]
+    fn a_step_made_next_by_a_wait_just_before_its_time_is_taken_at_it() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let (_, _, first) = step(&mut app);
+        let mut add = |name: &str| {
+            id(app.execute_command(EngineCommand::AddRundownStep {
+                name: name.into(),
+                buses: Some(vec![]),
+                main: false,
+            }))
+        };
+        let (a, b) = (add("A"), add("B"));
+        let nine = 9 * 3600;
+        for cmd in [
+            EngineCommand::SetRundownThen {
+                uuid: first.clone(),
+                secs: Some(0.1),
+            },
+            EngineCommand::SetRundownAt {
+                uuid: b.clone(),
+                at_secs: Some(nine),
+            },
+            EngineCommand::TakeRundownStep {
+                uuid: first,
+                fade: false,
+            },
+        ] {
+            assert!(matches!(app.execute_command(cmd), CommandResult::Ok));
+        }
+        let now = app.frame_stats.now_secs();
+        // Its wait runs out at 08:59:59.99: A is taken, B next.
+        app.advance_rundown_by(now + 1.0, f64::from(nine) - 0.01);
+        assert_eq!(app.rundown.last(), Some(a.as_str()));
+        // 09:00:00.01: B, at its time.
+        app.advance_rundown_by(now + 1.02, f64::from(nine) + 0.01);
+        assert_eq!(app.rundown.last(), Some(b.as_str()), "taken at 9:00");
+    }
 }
+

@@ -167,10 +167,37 @@ impl ApplicationHandler for UIRunner {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        // The control window taking or losing the keyboard, as it happens —
+        // while Nida is still starting too: the clicker read with another
+        // app in front stands aside while the window hears its keys (see
+        // `crate::clicker`).
+        if self.main_window_id == Some(window_id) {
+            if let WindowEvent::Focused(focused) = &event {
+                self.main_focused = *focused;
+                crate::clicker::set_focused(*focused || self.panel_windows.any_focused());
+            }
+        }
         if self.varda.is_none() && self.engine.is_none() {
             return;
         }
+        // A panel's window of its own: its egui input (the show's shortcuts
+        // run in its pass, on its keys). Nida holding the keyboard in either
+        // window, for the clicker.
+        if self
+            .panel_windows
+            .window_event(window_id, &event, self.gpu.as_ref())
+        {
+            if let WindowEvent::Focused(_) = &event {
+                crate::clicker::set_focused(self.main_focused || self.panel_windows.any_focused());
+            }
+            return;
+        }
         if self.main_window_id == Some(window_id) {
+            // A key held since before the window had the keyboard repeats
+            // into it: not its press (see `HeldKeys`).
+            if !self.main_held.takes(&event) {
+                return;
+            }
             if let (Some(window), Some(egui_state)) = (self.window, &mut self.egui_state) {
                 if egui_state.on_window_event(window, &event).consumed {
                     return;
@@ -379,6 +406,11 @@ impl UIRunner {
     pub(super) fn shut_down(&mut self) {
         if std::mem::replace(&mut self.shut_down, true) {
             return;
+        }
+        // The clicker's keys given back to the other apps (see
+        // `crate::clicker`).
+        if !self.config.headless {
+            crate::clicker::stop();
         }
         if let Some(engine) = self.engine.take() {
             if let Some(app) = engine.stop() {

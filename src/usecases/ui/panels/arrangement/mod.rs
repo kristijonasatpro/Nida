@@ -974,17 +974,24 @@ fn offer_drop_targets(ui: &egui::Ui, data: &UIData, rows: &[Row<'_>], layout: La
         .is_some_and(|p| matches!(&*p, LibraryDrag::Effect(_)));
     let fx_accent = egui::Color32::from_rgb(100, 200, 255);
 
+    // Rows scrolled under the ruler or toolbar are not seen: they take no
+    // drops there.
+    let seen = egui::Rect::from_min_max(
+        egui::pos2(header_rect.left(), lanes_rect.top()),
+        lanes_rect.max,
+    );
     for (row, (top, height)) in rows.iter().zip(row_spans(rows, lanes_rect, scroll_y)) {
         let rect = egui::Rect::from_min_max(
             egui::pos2(header_rect.left(), top),
             egui::pos2(lanes_rect.right(), top + height),
-        );
+        )
+        .intersect(seen);
+        if !rect.is_positive() {
+            continue;
+        }
         match row {
             Row::Group { ch_idx, .. } => {
-                ui.ctx().memory_mut(|mem| {
-                    mem.data
-                        .insert_temp(egui::Id::new("ch_drop_rect").with(*ch_idx), rect);
-                });
+                super::publish_drop_rect(ui, *ch_idx, rect);
                 if let Some(ch) = data.channels.get(*ch_idx) {
                     publish_channel_surface_fx(ui.ctx(), &ch.uuid, *ch_idx, rect);
                 }
@@ -2582,10 +2589,10 @@ mod tests {
         });
 
         for ch in &data.channels {
-            let key = egui::Id::new("ch_drop_rect").with(ch.ch_idx);
-            let rect: Option<egui::Rect> = harness
-                .ctx
-                .memory(|mem| mem.data.get_temp::<egui::Rect>(key));
+            let rect: Option<egui::Rect> =
+                crate::usecases::ui::panels::drop_rects(&harness.ctx, ch.ch_idx)
+                    .first()
+                    .copied();
             assert!(
                 rect.is_some_and(|r| r.width() > 0.0),
                 "channel {} published no drop target",
@@ -3059,12 +3066,9 @@ mod tests {
         // The published channel drop rect is the first row of the lane area, so
         // the axis and the first deck lane's centre follow from it and the row
         // constants rather than from guessed screen coordinates.
-        let group: egui::Rect = harness
-            .ctx
-            .memory(|mem| {
-                mem.data
-                    .get_temp(egui::Id::new("ch_drop_rect").with(0_usize))
-            })
+        let group: egui::Rect = crate::usecases::ui::panels::drop_rects(&harness.ctx, 0)
+            .first()
+            .copied()
             .expect("the first channel publishes its row");
         let axis = TimeAxis {
             left: group.left() + HEADER_WIDTH,

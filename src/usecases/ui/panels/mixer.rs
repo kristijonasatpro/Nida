@@ -778,7 +778,7 @@ pub(super) fn render_channel_column(
                             .iter()
                             .fold(drop_resp.rect, |area, (_, card)| area.union(*card))
                             .intersect(ui.clip_rect());
-                        super::insertion::publish_cards(ui.ctx(), ch_idx, cards, area);
+                        super::insertion::publish_cards(ui, ch_idx, cards, area);
                         if drop_resp.clicked() {
                             actions.session.select_channel = Some(ch_idx);
                         }
@@ -826,10 +826,7 @@ pub(super) fn render_channel_column(
 
         // Store this channel's screen rect for the deferred DnD drop handler
         let ch_rect = ui.min_rect();
-        ui.ctx().memory_mut(|mem| {
-            mem.data
-                .insert_temp(egui::Id::new("ch_drop_rect").with(ch_idx), ch_rect);
-        });
+        super::publish_drop_rect(ui, ch_idx, ch_rect);
         handle_deck_drop(ui, ch, ch_rect, accent, actions);
         // Effect drops resolve channel ownership from this surface (deck cards
         // publish their own rects and win by hit priority).
@@ -839,7 +836,9 @@ pub(super) fn render_channel_column(
 
 /// A deck card or a Library generator dragged over a channel column: show
 /// where it would land, and on release put a card there — before the card the
-/// pointer is in the upper half of, from this channel or another.
+/// pointer is in the upper half of, from this channel or another. Dropped on
+/// the channel away from its cards (its tile), another channel's deck goes
+/// behind its layers, so what it shows on air stays; one of its own stays.
 pub(super) fn handle_deck_drop(
     ui: &mut egui::Ui,
     ch: &ChannelUIInfo,
@@ -870,9 +869,16 @@ pub(super) fn handle_deck_drop(
     let Some(payload) = column.dnd_release_payload::<DeckDrag>() else {
         return;
     };
-    // Dropped back where it already is: nothing to do, and no undo step.
     let at = ch.decks.iter().position(|d| d.uuid == payload.deck_uuid);
-    let unmoved = at.is_some_and(|i| match &insertion.before {
+    let before = if insertion.line.is_some() {
+        insertion.before
+    } else if at.is_some() {
+        return;
+    } else {
+        ch.decks.first().map(|d| d.uuid.clone())
+    };
+    // Dropped back where it already is: nothing to do, and no undo step.
+    let unmoved = at.is_some_and(|i| match &before {
         Some(before) => {
             *before == payload.deck_uuid
                 || ch.decks.get(i + 1).is_some_and(|next| next.uuid == *before)
@@ -883,7 +889,7 @@ pub(super) fn handle_deck_drop(
         actions.commands.push(EngineCommand::MoveDeck {
             deck_uuid: payload.deck_uuid.clone(),
             dst_channel_uuid: ch.uuid.clone(),
-            before_deck_uuid: insertion.before,
+            before_deck_uuid: before,
         });
     }
 }
@@ -1653,6 +1659,65 @@ pub(super) fn render_deck_thumbnail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A layer dragged onto a channel away from its cards — its tile — goes
+    /// behind its layers, so what it shows on air stays; one of its own
+    /// dropped there stays where it is.
+    #[test]
+    fn a_deck_dropped_on_a_channel_away_from_its_cards_goes_behind_its_layers() {
+        let data = UIData::test_fixture();
+        let ch = data.channels[0].clone();
+        assert!(ch.decks.len() >= 2, "precondition: Ch A has two decks");
+        let others = data.channels[1].decks[0].uuid.clone();
+        let own = ch.decks[1].uuid.clone();
+        let tile = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(300.0, 200.0));
+        for (moved, expected) in [
+            (others.clone(), Some(ch.decks[0].uuid.clone())),
+            (own, None),
+        ] {
+            let ch = ch.clone();
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(400.0, 300.0))
+                .build_ui_state(
+                    move |ui, sent: &mut Vec<EngineCommand>| {
+                        let mut actions = UIActions::new();
+                        handle_deck_drop(ui, &ch, tile, egui::Color32::WHITE, &mut actions);
+                        sent.extend(actions.commands);
+                    },
+                    Vec::new(),
+                );
+            let start = tile.left_top() + egui::vec2(10.0, 10.0);
+            harness.hover_at(start);
+            harness.drag_at(start);
+            harness.run_steps(1);
+            egui::DragAndDrop::set_payload(
+                &harness.ctx,
+                DeckDrag {
+                    deck_uuid: moved.clone(),
+                },
+            );
+            harness.hover_at(tile.center());
+            harness.run_steps(2);
+            harness.drop_at(tile.center());
+            harness.run_steps(2);
+            let moves: Vec<Option<String>> = harness
+                .state()
+                .iter()
+                .filter_map(|c| match c {
+                    EngineCommand::MoveDeck {
+                        deck_uuid,
+                        before_deck_uuid,
+                        ..
+                    } if *deck_uuid == moved => Some(before_deck_uuid.clone()),
+                    _ => None,
+                })
+                .collect();
+            match &expected {
+                Some(_) => assert_eq!(moves, vec![expected.clone()], "behind its layers"),
+                None => assert!(moves.is_empty(), "its own stays: {moves:?}"),
+            }
+        }
+    }
 
     #[test]
     fn render_central_panel_smoke() {

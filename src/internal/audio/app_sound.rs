@@ -24,6 +24,12 @@ pub struct RunningApp {
 }
 
 /// The device an app's sound is listed under, as an input's.
+/// Nida's own web talks' sound, as an app the mixer can take: the `WebKit`
+/// helpers macOS counts as Nida's (`WebKit` plays a page's sound in a
+/// helper process of its own, one for every app using it — Safari's is
+/// another's).
+pub const WEB_TALKS: &str = "lt.proconf.nida.web-talks";
+
 pub fn device_name(bundle_id: &str) -> String {
     format!("App sound: {bundle_id}")
 }
@@ -42,6 +48,73 @@ pub fn owning_app(path: &str) -> Option<&str> {
             .then_some(path.len())
     })?;
     Some(&path[..end])
+}
+
+/// The processes of this Nida's own web talks, by number, as its `WebKit`
+/// says them — each page's, and the one it plays their video and sound in:
+/// what is taken as web talks' sound, and nothing else (another app's
+/// `WebKit`, another Nida's, share neither).
+static WEB_TALK_PIDS: std::sync::Mutex<std::collections::BTreeMap<i32, Option<u64>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// This Nida's web talks' processes are now `pids`: each with when it
+/// started ([`process_birth`]).
+pub fn set_web_talk_pids(pids: std::collections::BTreeMap<i32, Option<u64>>) {
+    *WEB_TALK_PIDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = pids;
+}
+
+/// Whether the process `pid`, its program at `path`, started at `born`, is
+/// one of this Nida's web talks': one its `WebKit` named, started when it
+/// was named, and `WebKit`'s own — a number reused since by another program
+/// is not.
+#[must_use]
+pub fn is_web_talks(pid: i32, path: Option<&str>, born: Option<u64>) -> bool {
+    path.is_some_and(is_webkit_helper)
+        && WEB_TALK_PIDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&pid)
+            .is_some_and(|named| *named == born)
+}
+
+/// When process `pid` started, in microseconds since 1970: told apart from
+/// another given its number since. None off macOS, or when not told.
+#[must_use]
+pub fn process_birth(pid: i32) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+        // SAFETY: `info` holds the size passed; read only when filled whole.
+        let filled = unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size)
+        };
+        if filled != size {
+            return None;
+        }
+        // SAFETY: filled whole, just checked.
+        let info = unsafe { info.assume_init() };
+        Some(info.pbi_start_tvsec.saturating_mul(1_000_000).saturating_add(info.pbi_start_tvusec))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Whether the program at `path` is one of `WebKit`'s own helpers — a
+/// page's, the one that plays its video and sound, its network's — wherever
+/// this macOS keeps `WebKit`: `…/WebKit.framework/…/com.apple.WebKit.GPU`.
+#[must_use]
+pub fn is_webkit_helper(path: &str) -> bool {
+    path.contains("/WebKit.framework/")
+        && std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("com.apple.WebKit."))
 }
 
 /// The apps among `processes` (the app each belongs to, making sound now):
@@ -284,11 +357,18 @@ mod mac {
                 let own_id = read_string(process, kAudioProcessPropertyBundleID)
                     .map(|id| id.to_string())
                     .unwrap_or_default();
-                let app = executable(pid)
-                    .as_deref()
-                    .and_then(owning_app)
-                    .and_then(bundle_id_at)
-                    .unwrap_or(own_id);
+                // One of this Nida's web talks' WebKit processes, as its
+                // WebKit named them: web talks' sound — not every app's
+                // WebKit, nor another Nida's.
+                let path = executable(pid);
+                let app = if super::is_web_talks(pid, path.as_deref(), super::process_birth(pid)) {
+                    super::WEB_TALKS.to_string()
+                } else {
+                    path.as_deref()
+                        .and_then(owning_app)
+                        .and_then(bundle_id_at)
+                        .unwrap_or(own_id)
+                };
                 let playing = read(
                     process,
                     kAudioProcessPropertyIsRunningOutput,
@@ -305,6 +385,9 @@ mod mac {
     /// What an app calls itself, from its bundle; its bundle ID otherwise.
     pub fn app_name(bundle_id: &str) -> String {
         use objc2_app_kit::NSRunningApplication;
+        if bundle_id == super::WEB_TALKS {
+            return "Nida web talks".to_string();
+        }
         autoreleasepool(|_| {
             let id = NSString::from_str(bundle_id);
             let apps = NSRunningApplication::runningApplicationsWithBundleIdentifier(&id);
@@ -502,7 +585,64 @@ mod other {
 
 #[cfg(test)]
 mod tests {
-    use super::{apps_of, device_name, only_the_tap, owning_app};
+    use super::{
+        apps_of, device_name, is_web_talks, is_webkit_helper, only_the_tap, owning_app,
+        process_birth, set_web_talk_pids,
+    };
+
+    /// A process's start is told, and is its own: this test's process has
+    /// one, and it stays the same.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_is_told_apart_by_when_it_started() {
+        let me = i32::try_from(std::process::id()).unwrap();
+        let born = process_birth(me);
+        assert!(born.is_some());
+        assert_eq!(process_birth(me), born);
+        assert_eq!(process_birth(-5), None);
+    }
+
+    /// Web talks' sound is this Nida's own `WebKit` processes, as its
+    /// `WebKit` named them: never another app's or another Nida's `WebKit`,
+    /// never a number reused by another program.
+    #[test]
+    fn web_talks_sound_is_this_nidas_own_webkit_processes_only() {
+        let gpu = "/System/Volumes/Preboot/Cryptexes/OS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU";
+        set_web_talk_pids([(4242, Some(100))].into_iter().collect());
+        assert!(is_web_talks(4242, Some(gpu), Some(100)));
+        assert!(!is_web_talks(4343, Some(gpu), Some(100)), "another app's, or Nida's, WebKit");
+        assert!(
+            !is_web_talks(4242, Some(gpu), Some(200)),
+            "the number reused since by another WebKit"
+        );
+        assert!(!is_web_talks(4242, Some("/usr/bin/afplay"), Some(100)), "by another program");
+        assert!(!is_web_talks(4242, None, Some(100)));
+        set_web_talk_pids(std::collections::BTreeMap::new());
+        assert!(!is_web_talks(4242, Some(gpu), Some(100)), "no pages open");
+    }
+
+    /// Only `WebKit`'s own helpers count as web talks' sound — as this macOS
+    /// keeps them (measured on the mini, 2026-10-26), or from a cryptex —
+    /// never a player started from the same terminal as Nida.
+    #[test]
+    fn only_webkits_own_helpers_are_web_talks_sound() {
+        for helper in [
+            "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+            "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+            "/System/Volumes/Preboot/Cryptexes/OS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU",
+        ] {
+            assert!(is_webkit_helper(helper), "{helper}");
+        }
+        for other in [
+            "/usr/bin/afplay",
+            "/opt/homebrew/bin/mpv",
+            "/Applications/Safari.app/Contents/MacOS/Safari",
+            "/Users/x/com.apple.WebKit.GPU",
+            "/System/Library/Frameworks/WebKit.framework/Versions/A/WebKit",
+        ] {
+            assert!(!is_webkit_helper(other), "{other}");
+        }
+    }
 
     /// A process belongs to the outermost app in its path: a helper to its
     /// app, Chrome Canary to itself and not to Chrome, a system service to

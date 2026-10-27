@@ -48,6 +48,7 @@ pub(super) fn render_output_section(ui: &mut egui::Ui, data: &UIData, actions: &
                         device: device.name.clone(),
                         mode: mode.name.clone(),
                         full_range: false,
+                        follow_show: true,
                     },
                 });
             }
@@ -529,13 +530,14 @@ fn render_headless_controls(
         device,
         mode,
         full_range,
+        follow_show,
     } = &output.target
     {
         render_blackmagic_config(
             ui,
             output_uuid,
             output.is_active,
-            (device, mode, *full_range),
+            (device, mode, *full_range, *follow_show),
             data,
             actions,
         );
@@ -830,20 +832,22 @@ fn render_source_picker(
     }
 }
 
-/// A Blackmagic output's format, picked from its device's, while it is
-/// stopped; whether the device is there at all.
+/// A Blackmagic output's format — the show's rate (Auto), or one of its
+/// device's picked while it is stopped — and a warning when the format's
+/// rate is not the show's; whether the device is there at all.
 fn render_blackmagic_config(
     ui: &mut egui::Ui,
     output_uuid: &str,
     active: bool,
-    (device, mode, full_range): (&str, &str, bool),
+    (device, mode, full_range, follow_show): (&str, &str, bool, bool),
     data: &UIData,
     actions: &mut UIActions,
 ) {
-    let target = |mode: String, full_range: bool| OutputTarget::DeckLink {
+    let target = |mode: String, full_range: bool, follow_show: bool| OutputTarget::DeckLink {
         device: device.to_string(),
         mode,
         full_range,
+        follow_show,
     };
     // Levels: chosen per output, running or not — taken up at once.
     ui.horizontal(|ui| {
@@ -859,7 +863,7 @@ fn render_blackmagic_config(
                     {
                         actions.commands.push(EngineCommand::SetOutputTarget {
                             output_uuid: output_uuid.to_string(),
-                            target: target(mode.to_string(), full),
+                            target: target(mode.to_string(), full, follow_show),
                         });
                     }
                 }
@@ -901,30 +905,85 @@ fn render_blackmagic_config(
         );
         return;
     };
+    let shown = if follow_show {
+        format!("Auto ({mode})")
+    } else {
+        mode.to_string()
+    };
     if active {
-        ui.label(egui::RichText::new(format!("Format: {mode}")).small().weak());
-        return;
+        ui.label(egui::RichText::new(format!("Format: {shown}")).small().weak());
+    } else {
+        ui.horizontal(|ui| {
+            let label = ui.label(egui::RichText::new("Format:").small());
+            // `None` for Auto: the show's rate.
+            let mut chosen: Option<String> = (!follow_show).then(|| mode.to_string());
+            // Uncapped has no rate to follow: Auto keeps the format.
+            let auto = if data.target_fps == 0 {
+                Some(mode.to_string())
+            } else {
+                found.mode_for(data.target_fps).map(|m| m.name.clone())
+            };
+            egui::ComboBox::from_id_salt(format!("blackmagic_mode_{output_uuid}"))
+                .selected_text(egui::RichText::new(&shown).small())
+                .width(130.0)
+                .show_ui(ui, |ui| {
+                    let auto_label = auto
+                        .as_deref()
+                        .map_or_else(|| "Auto".to_string(), |m| format!("Auto ({m})"));
+                    ui.selectable_value(&mut chosen, None, auto_label)
+                        .on_hover_text("The show's rate — chosen again when it changes");
+                    for m in &found.modes {
+                        ui.selectable_value(&mut chosen, Some(m.name.clone()), &m.name);
+                    }
+                })
+                .response
+                .labelled_by(label.id);
+            let unchanged = match &chosen {
+                None => follow_show,
+                Some(picked) => !follow_show && picked == mode,
+            };
+            if !unchanged {
+                let (to_mode, follows) = match chosen {
+                    None => (auto.unwrap_or_else(|| mode.to_string()), true),
+                    Some(picked) => (picked, false),
+                };
+                actions.commands.push(EngineCommand::SetOutputTarget {
+                    output_uuid: output_uuid.to_string(),
+                    target: target(to_mode, full_range, follows),
+                });
+            }
+        });
     }
-    ui.horizontal(|ui| {
-        let label = ui.label(egui::RichText::new("Format:").small());
-        let mut chosen = mode.to_string();
-        egui::ComboBox::from_id_salt(format!("blackmagic_mode_{output_uuid}"))
-            .selected_text(egui::RichText::new(mode).small())
-            .width(110.0)
-            .show_ui(ui, |ui| {
-                for m in &found.modes {
-                    ui.selectable_value(&mut chosen, m.name.clone(), &m.name);
-                }
-            })
-            .response
-            .labelled_by(label.id);
-        if chosen != mode {
-            actions.commands.push(EngineCommand::SetOutputTarget {
-                output_uuid: output_uuid.to_string(),
-                target: target(chosen, full_range),
-            });
-        }
-    });
+    // Its rate not the show's: frames left out, or shown twice, each second.
+    let format_fps = found.modes.iter().find(|m| m.name == mode).map(|m| m.fps);
+    if let Some(warning) = format_fps.and_then(|f| rate_warning(mode, f, data.target_fps)) {
+        ui.label(
+            egui::RichText::new(warning)
+                .small()
+                .color(egui::Color32::from_rgb(255, 180, 80)),
+        );
+    }
+}
+
+/// What a Blackmagic format of `format_fps` does to a show at `show_fps`,
+/// when they differ by half a frame a second or more: frames left out, or
+/// shown twice.
+fn rate_warning(mode: &str, format_fps: f64, show_fps: u32) -> Option<String> {
+    if show_fps == 0 || !format_fps.is_finite() || format_fps <= 0.0 {
+        return None;
+    }
+    let show = f64::from(show_fps);
+    let gap = show - format_fps;
+    if gap.abs() < 0.5 {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let each = gap.abs().round() as u32;
+    Some(if gap > 0.0 {
+        format!("⚠ {mode} on a {show_fps} fps show: {each} of every {show_fps} frames are left out")
+    } else {
+        format!("⚠ {mode} on a {show_fps} fps show: {each} frames a second are shown twice")
+    })
 }
 
 fn render_stream_config(
@@ -1767,15 +1826,19 @@ mod tests {
             device: "UltraStudio Monitor 3G".into(),
             mode: "1080p60".into(),
             full_range: false,
+            follow_show: true,
         };
         output.source = Some(crate::renderer::context::OutputSource::Master);
         output
     }
 
-    /// A stopped Blackmagic output's format is picked from its device's.
+    /// A stopped Blackmagic output's format: Auto — the show's rate — or one
+    /// of its device's picked by hand; and back to Auto, at the show's rate.
+    /// A format not at the show's rate says what it does to the frames.
     #[test]
     fn a_blackmagic_outputs_format_is_picked_while_it_is_stopped() {
         let mut data = UIData::test_fixture();
+        data.target_fps = 60;
         data.decklink_devices = vec![ultrastudio()];
         data.outputs = vec![blackmagic_output(false)];
         let mut actions = UIActions::new();
@@ -1783,7 +1846,7 @@ mod tests {
             let mut harness = egui_kittest::Harness::builder()
                 .with_size(egui::vec2(420.0, 900.0))
                 .build_ui(|ui| render_output_section(ui, &data, &mut actions));
-            harness.get_by_value("1080p60").click();
+            harness.get_by_value("Auto (1080p60)").click();
             harness.run_steps(2);
             harness.get_by_label("1080p50").click();
             harness.run_steps(2);
@@ -1793,12 +1856,56 @@ mod tests {
                 c,
                 EngineCommand::SetOutputTarget {
                     output_uuid,
-                    target: OutputTarget::DeckLink { device, mode, .. },
+                    target: OutputTarget::DeckLink { device, mode, follow_show: false, .. },
                 } if output_uuid == "out00001" && device == "UltraStudio Monitor 3G" && mode == "1080p50"
             )),
-            "{:?}",
+            "picked by hand: {:?}",
             actions.commands
         );
+
+        // Picked by hand at 50 on a 60 fps show: said; Auto again follows.
+        if let OutputTarget::DeckLink { mode, follow_show, .. } = &mut data.outputs[0].target {
+            *mode = "1080p50".into();
+            *follow_show = false;
+        }
+        let mut actions = UIActions::new();
+        {
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(420.0, 900.0))
+                .build_ui(|ui| render_output_section(ui, &data, &mut actions));
+            harness.get_by_label("⚠ 1080p50 on a 60 fps show: 10 of every 60 frames are left out");
+            harness.get_by_value("1080p50").click();
+            harness.run_steps(2);
+            harness.get_by_label("Auto (1080p60)").click();
+            harness.run_steps(2);
+        }
+        assert!(
+            actions.commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetOutputTarget {
+                    target: OutputTarget::DeckLink { mode, follow_show: true, .. },
+                    ..
+                } if mode == "1080p60"
+            )),
+            "Auto: {:?}",
+            actions.commands
+        );
+    }
+
+    /// The warning for a format's rate against the show's: frames left out
+    /// below it, shown twice above it; none within half a frame a second.
+    #[test]
+    fn a_format_at_another_rate_than_the_show_says_what_it_does() {
+        assert_eq!(
+            rate_warning("1080p50", 50.0, 60).as_deref(),
+            Some("⚠ 1080p50 on a 60 fps show: 10 of every 60 frames are left out")
+        );
+        assert_eq!(
+            rate_warning("1080p60", 60.0, 50).as_deref(),
+            Some("⚠ 1080p60 on a 50 fps show: 10 frames a second are shown twice")
+        );
+        assert_eq!(rate_warning("1080p59.94", 59.94, 60), None);
+        assert_eq!(rate_warning("1080p60", 60.0, 0), None, "uncapped");
     }
 
     /// A Blackmagic output's Levels are picked on its card, running or not —
@@ -1855,8 +1962,11 @@ mod tests {
             let harness = egui_kittest::Harness::builder()
                 .with_size(egui::vec2(420.0, 900.0))
                 .build_ui(|ui| render_output_section(ui, &data, &mut actions));
-            harness.get_by_label("Format: 1080p60");
-            assert!(harness.query_by_value("1080p60").is_none(), "not offered while running");
+            harness.get_by_label("Format: Auto (1080p60)");
+            assert!(
+                harness.query_by_value("Auto (1080p60)").is_none(),
+                "not offered while running"
+            );
         }
         data.decklink_devices.clear();
         let harness = egui_kittest::Harness::builder()

@@ -45,8 +45,9 @@ putting anything on a screen:
 | **Name** | |
 | **Screens** | For each bus: **Leave as it is**, Black, Master, or a channel |
 | **Main ▸ Takes** | **Leave as it is**, Black, or a channel. Under it, each overlay channel: **Leave as it is**, **On** or **Off** |
-| **Starts and stops** | **+ Clip, playlist or timer** adds one. Each: **Start from the beginning** (a clip from its in-point, a playlist from its first item, a timer from its top), **Carry on**, **Pause**, or **Stop, back to the beginning**. **×** takes it out |
+| **Starts and stops** | **+ Clip, playlist or timer** adds one. Each: **Start from the beginning** (a clip from its in-point, a playlist from its first item, a timer from its top), **Carry on**, **Pause**, or **Stop, back to the beginning**. **🗑**, at the head of its row, takes it out (a long name is cut short; hover it for all of it). A clip or playlist it starts or carries on: **Fade out at the next step** — see [Music for one moment](#music-for-one-moment). A timer it starts: **As the timer is set**, **Count down** from a length of the step's own, or **Count up** |
 | **Then go on to the next step after** | Ticked, the step after this one is taken by itself that many seconds later — see [Going on by itself](#going-on-by-itself) |
+| **Start by itself at** | Ticked, the step is taken by itself at that time of day — faded, as GO takes it — while it is the step GO takes next: see [At a time of day](#at-a-time-of-day) |
 | **Update from what is on now** | The screens the step sets, and Main if it sets it, become what is on now |
 
 A step's right-click menu also has **GO takes this next**, **Move earlier**,
@@ -133,6 +134,26 @@ the second.
 - Changing the rundown while a step waits — a step edited, moved, added or
   removed — stops the wait.
 
+### At a time of day
+
+A step with **Start by itself at** ticked — `B Opening` at 9:00, `C Keynote`
+at 9:15 — is taken by itself as the clock comes to its time, faded as GO
+takes it, while it is the step GO takes next. Its row says **at 09:15**.
+
+- While it is next, the panel counts down — ***step* at 09:15 — in 4:30** —
+  beside **Hold**.
+- **Hold** stops it: the step waits for GO — ***step* at 09:15 — held: GO
+  takes it**, with **By its time again** to let it go by its time after all.
+  **GO takes this next** on it, or changing its time, lets a hold go too.
+- It is taken only as the clock comes to its time while Nida runs, and no
+  more than a minute late: Nida opened, or the Mac woken, after the time
+  leaves it for GO (***step* at 09:15 — that time has gone: GO takes it**).
+- A step that is not next when its time comes is not taken: the show is
+  never sent back, nor on ahead past a step still to come.
+- If something is still fading when its time comes, it waits for it, for a
+  second at most, as a step going on by itself does; one that cannot be
+  taken says so.
+
 ## Clips, playlists and timers
 
 A step starts a clip whether it is on a screen or not: a sting on no screen
@@ -159,7 +180,26 @@ plays from its beginning and plays on to its end.
   again everywhere.
 
 A countdown started by the step a talk begins with is **Start from the
-beginning** on the timer.
+beginning** on the timer. Each talk can have its own: **Count down** from
+15:00 in one step, from 20:00 in the next, **Count up** for a panel — the
+timer is set so as the step starts it, and stays so until set again.
+
+### Music for one moment
+
+Music for the walk-in, started by a step, plays on through the steps after
+it until one stops it: a step does only what it sets, and
+[Audio Auto](16-audio-mixer.md#audio-auto) follows a picture — music on no
+screen has none to follow.
+
+- **Fade out at the next step**, under a clip or playlist a step starts or
+  carries on: when another step is taken — one that does not start or stop
+  it itself — its sound fades out over that step's fade, and it stops, back
+  at its beginning. Cut to, it stops at once.
+- A clip or playlist on no screen and not on Main — sound alone — that a
+  step faded to pauses or stops fades out with it in the same way, before it
+  pauses or stops.
+- Either way the strip's fader and **On** button stay as they are: only the
+  sound of what is faded out goes down, Audio Auto or not.
 
 ## Saved, and safe from undo
 
@@ -180,7 +220,8 @@ rundown does.
 
 The rundown is in `GET /api/state` under `rundown`: the fade time, each step
 with what it sets, why it cannot be taken (`missing`) or faded to just now
-(`fading`), the step taken last, the next, and a wait with its seconds left.
+(`fading`), the step taken last, the next, a wait with its seconds left, and
+the step whose time of day is held (`at_held`).
 
 ```sh
 # A step of what every bus shows now (a bus the stream takes left out)
@@ -211,7 +252,10 @@ curl -X POST http://localhost:8080/api/rundown/go \
 | `PUT /api/rundown/steps/{step_uuid}/main` | `{"main": {"Channel": "<uuid>"}}`, `{"main": {"Deck": "<uuid>"}}`, `{"main": "Black"}` — or `{"main": null}` to leave Main as it is |
 | `PUT /api/rundown/steps/{step_uuid}/overlays/{channel_uuid}` | `{"on": true}`, `{"on": false}` — or `{"on": null}` to leave it as it is |
 | `PUT /api/rundown/steps/{step_uuid}/plays/{deck_uuid}` | `{"action": "start"}`, `{"action": "resume"}`, `{"action": "pause"}`, `{"action": "stop"}` — or `{"action": null}` for nothing |
+| `PUT /api/rundown/steps/{step_uuid}/plays/{deck_uuid}/until-next` | `{"on": true}` — a clip or playlist the step plays, faded out at the next step |
+| `PUT /api/rundown/steps/{step_uuid}/plays/{deck_uuid}/timer` | `{"timer": {"down": {"secs": 900}}}`, `{"timer": "up"}` — or `{"timer": null}` for as the timer is set |
 | `PUT /api/rundown/steps/{step_uuid}/then` | `{"secs": 4}` — or `{"secs": null}` to wait for GO |
+| `PUT /api/rundown/steps/{step_uuid}/at` | `{"secs": 33300}` (9:15) — or `{"secs": null}` for none |
 | `POST /api/rundown/steps/{step_uuid}/capture` | Update from what is on now |
 | `POST /api/rundown/steps/{step_uuid}/take` | `{"fade": true}`. Refused (503) with the reason when it cannot be taken whole |
 | `POST /api/rundown/go` | `{"fade": true, "expect": "<step_uuid>"}` — the next step. With `expect`, only if that is the step: a press that arrives after the rundown went on by itself is refused rather than taking the step after |
@@ -225,7 +269,8 @@ curl -X POST http://localhost:8080/api/rundown/go \
   place and **How** (Fit, Fill, Part of the picture) are the LED feed's, the
   same in every step.
 - A step does not move a fader or switch a microphone: the Audio Mixer stays
-  by hand, or by [Audio Auto](16-audio-mixer.md).
+  by hand, or by [Audio Auto](16-audio-mixer.md) — only the sound of what a
+  step fades out goes down with it.
 - GO fades. A step that should always be cut is taken with its own **Cut**.
 - These steps are not the timeline's cue points (see
   [Arrangement Mode](15-arrangement.md#cue-points)).

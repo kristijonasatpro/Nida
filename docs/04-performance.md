@@ -56,6 +56,8 @@ Define a sub-range of the clip to play:
 
 Click **Clear In/Out** to reset to the full clip duration.
 
+The in-point stays before the out-point, as in an editing app: an in-point set at or past the out-point lets the out-point go (the clip plays to its end), and an out-point set at or before the in-point lets the in-point go (it plays from its start). The In and Out sliders stop a frame short of each other.
+
 Play/pause, speed, seek, loop mode, in/out points, and clear are all MIDI, OSC, and keyboard mappable, and can be driven by a macro. Transport chase (Auto / Always / Never, offset, delay) is authored on the clip instead. Loop mode uses **fader bucketing**: sweeping a fader/knob steps through Loop → Ping-Pong → One Shot → Hold Last. Enter learn mode and click any of these controls in the deck detail panel to bind it. See [Parameter Paths](06-control-surfaces.md#parameter-paths). Video chase is described in [Arrangement Mode](15-arrangement.md#chasing-a-clip-to-the-show).
 
 Play, speed, seek, and loop mode are also **modulation targets**, so an LFO can time-warp a clip and an audio band can gate it. In and out points are not, because they define the region the playhead offset is measured against. See [Video Playback](05-modulation.md#video-playback) for what to expect from each, including the decode cost of modulating the playhead.

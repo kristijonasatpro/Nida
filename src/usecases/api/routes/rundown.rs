@@ -229,6 +229,92 @@ pub async fn set_play(
     .await
 }
 
+/// Whether a clip or playlist a step plays is faded out at the next step.
+#[derive(Deserialize, ToSchema)]
+pub struct StepUntilNextBody {
+    /// `true`: faded out — its sound over the next step's fade — and
+    /// stopped, back at its beginning, when another step is taken.
+    pub on: bool,
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/rundown/steps/{step_uuid}/plays/{deck_uuid}/until-next",
+    params(
+        ("step_uuid" = String, Path, description = "Step UUID"),
+        ("deck_uuid" = String, Path, description = "UUID of a clip or playlist deck the step plays")
+    ),
+    request_body = StepUntilNextBody,
+    responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "Not a clip or playlist the step plays"), (status = 404, description = "No such step")),
+    tag = "Rundown"
+)]
+pub async fn set_until_next(
+    State(s): State<SharedState>,
+    Path((uuid, deck_uuid)): Path<(String, String)>,
+    Json(b): Json<StepUntilNextBody>,
+) -> impl IntoResponse {
+    dispatch(
+        &s,
+        EngineCommand::SetRundownUntilNext {
+            uuid,
+            deck_uuid,
+            on: b.on,
+        },
+    )
+    .await
+}
+
+/// How a step sets a timer it starts.
+#[derive(Deserialize, ToSchema)]
+pub struct StepTimerBody {
+    /// `{"down": {"secs": 900}}` — down from 15 minutes — or `"up"`; `null`
+    /// for as the timer is set.
+    pub timer: Option<crate::rundown::TimerSet>,
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/rundown/steps/{step_uuid}/plays/{deck_uuid}/timer",
+    params(
+        ("step_uuid" = String, Path, description = "Step UUID"),
+        ("deck_uuid" = String, Path, description = "UUID of a timer deck the step starts")
+    ),
+    request_body = StepTimerBody,
+    responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "Not a timer the step starts, or a count down of no time"), (status = 404, description = "No such step")),
+    tag = "Rundown"
+)]
+pub async fn set_timer(
+    State(s): State<SharedState>,
+    Path((uuid, deck_uuid)): Path<(String, String)>,
+    Json(b): Json<StepTimerBody>,
+) -> impl IntoResponse {
+    dispatch(
+        &s,
+        EngineCommand::SetRundownTimer {
+            uuid,
+            deck_uuid,
+            timer: b.timer,
+        },
+    )
+    .await
+}
+
+/// The time of day a step is taken by itself at.
+#[derive(Deserialize, ToSchema)]
+pub struct StepAtBody {
+    /// Seconds after midnight — 33300 for 9:15 — or `null` for none.
+    pub secs: Option<u32>,
+}
+
+#[utoipa::path(put, path = "/api/rundown/steps/{step_uuid}/at", params(("step_uuid" = String, Path, description = "Step UUID")), request_body = StepAtBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "Not a time of day"), (status = 404, description = "No such step")), tag = "Rundown")]
+pub async fn set_at(
+    State(s): State<SharedState>,
+    Path(uuid): Path<String>,
+    Json(b): Json<StepAtBody>,
+) -> impl IntoResponse {
+    dispatch(&s, EngineCommand::SetRundownAt { uuid, at_secs: b.secs }).await
+}
+
 /// When a step goes on to the next by itself.
 #[derive(Deserialize, ToSchema)]
 pub struct StepThenBody {

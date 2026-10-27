@@ -618,6 +618,16 @@ pub struct VardaApp {
     /// held for: Auto Play does not start them as that step brings them on
     /// air (see `state/on_air.rs`, `state/rundown.rs`).
     clips_held: Vec<(String, usize, u8)>,
+    /// Clips and playlists a rundown step is fading out — their sound — to
+    /// stop or pause when the fade is done (see `state/rundown.rs`).
+    rundown_fades: Vec<state::rundown::SoundFade>,
+    /// The clips and playlists the step taken last plays till the next
+    /// step, as it was taken: kept should that step be removed before then.
+    rundown_till_next: Vec<String>,
+    /// The time of day the rundown last looked at, seconds after local
+    /// midnight, with the step GO took next then: a step's time is due as
+    /// the clock comes to it while it is next.
+    rundown_day_was: Option<(f64, Option<String>)>,
     /// Writes the show's files on a thread of their own, so the outputs never
     /// wait for the disk (see `persistence::writer`).
     show_writer: crate::persistence::writer::ShowWriter,
@@ -650,6 +660,10 @@ pub struct VardaApp {
     screen_capture_manager: ScreenCaptureManager,
     /// PowerPoint inputs' worker, started with the first of them.
     presentations: state::presentations::Presentations,
+    /// Slides inputs' web talks: `WebKit`, made with the first of them.
+    web_talks: state::slides::WebTalks,
+    /// Talks' files looked over for what may go wrong in the show.
+    talk_checks: crate::presentation::check::Checker,
     registry: ShaderRegistry,
     analyzer_registry: crate::analyzer::AnalyzerRegistry,
     context: GpuContext,
@@ -912,6 +926,8 @@ impl VardaApp {
                 ScreenCaptureManager::new()
             },
             presentations: state::presentations::Presentations::new(config.powerpoint_disabled),
+            web_talks: state::slides::WebTalks::new(config.headless),
+            talk_checks: crate::presentation::check::Checker::new(),
             registry,
             analyzer_registry: crate::analyzer::default_registry(),
             context: gpu,
@@ -1038,6 +1054,9 @@ impl VardaApp {
             production_buses: crate::bus::BusBank::with_legacy_default(),
             rundown: crate::rundown::Rundown::default(),
             clips_held: Vec::new(),
+            rundown_fades: Vec::new(),
+            rundown_till_next: Vec::new(),
+            rundown_day_was: None,
             show_writer: crate::persistence::writer::ShowWriter::default(),
             saving_as: None,
             presets_on_way: Vec::new(),

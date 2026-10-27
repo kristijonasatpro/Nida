@@ -26,12 +26,15 @@ lower third over it, say. It offers the same kinds, all but **Audio Input**.
 | **Colour** | A solid colour. **Pick** beside it, then a click anywhere on the screen — a picture in Nida too — takes that colour (Esc cancels; macOS). A colour layer's colour can be changed later in its **Source** tab |
 | **Generator** | A generator from the shader library, found by typing part of its name |
 | **Timer / Clock** | A count down, a count to a time of day, a count up or the time of day, over a see-through background — below |
-| **PowerPoint** | A PowerPoint deck played by PowerPoint on this Mac, in a window Nida shows, moved on from Nida or a clicker (macOS, with PowerPoint installed) — see [PowerPoint](26-presentations.md) |
+| **PowerPoint** | A PowerPoint deck played by PowerPoint on this Mac, in a window Nida shows, moved on from Nida or a clicker (macOS, with PowerPoint installed) — see [PowerPoint](26-presentations.md#powerpoint) |
+| **Presentations** | A Slides input: a conference's talks — PowerPoint decks, PDFs, web pages, clips, pictures — in running order, each started with one press in the Presentations panel (macOS) — see [Presentations](26-presentations.md) |
 | **Another input** | As a layer: that input's picture inside this one, sized and placed like any layer (see [Another input as a layer](21-input-settings.md#another-input-as-a-layer)). As a new input: a copy of it, called "*name* (copy)", that can be sized and placed on its own — vMix's virtual input. Either way it is drawn once for both. An input that shows the one being added to is greyed out |
 | **Audio Input** | A sound device on its own — a microphone, a mixer's output — as a strip in the [Audio Mixer](16-audio-mixer.md), with the pair of channels (or one channel, mono) it takes |
 
 Files dropped from Finder still work as before: on a tile they go into that
-input, on the empty tile into a new one.
+input, on the empty tile into a new one. PowerPoint decks, PDFs and web pages
+are talks of the show's Slides input wherever they land (see
+[Presentations](26-presentations.md#adding-talks)).
 
 ## Playlists
 

@@ -21,6 +21,7 @@ mod detect;
 mod drag_position;
 mod engine_thread;
 mod event_loop;
+mod panel_windows;
 mod preview;
 mod shows;
 mod vsync;
@@ -192,6 +193,13 @@ pub struct UIRunner {
     egui_start_time: std::time::Instant,
     cached_screen_size: winit::dpi::PhysicalSize<u32>,
     cached_scale_factor: f32,
+
+    // ── Panels in windows of their own (see `panel_windows`) ─────────
+    panel_windows: panel_windows::PanelWindows,
+    /// The control window has the keyboard (a panel's window may, too).
+    main_focused: bool,
+    /// The control window's keys pressed and not let go (see `HeldKeys`).
+    main_held: panel_windows::HeldKeys,
 }
 
 impl UIRunner {
@@ -292,6 +300,9 @@ impl UIRunner {
             egui_start_time: std::time::Instant::now(),
             cached_screen_size: winit::dpi::PhysicalSize::new(0, 0),
             cached_scale_factor: 1.0,
+            panel_windows: panel_windows::PanelWindows::default(),
+            main_focused: true,
+            main_held: panel_windows::HeldKeys::default(),
         }
     }
 
@@ -314,11 +325,21 @@ impl UIRunner {
         let session = &mut ui_actions.session;
         // A fold is kept with the workspace too.
         let mut changed = session.toggle_collapsed_channel.is_some();
-        if let Some(screen) = session.screen_layout.take() {
+        if let Some(mut screen) = session.screen_layout.take() {
             let old = &self.layout.screen;
             changed = screen.name != old.name
                 || screen.locked != old.locked
+                || screen.windows != old.windows
                 || !crate::usecases::ui::screen_layout::same_arrangement(&screen.dock, &old.dock);
+            // A layout chosen puts its panels' windows where it keeps them:
+            // one open already is moved there.
+            for window in screen.windows.iter_mut().filter(|w| w.place) {
+                if let Some(rect) = window.rect {
+                    let zoom = self.egui_ctx.zoom_factor();
+                    self.panel_windows.place(ui::panels::window_viewport(window.pane), rect, zoom);
+                }
+                window.place = false;
+            }
             self.layout.screen = screen;
         }
         // The files below are written in the background, as a save is: the
@@ -332,7 +353,7 @@ impl UIRunner {
             let writes = self.layout_writes.clone();
             let result =
                 self.saved_layouts
-                    .save_as_with(&name, &self.layout.screen.dock, |path, text| {
+                    .save_as_with(&name, &self.layout.screen.dock, &self.layout.screen.windows, |path, text| {
                         let failed = ui::screen_layout::not_saved(path);
                         let then = Some(writes.landing());
                         keep_file(varda, "the saved layouts", path, text, said, failed, then)
@@ -560,6 +581,8 @@ impl UIRunner {
                 ws.surface_config.format,
                 egui_wgpu::RendererOptions::default(),
             ));
+            // Panels in windows of their own: windows of the runner's.
+            self.panel_windows.install(&self.egui_ctx);
 
             // Set the application icon on egui's viewport (controls dock/taskbar icon)
             {
@@ -627,8 +650,22 @@ impl UIRunner {
             self.layout = loaded_layout;
             self.saved_layouts.reconnect(&mut self.layout.screen);
         }
+        for pane in test_panel_windows() {
+            self.layout.screen.open_in_window(pane);
+        }
         // `load_workspace` clears the engine-owned undo/redo timeline.
         log::info!("[STARTUP] Workspace loaded ({:.0?})", startup_t0.elapsed());
+
+        // The clicker, heard with another app in front: the one learned
+        // before read again (nothing is asked of macOS at start).
+        if !self.config.headless {
+            crate::clicker::start(varda.command_sender());
+            // Whether the control window has the keyboard, as macOS has it
+            // now: a focus event before this may have come and gone.
+            if let Some(window) = self.window {
+                crate::clicker::set_focused(window.has_focus());
+            }
+        }
 
         // Start HTTP API server on background thread
         if self.api_handle.is_none() {
@@ -862,9 +899,16 @@ impl UIRunner {
             input.take()
         };
         let mut ui_actions = ui::UIActions::new();
-        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+        self.panel_windows.begin_frame(self.cached_scale_factor);
+        let mut full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             ui_actions = ui::panels::render_ui(ui, &ui_data);
         });
+        // After the panels' windows' own, whose passes ran inside this one;
+        // applied at the next frame painted, should this one not be.
+        self.panel_windows
+            .push_textures(std::mem::take(&mut full_output.textures_delta));
+        self.panel_windows.close_unshown();
+        self.make_panel_windows(event_loop, &mut ui_actions);
         {
             let Some(egui_state) = &mut self.egui_state else {
                 return;
@@ -891,6 +935,13 @@ impl UIRunner {
                 *largest = [largest[0].max(size[0]), largest[1].max(size[1])];
             }
         }
+        // And the panels' windows': their previews are kept up too.
+        let (drawn, drawn_px) = (&mut self.textures_drawn, &mut self.drawn_px);
+        self.panel_windows.for_each_drawn(|texture, size| {
+            drawn.insert(texture);
+            let largest = drawn_px.entry(texture).or_insert(size);
+            *largest = [largest[0].max(size[0]), largest[1].max(size[1])];
+        });
         self.part("ui tessellate", t_part);
 
         let mut actions = Some(ui_actions);
@@ -906,12 +957,7 @@ impl UIRunner {
 
         // The control window's own frame: the show's picture under the UI.
         let t_submit = std::time::Instant::now();
-        self.submit_frame(
-            &paint_jobs,
-            full_output.pixels_per_point,
-            full_output.textures_delta,
-            &shown,
-        );
+        self.submit_frame(&paint_jobs, full_output.pixels_per_point, &shown);
         self.part("ui submit", t_submit);
         #[allow(clippy::cast_precision_loss)]
         let frame_ms = 1000.0 / shown.target_fps.max(1) as f32;
@@ -1112,6 +1158,16 @@ impl UIRunner {
             &self.output_preview_textures,
             self.main_output_texture,
         );
+        if !self.config.headless {
+            crate::clicker::frame(
+                &ui_data.keymap_bindings,
+                crate::clicker::WindowKeys {
+                    keyboard_learn: ui_data.keyboard_learn_active,
+                    stage_editor: ui_data.stage_editor_open,
+                },
+            );
+            ui_data.clicker = crate::clicker::status();
+        }
         ui_data.saved_layouts = self.saved_layouts.layouts();
         ui_data.window_choices = self.window_choices.choices();
         ui_data.recent_shows = std::sync::Arc::clone(&self.recent_shows);
@@ -1273,9 +1329,12 @@ impl UIRunner {
             // Intercept shader_to_add: resolve and route to background loading
             if let Some((place, gen_idx)) = ui_actions.session.shader_to_add.take() {
                 if let Some(shader) = varda.resolve_generator(gen_idx) {
-                    let token = self
-                        .deck_load_targets
-                        .record_before(place.channel_uuid, place.before_deck_uuid);
+                    let spot = if place.back {
+                        deck_load::Spot::Back(self.deck_load_targets.batch())
+                    } else {
+                        deck_load::Spot::Before(place.before_deck_uuid)
+                    };
+                    let token = self.deck_load_targets.record_spot(place.channel_uuid, spot);
                     let context = varda.gpu_context();
                     VardaApp::spawn_deck_loads(
                         &self.deck_load_tx,
@@ -1405,6 +1464,9 @@ impl UIRunner {
             if let Some(file) = ui_actions.session.reveal_file.take() {
                 reveal_in_file_manager(&file);
             }
+            if let Some(ask) = ui_actions.session.clicker_ask.take() {
+                crate::clicker::ask(ask);
+            }
 
             // Spawn file dialogs on background threads (non-blocking)
             if let Some(uuid) = ui_actions.session.open_image_dialog_for_channel.take() {
@@ -1476,15 +1538,22 @@ impl UIRunner {
                 };
                 // One loader thread, in the order picked: with a thread per
                 // file, several slides picked together landed shuffled.
-                // Stacked in one input, last first: the first picked is in
-                // front, at the top of the lists of layers.
+                // Stacked in one input: behind its layers — what it shows,
+                // on air perhaps, stays — last first, so they keep the order
+                // picked down the lists of layers (see
+                // `deck_load::add_dropped_files`).
                 let stacked = result.channel_uuid.is_some();
+                let spot = if stacked {
+                    deck_load::Spot::Back(self.deck_load_targets.batch())
+                } else {
+                    deck_load::Spot::Before(None)
+                };
                 let mut files: Vec<_> = result
                     .paths
                     .into_iter()
                     .zip(targets)
                     .map(|(path, channel_uuid)| {
-                        let token = self.deck_load_targets.record(channel_uuid);
+                        let token = self.deck_load_targets.record_spot(channel_uuid, spot.clone());
                         let file = match result.kind {
                             FileDialogKind::Image => crate::app::DeckFile::Image(path),
                             FileDialogKind::Video => crate::app::DeckFile::Video(path),
@@ -1513,7 +1582,7 @@ impl UIRunner {
                         // can change while a decode or shader compile runs, and an
                         // index captured back then would now name a different
                         // channel. See `/spec/api-addressing.md`.
-                        let Some((channel_uuid, before_deck)) = target else {
+                        let Some((channel_uuid, spot)) = target else {
                             log::warn!(
                                 "Dropping background load '{}': no target channel was recorded",
                                 result.name
@@ -1548,9 +1617,15 @@ impl UIRunner {
                         let deck_uuid = deck.uuid().to_string();
                         self.inputs_awaiting_files.remove(&channel_uuid);
                         if let Some(ch) = varda.mixer_mut().channel_mut(ch_idx) {
-                            // Before the deck it was dropped in front of, if
-                            // that deck is still in this channel; else last.
-                            let idx = ch.insert_deck_before(deck, before_deck.as_deref());
+                            // Where it was dropped, as the channel is now:
+                            // before the deck it was dropped in front of, if
+                            // that deck is still in it (else last), or
+                            // behind its layers.
+                            let decks: Vec<String> =
+                                ch.decks.iter().map(|s| s.deck.uuid().to_string()).collect();
+                            let decks: Vec<&str> = decks.iter().map(String::as_str).collect();
+                            let at = self.deck_load_targets.landing(&spot, &decks, &deck_uuid);
+                            let idx = ch.insert_deck_at(deck, at);
                             log::info!(
                                 "Background load complete: deck {} to channel {}: {}",
                                 idx,
@@ -1642,12 +1717,14 @@ impl UIRunner {
         &mut self,
         paint_jobs: &[egui::ClippedPrimitive],
         pixels_per_point: f32,
-        mut textures_delta: egui::TexturesDelta,
         shown: &Shown,
     ) {
         let t_part = std::time::Instant::now();
+        // Every pass's textures since the last frame painted — the panels'
+        // windows' and this window's, in the order egui made them.
+        let mut textures = self.panel_windows.take_textures();
         if let (Some(context), Some(egui_renderer)) = (&self.gpu, &mut self.egui_renderer) {
-            for (id, deltas) in &textures_delta.set {
+            for (id, deltas) in textures.iter().flat_map(|t| &t.set) {
                 for delta in deltas {
                     egui_renderer.update_texture(&context.device, &context.queue, *id, delta);
                 }
@@ -1672,12 +1749,56 @@ impl UIRunner {
         for (part, took) in parts {
             self.ui_parts.add(part, took);
         }
+        let t_part = std::time::Instant::now();
+        if let (Some(context), Some(egui_renderer)) = (&self.gpu, &mut self.egui_renderer) {
+            self.panel_windows.paint(context, egui_renderer);
+        }
+        self.part("ui panel windows", t_part);
         if let Some(egui_renderer) = &mut self.egui_renderer {
-            for id in &textures_delta.free {
+            for id in textures.iter().flat_map(|t| &t.free) {
                 egui_renderer.free_texture(id);
             }
         }
-        textures_delta.clear();
+        for delta in &mut textures {
+            delta.clear();
+        }
+    }
+
+    /// The panels' windows the dock showed for the first time this frame,
+    /// made: a panel whose window could not be had put back — in the layout
+    /// this frame hands back (`actions`), which the runner keeps once the
+    /// frame is done — and said.
+    fn make_panel_windows(&mut self, event_loop: &ActiveEventLoop, actions: &mut ui::UIActions) {
+        let (Some(gpu), Some(ws)) = (&self.gpu, &self.window_surface) else {
+            return;
+        };
+        let failed = self.panel_windows.make_wanted(
+            &self.egui_ctx,
+            event_loop,
+            gpu,
+            &ws.surface_config,
+            self.window,
+        );
+        for (id, why) in failed {
+            let screen = match actions.session.screen_layout.as_mut() {
+                Some(screen) => screen,
+                None => &mut self.layout.screen,
+            };
+            let pane = screen
+                .windows
+                .iter()
+                .map(|w| w.pane)
+                .find(|pane| ui::panels::window_viewport(*pane) == id);
+            if let Some(pane) = pane {
+                screen.put_back(pane);
+            }
+            let said = format!("A panel's window could not be opened — it is back in the panels: {why}");
+            let _ = self.with_engine(|this| {
+                if let Some(varda) = this.varda.as_mut() {
+                    varda.notify_error(said);
+                }
+            });
+        }
     }
 
     /// Blit mixer output to screen, overlay egui, and present. Returns the
@@ -1805,6 +1926,24 @@ impl UIRunner {
         parts.push(("ui present", t_part.elapsed()));
         parts
     }
+}
+
+/// A test hook: `NIDA_TEST_PANEL_WINDOWS=Switcher,Audio` opens those panels
+/// in windows of their own at start — named as `Pane` names them — for a
+/// look at the windows with no hand on the mouse.
+fn test_panel_windows() -> Vec<ui::screen_layout::Pane> {
+    let Ok(names) = std::env::var("NIDA_TEST_PANEL_WINDOWS") else {
+        return Vec::new();
+    };
+    log::warn!("Test hook: panels in windows of their own at start: {names}");
+    names
+        .split(',')
+        .filter_map(|name| {
+            ui::screen_layout::Pane::ALL
+                .into_iter()
+                .find(|pane| format!("{pane:?}").eq_ignore_ascii_case(name.trim()))
+        })
+        .collect()
 }
 
 /// A test hook: the control window freezes `freeze` once a second, as a busy
@@ -2483,6 +2622,7 @@ mod tests {
         let saved = SavedLayout {
             name: "Broadcast".into(),
             dock: mine.clone(),
+            windows: Vec::new(),
             was: None,
         };
         store_saved(&path, &[saved]).unwrap();
@@ -2493,6 +2633,7 @@ mod tests {
             dock: mine,
             locked: false,
             naming: 0,
+            windows: Vec::new(),
         };
         let varda = runner.varda.as_mut().unwrap();
         varda.save_workspace(&runner.layout).unwrap();

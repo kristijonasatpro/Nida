@@ -123,6 +123,7 @@ pub(crate) fn build_ui_data(
                         screen_capture,
                         tap,
                         playlist: d.playlist.clone(),
+                        slides: d.slides.clone(),
                         timer: d.timer.clone(),
                         presentation: d.presentation.clone(),
                         presenter_of: d.presenter_of.clone(),
@@ -617,6 +618,8 @@ pub(crate) fn build_ui_data(
             .as_ref()
             .map(|t| format!("{t}")),
         keymap_bindings: app.input.keymap.bindings.clone(),
+        // The control window's own (see the runner): the Mac's clicker.
+        clicker: crate::clicker::ClickerStatus::default(),
         transition_names: engine.mixer.transition_names,
         active_transition_name: engine.mixer.active_transition_name,
         // UI layout/selection state — owned by the UI consumer, not the engine

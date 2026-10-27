@@ -731,6 +731,19 @@ pub fn snapshot_scene(
                                 scaling_mode: list.scaling_mode(),
                             }
                         }
+                        "slides" => {
+                            let slides = slot.deck.slides()?;
+                            let unlisted = slides.unlisted_live();
+                            SourceConfig::Slides {
+                                talks: slides.talks().to_vec(),
+                                settings: slides.settings().clone(),
+                                live: slides.saved_live().map(str::to_string),
+                                next: slides.next_pick().map(str::to_string),
+                                live_at: unlisted.as_ref().and_then(|(_, at)| *at),
+                                live_talk: unlisted.map(|(talk, _)| Box::new(talk)),
+                                scaling_mode: slides.scaling_mode(),
+                            }
+                        }
                         "timer" => {
                             let timer = slot.deck.timer()?;
                             SourceConfig::Timer {
@@ -989,10 +1002,12 @@ fn target_to_config(target: &OutputTarget) -> OutputTargetConfig {
             device,
             mode,
             full_range,
+            follow_show,
         } => OutputTargetConfig::DeckLink {
             device: device.clone(),
             mode: mode.clone(),
             full_range: *full_range,
+            follow_show: *follow_show,
         },
     }
 }
@@ -1093,10 +1108,12 @@ fn config_to_target(config: &OutputTargetConfig) -> OutputTarget {
             device,
             mode,
             full_range,
+            follow_show,
         } => OutputTarget::DeckLink {
             device: device.clone(),
             mode: mode.clone(),
             full_range: *full_range,
+            follow_show: *follow_show,
         },
     }
 }
@@ -1773,10 +1790,17 @@ pub(crate) fn restore_deck(
             deck.video_set_speed(*speed);
             deck.video_set_in_point(*in_point);
             deck.video_set_out_point(*out_point);
-            if *in_point > 0.0 {
+            // The In it keeps: one saved past its Out — by an older Nida —
+            // is let go as the commands just sent let it go.
+            let kept = deck.playback_snapshot().map_or(*in_point, |snap| {
+                let points =
+                    crate::video::put_in((0.0, 0.0), *in_point, snap.duration, snap.frame_rate);
+                crate::video::put_out(points, *out_point, snap.duration, snap.frame_rate).0
+            });
+            if kept > 0.0 {
                 // It opens paused: waiting on its in-point, not the file's
                 // first frame.
-                deck.video_seek(*in_point);
+                deck.video_seek(kept);
             }
             deck.set_scaling_mode(*scaling_mode);
             deck.video_set_transport_sync(*transport_sync);
@@ -1966,6 +1990,34 @@ pub(crate) fn restore_deck(
                 context,
                 items.clone(),
                 *settings,
+                render_width,
+                render_height,
+            );
+            deck.set_scaling_mode(*scaling_mode);
+            deck
+        }
+        // Its files are opened as they are started; the talk on when saved
+        // is started again at its slide.
+        SourceConfig::Slides {
+            talks,
+            settings,
+            live,
+            next,
+            live_talk,
+            live_at,
+            scaling_mode,
+        } => {
+            let resume = live.as_ref().map(|id| crate::deck::slides::Resume {
+                id: id.clone(),
+                unlisted: live_talk.as_deref().filter(|t| t.id == *id).cloned(),
+                at: *live_at,
+            });
+            let mut deck = Deck::new_slides(
+                context,
+                talks.clone(),
+                settings.clone(),
+                resume,
+                next.clone(),
                 render_width,
                 render_height,
             );
@@ -2465,6 +2517,9 @@ pub(crate) fn source_configs_match(deck: &Deck, config: &SourceConfig) -> bool {
         // Its items and settings are patched in place: an undo does not
         // stop the list or send it back to its first item.
         ("playlist", SourceConfig::Playlist { .. }) => true,
+        // Its list and settings are patched in place: an undo does not take
+        // the talk on off.
+        ("slides", SourceConfig::Slides { .. }) => true,
         // Its settings are patched in place: an undo does not reset it.
         ("timer", SourceConfig::Timer { .. }) => true,
         // Its layout is patched in place: an undo does not make it again.
@@ -2977,6 +3032,7 @@ mod tests {
             device: "UltraStudio Monitor 3G".into(),
             mode: "1080p60".into(),
             full_range: false,
+            follow_show: true,
         };
         let json = serde_json::to_string(&target_to_config(&target)).unwrap();
         assert_eq!(
@@ -2990,6 +3046,7 @@ mod tests {
             device: "UltraStudio Monitor 3G".into(),
             mode: "1080p60".into(),
             full_range: true,
+            follow_show: true,
         };
         let json = serde_json::to_string(&target_to_config(&full)).unwrap();
         assert!(json.contains(r#""full_range":true"#), "{json}");
@@ -3020,6 +3077,7 @@ mod tests {
             device: "UltraStudio Monitor 3G".into(),
             mode: "1080p60".into(),
             full_range: false,
+            follow_show: true,
         };
         let running = output_config(&make(blackmagic(), true));
         assert!(running.running);

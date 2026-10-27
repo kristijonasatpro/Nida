@@ -2,12 +2,16 @@
 //! Nida captures, moved on from Nida — its transitions, animations and
 //! videos as PowerPoint plays them. See docs/26-presentations.md.
 
+pub mod check;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod fake;
 pub mod manager;
+pub mod pdf;
+pub mod pictures;
 pub mod powerpoint;
 pub mod pptx;
 pub mod screens;
+pub mod web;
 
 /// A PowerPoint input's deck file, kept with the show on its capture deck.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]

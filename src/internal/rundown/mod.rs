@@ -59,6 +59,19 @@ pub enum PlayAction {
     Stop,
 }
 
+/// How a step sets a timer it starts: counting down from a length of its
+/// own, or up — a talk of 15 minutes, the next of 20, a panel counted up.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TimerSet {
+    /// Down from this many seconds.
+    Down { secs: u32 },
+    /// Up from zero.
+    Up,
+}
+
 /// A clip, playlist or timer a step starts or stops.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct PlaySet {
@@ -66,6 +79,28 @@ pub struct PlaySet {
     pub deck: String,
     /// What is done to it.
     pub action: PlayAction,
+    /// A clip or playlist it starts or carries on: faded out — its sound
+    /// over the fade of the step taken next — and stopped, back at its
+    /// beginning, when another step is taken that does not start or stop it
+    /// itself. Music for one moment of the show.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub until_next: bool,
+    /// A timer it starts: set so as it starts — counting down from its own
+    /// length, or up; as the timer is set when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timer: Option<TimerSet>,
+}
+
+impl PlaySet {
+    /// `action` done to `deck`, nothing more.
+    pub fn new(deck: impl Into<String>, action: PlayAction) -> Self {
+        Self {
+            deck: deck.into(),
+            action,
+            until_next: false,
+            timer: None,
+        }
+    }
 }
 
 /// One moment of the show: what every screen shows, what is on Main, which
@@ -93,7 +128,15 @@ pub struct Step {
     /// operator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub then_secs: Option<f32>,
+    /// The time of day it is taken by itself at — faded to, as GO takes it
+    /// — while it is the step GO takes next: seconds after midnight. `None`
+    /// waits for the operator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_secs: Option<u32>,
 }
+
+/// Seconds in a day: a time of day is fewer.
+pub const DAY_SECS: u32 = 24 * 3600;
 
 impl Step {
     /// A step called `name` that sets nothing yet.
@@ -106,6 +149,7 @@ impl Step {
             overlays: Vec::new(),
             plays: Vec::new(),
             then_secs: None,
+            at_secs: None,
         }
     }
 
@@ -164,9 +208,27 @@ impl Step {
         self.overlays.retain(|o| seen.insert(o.channel.clone()));
         seen.clear();
         self.plays.retain(|p| seen.insert(p.deck.clone()));
+        for play in &mut self.plays {
+            play.timer = play.timer.map(valid_timer);
+        }
         self.then_secs = self.then_secs.and_then(valid_then);
+        self.at_secs = self.at_secs.filter(|secs| *secs < DAY_SECS);
     }
 }
+
+/// A timer setting as kept: a count down of a second to a timer's longest.
+pub fn valid_timer(set: TimerSet) -> TimerSet {
+    match set {
+        TimerSet::Down { secs } => TimerSet::Down {
+            secs: secs.clamp(1, crate::engine::value::timer::MAX_DURATION_SECS),
+        },
+        TimerSet::Up => TimerSet::Up,
+    }
+}
+
+/// How long after its time of day a step can still be taken by it: a Mac
+/// waking, or Nida opened, after the time does not take a step long due.
+pub const AT_GRACE_SECS: f64 = 60.0;
 
 /// A `then` wait as kept: more than none and within an hour, or nothing for
 /// one that is not a time.
@@ -233,6 +295,9 @@ pub struct Rundown {
     /// The step the operator said `GO` takes instead, until a step is taken.
     next: Option<String>,
     follow: Option<Follow>,
+    /// The step whose time of day the operator held: not taken by itself at
+    /// it, till a step is taken, another is made next, or its time changed.
+    at_held: Option<String>,
 }
 
 impl Default for Rundown {
@@ -244,6 +309,7 @@ impl Default for Rundown {
             to_come: Vec::new(),
             next: None,
             follow: None,
+            at_held: None,
         }
     }
 }
@@ -440,13 +506,39 @@ impl Rundown {
                 (Some(at), None) => {
                     step.plays.remove(at);
                 }
-                (None, Some(action)) => step.plays.push(PlaySet {
-                    deck: deck.to_string(),
-                    action,
-                }),
+                (None, Some(action)) => step.plays.push(PlaySet::new(deck, action)),
                 (None, None) => {}
             }
         })
+    }
+
+    /// Whether a clip or playlist a step starts or carries on is faded out
+    /// and stopped when another step is taken. Whether the step has that
+    /// clip or playlist among what it starts and stops.
+    pub fn set_until_next(&mut self, uuid: &str, deck: &str, on: bool) -> bool {
+        let there = self
+            .step(uuid)
+            .is_some_and(|step| step.plays.iter().any(|p| p.deck == deck));
+        there
+            && self.edit(uuid, |step| {
+                for play in step.plays.iter_mut().filter(|p| p.deck == deck) {
+                    play.until_next = on;
+                }
+            })
+    }
+
+    /// How a step sets a timer it starts, or with `None` as the timer is
+    /// set. Whether the step has that timer among what it starts and stops.
+    pub fn set_timer(&mut self, uuid: &str, deck: &str, timer: Option<TimerSet>) -> bool {
+        let there = self
+            .step(uuid)
+            .is_some_and(|step| step.plays.iter().any(|p| p.deck == deck));
+        there
+            && self.edit(uuid, |step| {
+                for play in step.plays.iter_mut().filter(|p| p.deck == deck) {
+                    play.timer = timer.map(valid_timer);
+                }
+            })
     }
 
     /// How long after a step the next is taken by itself, or with `None`
@@ -454,6 +546,64 @@ impl Rundown {
     /// none.
     pub fn set_then(&mut self, uuid: &str, secs: Option<f32>) -> bool {
         self.edit(uuid, |step| step.then_secs = secs.and_then(valid_then))
+    }
+
+    /// The time of day a step is taken by itself at, seconds after midnight,
+    /// or with `None` not at all — a time past the day counting as none. A
+    /// hold on its time is let go: the new one stands.
+    pub fn set_at(&mut self, uuid: &str, at_secs: Option<u32>) -> bool {
+        if self.at_held.as_deref() == Some(uuid) {
+            self.at_held = None;
+        }
+        self.edit(uuid, |step| step.at_secs = at_secs.filter(|s| *s < DAY_SECS))
+    }
+
+    /// The step whose time of day the operator held, by UUID.
+    pub fn at_held(&self) -> Option<&str> {
+        self.at_held.as_deref()
+    }
+
+    /// The step due by its time of day: the step `GO` takes next, with a
+    /// time the clock has just come to — from `was` to `now`, seconds after
+    /// local midnight, read a frame apart — not held, and no more than
+    /// [`AT_GRACE_SECS`] past it.
+    ///
+    /// A reading lower than the one before is midnight only when it is half
+    /// a day lower: then `was` is of the day before, and so may be a time
+    /// just before midnight. Any other step back — the clock set back,
+    /// summer time ending — takes nothing.
+    pub fn due_at(&self, was: f64, now: f64) -> Option<&Step> {
+        let step = self.next()?;
+        let at = f64::from(step.at_secs?);
+        if self.at_held.as_deref() == Some(step.uuid.as_str()) {
+            return None;
+        }
+        let day = f64::from(DAY_SECS);
+        let was = if was <= now {
+            was
+        } else if was - now > day / 2.0 {
+            was - day
+        } else {
+            return None;
+        };
+        let come_to = |at: f64| was < at && at <= now && now - at <= AT_GRACE_SECS;
+        (come_to(at) || come_to(at - day)).then_some(step)
+    }
+
+    /// The step `uuid`, due by its time of day, to be taken now — at `now`
+    /// on the frame clock — as a wait run out is: faded to, tried again
+    /// while something still lands, and said when it cannot be.
+    pub fn start_at(&mut self, uuid: &str, now: f64) -> bool {
+        if self.position(uuid).is_none() {
+            return false;
+        }
+        self.follow = Some(Follow {
+            from: self.last.clone().unwrap_or_default(),
+            to: uuid.to_string(),
+            due: now,
+            fade: true,
+        });
+        true
     }
 
     /// Replace a step's picture with `with`'s — its screens, Main and
@@ -489,12 +639,14 @@ impl Rundown {
         self.last = Some(uuid.to_string());
         self.to_come.clear();
         self.next = None;
+        self.at_held = None;
         true
     }
 
     /// Make `GO` take this step next, without taking anything: the step
     /// taken last stays where the show is. The operator has taken the order
-    /// into their own hands, so a wait being counted out is dropped.
+    /// into their own hands, so a wait being counted out is dropped — and a
+    /// hold on a time of day let go, the step next now going by its own.
     /// Whether there was such a step.
     pub fn set_next(&mut self, uuid: &str) -> bool {
         if self.position(uuid).is_none() {
@@ -502,6 +654,7 @@ impl Rundown {
         }
         self.next = Some(uuid.to_string());
         self.follow = None;
+        self.at_held = None;
         true
     }
 
@@ -513,9 +666,25 @@ impl Rundown {
         self.follow.as_ref().filter(|follow| now >= follow.due)
     }
 
-    /// Drop a wait being counted out. Whether there was one.
-    pub fn hold(&mut self) -> bool {
+    /// Drop a wait being counted out: a step taken by hand, or the step it
+    /// led to being taken. Whether there was one.
+    pub fn drop_wait(&mut self) -> bool {
         self.follow.take().is_some()
+    }
+
+    /// The operator's Hold: drop a wait being counted out, and hold the time
+    /// of day of the step `GO` takes next, if it has one — the show waits
+    /// for the operator. Whether there was either to stop.
+    pub fn hold(&mut self) -> bool {
+        let timed = self
+            .next()
+            .filter(|step| step.at_secs.is_some())
+            .map(|step| step.uuid.clone());
+        let held = timed.is_some() && self.at_held != timed;
+        if held {
+            self.at_held = timed;
+        }
+        self.follow.take().is_some() || held
     }
 
     /// A bus was removed: no step sets it any more. Whether anything changed.
@@ -588,6 +757,9 @@ impl Rundown {
         }
         if self.next.as_ref().is_some_and(|n| self.position(n).is_none()) {
             self.next = None;
+        }
+        if self.at_held.as_ref().is_some_and(|h| self.position(h).is_none()) {
+            self.at_held = None;
         }
         self.follow = None;
     }

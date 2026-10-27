@@ -107,8 +107,8 @@ fn deck_files(
 }
 
 /// Start loading files dropped in from Finder as decks in one channel, in the
-/// order given, before the deck `place` names (or at the end). See
-/// `deck_files` for what is left out.
+/// order given: before the deck `place` names (or at the end), or behind
+/// its layers. See `deck_files` for what is left out.
 pub(super) fn add_dropped_files(
     varda: &mut crate::app::VardaApp,
     targets: &mut DeckLoadTargets,
@@ -130,16 +130,19 @@ pub(super) fn add_dropped_files(
         );
         return;
     }
-    // Every file goes before the same deck, loaded last first so they keep
-    // their order in the lists, which show the front first: B before X,
-    // then A before X, is B, A, X — listed X, A, B.
+    // Loaded last first, so they keep their order in the lists, which show
+    // the front first: every file before the same deck — B before X, then A
+    // before X, is B, A, X, listed X, A, B — or behind the layers, each
+    // after those of the batch there before it — B, then A after it, is B,
+    // A, X, the same.
+    let spot = if place.back {
+        Spot::Back(targets.batch())
+    } else {
+        Spot::Before(place.before_deck_uuid.clone())
+    };
     let mut files: Vec<_> = deck_files(varda, paths)
         .into_iter()
-        .map(|(_, file)| {
-            let token =
-                targets.record_before(channel_uuid.to_string(), place.before_deck_uuid.clone());
-            (token, file)
-        })
+        .map(|(_, file)| (targets.record_spot(channel_uuid.to_string(), spot.clone()), file))
         .collect();
     files.reverse();
     let size = (varda.render_width(), varda.render_height());
@@ -216,6 +219,18 @@ pub(super) fn remove_if_empty(varda: &mut crate::app::VardaApp, channel_uuid: &s
     }
 }
 
+/// Where a background load's deck goes in its channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Spot {
+    /// Before this deck, if it is still in the channel when the load lands;
+    /// else — or `None` — at the end, in front of them all.
+    Before(Option<String>),
+    /// Behind the channel's layers as they are when it lands — what it
+    /// shows, on air perhaps, stays — after those of its batch (by number)
+    /// landed there before it.
+    Back(u64),
+}
+
 /// Target channel of each in-flight background deck load, keyed by the token
 /// handed to `spawn_deck_loads` and echoed back in `DeckLoadResult::token`.
 ///
@@ -224,8 +239,11 @@ pub(super) fn remove_if_empty(varda: &mut crate::app::VardaApp, channel_uuid: &s
 /// See [`/spec/api-addressing.md`].
 #[derive(Default)]
 pub(super) struct DeckLoadTargets {
-    by_token: std::collections::HashMap<DeckLoadToken, (String, Option<String>)>,
+    by_token: std::collections::HashMap<DeckLoadToken, (String, Spot)>,
     next_token: usize,
+    /// Of each batch landing at the back, the decks landed so far.
+    landed: std::collections::HashMap<u64, Vec<String>>,
+    next_batch: u64,
 }
 
 impl DeckLoadTargets {
@@ -243,17 +261,54 @@ impl DeckLoadTargets {
         channel_uuid: String,
         before_deck_uuid: Option<String>,
     ) -> DeckLoadToken {
+        self.record_spot(channel_uuid, Spot::Before(before_deck_uuid))
+    }
+
+    /// A new batch of loads landing at the back of a channel together.
+    pub(super) fn batch(&mut self) -> u64 {
+        self.next_batch += 1;
+        self.next_batch
+    }
+
+    /// Record a load's target: a channel, at `spot` in it.
+    pub(super) fn record_spot(&mut self, channel_uuid: String, spot: Spot) -> DeckLoadToken {
         let token = DeckLoadToken(self.next_token);
         self.next_token += 1;
-        self.by_token
-            .insert(token, (channel_uuid, before_deck_uuid));
+        self.by_token.insert(token, (channel_uuid, spot));
         token
     }
 
-    /// Claim a completed load's target channel and the deck it goes before.
-    /// `None` means the token was never issued or has already been claimed.
-    pub(super) fn claim(&mut self, token: DeckLoadToken) -> Option<(String, Option<String>)> {
+    /// Claim a completed load's target channel and its spot there. `None`
+    /// means the token was never issued or has already been claimed.
+    pub(super) fn claim(&mut self, token: DeckLoadToken) -> Option<(String, Spot)> {
         self.by_token.remove(&token)
+    }
+
+    /// Where the deck `landing` goes among a channel's decks (`decks`, by
+    /// UUID, back first) for `spot`. At the back: after those of its batch
+    /// landed before it that are still the rearmost — one taken away or
+    /// moved meanwhile, it goes behind the rest of the channel's layers all
+    /// the same.
+    pub(super) fn landing(&mut self, spot: &Spot, decks: &[&str], landing: &str) -> usize {
+        match spot {
+            Spot::Before(before) => before
+                .as_deref()
+                .and_then(|before| decks.iter().position(|d| *d == before))
+                .unwrap_or(decks.len()),
+            Spot::Back(batch) => {
+                let landed = self.landed.entry(*batch).or_default();
+                let at = decks
+                    .iter()
+                    .take_while(|d| landed.iter().any(|l| l == *d))
+                    .count();
+                landed.push(landing.to_string());
+                if !self.by_token.values().any(|(_, s)| s == spot) {
+                    // Its batch's last: nothing more lands after it.
+                    self.landed.remove(batch);
+                }
+                at
+            }
+        }
     }
 }
 
@@ -273,8 +328,8 @@ mod tests {
         let first = targets.record("ch-aaa".to_string());
         let second = targets.record("ch-bbb".to_string());
         assert_ne!(first, second, "each load gets a distinct token");
-        assert_eq!(targets.claim(first), Some(("ch-aaa".to_string(), None)));
-        assert_eq!(targets.claim(second), Some(("ch-bbb".to_string(), None)));
+        assert_eq!(targets.claim(first), Some(("ch-aaa".to_string(), Spot::Before(None))));
+        assert_eq!(targets.claim(second), Some(("ch-bbb".to_string(), Spot::Before(None))));
     }
 
     /// A token is single-use: claiming twice must not resurrect a stale target.
@@ -282,7 +337,7 @@ mod tests {
     fn deck_load_token_cannot_be_claimed_twice() {
         let mut targets = DeckLoadTargets::default();
         let token = targets.record("ch-aaa".to_string());
-        assert_eq!(targets.claim(token), Some(("ch-aaa".to_string(), None)));
+        assert_eq!(targets.claim(token), Some(("ch-aaa".to_string(), Spot::Before(None))));
         assert_eq!(targets.claim(token), None, "second claim yields nothing");
     }
 
@@ -299,9 +354,63 @@ mod tests {
         let a = targets.record("ch-aaa".to_string());
         let b = targets.record("ch-bbb".to_string());
         let c = targets.record("ch-ccc".to_string());
-        assert_eq!(targets.claim(b), Some(("ch-bbb".to_string(), None)));
-        assert_eq!(targets.claim(c), Some(("ch-ccc".to_string(), None)));
-        assert_eq!(targets.claim(a), Some(("ch-aaa".to_string(), None)));
+        assert_eq!(targets.claim(b), Some(("ch-bbb".to_string(), Spot::Before(None))));
+        assert_eq!(targets.claim(c), Some(("ch-ccc".to_string(), Spot::Before(None))));
+        assert_eq!(targets.claim(a), Some(("ch-aaa".to_string(), Spot::Before(None))));
+    }
+
+    /// Loads landing behind a channel's layers go there as the channel is
+    /// when each lands — its rearmost deck taken away meanwhile or not —
+    /// each after those of its batch landed before it, so a batch loaded
+    /// last first keeps its order down the lists; never in front of the
+    /// layer on air. One that did not load leaves no gap. A deck to go
+    /// before goes there while that deck is in the channel, else last.
+    #[test]
+    fn loads_land_behind_a_channels_layers_as_it_is_when_they_land() {
+        let mut targets = DeckLoadTargets::default();
+        let batch = targets.batch();
+        let tokens: Vec<_> = (0..3)
+            .map(|_| targets.record_spot("ch".into(), Spot::Back(batch)))
+            .collect();
+        // [rear, live] when dropped; the rear layer taken away before any
+        // landed.
+        let mut decks: Vec<String> = vec!["live".into()];
+        for (i, token) in tokens.into_iter().enumerate() {
+            let (channel, spot) = targets.claim(token).expect("recorded");
+            assert_eq!(channel, "ch");
+            if i == 1 {
+                // This one did not load: not landed.
+                continue;
+            }
+            let name = format!("new{i}");
+            let at = targets.landing(
+                &spot,
+                &decks.iter().map(String::as_str).collect::<Vec<_>>(),
+                &name,
+            );
+            decks.insert(at, name);
+        }
+        assert_eq!(decks, ["new0", "new2", "live"], "behind the layer on air, in order");
+        assert!(targets.landed.is_empty(), "its batch done");
+
+        // An earlier arrival taken away, or moved in front, before the next
+        // lands: the next still goes behind the layer on air.
+        for after in [vec!["live"], vec!["live", "b"]] {
+            let batch = targets.batch();
+            let (b, a) = (
+                targets.record_spot("ch".into(), Spot::Back(batch)),
+                targets.record_spot("ch".into(), Spot::Back(batch)),
+            );
+            let (_, spot) = targets.claim(b).unwrap();
+            assert_eq!(targets.landing(&spot, &["live"], "b"), 0);
+            let (_, spot) = targets.claim(a).unwrap();
+            assert_eq!(targets.landing(&spot, &after, "a"), 0, "{after:?}");
+        }
+
+        let before = Spot::Before(Some("live".into()));
+        assert_eq!(targets.landing(&before, &["a", "live"], "x"), 1);
+        assert_eq!(targets.landing(&before, &["a", "b"], "x"), 2, "gone: last");
+        assert_eq!(targets.landing(&Spot::Before(None), &["a", "b"], "x"), 2);
     }
 
     /// Files dropped together go before the same deck, the last loaded
@@ -333,6 +442,7 @@ mod tests {
         let place = crate::usecases::ui::DeckPlace {
             channel_uuid,
             before_deck_uuid: None,
+            back: false,
         };
         add_dropped_files(&mut app, &mut targets, &tx, &pending, &place, paths);
         let names: Vec<String> = (0..3)
@@ -388,7 +498,7 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("every file loads");
             let (target, before_deck) = targets.claim(result.token).expect("recorded");
-            assert_eq!((&target, before_deck), (uuid, None), "{}", result.name);
+            assert_eq!((&target, before_deck), (uuid, Spot::Before(None)), "{}", result.name);
         }
     }
 }

@@ -37,7 +37,8 @@ channel view on screen (Channels, Layers or Inputs).
 ## Making your own
 
 - **Drag a tab** onto another panel to put it in that group, or to an edge of
-  a panel to split it there. Dragging a tab away from everything floats it.
+  a panel to split it there. Dragging a tab away from everything opens that
+  panel in a window of its own (see below).
 - **Drag a divider** to resize.
 - **×** on a tab closes it. **Layout ▸ Panels** opens or closes any panel.
 - **Layout ▸ Save as** keeps the arrangement under a name. Saved layouts are
@@ -51,6 +52,39 @@ the layout has them. The 🗑 beside a saved layout deletes it.
 
 **Lock panels** stops tabs being dragged, closed or floated, so a stray drag
 during a show can't rearrange the screen. Dividers still resize.
+
+## Panels in windows of their own
+
+The **Switcher**, **Audio Mixer**, **Preview / Program**, **Main Output**,
+**Rundown**, **Presentations** and **timer** panels can each be in a window of
+their own — to put on another screen, moved and sized like any window.
+
+- **Open one**: drag its tab out of the panels, away from all of them; or
+  right-click its tab ▸ **Open in a window**; or **Window** beside it in
+  **Layout ▸ Panels**.
+- **Put it back**: close its window, or **Put back** at the top of it (or
+  beside it in **Layout ▸ Panels**). It goes back among the panels where it
+  is most likely wanted.
+- The windows are kept with the show and the workspace, each where it was.
+  One whose screen is no longer connected opens beside the main window.
+- A built-in layout chosen — **Classic**, **Broadcast**, **VJ** — or
+  **Reset to "…"** one puts every panel back in the main window, as it has
+  them.
+- **Save as** keeps the panels in windows of their own too, each where its
+  window is: save one layout for one screen and another for two — Audio Mixer
+  and Switcher on the second — and choosing it puts them back so, the other
+  panels in the main window. A window moved since does not count as a change
+  (no `*`); a panel put in a window, or back, does.
+- The show's keyboard shortcuts work from a panel's window too — unless you
+  are typing in a field there. Files dragged from Finder onto the
+  Presentations panel in its window become talks, as in the main window.
+
+The Library, Channels, Layers, Inputs, Properties and Setup stay in the main
+window: things are dragged into and out of them, and a drag reaches no further
+than its own window. A Rundown in a window opens its steps' settings beside
+it, in that window; other settings windows (an input's, a timer's) open in
+the main window. With **Lock panels** on, no panel goes into a window or
+back, and a panel window's close button is off.
 
 ## Broadcast: Preview / Program and Inputs
 

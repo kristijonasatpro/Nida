@@ -14,6 +14,7 @@
 //! - `playlists` — playlist layers: adding one, its list, settings and transport
 //! - `timers` — timer layers: adding one, its settings, starting and stopping it
 //! - `presentations` — PowerPoint inputs: adding one, its steps, the worker kept in step
+//! - `slides` — Slides inputs: their talks, starting one, stepping the talk on
 //! - `presets` — deck/channel preset load + save
 //! - `sequences` — transition sequence CRUD and step mutations
 //! - `surfaces` — surface command state mutations
@@ -37,6 +38,7 @@ pub(crate) mod record;
 pub(crate) mod recorder;
 pub(crate) mod rundown;
 mod sequences;
+pub(crate) mod slides;
 pub(crate) mod streaming;
 mod surfaces;
 mod timers;

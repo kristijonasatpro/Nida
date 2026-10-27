@@ -37,6 +37,7 @@ enum Kind {
     Generator,
     Timer,
     PowerPoint,
+    Presentations,
     Input,
     Audio,
 }
@@ -56,6 +57,7 @@ impl Kind {
             Self::Generator => "Generator",
             Self::Timer => "Timer / Clock",
             Self::PowerPoint => "PowerPoint",
+            Self::Presentations => "Presentations",
             Self::Input => "Another input",
             Self::Audio => "Audio Input",
         }
@@ -80,6 +82,8 @@ impl Kind {
         // PowerPoint for Mac plays the deck: macOS only.
         if cfg!(target_os = "macos") {
             kinds.push(Self::PowerPoint);
+            // Talks in running order: PowerPoint and PDF play on macOS.
+            kinds.push(Self::Presentations);
         }
         kinds.push(Self::Input);
         if !layer {
@@ -391,6 +395,10 @@ fn kind_body(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions, state: &
             powerpoint_body(ui, state);
             false
         }
+        Kind::Presentations => {
+            presentations_body(ui, state);
+            false
+        }
         Kind::Input => input_body(ui, data, state),
         Kind::Audio => audio_body(ui, data, actions, state),
     }
@@ -558,6 +566,45 @@ fn playlist_body(ui: &mut egui::Ui, state: &mut State) {
 }
 
 /// A PowerPoint deck: chosen, it opens in PowerPoint, which plays it.
+/// A Slides input: the day's talks in running order, each started with
+/// one press, managed in the Presentations panel.
+fn presentations_body(ui: &mut egui::Ui, state: &mut State) {
+    if state.layer_of.is_some() {
+        ui.label(
+            "A Slides layer in this input: talks in running order, one on at a time. OK adds \
+             it empty; its talks are put in order and started in Layout ▸ Panels ▸ \
+             Presentations.",
+        );
+        return;
+    }
+    ui.label(
+        "The day's talks in running order, in one input — PowerPoint decks, PDFs, web \
+         presentations, clips and pictures — prepared before the show and each started with \
+         one press. Whatever shows this input (a picture-in-picture, a presenter view) follows \
+         the talk on.",
+    );
+    ui.add_space(8.0);
+    if ui
+        .add(egui::Button::new(
+            egui::RichText::new("Choose files…").size(15.0),
+        ))
+        .on_hover_text("The talks: added to the show's Slides input, made when there is none")
+        .clicked()
+    {
+        super::slides::choose_talks(ui.ctx());
+        state.open = false;
+    }
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(
+            "OK makes an empty Slides input. Its talks are put in order, named and started in \
+             Layout ▸ Panels ▸ Presentations.",
+        )
+        .small()
+        .weak(),
+    );
+}
+
 fn powerpoint_body(ui: &mut egui::Ui, state: &mut State) {
     ui.label(match &state.layer_of {
         None => {
@@ -1054,6 +1101,8 @@ fn source(data: &UIData, state: &State) -> Option<InputSource> {
             .map(|channel_uuid| InputSource::Input { channel_uuid }),
         // An empty list, filled in its window.
         Kind::Playlist => Some(InputSource::Playlist { items: Vec::new() }),
+        // Its talks added in the Presentations panel.
+        Kind::Presentations => Some(InputSource::Slides { paths: Vec::new() }),
         Kind::Timer => Some(InputSource::Timer {
             settings: Some(state.timer.clone()),
         }),

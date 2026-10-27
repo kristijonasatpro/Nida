@@ -512,6 +512,7 @@ impl MixerCommands for VardaApp {
     fn remove_deck(&mut self, deck_uuid: &str) -> Result<()> {
         let (channel_idx, deck_idx) = self.resolve_deck(deck_uuid)?;
         let was_powerpoint = self.powerpoint_decks().iter().any(|d| d == deck_uuid);
+        let was_slides = self.slides_decks().iter().any(|d| d == deck_uuid);
         // Release external resources before removal. The held identifiers are
         // read out first so the mixer borrow ends before the managers are
         // touched.
@@ -585,6 +586,16 @@ impl MixerCommands for VardaApp {
                 deck_uuid,
                 &other,
             );
+        }
+        // Web talks' sound is every Slides input's, so too.
+        let other = self
+            .slides_decks()
+            .into_iter()
+            .find(|d| d != deck_uuid)
+            .filter(|_| was_slides);
+        if let Some(other) = other {
+            self.audio_mix
+                .retie_app_inputs(crate::audio::app_sound::WEB_TALKS, deck_uuid, &other);
         }
         // So does a camera's sound, added with it.
         self.audio_mix.remove_inputs_of_deck(deck_uuid);

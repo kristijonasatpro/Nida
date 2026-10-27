@@ -451,6 +451,9 @@ pub struct RundownSnapshot {
     /// The wait of a step that goes on to the next by itself, while it
     /// runs.
     pub wait: Option<RundownWaitSnapshot>,
+    /// The step whose time of day was held, by UUID: it waits for GO.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_held: Option<String>,
 }
 
 /// One step of the rundown, and whether it can be taken now.
@@ -742,6 +745,10 @@ pub struct DeckSnapshot {
     /// A playlist's items and where it has got (None = not a playlist).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playlist: Option<crate::engine::value::playlist::PlaylistSnapshot>,
+    /// A Slides input's talks and where it has got (None = not a Slides
+    /// input).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slides: Option<crate::engine::value::slides::SlidesSnapshot>,
     /// A timer's settings and what it reads (None = not a timer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timer: Option<crate::engine::value::timer::TimerSnapshot>,
@@ -1684,6 +1691,7 @@ mod tests {
             screen_capture: None,
             tap: None,
             playlist: None,
+            slides: None,
             timer: None,
             presentation: None,
             presenter_of: None,

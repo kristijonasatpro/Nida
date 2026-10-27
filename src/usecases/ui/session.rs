@@ -22,20 +22,24 @@ pub enum ShowAction {
 }
 
 /// Where a new deck goes: a channel, and the deck in it that it goes
-/// before — `None` for the end. Both by UUID, since a load can outlive the
-/// positions it was aimed at.
+/// before — `None` for the end — or behind its layers. By UUID, since a load
+/// can outlive the positions it was aimed at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeckPlace {
     pub channel_uuid: String,
     pub before_deck_uuid: Option<String>,
+    /// Behind the channel's layers as they are when it lands, instead —
+    /// what it shows, on air perhaps, stays.
+    pub back: bool,
 }
 
 impl DeckPlace {
-    /// The end of a channel.
-    pub fn end_of(channel_uuid: impl Into<String>) -> Self {
+    /// Behind a channel's layers.
+    pub fn back_of(channel_uuid: impl Into<String>) -> Self {
         Self {
             channel_uuid: channel_uuid.into(),
             before_deck_uuid: None,
+            back: true,
         }
     }
 }
@@ -81,6 +85,9 @@ pub struct UISession {
     pub choose_record_folder: bool,
     /// Show a file in Finder (or the system's file manager).
     pub reveal_file: Option<std::path::PathBuf>,
+    /// What the Presentations panel asks of the clicker (see
+    /// `crate::clicker`): its device is the Mac's, not the show's.
+    pub clicker_ask: Option<crate::clicker::ClickerAsk>,
     /// Notifications to put away, by id (see `Notification::id`).
     pub notifications_to_dismiss: Vec<u64>,
     /// Info notifications to push (e.g. "Copied URL to clipboard")
@@ -202,6 +209,7 @@ impl UISession {
             files_as_inputs: Vec::new(),
             choose_record_folder: false,
             reveal_file: None,
+            clicker_ask: None,
             notifications_to_dismiss: Vec::new(),
             info_notifications: Vec::new(),
             midi_learn_toggle: false,

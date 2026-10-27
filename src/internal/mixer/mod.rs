@@ -527,10 +527,30 @@ impl Mixer {
             .map(|(i, ch)| (ch.uuid().to_string(), i))
             .collect();
         let mut master_tapped = false;
+        // Where each Slides layer is: a presenter view of one shows its
+        // picture, so draws after it, as a tap does.
+        let slides_at: std::collections::HashMap<String, usize> = self
+            .channels
+            .iter()
+            .enumerate()
+            .flat_map(|(i, ch)| {
+                ch.decks
+                    .iter()
+                    .filter(|slot| slot.deck.slides().is_some())
+                    .map(move |slot| (slot.deck.uuid().to_string(), i))
+            })
+            .collect();
         // The channels each channel's decks show.
         let mut shows: Vec<Vec<usize>> = vec![Vec::new(); self.channels.len()];
         for (at, channel) in self.channels.iter().enumerate() {
             for slot in &channel.decks {
+                if let Some(&shown) = slot
+                    .deck
+                    .presenter()
+                    .and_then(|p| slides_at.get(p.follows()))
+                {
+                    shows[at].push(shown);
+                }
                 match slot.deck.tap.as_ref().map(|t| &t.source) {
                     Some(crate::deck::TapSource::MasterProgram) => master_tapped = true,
                     Some(crate::deck::TapSource::Channel(uuid)) => {

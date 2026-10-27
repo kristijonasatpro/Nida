@@ -83,15 +83,16 @@ impl PlaysOn {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ClocksAt {
-    #[default]
     Top,
+    #[default]
     Bottom,
 }
 
 /// How a presenter view is laid out: which of the talk's clock and the time
-/// of day it shows, and where; whether it names what comes next; how much of
-/// its width the slide takes; how big the notes and the next slide's line
-/// are drawn.
+/// of day it shows, and where; whether it shows what comes next; how much of
+/// its width the slide takes; how big the notes and what comes next are
+/// drawn. A new one shows the talk's clock at its foot, not the time of day,
+/// and the next slide — its picture as wide as the notes' column.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(default)]
 pub struct PresenterLayout {
@@ -101,13 +102,16 @@ pub struct PresenterLayout {
     pub clock: bool,
     /// Where the bar with where the show is and the clocks goes.
     pub clocks_at: ClocksAt,
-    /// What comes next, under the slide.
+    /// What comes next: the next slide's picture beside the slide, where
+    /// Nida has one (a PDF talk's next page), with its line under it; else
+    /// the line under the slide.
     pub next: bool,
     /// The slide's share of the width, 0.35 to 0.8; the notes have the rest.
     pub slide_share: f32,
     /// The notes' size, 0.5 to 2 (1 as Nida draws them).
     pub notes_size: f32,
-    /// The size of the line saying what comes next, 0.5 to 2.
+    /// The size of what comes next — its picture, or its line — 0.5 to 2;
+    /// at 1 the picture is as wide as the notes' column, and no wider above.
     pub next_size: f32,
 }
 
@@ -115,8 +119,8 @@ impl Default for PresenterLayout {
     fn default() -> Self {
         Self {
             timer: true,
-            clock: true,
-            clocks_at: ClocksAt::Top,
+            clock: false,
+            clocks_at: ClocksAt::Bottom,
             next: true,
             slide_share: 0.6,
             notes_size: 1.0,
@@ -202,6 +206,9 @@ pub enum PresentationStatus {
     Failed,
     /// The show runs but its window was not found to capture.
     NoWindow,
+    /// Open in PowerPoint, its show not started: a Slides input's next talk
+    /// (or the one before the talk on), ready to start quickly.
+    Ready,
 }
 
 /// A PowerPoint input's show, for `GET /api/state` and the panels.

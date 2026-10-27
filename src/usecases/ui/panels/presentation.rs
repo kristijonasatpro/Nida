@@ -16,11 +16,6 @@ use crate::engine::{EngineCommand, InputSource};
 
 const WARN: egui::Color32 = egui::Color32::from_rgb(230, 170, 60);
 
-/// The files PowerPoint opens.
-const DECK_EXTENSIONS: &[&str] = &[
-    "pptx", "ppt", "pptm", "ppsx", "pps", "ppsm", "potx", "pot", "potm",
-];
-
 /// A channel's PowerPoint layer, if it has one.
 pub(super) fn of_channel(ch: &ChannelUIInfo) -> Option<(&DeckUIInfo, &PresentationSnapshot)> {
     ch.decks
@@ -32,6 +27,7 @@ pub(super) fn of_channel(ch: &ChannelUIInfo) -> Option<(&DeckUIInfo, &Presentati
 fn position_text(p: &PresentationSnapshot) -> String {
     match p.status {
         PresentationStatus::Opening => "Opening in PowerPoint…".into(),
+        PresentationStatus::Ready => "Ready in PowerPoint".into(),
         PresentationStatus::Failed => "⚠ PowerPoint".into(),
         PresentationStatus::NoWindow => "⚠ No window".into(),
         PresentationStatus::Showing => {
@@ -270,7 +266,12 @@ pub(super) fn render_deck_column(
 /// PowerPoint's own sound — a slide's video's — taken into the audio mixer
 /// in one click, heard with this input on air (Audio Auto); once it is
 /// there, said so.
-fn powerpoint_sound(ui: &mut egui::Ui, data: &UIData, deck: &DeckUIInfo, actions: &mut UIActions) {
+pub(super) fn powerpoint_sound(
+    ui: &mut egui::Ui,
+    data: &UIData,
+    deck: &DeckUIInfo,
+    actions: &mut UIActions,
+) {
     use crate::audio_mix::AudioSourceKind;
     use crate::presentation::powerpoint::POWERPOINT_ID;
     // PowerPoint's sound is one, whichever PowerPoint input shows it: its
@@ -282,7 +283,7 @@ fn powerpoint_sound(ui: &mut egui::Ui, data: &UIData, deck: &DeckUIInfo, actions
             .iter()
             .flat_map(|c| &c.decks)
             .find(|d| d.uuid == tied)
-            .is_none_or(|d| d.presentation.is_some())
+            .is_none_or(|d| d.presentation.is_some() || d.slides.is_some())
     };
     let strip = |tied: bool| {
         data.audio_mix.sources.iter().any(|s| {
@@ -471,8 +472,10 @@ pub(super) fn render_presenter_column(
         ui.selectable_value(&mut layout.clocks_at, ClocksAt::Top, "Top");
         ui.selectable_value(&mut layout.clocks_at, ClocksAt::Bottom, "Bottom");
     });
-    ui.checkbox(&mut layout.next, "Next slide")
-        .on_hover_text("What comes next, under the slide");
+    ui.checkbox(&mut layout.next, "Next slide").on_hover_text(
+        "What comes next: the next slide's picture beside the slide where Nida has one (a PDF \
+         talk's next page), else a line under the slide",
+    );
     ui.label(egui::RichText::new("Sizes").small().weak());
     // A drag is one change to undo, not one a frame.
     let sliders = [
@@ -551,7 +554,10 @@ pub(super) fn choose_deck(ctx: &egui::Context, into: DeckFor) {
         .spawn(move || {
             let picked = rfd::FileDialog::new()
                 .set_title("A PowerPoint deck")
-                .add_filter("PowerPoint", DECK_EXTENSIONS)
+                .add_filter(
+                    "PowerPoint",
+                    crate::engine::value::slides::POWERPOINT_EXTENSIONS,
+                )
                 .pick_file();
             if let Some(path) = picked {
                 let _ = tx.send(path);
@@ -597,49 +603,43 @@ pub(super) fn take_chosen(ctx: &egui::Context, actions: &mut UIActions) {
     });
 }
 
-/// Whether `path` is a file PowerPoint opens.
-pub(super) fn is_deck(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| DECK_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
-}
-
 // ── The clicker ─────────────────────────────────────────────────────
 
 /// `PageDown`, `PageUp` and B — or the keys the keymap binds to the PowerPoint
 /// actions — step and black out the show on air (else the one moved last),
-/// when there is a PowerPoint input and no text field is being typed into.
+/// when there is a PowerPoint or Slides input and no text field is being
+/// typed into.
 /// The key is the show's alone: it does not also scroll or press a button.
 pub(super) fn clicker_shortcuts(ui: &egui::Ui, data: &UIData, actions: &mut UIActions) {
-    use crate::keymap::{ActionId, KeyTarget};
-    if data.keyboard_learn_active || data.stage_editor_open || super::typing(ui.ctx()) {
+    use crate::keymap::KeyTarget;
+    // Learning the clicker: its press teaches, it does not move the show.
+    let learning = data.clicker.learning || data.clicker.just_learned;
+    // Typing in a field: the field's keys. The clicker's keys macOS turns
+    // for every app still step the show, read as the device (see
+    // `crate::clicker`).
+    if data.keyboard_learn_active || data.stage_editor_open || learning || super::typing(ui.ctx())
+    {
         return;
     }
-    if !data.channels.iter().any(|ch| of_channel(ch).is_some()) {
+    let shows = data.channels.iter().any(|ch| {
+        of_channel(ch).is_some() || ch.decks.iter().any(|d| d.slides.is_some())
+    });
+    if !shows {
         return;
     }
-    for combo in crate::usecases::ui::keyboard::collect_pressed_keys(ui.ctx()) {
-        let command = match data.keymap_bindings.get(&combo) {
-            Some(KeyTarget::Action(ActionId::PresentationNext)) => EngineCommand::PresentationGo {
-                deck_uuid: None,
-                to: Go::Next,
-            },
-            Some(KeyTarget::Action(ActionId::PresentationPrevious)) => {
-                EngineCommand::PresentationGo {
-                    deck_uuid: None,
-                    to: Go::Previous,
-                }
-            }
-            Some(KeyTarget::Action(ActionId::PresentationBlack)) => {
-                EngineCommand::TogglePresentationScreen {
-                    deck_uuid: None,
-                    screen: Screen::Black,
-                }
-            }
-            _ => continue,
+    for (combo, repeat) in crate::usecases::ui::keyboard::collect_key_downs(ui.ctx()) {
+        // The same commands the clicker sends with another app in front.
+        let Some(command) = (match data.keymap_bindings.get(&combo) {
+            Some(KeyTarget::Action(id)) => crate::clicker::command_for(*id),
+            _ => None,
+        }) else {
+            continue;
         };
+        // Held, it repeats: taken from the panels, one step a press.
         super::consume(ui.ctx(), &combo);
-        actions.commands.push(command);
+        if !repeat {
+            actions.commands.push(command);
+        }
     }
 }
 
@@ -740,6 +740,48 @@ mod tests {
              PresentationGo { deck_uuid: None, to: Previous }, \
              TogglePresentationScreen { deck_uuid: None, screen: Black }]"
         );
+    }
+
+    /// A key pressed with Shift is Shift and the key, though Shift was let go
+    /// before the frame: the key's own event says so.
+    #[test]
+    fn a_key_pressed_with_shift_keeps_it_though_let_go_before_the_frame() {
+        let mut data = with_deck();
+        data.keymap_bindings.insert(
+            crate::keymap::KeyCombo {
+                key: "PageDown".into(),
+                command: false,
+                shift: true,
+                alt: false,
+            },
+            crate::keymap::KeyTarget::Action(crate::keymap::ActionId::PresentationPrevious),
+        );
+        let mut harness = harness(&data);
+        harness.event(egui::Event::Key {
+            key: egui::Key::PageDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::SHIFT,
+        });
+        harness.run_steps(2);
+        assert_eq!(sent(&harness), "[PresentationGo { deck_uuid: None, to: Previous }]");
+    }
+
+    /// The clicker being learned — or just learned — its press teaches,
+    /// it does not also move the show (the control window hears it as a
+    /// keyboard's too).
+    #[test]
+    fn a_press_learning_the_clicker_moves_nothing() {
+        for (learning, just_learned) in [(true, false), (false, true)] {
+            let mut data = with_deck();
+            data.clicker.learning = learning;
+            data.clicker.just_learned = just_learned;
+            let mut harness = harness(&data);
+            harness.key_press(egui::Key::PageDown);
+            harness.run_steps(2);
+            assert_eq!(sent(&harness), "[]");
+        }
     }
 
     #[test]
@@ -863,9 +905,10 @@ mod tests {
         harness(&data).get_by_label("PowerPoint's sound: in the audio mixer, tied to no input");
     }
 
-    /// A presenter view's time of day switched off, and its clocks moved
-    /// to the foot, from its column: each a `SetPresenterLayout` carrying
-    /// the whole layout.
+    /// A presenter view's time of day switched on — a new one has it off —
+    /// and its clocks moved to the top — a new one has them at the foot —
+    /// from its column: each a `SetPresenterLayout` carrying the whole
+    /// layout.
     #[test]
     fn a_presenter_views_clocks_are_switched_and_moved_from_its_column() {
         let data = with_deck();
@@ -888,19 +931,19 @@ mod tests {
             );
         harness.get_by_label("Time of day").click();
         harness.run_steps(2);
-        harness.get_by_label("Bottom").click();
+        harness.get_by_label("Top").click();
         harness.run_steps(2);
         let sent = harness.state();
         assert_eq!(sent.len(), 2, "{sent:?}");
         assert!(matches!(
             &sent[0],
             EngineCommand::SetPresenterLayout { deck_uuid, layout }
-                if deck_uuid == "a0000009" && !layout.clock && layout.timer
+                if deck_uuid == "a0000009" && layout.clock && layout.timer
         ));
         assert!(matches!(
             &sent[1],
             EngineCommand::SetPresenterLayout { layout, .. }
-                if layout.clocks_at == ClocksAt::Bottom
+                if layout.clocks_at == ClocksAt::Top
         ));
     }
 
@@ -1005,7 +1048,5 @@ mod tests {
         assert_eq!(position_text(&p), "Opening in PowerPoint…");
         p.status = PresentationStatus::Failed;
         assert_eq!(position_text(&p), "⚠ PowerPoint");
-        assert!(is_deck(std::path::Path::new("/a/Talk.PPTX")));
-        assert!(!is_deck(std::path::Path::new("/a/talk.pdf")));
     }
 }

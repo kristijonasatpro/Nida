@@ -819,7 +819,6 @@ fn a_presenter_view_shows_the_slide_live_beside_its_notes() {
         let words = presenter_words(&app).unwrap_or_default();
         if words.position == "1 / 2" {
             assert_eq!(words.notes, "Thank the organisers.");
-            assert_eq!(words.title, "Welcome");
             assert_eq!(words.next, "Next: 3 · Results");
             break;
         }

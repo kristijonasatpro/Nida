@@ -246,6 +246,7 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                             .deck
                             .playlist()
                             .map(crate::deck::playlist::Playlist::snapshot),
+                        slides: app.slides_snapshot(&slot.deck),
                         timer: slot.deck.timer().map(|timer| {
                             timer.snapshot(crate::engine::value::timer::panel_of(slot.deck.uuid()))
                         }),

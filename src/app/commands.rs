@@ -746,7 +746,18 @@ impl VardaApp {
                 deck_uuid,
                 action,
             } => self.cmd_set_rundown_play(&uuid, &deck_uuid, action),
+            EngineCommand::SetRundownUntilNext {
+                uuid,
+                deck_uuid,
+                on,
+            } => self.cmd_set_rundown_until_next(&uuid, &deck_uuid, on),
+            EngineCommand::SetRundownTimer {
+                uuid,
+                deck_uuid,
+                timer,
+            } => self.cmd_set_rundown_timer(&uuid, &deck_uuid, timer),
             EngineCommand::SetRundownThen { uuid, secs } => self.cmd_set_rundown_then(&uuid, secs),
+            EngineCommand::SetRundownAt { uuid, at_secs } => self.cmd_set_rundown_at(&uuid, at_secs),
             EngineCommand::CaptureRundownStep { uuid } => self.cmd_capture_rundown_step(&uuid),
             EngineCommand::TakeRundownStep { uuid, fade } => {
                 self.cmd_take_rundown_step(&uuid, fade)
@@ -1054,6 +1065,51 @@ impl VardaApp {
             }
             EngineCommand::ShowPlaylistItem { deck_uuid, index } => {
                 wire(self.edit_playlist(&deck_uuid, |list| list.show_item(index)))
+            }
+
+            // ── Slides ────────────────────────────────────────
+            EngineCommand::AddSlidesDeck {
+                channel_uuid,
+                paths,
+                settings,
+            } => wire_id(self.add_slides_deck(&channel_uuid, &paths, settings)),
+            EngineCommand::SetSlidesTalks { deck_uuid, talks } => {
+                wire(self.set_slides_talks(&deck_uuid, talks))
+            }
+            EngineCommand::AddTalks {
+                deck_uuid,
+                paths,
+                at,
+            } => self.add_talks(deck_uuid.as_deref(), &paths, at),
+            EngineCommand::EditTalk {
+                deck_uuid,
+                talk_id,
+                name,
+                path,
+            } => wire(self.edit_talk(&deck_uuid, &talk_id, name, path.as_deref())),
+            EngineCommand::MoveTalk {
+                deck_uuid,
+                talk_id,
+                to,
+            } => wire(self.move_talk(&deck_uuid, &talk_id, to)),
+            EngineCommand::RemoveTalk { deck_uuid, talk_id } => {
+                wire(self.remove_talk(&deck_uuid, &talk_id))
+            }
+            EngineCommand::SetSlidesSettings {
+                deck_uuid,
+                settings,
+            } => wire(self.edit_slides(&deck_uuid, |s| s.set_settings(settings))),
+            EngineCommand::StartTalk { deck_uuid, to } => {
+                wire(self.start_talk(deck_uuid.as_deref(), &to))
+            }
+            EngineCommand::SetNextTalk { deck_uuid, talk_id } => {
+                wire(self.set_next_talk(&deck_uuid, talk_id))
+            }
+            EngineCommand::CheckTalks { deck_uuid } => {
+                wire(self.check_talks(deck_uuid.as_deref()))
+            }
+            EngineCommand::MakeSlidePictures { deck_uuid } => {
+                wire(self.make_slide_pictures(deck_uuid.as_deref()))
             }
 
             // ── Timers ────────────────────────────────────────
@@ -2140,6 +2196,7 @@ impl VardaApp {
 
             EngineCommand::SetTargetFps { fps } => {
                 self.set_target_fps(fps);
+                self.blackmagic_follow_show_rate();
                 CommandResult::Ok
             }
             EngineCommand::SetFramesInFlight { frames } => {
@@ -2393,6 +2450,14 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::ShowPlaylistItem { .. }
             // Starting and stopping a timer is live, like a clip's transport.
             | C::ControlTimer { .. }
+            // Starting a talk, and which comes next, are live, like a
+            // playlist's transport; the list itself is undoable.
+            | C::StartTalk { .. }
+            | C::SetNextTalk { .. }
+            // Looking files over changes nothing in the show, nor does
+            // having PowerPoint save them as pictures.
+            | C::CheckTalks { .. }
+            | C::MakeSlidePictures { .. }
             // A PowerPoint show's steps are live, like a playlist's.
             | C::PresentationGo { .. }
             | C::PresentationVideo { .. }
@@ -2605,9 +2670,23 @@ mod tests {
                 deck_uuid: "d".into(),
                 action: None,
             },
+            C::SetRundownUntilNext {
+                uuid: step(),
+                deck_uuid: "d".into(),
+                on: true,
+            },
+            C::SetRundownTimer {
+                uuid: step(),
+                deck_uuid: "d".into(),
+                timer: None,
+            },
             C::SetRundownThen {
                 uuid: step(),
                 secs: None,
+            },
+            C::SetRundownAt {
+                uuid: step(),
+                at_secs: None,
             },
             C::CaptureRundownStep { uuid: step() },
         ] {

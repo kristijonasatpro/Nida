@@ -13,7 +13,7 @@ use varda::engine::{
 };
 use varda::mixer::{MainSource, MixMode};
 use varda::renderer::context::{OutputSource, OutputTarget, UnifiedOutput};
-use varda::rundown::PlayAction;
+use varda::rundown::{PlayAction, TimerSet};
 use varda::usecases::ui::UILayoutState;
 
 mod common;
@@ -2518,4 +2518,346 @@ fn a_step_starts_and_stops_a_playlist() {
     ok(take(&mut show.app, &stop, false));
     assert!(!state(&show.app).0, "stopped");
     shows(&mut show.app, 0);
+}
+
+/// Music for one moment: a playlist a step starts "till the next step" is
+/// faded out as the next step is faded to — playing on through the fade —
+/// and stopped at its end, back on its first item; cut to, at once. A step
+/// that carries it on itself keeps it playing.
+#[test]
+fn music_till_the_next_step_fades_out_and_stops_as_it_is_taken() {
+    use varda::engine::value::playlist::PlaylistItem;
+    let Some(mut show) = show() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let items: Vec<PlaylistItem> = [("one.png", [255u8, 0, 0]), ("two.png", [0, 255, 0])]
+        .into_iter()
+        .map(|(name, rgb)| {
+            let path = dir.path().join(name);
+            image::RgbaImage::from_pixel(16, 9, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
+                .save(&path)
+                .unwrap();
+            PlaylistItem::new(path.to_string_lossy())
+        })
+        .collect();
+    let list = id(send(
+        &mut show.app,
+        EngineCommand::AddPlaylistDeck {
+            channel_uuid: show.c.clone(),
+            items,
+            settings: None,
+        },
+    ));
+    let mut new_step = |name: &str| {
+        id(send(
+            &mut show.app,
+            EngineCommand::AddRundownStep {
+                name: name.to_string(),
+                buses: Some(vec![]),
+                main: false,
+            },
+        ))
+    };
+    let (a, b, c) = (new_step("A"), new_step("B"), new_step("C"));
+    for (step, action) in [(&a, PlayAction::Start), (&c, PlayAction::Resume)] {
+        ok(send(
+            &mut show.app,
+            EngineCommand::SetRundownPlay {
+                uuid: step.clone(),
+                deck_uuid: list.clone(),
+                action: Some(action),
+            },
+        ));
+    }
+    ok(send(
+        &mut show.app,
+        EngineCommand::SetRundownUntilNext {
+            uuid: a.clone(),
+            deck_uuid: list.clone(),
+            on: true,
+        },
+    ));
+    ok(send(&mut show.app, EngineCommand::SetRundownFade { secs: 1.0 }));
+    let state = |app: &VardaApp| {
+        let state = app.build_engine_state();
+        let decks = state.mixer.channels.iter().flat_map(|ch| &ch.decks);
+        let deck = decks.into_iter().find(|d| d.uuid == list);
+        let list = deck.and_then(|d| d.playlist.clone()).expect("a playlist");
+        (list.playing, list.shown)
+    };
+    let shows = |app: &mut VardaApp, item: usize| {
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while state(app).1 != Some(item) {
+            assert!(std::time::Instant::now() < until, "item {item} never shown");
+            run(app, 0.05);
+        }
+    };
+    shows(&mut show.app, 0);
+
+    // Faded to: it plays on through B's fade, then stops on its first item.
+    ok(take(&mut show.app, &a, false));
+    assert!(state(&show.app).0, "A starts it");
+    ok(send(
+        &mut show.app,
+        EngineCommand::ShowPlaylistItem {
+            deck_uuid: list.clone(),
+            index: 1,
+        },
+    ));
+    shows(&mut show.app, 1);
+    ok(take(&mut show.app, &b, true));
+    run(&mut show.app, 0.4);
+    assert!(state(&show.app).0, "playing on through the fade");
+    run(&mut show.app, 1.0);
+    assert!(!state(&show.app).0, "stopped once faded out");
+    shows(&mut show.app, 0);
+
+    // Cut to: stopped at once.
+    ok(take(&mut show.app, &a, false));
+    assert!(state(&show.app).0);
+    ok(take(&mut show.app, &b, false));
+    assert!(!state(&show.app).0, "a cut stops it at once");
+
+    // A step that carries it on itself keeps it.
+    ok(take(&mut show.app, &a, false));
+    ok(take(&mut show.app, &c, true));
+    run(&mut show.app, 1.4);
+    assert!(state(&show.app).0, "C carries it on");
+
+    // On no screen, stopped by a step faded to: it fades out first.
+    let d = new_step_named(&mut show.app, "D");
+    ok(send(
+        &mut show.app,
+        EngineCommand::SetRundownPlay {
+            uuid: d.clone(),
+            deck_uuid: list.clone(),
+            action: Some(PlayAction::Stop),
+        },
+    ));
+    ok(take(&mut show.app, &d, true));
+    run(&mut show.app, 0.4);
+    assert!(state(&show.app).0, "stopping, it fades out first");
+    run(&mut show.app, 1.0);
+    assert!(!state(&show.app).0, "then stops");
+
+    // The step taken last removed before the next is taken: what it played
+    // till the next step stops all the same.
+    ok(take(&mut show.app, &a, false));
+    assert!(state(&show.app).0);
+    ok(send(&mut show.app, EngineCommand::RemoveRundownStep { uuid: a.clone() }));
+    ok(take(&mut show.app, &b, false));
+    assert!(!state(&show.app).0, "stopped though its step is gone");
+}
+
+/// A clip a step played till the next step, which the next step puts on a
+/// screen without starting or stopping it: stopped, and kept so — Auto
+/// Play, as it arrives, does not start it again.
+#[test]
+fn a_clip_stopped_at_the_next_step_stays_stopped_as_that_step_shows_it() {
+    let Some(mut show) = show() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let Some(path) = clip(dir.path()) else {
+        return;
+    };
+    let sting = id(send(&mut show.app, EngineCommand::AddChannel));
+    let deck = id(send(
+        &mut show.app,
+        EngineCommand::AddVideoDeck {
+            channel_uuid: sting,
+            path,
+        },
+    ));
+    let a = new_step_named(&mut show.app, "A");
+    let b = new_step_named(&mut show.app, "B");
+    ok(send(
+        &mut show.app,
+        EngineCommand::SetRundownPlay {
+            uuid: a.clone(),
+            deck_uuid: deck.clone(),
+            action: Some(PlayAction::Start),
+        },
+    ));
+    ok(send(
+        &mut show.app,
+        EngineCommand::SetRundownUntilNext {
+            uuid: a.clone(),
+            deck_uuid: deck.clone(),
+            on: true,
+        },
+    ));
+    ok(send(
+        &mut show.app,
+        EngineCommand::SetRundownScreen {
+            uuid: b.clone(),
+            bus_uuid: show.wall[0].clone(),
+            input: Some(BusInputRef::Deck(deck.clone())),
+        },
+    ));
+    let playing = |app: &VardaApp| {
+        let (ch, d) = app.mixer_ref().find_deck_by_uuid(&deck).expect("the deck");
+        app.mixer_ref().channels()[ch].decks[d]
+            .deck
+            .playback_snapshot()
+            .expect("a clip")
+            .playing
+    };
+    run(&mut show.app, 0.3);
+    ok(take(&mut show.app, &a, false));
+    run(&mut show.app, 0.3);
+    assert!(playing(&show.app), "A starts it, on no screen");
+    ok(take(&mut show.app, &b, false));
+    run(&mut show.app, 0.5);
+    assert!(!playing(&show.app), "stopped by B, and kept so as B shows it");
+}
+
+fn new_step_named(app: &mut VardaApp, name: &str) -> String {
+    id(send(
+        app,
+        EngineCommand::AddRundownStep {
+            name: name.to_string(),
+            buses: Some(vec![]),
+            main: false,
+        },
+    ))
+}
+
+/// Each talk its own timer: a step starts the timer counting down from a
+/// length of its own, the next one counting up — and a count down of no
+/// time, or a timer the step does not start, is refused.
+#[test]
+fn a_step_sets_the_timer_it_starts() {
+    let Some(mut show) = show() else {
+        return;
+    };
+    let timer = id(send(
+        &mut show.app,
+        EngineCommand::AddTimerDeck {
+            channel_uuid: show.c.clone(),
+            settings: Some(TimerSettings {
+                mode: TimerMode::Countdown,
+                duration_secs: 300,
+                ..TimerSettings::default()
+            }),
+        },
+    ));
+    let mut step_with = |name: &str, set: TimerSet| {
+        let step = id(send(
+            &mut show.app,
+            EngineCommand::AddRundownStep {
+                name: name.to_string(),
+                buses: Some(vec![]),
+                main: false,
+            },
+        ));
+        ok(send(
+            &mut show.app,
+            EngineCommand::SetRundownPlay {
+                uuid: step.clone(),
+                deck_uuid: timer.clone(),
+                action: Some(PlayAction::Start),
+            },
+        ));
+        ok(send(
+            &mut show.app,
+            EngineCommand::SetRundownTimer {
+                uuid: step.clone(),
+                deck_uuid: timer.clone(),
+                timer: Some(set),
+            },
+        ));
+        step
+    };
+    let talk = step_with("Talk", TimerSet::Down { secs: 900 });
+    let panel = step_with("Panel", TimerSet::Up);
+    let reading = |app: &VardaApp| {
+        let state = app.build_engine_state();
+        let decks = state.mixer.channels.iter().flat_map(|ch| &ch.decks);
+        let deck = decks.into_iter().find(|d| d.uuid == timer);
+        let timer = deck.and_then(|d| d.timer.clone()).expect("a timer");
+        (timer.settings.mode, timer.settings.duration_secs, timer.running)
+    };
+    ok(take(&mut show.app, &talk, false));
+    assert_eq!(reading(&show.app), (TimerMode::Countdown, 900, true));
+    ok(take(&mut show.app, &panel, false));
+    let (mode, _, running) = reading(&show.app);
+    assert_eq!((mode, running), (TimerMode::CountUp, true));
+
+    // Undoing an edit made before the take keeps the talk's count down: the
+    // step set it for this run, not in the timer's saved settings.
+    ok(send(
+        &mut show.app,
+        EngineCommand::RenameRundownStep {
+            uuid: panel.clone(),
+            name: "Panel 2".into(),
+        },
+    ));
+    ok(take(&mut show.app, &talk, false));
+    assert_eq!(reading(&show.app), (TimerMode::Countdown, 900, true));
+    ok(send(&mut show.app, EngineCommand::Undo));
+    assert_eq!(reading(&show.app), (TimerMode::Countdown, 900, true), "kept by an undo");
+    // Undoing an edit of the timer's own look — its saved settings changed —
+    // keeps the count too.
+    ok(send(
+        &mut show.app,
+        EngineCommand::SetTimerSettings {
+            deck_uuid: timer.clone(),
+            settings: TimerSettings {
+                mode: TimerMode::Countdown,
+                duration_secs: 300,
+                warn_secs: 45,
+                ..TimerSettings::default()
+            },
+        },
+    ));
+    ok(take(&mut show.app, &talk, false));
+    // 400 s into the talk's 900 — past the timer's saved 300.
+    ok(send(
+        &mut show.app,
+        EngineCommand::ControlTimer {
+            deck_uuid: timer.clone(),
+            action: varda::engine::value::timer::TimerAction::Adjust { secs: -400 },
+        },
+    ));
+    ok(send(&mut show.app, EngineCommand::Undo));
+    assert_eq!(
+        reading(&show.app),
+        (TimerMode::Countdown, 900, true),
+        "kept by undoing the timer's look, counting on past its saved length"
+    );
+    // Set to show the time of day in its panel, the step still starts it
+    // counting down from the talk's length.
+    ok(send(
+        &mut show.app,
+        EngineCommand::SetTimerSettings {
+            deck_uuid: timer.clone(),
+            settings: TimerSettings {
+                mode: TimerMode::Clock,
+                ..TimerSettings::default()
+            },
+        },
+    ));
+    ok(take(&mut show.app, &talk, false));
+    assert_eq!(reading(&show.app), (TimerMode::Countdown, 900, true), "over a clock");
+
+    let zero = refused(send(
+        &mut show.app,
+        EngineCommand::SetRundownTimer {
+            uuid: talk.clone(),
+            deck_uuid: timer.clone(),
+            timer: Some(TimerSet::Down { secs: 0 }),
+        },
+    ));
+    assert!(zero.contains("longer than no time"), "{zero}");
+    let elsewhere = refused(send(
+        &mut show.app,
+        EngineCommand::SetRundownTimer {
+            uuid: talk.clone(),
+            deck_uuid: show.c.clone(),
+            timer: Some(TimerSet::Up),
+        },
+    ));
+    assert!(elsewhere.contains("timer"), "{elsewhere}");
 }

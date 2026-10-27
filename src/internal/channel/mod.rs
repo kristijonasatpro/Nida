@@ -712,6 +712,13 @@ impl Channel {
         self.insert_deck_slot_before(DeckSlot::new(deck), before)
     }
 
+    /// Add a deck at `at` in the stack — 0 the back — or at the end.
+    pub fn insert_deck_at(&mut self, deck: Deck, at: usize) -> usize {
+        let at = at.min(self.decks.len());
+        self.decks.insert(at, DeckSlot::new(deck));
+        at
+    }
+
     /// Get number of decks
     /// Frames this channel has been drawn.
     pub fn frames_drawn(&self) -> u32 {

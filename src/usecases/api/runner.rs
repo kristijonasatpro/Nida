@@ -240,7 +240,9 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::rundown::duplicate_step, routes::rundown::rename_step,
         routes::rundown::move_step, routes::rundown::set_screen,
         routes::rundown::set_main, routes::rundown::set_overlay,
-        routes::rundown::set_play, routes::rundown::set_then,
+        routes::rundown::set_play, routes::rundown::set_until_next,
+        routes::rundown::set_timer, routes::rundown::set_then,
+        routes::rundown::set_at,
         routes::rundown::capture_step, routes::rundown::take_step,
         routes::rundown::go, routes::rundown::set_next,
         routes::rundown::hold, routes::rundown::set_fade_time,
@@ -1470,8 +1472,20 @@ pub fn build_router(shared: SharedState) -> Router {
             axum::routing::put(routes::rundown::set_play),
         )
         .route(
+            "/api/rundown/steps/{step_uuid}/plays/{deck_uuid}/until-next",
+            axum::routing::put(routes::rundown::set_until_next),
+        )
+        .route(
+            "/api/rundown/steps/{step_uuid}/plays/{deck_uuid}/timer",
+            axum::routing::put(routes::rundown::set_timer),
+        )
+        .route(
             "/api/rundown/steps/{step_uuid}/then",
             axum::routing::put(routes::rundown::set_then),
+        )
+        .route(
+            "/api/rundown/steps/{step_uuid}/at",
+            axum::routing::put(routes::rundown::set_at),
         )
         .route(
             "/api/rundown/steps/{step_uuid}/capture",

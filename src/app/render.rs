@@ -523,6 +523,20 @@ impl VardaApp {
                 if let Some(cap_id) = slot.deck.screen_capture_id() {
                     *capture_holders.entry(cap_id).or_default() += 1;
                 }
+                // A Slides input's talks on and coming hold their shows'
+                // captures.
+                let talk_captures = slot
+                    .deck
+                    .slides()
+                    .map(crate::deck::slides::Slides::capture_ids)
+                    .unwrap_or_default();
+                for cap_id in &talk_captures {
+                    *capture_holders.entry(*cap_id).or_default() += 1;
+                }
+                // Wanted or not: a talk started while its Slides input is off
+                // air (a camera on, the next speaker coming up) takes over
+                // only once its picture is there, so its capture keeps coming.
+                needed_capture_ids.extend(talk_captures.iter().copied());
                 if let Some(cam_id) = slot.deck.camera_id() {
                     camera_colours.insert(cam_id, slot.deck.camera_colour);
                     camera_latencies.insert(cam_id, slot.deck.camera_lowest_latency);
@@ -567,6 +581,8 @@ impl VardaApp {
         // PowerPoint inputs: shows opened, closed, their windows captured;
         // presenter views told where their shows are.
         self.reconcile_presentations();
+        // Web talks: pages opened, captured and closed.
+        self.reconcile_web_talks();
         self.feed_presenters();
         // macOS camera effects change a camera's picture on air: say so.
         if let Some(effects) = self.camera_manager.poll_video_effects() {
@@ -640,12 +656,50 @@ impl VardaApp {
             })
             .collect();
 
+        // A presenter view of a Slides input shows that input's picture —
+        // drawn before it this frame (see `Mixer::prepare_taps`).
+        let slides_pictures: std::collections::HashMap<String, (wgpu::TextureView, (u32, u32))> =
+            self.mixer
+                .channels()
+                .iter()
+                .flat_map(|ch| &ch.decks)
+                .filter(|slot| slot.deck.slides().is_some())
+                .map(|slot| {
+                    let size = (slot.deck.texture.width(), slot.deck.texture.height());
+                    (
+                        slot.deck.uuid().to_string(),
+                        (slot.deck.output_view().clone(), size),
+                    )
+                })
+                .collect();
+
         for channel in self.mixer.channels_mut() {
             for slot in &mut channel.decks {
                 if let Some(presenter) = slot.deck.presenter_mut() {
-                    presenter.slide = shows.get(presenter.follows()).and_then(|id| {
-                        let view = self.screen_capture_manager.texture_view(*id)?.clone();
-                        Some((view, self.screen_capture_manager.resolution(*id)?))
+                    presenter.slide = shows
+                        .get(presenter.follows())
+                        .and_then(|id| {
+                            let view = self.screen_capture_manager.texture_view(*id)?.clone();
+                            Some((view, self.screen_capture_manager.resolution(*id)?))
+                        })
+                        .or_else(|| slides_pictures.get(presenter.follows()).cloned());
+                }
+                // A Slides input's talks on and coming: each capture's picture,
+                // once it has one — until then the talk is not ready, and what
+                // is on stays on.
+                if let Some(slides) = slot.deck.slides_mut() {
+                    let captures = &self.screen_capture_manager;
+                    slides.for_each_deck_mut(|deck| {
+                        let Some(id) = deck.screen_capture_id() else {
+                            return;
+                        };
+                        if let Some((w, h)) = captures.resolution(id) {
+                            deck.set_external_source_size(w, h);
+                        }
+                        deck.external_source_view = captures
+                            .has_picture(id)
+                            .then(|| captures.texture_view(id).cloned())
+                            .flatten();
                     });
                 }
                 if let Some(kind) = slot.deck.external_source_kind() {
