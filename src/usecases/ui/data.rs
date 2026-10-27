@@ -327,6 +327,8 @@ pub struct ChannelUIInfo {
     pub ch_idx: usize,
     pub uuid: String,
     pub name: String,
+    /// Never named: `name` is "Input 8", by where it is, not one given.
+    pub unnamed: bool,
     pub opacity: f32,
     pub blend_mode: BlendMode,
     pub decks: Vec<DeckUIInfo>,
@@ -336,6 +338,24 @@ pub struct ChannelUIInfo {
     /// Where it is on air: "Main", or the name of the bus showing it (see
     /// `ChannelSnapshot::on_air`). `None` off air.
     pub on_air: Option<String>,
+}
+
+impl ChannelUIInfo {
+    /// Its number: where it is in the Inputs row, as its tile shows it.
+    pub fn number(&self) -> usize {
+        self.ch_idx + 1
+    }
+
+    /// Its number, then its name — as its tile, the Audio Mixer and the
+    /// lists to pick an input from show it. One never named is its number.
+    pub fn numbered(&self) -> String {
+        let number = self.number();
+        if self.unnamed {
+            format!("{number}  Input")
+        } else {
+            format!("{number}  {}", self.name)
+        }
+    }
 }
 
 /// Audio input device info for UI display.

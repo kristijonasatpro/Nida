@@ -461,7 +461,7 @@ fn sources(data: &UIData) -> Vec<(BusInputRef, String)> {
     out.extend(
         data.channels
             .iter()
-            .map(|ch| (BusInputRef::Channel(ch.uuid.clone()), ch.name.clone())),
+            .map(|ch| (BusInputRef::Channel(ch.uuid.clone()), ch.numbered())),
     );
     out
 }
@@ -819,7 +819,7 @@ mod tests {
         let harness = egui_kittest::Harness::builder()
             .with_size(egui::vec2(420.0, 480.0))
             .build_ui(|ui| render_switcher_section(ui, &data, &mut actions));
-        for label in ["Black", "Master", "Ch A", "Ch B"] {
+        for label in ["Black", "Master", "1  Ch A", "2  Ch B"] {
             harness.get_by_role_and_label(egui::accesskit::Role::Button, label);
         }
         for deck in ["test_generator_a", "test_generator_d"] {

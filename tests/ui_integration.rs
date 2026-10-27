@@ -2059,6 +2059,7 @@ fn click_remove_channel_with_three_channels() {
         uuid: "cc000003".to_string(),
         ch_idx: 2,
         name: "Ch C".to_string(),
+        unnamed: false,
         opacity: 1.0,
         blend_mode: BlendMode::Normal,
         decks: vec![],

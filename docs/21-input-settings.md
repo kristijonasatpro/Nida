@@ -69,10 +69,11 @@ saved with it gone) draws nothing, its border and effects included.
 ## A layer
 
 The right side shows a **preview** — the layer alone, the channel, the Main
-output or any screen. **Drag** the picture to move it; **Shift-drag** or
-**scroll** to resize it; **Reset position & size** puts it back. The outline
-shows what shows of the picture — what the crop keeps — even when its edges
-are transparent.
+output or any screen. **Drag** the picture to move it. To resize it, **drag a
+corner** of its outline — the opposite corner stays where it is, and the
+pointer changes over a corner — or **Shift-drag** or **scroll**; **Reset
+position & size** puts it back. The outline shows what shows of the picture —
+what the crop keeps — even when its edges are transparent.
 
 **Snapping**, as Apple's apps line things up: a dragged layer's edges and
 centre snap to the frame's edges and middle and to the other layers' edges and

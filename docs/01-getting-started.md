@@ -178,7 +178,7 @@ To work on one deck, **double-click its card** (or right-click it →
 **Adjust…**, or **Adjust…** in the bottom bar). Its channel's **Input
 Settings** window opens with that deck — that layer — picked: the channel's
 result and its layers down the left, and on the right a preview to drag the
-layer on (Shift-drag or scroll to resize) with its Position, Colour, Key and
+layer on (drag a corner, Shift-drag or scroll to resize) with its Position, Colour, Key and
 Effects. Double-clicking a channel's name opens the same window on the whole
 channel. See [Input Settings](21-input-settings.md).
 

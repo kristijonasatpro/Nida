@@ -1345,6 +1345,13 @@ fn channel_name(index: usize) -> String {
     format!("Ch {index}")
 }
 
+/// Whether `name` is one a channel was given when made ("Ch 25"), not one
+/// it was named: its number counts every channel ever made, not where it is.
+pub fn is_default_channel_name(name: &str) -> bool {
+    name.strip_prefix("Ch ")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// The order to render channels in, given the channels each one's decks
 /// show: every channel after the ones it shows, otherwise as they stand.
 /// Round a loop no order can do that, so the loop's first channel found goes
@@ -1542,6 +1549,17 @@ mod tests {
         assert_eq!(channel_name(0), "Ch 0");
         assert_eq!(channel_name(1), "Ch 1");
         assert_eq!(channel_name(42), "Ch 42");
+    }
+
+    /// The name a channel is made with is told from one it was given.
+    #[test]
+    fn a_made_name_is_told_from_a_given_one() {
+        for made in [channel_name(0), channel_name(25)] {
+            assert!(is_default_channel_name(&made), "{made}");
+        }
+        for given in ["Ch A", "Ch ", "Ch 2a", "Ch 25 talk", "Camera", "1_Forward", ""] {
+            assert!(!is_default_channel_name(given), "{given:?}");
+        }
     }
 
     // ── Mixer-level DnD data model tests ─────────────────────────────

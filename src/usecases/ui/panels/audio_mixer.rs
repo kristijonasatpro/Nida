@@ -823,11 +823,18 @@ fn header(
     let response = ui.interact(rect, id, egui::Sense::click());
     let painter = ui.painter();
     painter.rect_filled(rect, 2.0, fill);
-    painter.with_clip_rect(rect.shrink(2.0)).text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        name,
+    // Its beginning, cut short with "…": a long name centred and clipped
+    // showed only its middle.
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        name.to_string(),
         egui::FontId::proportional(13.0),
+        egui::Color32::WHITE,
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width((rect.width() - 6.0).max(0.0));
+    let galley = painter.layout_job(job);
+    painter.with_clip_rect(rect.shrink(2.0)).galley(
+        rect.center() - galley.size() / 2.0,
+        galley,
         egui::Color32::WHITE,
     );
     let label = name.to_string();
@@ -1184,8 +1191,17 @@ fn input_strip(
             });
         }
     }
-    let title =
-        header(ui, name_rect, name, fill, id.with("header")).on_hover_text(describe(source, data));
+    // A clip's, an NDI source's or a camera's: its input's number first, as
+    // the input's tile has it.
+    let number = source_deck(source).and_then(|deck| {
+        data.channels
+            .iter()
+            .find(|c| c.decks.iter().any(|d| d.uuid == deck))
+            .map(super::super::ChannelUIInfo::number)
+    });
+    let title_text = number.map_or_else(|| name.clone(), |n| format!("{n}  {name}"));
+    let title = header(ui, name_rect, &title_text, fill, id.with("header"))
+        .on_hover_text(describe(source, data));
     // A clip, an NDI source's sound or a camera's: switched with its picture.
     let follows_a_picture = clip_deck.is_some()
         || matches!(
@@ -1334,6 +1350,16 @@ fn input_strip(
         });
     }
     sends(ui, layout.footer, source, data, actions);
+}
+
+/// The layer a source's sound comes with, if any.
+fn source_deck(source: &AudioSourceSnapshot) -> Option<&str> {
+    match &source.kind {
+        AudioSourceKind::Clip { deck_uuid } | AudioSourceKind::Live { deck_uuid } => {
+            Some(deck_uuid)
+        }
+        AudioSourceKind::Input { deck, .. } => deck.as_deref(),
+    }
 }
 
 /// What a strip says while its source is not there: an app's sound is there
@@ -2406,6 +2432,38 @@ mod tests {
             .build_ui(move |ui| render_audio_mixer_section(ui, data, actions))
     }
 
+    /// A clip's strip is named by its input's number and its name's
+    /// beginning, cut short with "…" — not centred, its middle showing.
+    #[test]
+    fn a_long_name_shows_its_number_and_beginning() {
+        let mut data = mixer_data();
+        let long = "1_Forward_Momentum_pertrauka_su_muzika.mp4";
+        data.audio_mix.sources[0].name = long.into();
+        let mut actions = UIActions::new();
+        let mut harness = harness(&data, &mut actions);
+        harness.run();
+        let title = format!("1  {long}");
+        let header = harness.get_by_label(&title).rect();
+        let drawn: Vec<(String, egui::Rect)> = harness
+            .output()
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.job.text == title => Some((
+                    text.galley.rows.iter().flat_map(|r| r.glyphs.iter().map(|g| g.chr)).collect(),
+                    text.visual_bounding_rect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        let [(shown, at)] = drawn.as_slice() else {
+            panic!("the strip's name drawn once: {drawn:?}");
+        };
+        assert!(shown.starts_with("1  1_Forw"), "its beginning: {shown:?}");
+        assert!(shown.ends_with('…') && shown.len() < title.len(), "cut short: {shown:?}");
+        assert!(header.expand(1.0).contains_rect(*at), "within {header:?}: {at:?}");
+    }
+
     /// A clip plays and pauses from its strip, green while it plays: what
     /// plays is seen, and stopped, in the mixer.
     #[test]
@@ -2490,7 +2548,7 @@ mod tests {
             "+ Bus under the last strip: {bus:?}"
         );
         let inputs = rect_of(&data, size, "INPUTS")[0];
-        let first = rect_of(&data, size, "intro.mp4")[0];
+        let first = rect_of(&data, size, "1  intro.mp4")[0];
         assert!(
             (inputs.top() - first.top()).abs() < 1.0,
             "INPUTS on its first strip's row: {inputs:?}, {first:?}"
@@ -2745,8 +2803,8 @@ mod tests {
         assert!(x("OUTPUTS") < x("Master"));
         assert!(x("Master") < x("Bus A"));
         assert!(x("Bus A") < x("INPUTS"));
-        assert!(x("INPUTS") < x("intro.mp4"));
-        assert!(x("intro.mp4") < x("Lectern mic"));
+        assert!(x("INPUTS") < x("1  intro.mp4"));
+        assert!(x("1  intro.mp4") < x("Lectern mic"));
         // Buttons stacked beside the fader, bus buttons below.
         let y = |label: &str| harness.get_by_label(label).rect().center().y;
         assert!(y("Settings intro.mp4") < y("Solo intro.mp4"));
@@ -2913,7 +2971,7 @@ mod tests {
         let mut harness = harness(&data, &mut actions);
         harness.run();
         let image = harness.render().expect("rendered");
-        let rect = harness.get_by_label("intro.mp4").rect();
+        let rect = harness.get_by_label("1  intro.mp4").rect();
         let ppp = harness.ctx.pixels_per_point();
         let px = image.get_pixel(
             ((rect.left() + 4.0) * ppp) as u32,

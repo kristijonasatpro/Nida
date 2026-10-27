@@ -35,19 +35,20 @@ fn bus_name<'a>(data: &'a UIData, uuid: &str) -> Option<&'a str> {
         .map(|b| b.bus.name.as_str())
 }
 
-fn channel_name<'a>(data: &'a UIData, uuid: &str) -> Option<&'a str> {
+/// An input by its number and name, as its tile shows it.
+fn channel_name(data: &UIData, uuid: &str) -> Option<String> {
     data.channels
         .iter()
         .find(|ch| ch.uuid == uuid)
-        .map(|ch| ch.name.as_str())
+        .map(super::super::ChannelUIInfo::numbered)
 }
 
-fn deck_name<'a>(data: &'a UIData, uuid: &str) -> Option<&'a str> {
-    data.channels
-        .iter()
-        .flat_map(|ch| &ch.decks)
-        .find(|d| d.uuid == uuid)
-        .map(|d| d.name.as_str())
+/// A layer by its input's number and its own name.
+fn deck_name(data: &UIData, uuid: &str) -> Option<String> {
+    data.channels.iter().find_map(|ch| {
+        let deck = ch.decks.iter().find(|d| d.uuid == uuid)?;
+        Some(format!("{}  {}", ch.number(), deck.name))
+    })
 }
 
 const MISSING: &str = "⚠ missing";
@@ -57,16 +58,16 @@ fn input_name(data: &UIData, input: &BusInputRef) -> String {
     match input {
         BusInputRef::Black => "Black".to_string(),
         BusInputRef::Master => "Master".to_string(),
-        BusInputRef::Channel(uuid) => channel_name(data, uuid).unwrap_or(MISSING).to_string(),
-        BusInputRef::Deck(uuid) => deck_name(data, uuid).unwrap_or(MISSING).to_string(),
+        BusInputRef::Channel(uuid) => channel_name(data, uuid).unwrap_or_else(|| MISSING.into()),
+        BusInputRef::Deck(uuid) => deck_name(data, uuid).unwrap_or_else(|| MISSING.into()),
     }
 }
 
 fn main_name(data: &UIData, source: &MainSource) -> String {
     match source {
         MainSource::Black => "Black".to_string(),
-        MainSource::Channel(uuid) => channel_name(data, uuid).unwrap_or(MISSING).to_string(),
-        MainSource::Deck(uuid) => deck_name(data, uuid).unwrap_or(MISSING).to_string(),
+        MainSource::Channel(uuid) => channel_name(data, uuid).unwrap_or_else(|| MISSING.into()),
+        MainSource::Deck(uuid) => deck_name(data, uuid).unwrap_or_else(|| MISSING.into()),
     }
 }
 
@@ -106,7 +107,7 @@ fn summary(data: &UIData, step: &Step) -> String {
     parts.extend(step.overlays.iter().map(|o| {
         format!(
             "{} {}",
-            channel_name(data, &o.channel).unwrap_or(MISSING),
+            channel_name(data, &o.channel).unwrap_or_else(|| MISSING.into()),
             if o.on { "on" } else { "off" }
         )
     }));
@@ -114,7 +115,7 @@ fn summary(data: &UIData, step: &Step) -> String {
         let mut said = format!(
             "{} {}",
             action_mark(p.action),
-            deck_name(data, &p.deck).unwrap_or(MISSING)
+            deck_name(data, &p.deck).unwrap_or_else(|| MISSING.into())
         );
         let playing = matches!(p.action, PlayAction::Start | PlayAction::Resume);
         if p.until_next && playing {
@@ -752,66 +753,111 @@ fn render_editor(ctx: &egui::Context, data: &UIData, actions: &mut UIActions) {
         return;
     };
     let step = &snapshot.step;
-    let uuid = &step.uuid;
     let mut open = true;
+    // The first time, the window takes the size of what it has; from then
+    // on it is sized by hand — wider for long names, or shorter, its
+    // contents then scrolled — and opens again at that size.
+    let fitted = ctx.data(|d| d.get_temp::<bool>(editor_fitted_id())).unwrap_or(false);
     egui::Window::new(format!("Step: {}", step.name))
-        .id(egui::Id::new("rundown_editor_window"))
+        .id(editor_window_id())
         .default_pos(state.at)
+        .default_size(egui::vec2(EDITOR_WIDTH, 0.0))
         .collapsible(false)
-        .resizable(false)
+        .resizable(fitted)
         .open(&mut open)
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Name");
-                let field = egui::Id::new("rundown_editor_name");
-                let typing = ui.ctx().memory(|m| m.has_focus(field));
-                if step.name != state.name_was && !typing {
-                    state.name.clone_from(&step.name);
-                    state.name_was.clone_from(&step.name);
-                }
-                let edit = ui.add(
-                    egui::TextEdit::singleline(&mut state.name)
-                        .id(field)
-                        .desired_width(220.0),
-                );
-                let name = state.name.trim();
-                if edit.lost_focus() && !name.is_empty() && name != step.name {
-                    actions.commands.push(EngineCommand::RenameRundownStep {
-                        uuid: uuid.clone(),
-                        name: name.to_string(),
-                    });
-                }
-            });
-            if !snapshot.missing.is_empty() {
-                ui.add(egui::Label::new(egui::RichText::new(why_not(snapshot)).color(WARN)).wrap());
-            }
-            ui.separator();
-            edit_screens(ui, step, data, actions);
-            ui.separator();
-            edit_main(ui, step, data, actions);
-            ui.separator();
-            edit_plays(ui, step, data, actions);
-            ui.separator();
-            edit_then(ui, step, data, actions);
-            edit_at(ui, step, actions);
-            ui.separator();
-            if ui
-                .button("Update from what is on now")
-                .on_hover_text(
-                    "The screens it sets, and Main if it sets it, become what is on now",
-                )
-                .clicked()
-            {
-                actions
-                    .commands
-                    .push(EngineCommand::CaptureRundownStep { uuid: uuid.clone() });
+            if fitted {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| edit_step(ui, &mut state, snapshot, data, actions));
+            } else {
+                edit_step(ui, &mut state, snapshot, data, actions);
             }
         });
+    if !fitted {
+        ctx.data_mut(|d| d.insert_temp(editor_fitted_id(), true));
+    }
     if open {
         ctx.data_mut(|d| d.insert_temp(editing_id(), state));
     } else {
         ctx.data_mut(|d| d.remove::<Editing>(editing_id()));
     }
+}
+
+fn editor_window_id() -> egui::Id {
+    egui::Id::new("rundown_editor_window")
+}
+
+fn editor_fitted_id() -> egui::Id {
+    egui::Id::new("rundown_editor_fitted")
+}
+
+/// What the step's window has: its name, what it sets, and what it starts.
+fn edit_step(
+    ui: &mut egui::Ui,
+    state: &mut Editing,
+    snapshot: &RundownStepSnapshot,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
+    let step = &snapshot.step;
+    let uuid = &step.uuid;
+    ui.horizontal(|ui| {
+        ui.label("Name");
+        let field = egui::Id::new("rundown_editor_name");
+        let typing = ui.ctx().memory(|m| m.has_focus(field));
+        if step.name != state.name_was && !typing {
+            state.name.clone_from(&step.name);
+            state.name_was.clone_from(&step.name);
+        }
+        let edit = ui.add(
+            egui::TextEdit::singleline(&mut state.name)
+                .id(field)
+                .desired_width(220.0),
+        );
+        let name = state.name.trim();
+        if edit.lost_focus() && !name.is_empty() && name != step.name {
+            actions.commands.push(EngineCommand::RenameRundownStep {
+                uuid: uuid.clone(),
+                name: name.to_string(),
+            });
+        }
+    });
+    if !snapshot.missing.is_empty() {
+        ui.add(egui::Label::new(egui::RichText::new(why_not(snapshot)).color(WARN)).wrap());
+    }
+    ui.separator();
+    edit_screens(ui, step, data, actions);
+    ui.separator();
+    edit_main(ui, step, data, actions);
+    ui.separator();
+    edit_plays(ui, step, data, actions);
+    ui.separator();
+    edit_then(ui, step, data, actions);
+    edit_at(ui, step, actions);
+    ui.separator();
+    ui.horizontal(|ui| {
+        if ui
+            .button("Update from what is on now")
+            .on_hover_text(
+                "The screens it sets, and Main if it sets it, become what is on now",
+            )
+            .clicked()
+        {
+            actions
+                .commands
+                .push(EngineCommand::CaptureRundownStep { uuid: uuid.clone() });
+        }
+        if ui
+            .button("Remove step")
+            .on_hover_text("Take this step out of the rundown — Undo brings it back")
+            .clicked()
+        {
+            actions
+                .commands
+                .push(EngineCommand::RemoveRundownStep { uuid: uuid.clone() });
+        }
+    });
 }
 
 /// What each bus shows in the step.
@@ -903,7 +949,7 @@ fn edit_main(ui: &mut egui::Ui, step: &Step, data: &UIData, actions: &mut UIActi
                     channel_uuid: ch.uuid.clone(),
                     on,
                 };
-                ui.label(&ch.name);
+                ui.label(ch.numbered());
                 let choices = vec![
                     (LEAVE.to_string(), now.is_none(), set(None)),
                     ("On".to_string(), now == Some(true), set(Some(true))),
@@ -926,7 +972,7 @@ fn edit_main(ui: &mut egui::Ui, step: &Step, data: &UIData, actions: &mut UIActi
                 }
                 let what = channel.map_or_else(
                     || "⚠ an overlay that is gone".to_string(),
-                    |ch| format!("⚠ {} — not an overlay now", ch.name),
+                    |ch| format!("⚠ {} — not an overlay now", ch.numbered()),
                 );
                 ui.label(egui::RichText::new(what).color(WARN));
                 if ui.small_button("Take out").clicked() {
@@ -984,8 +1030,13 @@ fn runs_of(data: &UIData, deck: &str) -> Option<Runs> {
 }
 
 /// How wide a name is in the step's window, and what is said under an
-/// action: cut short, or wrapped, rather than pushing the window wider.
+/// action: cut short, or wrapped, rather than pushing the window wider. A
+/// name takes the width the window has beyond the rest of its row — more
+/// than ×, an action and its notes ever take, so a name never makes the
+/// window wider.
 const PLAY_NAME_WIDTH: f32 = 150.0;
+const PLAY_NAME_MAX: f32 = 600.0;
+const PLAY_ROW_REST: f32 = 330.0;
 const PLAY_NOTE_WIDTH: f32 = 230.0;
 
 /// `text` in at most `width`, cut short with "…" — all of it on hover.
@@ -1000,16 +1051,14 @@ fn short_label(ui: &mut egui::Ui, text: &str, width: f32) {
     );
 }
 
-/// A small note under an action, wrapped to `PLAY_NOTE_WIDTH`.
+/// A small note under an action, wrapped to `PLAY_NOTE_WIDTH` — from the
+/// top of its cell: a grid's row is centred, and a note begun at its middle
+/// ran its second line under the row below.
 fn play_note(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(PLAY_NOTE_WIDTH, 0.0),
-        egui::Layout::top_down(egui::Align::Min),
-        |ui| {
-            ui.set_max_width(PLAY_NOTE_WIDTH);
-            ui.add(egui::Label::new(egui::RichText::new(text).small().color(colour)).wrap());
-        },
-    );
+    ui.vertical(|ui| {
+        ui.set_max_width(PLAY_NOTE_WIDTH);
+        ui.add(egui::Label::new(egui::RichText::new(text).small().color(colour)).wrap());
+    });
 }
 
 /// The clips, playlists and timers the step starts and stops.
@@ -1020,6 +1069,8 @@ fn edit_plays(ui: &mut egui::Ui, step: &Step, data: &UIData, actions: &mut UIAct
         deck_uuid: deck.to_string(),
         action,
     };
+    // Names take what a wider window has beyond the rest of a row.
+    let name_width = (ui.available_width() - PLAY_ROW_REST).clamp(PLAY_NAME_WIDTH, PLAY_NAME_MAX);
     egui::Grid::new("rundown_editor_plays")
         .num_columns(3)
         .spacing([8.0, 4.0])
@@ -1028,13 +1079,14 @@ fn edit_plays(ui: &mut egui::Ui, step: &Step, data: &UIData, actions: &mut UIAct
                 // Taken out first in the row: a long name never pushes it out
                 // of a narrow window.
                 if ui
-                    .small_button("🗑")
-                    .on_hover_text("Take it out of this step: the step leaves it alone")
+                    .small_button("×")
+                    .on_hover_text("Remove it from this step: the step leaves it alone")
                     .clicked()
                 {
                     actions.commands.push(set(&play.deck, None));
                 }
-                short_label(ui, deck_name(data, &play.deck).unwrap_or(MISSING), PLAY_NAME_WIDTH);
+                let name = deck_name(data, &play.deck).unwrap_or_else(|| MISSING.into());
+                short_label(ui, &name, name_width);
                 let choices = [
                     PlayAction::Start,
                     PlayAction::Resume,
@@ -1083,7 +1135,7 @@ fn edit_plays(ui: &mut egui::Ui, step: &Step, data: &UIData, actions: &mut UIAct
                     }
                     Some(Runs::Timer) if play.action == PlayAction::Start => {
                         ui.label("");
-                        ui.label("");
+                        ui.label("Time for this step");
                         edit_timer_set(ui, step, play, data, actions);
                         ui.end_row();
                     }
@@ -1111,7 +1163,7 @@ fn edit_plays(ui: &mut egui::Ui, step: &Step, data: &UIData, actions: &mut UIAct
         // A timer counts whatever the timeline does with its picture.
         chasing || (has_lane && deck.timer.is_none())
     };
-    let runnable: Vec<(&str, &str, &str, bool)> = data
+    let runnable: Vec<(String, &str, &str, bool)> = data
         .channels
         .iter()
         // Front first, as the lists of a channel's layers.
@@ -1124,7 +1176,7 @@ fn edit_plays(ui: &mut egui::Ui, step: &Step, data: &UIData, actions: &mut UIAct
                     .is_some_and(|t| t.settings.mode.has_transport())
         })
         .filter(|(_, d)| !step.plays.iter().any(|p| p.deck == d.uuid))
-        .map(|(ch, d)| (ch.name.as_str(), d.name.as_str(), d.uuid.as_str(), !on_timeline(d)))
+        .map(|(ch, d)| (ch.numbered(), d.name.as_str(), d.uuid.as_str(), !on_timeline(d)))
         .collect();
     ui.add_enabled_ui(!runnable.is_empty(), |ui| {
         ui.menu_button("+ Clip, playlist or timer", |ui| {
@@ -1160,26 +1212,28 @@ fn edit_timer_set(
         deck_uuid: play.deck.clone(),
         timer,
     };
+    let settings = data
+        .channels
+        .iter()
+        .flat_map(|ch| &ch.decks)
+        .find(|d| d.uuid == play.deck)
+        .and_then(|d| d.timer.as_ref())
+        .map(|t| &t.settings);
     // A count down chosen here starts from the timer's own length.
     let length = match play.timer {
         Some(TimerSet::Down { secs }) => secs,
-        _ => data
-            .channels
-            .iter()
-            .flat_map(|ch| &ch.decks)
-            .find(|d| d.uuid == play.deck)
-            .and_then(|d| d.timer.as_ref())
-            .map_or(15 * 60, |t| t.settings.duration_secs),
+        _ => settings.map_or(15 * 60, |t| t.duration_secs),
     };
+    let as_set = as_set(settings);
     let named = |set: Option<TimerSet>| match set {
-        None => "As the timer is set",
-        Some(TimerSet::Down { .. }) => "Count down",
+        None => as_set.as_str(),
+        Some(TimerSet::Down { .. }) => "Count down from",
         Some(TimerSet::Up) => "Count up",
     };
     ui.horizontal(|ui| {
         egui::ComboBox::from_id_salt(("rundown_timer_set", &play.deck))
             .selected_text(named(play.timer))
-            .width(130.0)
+            .width(150.0)
             .show_ui(ui, |ui| {
                 for set in [None, Some(TimerSet::Down { secs: length }), Some(TimerSet::Up)] {
                     let current = named(set) == named(play.timer);
@@ -1189,7 +1243,10 @@ fn edit_timer_set(
                 }
             })
             .response
-            .on_hover_text("Each talk its own: counting down from its length, or up");
+            .on_hover_text(
+                "This step's own: down from a length of its own, or up — or as the timer is \
+                 set in its input",
+            );
         if let Some(TimerSet::Down { secs }) = play.timer {
             let mut now = secs;
             let drag = ui
@@ -1213,6 +1270,18 @@ fn edit_timer_set(
             }
         }
     });
+}
+
+/// What a timer does as it is set in its input, said short.
+fn as_set(settings: Option<&crate::engine::value::timer::TimerSettings>) -> String {
+    use crate::engine::value::timer::TimerMode;
+    match settings {
+        Some(t) if t.mode == TimerMode::Countdown => {
+            format!("As set: {} down", span_text(u64::from(t.duration_secs), TimeFormat::Auto))
+        }
+        Some(t) if t.mode == TimerMode::CountUp => "As set: up".to_string(),
+        _ => "As set".to_string(),
+    }
 }
 
 /// Whether the step is taken by itself at a time of day, and at which.
@@ -1350,8 +1419,12 @@ mod tests {
 
     /// The panel and its windows, the commands they send kept as state.
     fn harness(data: &UIData) -> Harness<'_> {
+        harness_sized(data, egui::vec2(460.0, 620.0))
+    }
+
+    fn harness_sized(data: &UIData, size: egui::Vec2) -> Harness<'_> {
         egui_kittest::Harness::builder()
-            .with_size(egui::vec2(460.0, 620.0))
+            .with_size(size)
             .build_ui_state(
                 |ui, sent: &mut Vec<EngineCommand>| {
                     let mut actions = UIActions::new();
@@ -1518,7 +1591,7 @@ mod tests {
         let mut harness = harness(&data);
         harness.get_by_label("+ Step").click();
         settle(&mut harness);
-        harness.get_by_label("TV — Ch A");
+        harness.get_by_label("TV — 1  Ch A");
         harness.get_by_label("Main, and every overlay on or off").click();
         settle(&mut harness);
         harness.get_by_label("Add step").click();
@@ -1535,7 +1608,7 @@ mod tests {
         let mut harness = self::harness(&data);
         harness.get_by_label("+ Step").click();
         settle(&mut harness);
-        harness.get_by_label("TV — Ch A  (the stream or recording takes it)");
+        harness.get_by_label("TV — 1  Ch A  (the stream or recording takes it)");
         harness.get_by_label("Add step").click();
         settle(&mut harness);
         assert_eq!(
@@ -1585,8 +1658,8 @@ mod tests {
         step.then_secs = Some(5.0);
         let harness = harness(&data);
         harness.get_by_label(
-            "TV: Ch B  ·  ⚠ a bus that is gone: Black  ·  Main: Ch A  ·  Ch B off  ·  \
-             ▶ test_generator_a  ·  then the next after 5 s",
+            "TV: 2  Ch B  ·  ⚠ a bus that is gone: Black  ·  Main: 1  Ch A  ·  2  Ch B off  ·  \
+             ▶ 1  test_generator_a  ·  then the next after 5 s",
         );
         assert_eq!(harness.query_all_by_label_contains("Sets nothing yet").count(), 2, "B and C");
     }
@@ -1633,12 +1706,12 @@ mod tests {
             harness.get_by_label(item).click();
             settle(harness);
         };
-        pick(&mut harness, 0, "Ch A");
+        pick(&mut harness, 0, "1  Ch A");
         pick(&mut harness, 1, "Black");
         pick(&mut harness, 2, "Off");
         harness.get_by_label("+ Clip, playlist or timer").click();
         settle(&mut harness);
-        harness.get_by_label("Ch A ▸ test_generator_a").click();
+        harness.get_by_label("1  Ch A ▸ test_generator_a").click();
         settle(&mut harness);
         harness.get_by_label("Then go on to the next step after").click();
         settle(&mut harness);
@@ -1653,7 +1726,7 @@ mod tests {
         menus.sort_by(|a, b| a.rect().top().total_cmp(&b.rect().top()));
         menus[1].click();
         settle(&mut harness);
-        assert_eq!(harness.query_all_by_label("Ch B").count(), 1, "its own row only");
+        assert_eq!(harness.query_all_by_label("2  Ch B").count(), 1, "its own row only");
     }
 
     /// Set, each thing reads as it is set and is put back to "Leave as it
@@ -1673,7 +1746,7 @@ mod tests {
         open_editor_of(&mut harness, "B");
         harness.get_by_label_contains("Cannot be taken — not in the show: a bus that is gone");
 
-        harness.get_by_value("Ch B").click();
+        harness.get_by_value("2  Ch B").click();
         settle(&mut harness);
         harness.get_by_label(LEAVE).click();
         settle(&mut harness);
@@ -1683,7 +1756,7 @@ mod tests {
         settle(&mut harness);
         harness.get_by_label(action_name(PlayAction::Stop)).click();
         settle(&mut harness);
-        harness.get_by_label("🗑").click();
+        harness.get_by_label("×").click();
         settle(&mut harness);
         harness.get_by_label("Then go on to the next step after").click();
         settle(&mut harness);
@@ -1705,7 +1778,7 @@ mod tests {
         ];
         let mut harness = harness(&data);
         open_editor_of(&mut harness, "B");
-        harness.get_by_label("⚠ Ch B — not an overlay now");
+        harness.get_by_label("⚠ 2  Ch B — not an overlay now");
         harness.get_by_label("⚠ an overlay that is gone");
         for _ in 0..2 {
             let mut out: Vec<_> = harness.get_all_by_label("Take out").collect();
@@ -1761,17 +1834,17 @@ mod tests {
         open_editor_of(&mut harness, "B");
         harness.get_by_label("+ Clip, playlist or timer").click();
         settle(&mut harness);
-        let chasing = harness.get_by_label("Ch A ▸ test_generator_b");
+        let chasing = harness.get_by_label("1  Ch A ▸ test_generator_b");
         assert!(chasing.accesskit_node().is_disabled());
         chasing.click();
         settle(&mut harness);
         assert_eq!(sent(&harness), "[]");
         // (The press closed the menu.)
-        if harness.query_by_label(&format!("Ch B ▸ {free}")).is_none() {
+        if harness.query_by_label(&format!("2  Ch B ▸ {free}")).is_none() {
             harness.get_by_label("+ Clip, playlist or timer").click();
             settle(&mut harness);
         }
-        harness.get_by_label(&format!("Ch B ▸ {free}")).click();
+        harness.get_by_label(&format!("2  Ch B ▸ {free}")).click();
         settle(&mut harness);
         assert!(sent(&harness).contains("action: Some(Start)"), "{}", sent(&harness));
         drop(harness);
@@ -1795,10 +1868,10 @@ mod tests {
         open_editor_of(&mut harness, "B");
         harness.get_by_label("+ Clip, playlist or timer").click();
         settle(&mut harness);
-        let with_a_row = format!("Ch B ▸ {free}");
+        let with_a_row = format!("2  Ch B ▸ {free}");
         let clip = harness.get_by_label(&with_a_row);
         assert!(clip.accesskit_node().is_disabled(), "a clip with a row");
-        let timer = harness.get_by_label("Ch A ▸ test_generator_a");
+        let timer = harness.get_by_label("1  Ch A ▸ test_generator_a");
         assert!(!timer.accesskit_node().is_disabled(), "a timer with a row");
         drop(harness);
 
@@ -1999,7 +2072,7 @@ mod tests {
         }
     }
 
-    /// What a step starts is taken out with 🗑 at the head of its row — a
+    /// What a step starts is taken out with × at the head of its row — a
     /// long name cut short after it, never pushing it out of a narrow
     /// window; music is faded out at the next step; a timer counts down
     /// from a length of the step's own, or up; and the step is started by
@@ -2022,16 +2095,19 @@ mod tests {
         ];
         let mut harness = harness(&data);
         open_editor_of(&mut harness, "B");
-        let bin = harness.get_all_by_label("🗑").next().unwrap().rect();
-        let name = harness.get_by_label(long).rect();
-        assert!(bin.right() <= name.left(), "🗑 {bin:?} before the name {name:?}");
+        let bin = harness.get_all_by_label("×").next().unwrap().rect();
+        let name = harness.get_by_label(&format!("2  {long}")).rect();
+        assert!(bin.right() <= name.left(), "× {bin:?} before the name {name:?}");
         assert!(name.width() <= PLAY_NAME_WIDTH + 0.5, "cut short: {name:?}");
 
         harness.get_by_label("Fade out at the next step").click();
         settle(&mut harness);
-        harness.get_by_value("As the timer is set").click();
+        // What the timer's own setting is, said; this step's own chosen.
+        harness.get_by_label("Time for this step");
+        let as_set = format!("As set: {} down", span_text(u64::from(length), TimeFormat::Auto));
+        harness.get_by_value(&as_set).click();
         settle(&mut harness);
-        harness.get_by_label("Count down").click();
+        harness.get_by_label("Count down from").click();
         settle(&mut harness);
         harness.get_by_label("Start by itself at").click();
         settle(&mut harness);
@@ -2067,6 +2143,128 @@ mod tests {
         harness.get_by_label("By its time again").click();
         settle(&mut harness);
         assert_eq!(sent(&harness), r#"[SetRundownNext { uuid: "s2" }]"#);
+    }
+    /// The step's window: made wider by its corner, a long name shows more
+    /// of itself and the window stays as wide as it was made; made shorter,
+    /// it stays short, its contents scrolled.
+    #[test]
+    fn a_steps_window_is_sized_by_hand() {
+        let mut data = with_timer(show());
+        let long = "Nida 2026-10-26 10-10-13 — the walk-in music for the morning.mp3";
+        data.channels[1].decks[0].video_playback = Some(music());
+        data.channels[1].decks[0].name = long.into();
+        let clip = data.channels[1].decks[0].uuid.clone();
+        data.rundown.steps[1].step.plays = vec![
+            PlaySet::new(clip, PlayAction::Start),
+            PlaySet::new("a0000001", PlayAction::Start),
+        ];
+        let mut harness = harness_sized(&data, egui::vec2(1400.0, 1000.0));
+        open_editor_of(&mut harness, "B");
+        let window = |h: &Harness<'_>| h.ctx.memory(|m| m.area_rect(editor_window_id())).unwrap();
+        let before = window(&harness);
+        // At first, as tall as what it has: no empty space under its last row.
+        let last = harness.get_by_label("Remove step").rect();
+        assert!(before.bottom() - last.bottom() < 24.0, "fits: {last:?} in {before:?}");
+        let narrow = harness.get_by_label(&format!("2  {long}")).rect().width();
+        assert!(narrow <= PLAY_NAME_WIDTH + 0.5, "cut short at first: {narrow}");
+
+        let drag = |h: &mut Harness<'_>, by: egui::Vec2| {
+            let corner = window(h).right_bottom() - egui::vec2(3.0, 3.0);
+            h.hover_at(corner);
+            h.run_steps(2);
+            h.drag_at(corner);
+            h.run_steps(2);
+            for i in 1..=8 {
+                #[allow(clippy::cast_precision_loss)]
+                h.hover_at(corner + by * (i as f32 / 8.0));
+                h.run_steps(1);
+            }
+            h.drop_at(corner + by);
+            h.run_steps(4);
+        };
+        drag(&mut harness, egui::vec2(400.0, 0.0));
+        let wider = window(&harness);
+        assert!(wider.width() >= before.width() + 300.0, "wider: {before:?} → {wider:?}");
+        let name = harness.get_by_label(&format!("2  {long}")).rect().width();
+        assert!(name > narrow + 200.0, "the name shows more: {narrow} → {name}");
+        harness.run_steps(10);
+        let later = window(&harness);
+        assert!((later.width() - wider.width()).abs() < 1.0, "it stays: {wider:?} → {later:?}");
+
+        drag(&mut harness, egui::vec2(0.0, -300.0));
+        let shorter = window(&harness);
+        assert!(shorter.height() <= wider.height() - 200.0, "shorter: {wider:?} → {shorter:?}");
+        harness.run_steps(10);
+        let later = window(&harness);
+        assert!((later.height() - shorter.height()).abs() < 1.0, "it stays: {shorter:?} → {later:?}");
+
+        // Closed and opened again: at the size it was made, though what it
+        // has is taller.
+        harness.ctx.data_mut(|d| d.remove::<Editing>(editing_id()));
+        settle(&mut harness);
+        open_editor_of(&mut harness, "B");
+        let again = window(&harness);
+        assert!(
+            (again.size() - shorter.size()).length() < 1.0,
+            "as it was made: {shorter:?} → {again:?}"
+        );
+    }
+
+    /// A note under what a step starts is all above the next row — its
+    /// second line once ran under the timer's row.
+    #[test]
+    fn a_note_under_a_clip_is_above_the_next_row() {
+        use crate::audio_mix::{AudioSourceKind, AudioSourceSnapshot};
+        let mut data = with_timer(show());
+        data.channels[1].decks[0].video_playback = Some(music());
+        let clip = data.channels[1].decks[0].uuid.clone();
+        data.audio_mix.sources = vec![AudioSourceSnapshot {
+            dynamics: crate::audio_mix::DynamicsSnapshot::default(),
+            uuid: "strip001".into(),
+            name: "Music".into(),
+            kind: AudioSourceKind::Clip { deck_uuid: clip.clone() },
+            gain_db: 0.0,
+            muted: false,
+            sends: vec![],
+            auto: true,
+            follow: None,
+            balance: 0.0,
+            delay_ms: 0.0,
+            on_air: 0.0,
+            gate: 1.0,
+            solo: false,
+            live: true,
+            meter_db: [-96.0, -96.0],
+            peak_db: [-96.0; 2],
+            refused: None,
+        }];
+        data.rundown.steps[1].step.plays = vec![
+            PlaySet::new(clip, PlayAction::Start),
+            PlaySet::new("a0000001", PlayAction::Start),
+        ];
+        let mut harness = harness(&data);
+        open_editor_of(&mut harness, "B");
+        let note = harness
+            .get_by_label_contains("Heard only while its input is on Main or a screen")
+            .rect();
+        let fade = harness.get_by_label("Fade out at the next step").rect();
+        let mut removes: Vec<_> = harness.get_all_by_label("×").map(|n| n.rect()).collect();
+        removes.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        let next_row = removes[1];
+        assert!(note.height() > 15.0, "two lines: {note:?}");
+        assert!(note.top() >= fade.bottom(), "under the fade {fade:?}: {note:?}");
+        assert!(note.bottom() <= next_row.top(), "above the next row {next_row:?}: {note:?}");
+    }
+
+    /// The step's window removes the step itself.
+    #[test]
+    fn a_steps_window_removes_the_step() {
+        let data = show();
+        let mut harness = harness(&data);
+        open_editor_of(&mut harness, "B");
+        harness.get_by_label("Remove step").click();
+        settle(&mut harness);
+        assert!(sent(&harness).contains(r#"RemoveRundownStep { uuid: "s2" }"#), "{}", sent(&harness));
     }
 }
 

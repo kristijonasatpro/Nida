@@ -443,13 +443,13 @@ fn input_body(ui: &mut egui::Ui, data: &UIData, state: &mut State) -> bool {
     for other in &data.channels {
         if !input_allowed(data, state, &other.uuid) {
             if state.layer_of.as_deref() != Some(other.uuid.as_str()) {
-                ui.add_enabled(false, egui::Button::selectable(false, other.name.as_str()))
+                ui.add_enabled(false, egui::Button::selectable(false, other.numbered()))
                     .on_disabled_hover_text(format!("{} shows this input already", other.name));
             }
             continue;
         }
         let selected = state.input.as_deref() == Some(other.uuid.as_str());
-        let (clicked, twice) = row(ui, selected, &other.name);
+        let (clicked, twice) = row(ui, selected, &other.numbered());
         if clicked || twice {
             state.input = Some(other.uuid.clone());
         }
@@ -1520,14 +1520,14 @@ mod tests {
             fresh.channels[0].uuid.clone(),
             fresh.channels[1].uuid.clone(),
         );
-        let (a_name, b_name) = (
-            fresh.channels[0].name.clone(),
-            fresh.channels[1].name.clone(),
-        );
+        let a_name = fresh.channels[0].name.clone();
+        // Listed by number and name, as their tiles have them.
+        let (a_row, b_row) = (fresh.channels[0].numbered(), fresh.channels[1].numbered());
+        assert_eq!(b_row, format!("2  {}", fresh.channels[1].name));
         let mut harness_ = harness(fresh, Some(&a));
         click(&mut harness_, "Another input");
-        assert!(harness_.query_by_label(&a_name).is_none(), "not itself");
-        click(&mut harness_, &b_name);
+        assert!(harness_.query_by_label(&a_row).is_none(), "not itself");
+        click(&mut harness_, &b_row);
         click(&mut harness_, "OK");
         match added(&harness_).as_slice() {
             [EngineCommand::AddTapDeck {
@@ -1547,13 +1547,13 @@ mod tests {
         });
         let mut looped = harness(shows_a, Some(&a));
         click(&mut looped, "Another input");
-        click(&mut looped, &b_name);
+        click(&mut looped, &b_row);
         click(&mut looped, "OK");
         assert!(added(&looped).is_empty(), "{:?}", added(&looped));
 
         let mut copy = harness(data(), None);
         click(&mut copy, "Another input");
-        click(&mut copy, &a_name);
+        click(&mut copy, &a_row);
         click(&mut copy, "OK");
         match added(&copy).as_slice() {
             [EngineCommand::AddInput {

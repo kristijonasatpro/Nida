@@ -158,7 +158,8 @@ pub(crate) fn build_ui_data(
             ChannelUIInfo {
                 ch_idx: ch.idx,
                 uuid: ch.uuid.clone(),
-                name: ch.name.clone(),
+                name: shown_channel_name(&ch.name, ch.idx),
+                unnamed: crate::mixer::is_default_channel_name(&ch.name),
                 opacity: ch.opacity,
                 blend_mode: ch.blend_mode,
                 decks,
@@ -917,9 +918,87 @@ fn list_available_luts(workspace: &crate::persistence::Workspace) -> Vec<String>
     files
 }
 
+/// What a channel is called in the UI: its name, or — never named, still
+/// "Ch 25" as it was made — "Input 8", by where it is in the Inputs row.
+fn shown_channel_name(name: &str, idx: usize) -> String {
+    if crate::mixer::is_default_channel_name(name) {
+        format!("Input {}", idx + 1)
+    } else {
+        name.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::channel_fps;
+    use super::{channel_fps, shown_channel_name};
+
+    /// A channel never named is called by where it is in the Inputs row,
+    /// not by the count of channels ever made; one named keeps its name.
+    #[test]
+    fn a_channel_never_named_is_called_by_its_number() {
+        assert_eq!(shown_channel_name("Ch 25", 7), "Input 8");
+        assert_eq!(shown_channel_name("Ch 0", 0), "Input 1");
+        assert_eq!(shown_channel_name("1_Forward_Momentum", 8), "1_Forward_Momentum");
+        assert_eq!(shown_channel_name("Ch A", 0), "Ch A");
+    }
+
+    /// The UI's inputs, made from the app: one never named is called by its
+    /// number there, one named by its name.
+    #[test]
+    fn the_uis_inputs_are_called_by_their_numbers_when_never_named() {
+        use crate::engine::traits::*;
+        let Some(gpu) = crate::renderer::context::GpuContext::new_headless().ok() else {
+            return;
+        };
+        let Ok(mut app) = crate::app::VardaApp::new(gpu, &crate::testing::headless_config())
+        else {
+            return;
+        };
+        app.add_channel().unwrap();
+        let made: Vec<(usize, String)> = app
+            .mixer_ref()
+            .channels()
+            .iter()
+            .enumerate()
+            .map(|(i, ch)| (i, ch.name.clone()))
+            .collect();
+        assert!(made.iter().any(|(_, n)| crate::mixer::is_default_channel_name(n)), "{made:?}");
+        let none = std::collections::HashMap::new();
+        let data = super::build_ui_data(
+            &app,
+            &crate::usecases::ui::UILayoutState::default(),
+            &std::collections::HashMap::new(),
+            &none,
+            &std::collections::HashMap::new(),
+            None,
+        );
+        for ((i, name), ch) in made.iter().zip(&data.channels) {
+            let want = if crate::mixer::is_default_channel_name(name) {
+                format!("Input {}", i + 1)
+            } else {
+                name.clone()
+            };
+            assert_eq!(ch.name, want, "{name} at {i}");
+            assert_eq!(ch.unnamed, crate::mixer::is_default_channel_name(name), "{name}");
+        }
+    }
+
+    /// Number and name, as a tile shows them; one never named, its number.
+    #[test]
+    fn an_input_is_numbered_as_its_tile() {
+        let mut ch = crate::usecases::ui::UIData::test_fixture().channels.remove(0);
+        ch.ch_idx = 8;
+        ch.name = "1_Forward_Momentum_pertrauka".into();
+        assert_eq!(ch.number(), 9);
+        assert_eq!(ch.numbered(), "9  1_Forward_Momentum_pertrauka");
+        ch.ch_idx = 7;
+        ch.name = shown_channel_name("Ch 25", 7);
+        ch.unnamed = true;
+        assert_eq!(ch.numbered(), "8  Input");
+        // One named "Input 8" by hand keeps it.
+        ch.unnamed = false;
+        assert_eq!(ch.numbered(), "8  Input 8");
+    }
 
     #[test]
     fn a_channel_runs_at_its_slowest_moving_layer_and_a_still_does_not_count() {

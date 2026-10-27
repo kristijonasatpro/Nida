@@ -228,7 +228,7 @@ fn render_strip(
     );
     // Read from the bottom up, as a folded name on a spine.
     let galley = painter.layout_no_wrap(
-        format!("{}  {}", ch.ch_idx + 1, ch.name),
+        ch.numbered(),
         egui::FontId::proportional(15.0),
         egui::Color32::WHITE,
     );
@@ -372,7 +372,7 @@ fn render_tile(
         egui::vec2(width - 2.0 * PAD, TITLE_HEIGHT),
     );
     painter.rect_filled(title, 2.0, accent.linear_multiply(0.25));
-    let name = format!("{}  {}", ch.ch_idx + 1, ch.name);
+    let name = ch.numbered();
     painter.with_clip_rect(title).text(
         title.left_center() + egui::vec2(6.0, 0.0),
         egui::Align2::LEFT_CENTER,

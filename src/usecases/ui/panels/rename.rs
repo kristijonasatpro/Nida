@@ -18,6 +18,10 @@ enum Named {
 struct Renaming {
     named: Named,
     text: String,
+    /// A channel never named, shown "Input 8" by where it is: left so,
+    /// nothing is renamed — it is not given that as its name, even moved
+    /// meanwhile and another number now.
+    unnamed: Option<String>,
     at: egui::Pos2,
     /// Not yet drawn: the name is selected, to be typed over.
     fresh: bool,
@@ -34,6 +38,12 @@ fn field_id() -> egui::Id {
 /// Ask for a new name for `ch`, next to the pointer.
 pub(super) fn open(ctx: &egui::Context, ch: &ChannelUIInfo) {
     ask(ctx, Named::Channel(ch.uuid.clone()), &ch.name);
+    if ch.unnamed {
+        if let Some(mut r) = ctx.data(|d| d.get_temp::<Renaming>(state_id())) {
+            r.unnamed = Some(ch.name.clone());
+            ctx.data_mut(|d| d.insert_temp(state_id(), r));
+        }
+    }
 }
 
 /// Ask for a new name for the bus `uuid`, now `name`, next to the pointer.
@@ -57,6 +67,7 @@ fn ask(ctx: &egui::Context, named: Named, name: &str) {
             Renaming {
                 named,
                 text: name.to_string(),
+                unnamed: None,
                 at,
                 fresh: true,
             },
@@ -125,7 +136,7 @@ pub(super) fn render_rename(ctx: &egui::Context, data: &UIData, actions: &mut UI
                     .add_enabled(!name.is_empty(), egui::Button::new("Rename"))
                     .clicked();
                 if (ok || entered) && !name.is_empty() {
-                    if name != current {
+                    if name != current && state.unnamed.as_deref() != Some(name) {
                         actions.commands.push(match &state.named {
                             Named::Channel(uuid) => EngineCommand::RenameChannel {
                                 channel_uuid: uuid.clone(),
@@ -198,6 +209,111 @@ mod tests {
             );
         harness.run();
         harness
+    }
+
+    /// A channel never named, shown by its number, is not given that name
+    /// when the window is left as it was — even moved meanwhile, its number
+    /// another now.
+    #[test]
+    fn a_name_left_as_it_was_renames_nothing_even_moved_meanwhile() {
+        let data = std::rc::Rc::new(std::cell::RefCell::new(UIData::test_fixture()));
+        data.borrow_mut().channels[0].name = "Input 8".into();
+        data.borrow_mut().channels[0].ch_idx = 7;
+        data.borrow_mut().channels[0].unnamed = true;
+        let ch = data.borrow().channels[0].clone();
+        let shown = data.clone();
+        let mut opened = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_ui_state(
+                move |ui, commands: &mut Vec<EngineCommand>| {
+                    if !opened {
+                        open(ui.ctx(), &ch);
+                        opened = true;
+                    }
+                    let mut actions = UIActions::new();
+                    render_rename(ui.ctx(), &shown.borrow(), &mut actions);
+                    commands.extend(actions.commands);
+                },
+                Vec::new(),
+            );
+        harness.run();
+        data.borrow_mut().channels[0].name = "Input 7".into();
+        data.borrow_mut().channels[0].ch_idx = 6;
+        harness.run();
+        harness.get_by_label("Rename").click();
+        harness.run();
+        assert!(harness.state().is_empty(), "{:?}", harness.state());
+        assert_eq!(renaming(&harness.ctx), None, "closed");
+    }
+
+    /// A channel named "Input 8" by hand, renamed meanwhile from outside,
+    /// is given that name back when Rename is pressed.
+    #[test]
+    fn a_channel_named_like_its_number_is_given_its_name_back() {
+        let data = std::rc::Rc::new(std::cell::RefCell::new(UIData::test_fixture()));
+        data.borrow_mut().channels[0].name = "Input 8".into();
+        data.borrow_mut().channels[0].ch_idx = 7;
+        let ch = data.borrow().channels[0].clone();
+        let shown = data.clone();
+        let mut opened = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_ui_state(
+                move |ui, commands: &mut Vec<EngineCommand>| {
+                    if !opened {
+                        open(ui.ctx(), &ch);
+                        opened = true;
+                    }
+                    let mut actions = UIActions::new();
+                    render_rename(ui.ctx(), &shown.borrow(), &mut actions);
+                    commands.extend(actions.commands);
+                },
+                Vec::new(),
+            );
+        harness.run();
+        data.borrow_mut().channels[0].name = "Slides".into();
+        harness.run();
+        harness.get_by_label("Rename").click();
+        harness.run();
+        assert!(
+            format!("{:?}", harness.state()).contains(r#"name: "Input 8""#),
+            "{:?}",
+            harness.state()
+        );
+    }
+
+    /// A bus renamed meanwhile from outside is given back the name the
+    /// window opened with when Rename is pressed.
+    #[test]
+    fn a_bus_renamed_meanwhile_is_given_its_name_back() {
+        let data = UIData::test_fixture();
+        let uuid = data.buses[0].bus.uuid.clone();
+        let now = data.buses[0].bus.name.clone();
+        let mut opened = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_ui_state(
+                move |ui, commands: &mut Vec<EngineCommand>| {
+                    if !opened {
+                        open_bus(ui.ctx(), &uuid, "LED");
+                        opened = true;
+                    }
+                    let mut actions = UIActions::new();
+                    render_rename(ui.ctx(), &data, &mut actions);
+                    commands.extend(actions.commands);
+                },
+                Vec::new(),
+            );
+        harness.run();
+        assert_ne!(now, "LED");
+        harness.get_by_label("Rename").click();
+        harness.run();
+        assert!(
+            format!("{:?}", harness.state()).contains(r#"name: "LED""#),
+            "{:?}",
+            harness.state()
+        );
     }
 
     #[test]
