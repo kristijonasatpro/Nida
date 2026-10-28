@@ -42,6 +42,7 @@ pub(crate) mod slides;
 pub(crate) mod streaming;
 mod surfaces;
 mod timers;
+pub(crate) mod ui_motion;
 
 pub(crate) use outputs::{encoder_fps, resolve_output_audio, OutputAudio};
 pub use streaming::DestinationEdit;

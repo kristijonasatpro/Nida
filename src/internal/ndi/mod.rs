@@ -172,6 +172,8 @@ struct NdiReceiver {
     recv_instance: ffi::NDIlib_recv_instance_t,
     width: u32,
     height: u32,
+    /// When its last picture was put in its texture.
+    last_picture: Option<std::time::Instant>,
 }
 
 struct NdiSender {
@@ -572,6 +574,7 @@ impl NdiManager {
             recv_instance: std::ptr::null_mut(), // Owned by the thread now
             width,
             height,
+            last_picture: None,
         });
         self.textures.push(Some((texture, texture_view)));
         log::info!("NDI receiver started for '{source_name}'");
@@ -652,8 +655,18 @@ impl NdiManager {
                         depth_or_array_layers: 1,
                     },
                 );
+                self.receivers[i].last_picture = Some(std::time::Instant::now());
             }
         }
+    }
+
+    /// Whether receiver `idx` put a new picture in its texture within
+    /// `within`: one waiting for its sender has none.
+    pub fn receiving(&self, idx: usize, within: std::time::Duration) -> bool {
+        self.receivers
+            .get(idx)
+            .and_then(|r| r.last_picture)
+            .is_some_and(|at| at.elapsed() <= within)
     }
 
     pub fn texture_view(&self, idx: usize) -> Option<&wgpu::TextureView> {

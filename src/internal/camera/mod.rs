@@ -501,6 +501,8 @@ struct ActiveCamera {
     /// A profile that could not be set up (a LUT file that will not read):
     /// not tried again every frame, and said once.
     failed: Option<CameraProfile>,
+    /// When its last new picture was put in its texture.
+    last_picture: Option<std::time::Instant>,
 }
 
 /// `profile`, if it is `from`, named `to`.
@@ -1197,6 +1199,7 @@ impl CameraManager {
                 profile: CameraProfile::Normal,
                 converted: None,
                 failed: None,
+                last_picture: None,
             },
         );
         (width, height)
@@ -1555,6 +1558,15 @@ impl CameraManager {
         })
     }
 
+    /// Whether a camera sent a new picture within `within`: a camera with no
+    /// device, or no signal, sends none.
+    pub fn receiving(&self, id: CameraId, within: std::time::Duration) -> bool {
+        self.active
+            .get(&id)
+            .and_then(|a| a.last_picture)
+            .is_some_and(|at| at.elapsed() <= within)
+    }
+
     /// Each open camera's name and how long before its show frame's time
     /// the picture shown last was captured, seconds.
     pub fn picture_delays(&self) -> Vec<(String, f64)> {
@@ -1597,6 +1609,9 @@ impl CameraManager {
                 continue;
             }
             let uploaded = Self::upload_frame(*id, active, device, queue, show_at);
+            if uploaded {
+                active.last_picture = Some(std::time::Instant::now());
+            }
             if active.profile.is_normal() {
                 active.converted = None;
                 continue;

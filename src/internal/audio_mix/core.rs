@@ -208,6 +208,12 @@ impl Source {
         self.signal
     }
 
+    /// Its measured level, for tests.
+    #[cfg(test)]
+    pub(super) fn set_signal_for_tests(&mut self, signal: Frame) {
+        self.signal = signal;
+    }
+
     /// Post-fader peak level per channel, linear.
     pub fn meter(&self) -> Frame {
         self.meter
@@ -309,6 +315,12 @@ impl Bus {
     /// Post-fader peak level per channel, linear.
     pub fn meter(&self) -> Frame {
         self.meter
+    }
+
+    /// Its measured level, for tests.
+    #[cfg(test)]
+    pub(super) fn set_meter_for_tests(&mut self, meter: Frame) {
+        self.meter = meter;
     }
 
     /// Run `block` through the delay line in place.

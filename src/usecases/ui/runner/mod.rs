@@ -6,7 +6,6 @@
 
 use crate::app::render::{DeckLoadResult, FileDialogKind, FileDialogResult};
 use crate::app::{AppConfig, VardaApp};
-use crate::renderer::blit::BlitPipeline;
 use crate::renderer::context::{GpuContext, WindowSurface};
 use crate::usecases::ui;
 
@@ -43,7 +42,6 @@ pub struct UIRunner {
     // ── Window / egui state (delivery layer) ────────────────────────
     window: Option<&'static Window>,
     window_surface: Option<WindowSurface>,
-    blit_pipeline: Option<BlitPipeline>,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     egui_renderer: Option<egui_wgpu::Renderer>,
@@ -66,6 +64,22 @@ pub struct UIRunner {
     ui_due: bool,
     /// When the control window last drew a frame.
     last_ui_frame: Option<std::time::Instant>,
+    /// What moved in the show at the last frame drawn: how often the next
+    /// are drawn (see [`UIRunner::ui_period`]).
+    ui_motion: crate::app::state::ui_motion::UiMotion,
+    /// When a hand was last on the control window or a panel's window: the
+    /// mouse, a key, a scroll, a file dragged.
+    last_input: Option<std::time::Instant>,
+    /// How soon egui asked to be drawn again at the last frame — an
+    /// animation, a blink, a tooltip's delay; `Duration::MAX` for not.
+    egui_wants: std::time::Duration,
+    /// The wait the frames now drawn were meant to have between them — none
+    /// at full rate — and the longer of it and the wait before: a frame
+    /// drawn at the idle rate is not taken for a slow one, nor its gap on
+    /// screen for a hitch, nor the idle gap before a frame drawn at full
+    /// rate again (a hand back on the window).
+    ui_frame_period: std::time::Duration,
+    ui_frame_allowance: std::time::Duration,
     /// Where the control window's frames' time goes (see `app::frame_parts`).
     ui_parts: crate::app::frame_parts::FrameParts,
     /// Control window frames drawn.
@@ -84,6 +98,10 @@ pub struct UIRunner {
     ui_frame_hold: Option<f64>,
     /// How evenly the control window's frames reached its screen.
     ui_on_screen: crate::renderer::on_screen::OnScreen,
+    /// Each control frame presented and not yet reported on screen: the wait
+    /// it was drawn for (see `ui_frame_allowance`), oldest first — macOS
+    /// reports frames a little later, after the rate may have changed.
+    ui_presented_allowances: std::collections::VecDeque<f64>,
     /// The control window's frames waiting to be shown, and the most seen
     /// since the last report.
     ui_queue: crate::renderer::on_screen::Waiting,
@@ -212,7 +230,6 @@ impl UIRunner {
             config,
             window: None,
             window_surface: None,
-            blit_pipeline: None,
             egui_ctx: {
                 let ctx = egui::Context::default();
                 ui::one_pass_a_frame(&ctx);
@@ -230,6 +247,11 @@ impl UIRunner {
             proxy: None,
             ui_due: false,
             last_ui_frame: None,
+            ui_motion: crate::app::state::ui_motion::UiMotion::default(),
+            last_input: None,
+            egui_wants: std::time::Duration::ZERO,
+            ui_frame_period: std::time::Duration::ZERO,
+            ui_frame_allowance: std::time::Duration::ZERO,
             ui_parts: crate::app::frame_parts::FrameParts::default(),
             ui_frames: 0,
             stashed_actions: None,
@@ -238,6 +260,7 @@ impl UIRunner {
             last_ui_stall: None,
             ui_frame_hold: None,
             ui_on_screen: crate::renderer::on_screen::OnScreen::default(),
+            ui_presented_allowances: std::collections::VecDeque::new(),
             ui_queue: crate::renderer::on_screen::Waiting::default(),
             ui_waiting_most: 0,
             screen_rate: crate::screen_rate::ScreenRate::default(),
@@ -562,12 +585,11 @@ impl UIRunner {
         startup_t0: std::time::Instant,
         event_loop: &ActiveEventLoop,
     ) {
-        // Set up egui + blit pipeline for windowed mode
+        // Set up egui for windowed mode
         if let (Some(window_static), Some(ws)) = (self.window, &win_surface) {
             self.cached_screen_size = window_static.inner_size();
             self.cached_scale_factor = window_static.scale_factor() as f32;
             self.egui_start_time = std::time::Instant::now();
-            self.blit_pipeline = BlitPipeline::new(&gpu.device, ws.surface_config.format).ok();
             self.egui_state = Some(egui_winit::State::new(
                 self.egui_ctx.clone(),
                 egui::ViewportId::ROOT,
@@ -903,6 +925,13 @@ impl UIRunner {
         let mut full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             ui_actions = ui::panels::render_ui(ui, &ui_data);
         });
+        // How soon egui wants the next frame, in this window or a panel's.
+        self.egui_wants = full_output
+            .viewport_output
+            .values()
+            .map(|v| v.repaint_delay)
+            .min()
+            .unwrap_or(std::time::Duration::MAX);
         // After the panels' windows' own, whose passes ran inside this one;
         // applied at the next frame painted, should this one not be.
         self.panel_windows
@@ -955,12 +984,14 @@ impl UIRunner {
             }
         };
 
-        // The control window's own frame: the show's picture under the UI.
+        self.ui_motion = shown.motion;
+        // The control window's own frame: the UI.
         let t_submit = std::time::Instant::now();
         self.submit_frame(&paint_jobs, full_output.pixels_per_point, &shown);
         self.part("ui submit", t_submit);
         #[allow(clippy::cast_precision_loss)]
-        let frame_ms = 1000.0 / shown.target_fps.max(1) as f32;
+        let frame_ms =
+            (1000.0 / shown.target_fps.max(1) as f32).max(self.ui_frame_allowance.as_secs_f32() * 1000.0);
         self.ui_parts.end(std::time::Instant::now(), frame_ms);
     }
 
@@ -1230,7 +1261,13 @@ impl UIRunner {
         // How the control window has been doing, for the performance figures.
         self.ui_frames += 1;
         if self.ui_frames.is_multiple_of(10) {
+            #[allow(clippy::cast_precision_loss)]
+            let period_ms = self.ui_period().as_secs_f32() * 1000.0;
+            let hands_on = self.last_input.is_some_and(|at| at.elapsed() < HANDS_ON);
+            let widgets_ms = (self.egui_wants < std::time::Duration::from_secs(3600))
+                .then_some(self.egui_wants.as_secs_f32() * 1000.0);
             if let Some(varda) = self.varda.as_mut() {
+                varda.set_control_rate(period_ms, hands_on, widgets_ms);
                 varda.set_control_on_screen(
                     self.ui_on_screen.stats(),
                     crate::engine::ControlQueueStats {
@@ -1703,8 +1740,8 @@ impl UIRunner {
             },
         );
         Some(Shown {
-            picture: Some(varda.mixer_ref().composite_view().clone()),
             target_fps: varda.target_fps(),
+            motion: varda.ui_motion(),
         })
     }
 
@@ -1731,14 +1768,19 @@ impl UIRunner {
             }
         }
         self.part("ui textures", t_part);
-        let parts = self.present_ui(paint_jobs, pixels_per_point, shown.picture.as_ref());
+        let parts = self.present_ui(paint_jobs, pixels_per_point);
         if let Some(ws) = &self.window_surface {
             let times = crate::renderer::context::take_presented_times(&ws.surface);
             self.ui_queue.reported(times.len());
             self.ui_waiting_most = self.ui_waiting_most.max(self.ui_queue.waiting());
             if !times.is_empty() {
                 let frame = 1.0 / f64::from(shown.target_fps.max(1));
-                self.ui_on_screen.record(&times, frame);
+                record_presented(
+                    &mut self.ui_on_screen,
+                    &times,
+                    &mut self.ui_presented_allowances,
+                    frame,
+                );
                 crate::renderer::present_trace::TRACE.note(
                     CONTROL,
                     0,
@@ -1801,13 +1843,18 @@ impl UIRunner {
         }
     }
 
-    /// Blit mixer output to screen, overlay egui, and present. Returns the
-    /// time each part took, for the frame's parts.
+    /// Draw the UI and present it. Returns the time each part took, for the
+    /// frame's parts.
+    ///
+    /// Nothing is drawn under the UI: its panels cover the window edge to
+    /// edge in an opaque fill, so the show's picture blitted beneath them —
+    /// as Varda's window did — was never seen, yet cost a full-window draw
+    /// of a 16-bit picture every frame (about 2 ms of GPU a frame for a 4K
+    /// window on an M5 Max; most of the window's GPU time).
     fn present_ui(
         &mut self,
         paint_jobs: &[egui::ClippedPrimitive],
         pixels_per_point: f32,
-        picture: Option<&wgpu::TextureView>,
     ) -> Vec<(&'static str, std::time::Duration)> {
         use crate::renderer::present_trace::{Step, TRACE};
         let mut parts = Vec::with_capacity(4);
@@ -1866,11 +1913,6 @@ impl UIRunner {
                 label: Some("Screen Encoder"),
             });
 
-        let bind_group = match (&self.blit_pipeline, picture) {
-            (Some(blit), Some(picture)) => Some(blit.create_bind_group(&context.device, picture)),
-            _ => None,
-        };
-
         // The scale egui laid this frame out and read the pointer at — zoom
         // (Cmd +/−) included. The bare window scale factor drops the zoom, so
         // at any zoom but 100% the drawn UI and the pointer drift apart.
@@ -1888,7 +1930,7 @@ impl UIRunner {
         );
 
         {
-            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Control Window Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -1909,9 +1951,6 @@ impl UIRunner {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if let (Some(bg), Some(blit)) = (&bind_group, &self.blit_pipeline) {
-                blit.render(&mut rp, bg);
-            }
             let mut rp_static = rp.forget_lifetime();
             egui_renderer.render(&mut rp_static, paint_jobs, &screen_desc);
         }
@@ -1921,6 +1960,12 @@ impl UIRunner {
         parts.push(("ui draw", t_draw.elapsed()));
         let t_part = std::time::Instant::now();
         context.queue.present(output);
+        // The wait this frame was drawn for, for when macOS reports it shown.
+        if self.ui_presented_allowances.len() >= PRESENTED_KEPT {
+            self.ui_presented_allowances.pop_front();
+        }
+        self.ui_presented_allowances
+            .push_back(self.ui_frame_allowance.as_secs_f64());
         TRACE.note(CONTROL, u64::from(self.ui_frames), Step::Presented);
         self.ui_queue.presented();
         parts.push(("ui present", t_part.elapsed()));
@@ -2002,11 +2047,143 @@ fn display_id(monitor: &winit::monitor::MonitorHandle) -> Option<u32> {
     }
 }
 
-/// What the control window shows under its UI, taken with the engine.
+/// What the control window's frame is drawn at, taken with the engine.
 struct Shown {
-    /// The show's composited picture.
-    picture: Option<wgpu::TextureView>,
     target_fps: u32,
+    /// What moves in the show: how often the next frames are drawn.
+    motion: crate::app::state::ui_motion::UiMotion,
+}
+
+/// The wait between the control window's frames: none with a hand on it or
+/// pictures moving, [`SOUND_PERIOD`] while only sound moves,
+/// [`IDLE_PERIOD`] while the show stands still — but no longer than egui
+/// asked for (`egui_wants`).
+fn frame_period(
+    hands_on: bool,
+    motion: crate::app::state::ui_motion::UiMotion,
+    egui_wants: std::time::Duration,
+) -> std::time::Duration {
+    use crate::app::state::ui_motion::UiMotion;
+    let rate = if hands_on {
+        std::time::Duration::ZERO
+    } else {
+        match motion {
+            UiMotion::Pictures => std::time::Duration::ZERO,
+            UiMotion::Sound => SOUND_PERIOD,
+            UiMotion::Still => IDLE_PERIOD,
+        }
+    };
+    rate.min(egui_wants)
+}
+
+/// Control frames presented whose report on screen is awaited, at most: one
+/// never reported does not hold the rest back.
+const PRESENTED_KEPT: usize = 16;
+
+/// Take the control frames macOS reports shown, each judged against the
+/// wait it was drawn for — taken from `allowances` in the order they were
+/// presented — or a frame (`frame`) where that was less.
+fn record_presented(
+    on_screen: &mut crate::renderer::on_screen::OnScreen,
+    times: &[f64],
+    allowances: &mut std::collections::VecDeque<f64>,
+    frame: f64,
+) {
+    for &shown in times {
+        let allowance = allowances.pop_front().unwrap_or(0.0);
+        on_screen.record(&[shown], frame.max(allowance));
+    }
+}
+
+/// The wait a control frame is judged against: the longer of the wait it
+/// is drawn after (`period`) and the one before (`previous`) — a hand back
+/// on a window drawn at the idle rate makes the next frame come after an
+/// idle wait, not a slow one.
+fn frame_allowance(previous: std::time::Duration, period: std::time::Duration) -> std::time::Duration {
+    previous.max(period)
+}
+
+#[cfg(test)]
+mod frame_period_tests {
+    use super::*;
+    use crate::app::state::ui_motion::UiMotion;
+    use std::time::Duration;
+
+    /// Every frame with a hand on the window or pictures moving; about 30
+    /// a second for sound alone; about 15 standing still — sooner when egui
+    /// asks, never later.
+    #[test]
+    fn the_window_is_drawn_as_often_as_what_moves_needs() {
+        let never = Duration::MAX;
+        assert_eq!(frame_period(true, UiMotion::Still, never), Duration::ZERO);
+        assert_eq!(frame_period(false, UiMotion::Pictures, never), Duration::ZERO);
+        assert_eq!(frame_period(false, UiMotion::Sound, never), SOUND_PERIOD);
+        assert_eq!(frame_period(false, UiMotion::Still, never), IDLE_PERIOD);
+        let blink = Duration::from_millis(40);
+        assert_eq!(frame_period(false, UiMotion::Still, blink), blink, "egui's sooner");
+        assert_eq!(
+            frame_period(false, UiMotion::Sound, Duration::from_millis(100)),
+            SOUND_PERIOD,
+            "never later than the motion needs"
+        );
+        assert_eq!(frame_period(false, UiMotion::Still, Duration::ZERO), Duration::ZERO);
+        assert!(IDLE_PERIOD <= Duration::from_millis(70), "about 15 a second");
+    }
+
+    /// A frame reported shown after the rate went back to full is judged by
+    /// the wait it was drawn for, not the rate now: its idle gap is no hitch.
+    #[test]
+    fn a_frame_reported_late_is_judged_by_its_own_wait() {
+        let frame = 1.0 / 60.0;
+        let idle = IDLE_PERIOD.as_secs_f64();
+        // Shown 16.7 ms apart, then an idle gap, then 16.7 ms again.
+        let times = [1.0, 1.0 + frame, 1.0 + frame + 0.0667, 1.0 + 2.0 * frame + 0.0667];
+        let mut on_screen = crate::renderer::on_screen::OnScreen::default();
+        let mut allowances: std::collections::VecDeque<f64> =
+            [0.0, 0.0, idle, 0.0].into_iter().collect();
+        // Reported in two goes, the idle frame's in the second.
+        record_presented(&mut on_screen, &times[..2], &mut allowances, frame);
+        record_presented(&mut on_screen, &times[2..], &mut allowances, frame);
+        assert_eq!(on_screen.stats().hitches, 0);
+        assert!(allowances.is_empty());
+    }
+
+    /// Back to full rate after the idle rate, the frame after the idle wait
+    /// is judged by it; at full rate again, by a frame.
+    #[test]
+    fn a_frame_after_an_idle_wait_is_judged_by_it() {
+        assert_eq!(frame_allowance(IDLE_PERIOD, Duration::ZERO), IDLE_PERIOD);
+        assert_eq!(frame_allowance(Duration::ZERO, IDLE_PERIOD), IDLE_PERIOD);
+        assert_eq!(frame_allowance(Duration::ZERO, Duration::ZERO), Duration::ZERO);
+    }
+}
+
+/// A hand on the window keeps it drawn every frame this long after.
+const HANDS_ON: std::time::Duration = std::time::Duration::from_secs(1);
+/// Between frames while only sound moves: about 30 a second, the meters
+/// smooth enough.
+const SOUND_PERIOD: std::time::Duration = std::time::Duration::from_millis(30);
+/// Between frames while the show stands still: about 15 a second — a
+/// clock's seconds, a slide changed by the clicker or the API, a meter
+/// coming up, all shown within a few hundredths of a second.
+const IDLE_PERIOD: std::time::Duration = std::time::Duration::from_millis(60);
+
+impl UIRunner {
+    /// How long the control window waits between frames: none while a hand
+    /// is on it or pictures move in the show; [`SOUND_PERIOD`] while only
+    /// sound moves; [`IDLE_PERIOD`] while the show stands still — sooner
+    /// when egui asks for a frame (an animation, a blink, a tooltip).
+    fn ui_period(&self) -> std::time::Duration {
+        let hands_on = self.last_input.is_some_and(|at| at.elapsed() < HANDS_ON);
+        frame_period(hands_on, self.ui_motion, self.egui_wants)
+    }
+
+    /// A hand on the control window or a panel's window: drawn at once, and
+    /// every frame for [`HANDS_ON`] after.
+    fn note_input(&mut self) {
+        self.last_input = Some(std::time::Instant::now());
+        self.ui_due = true;
+    }
 }
 
 /// Whether a show folder was named on the command line (`--workspace`),

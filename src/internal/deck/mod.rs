@@ -993,6 +993,37 @@ impl Deck {
     }
 
     /// Get a read-only snapshot of the video playback state.
+    /// Whether its own picture changes by itself, for how often the control
+    /// window is drawn (see `app::state::ui_motion`): a generator reading the
+    /// clock, a clip or playlist playing, a live source, a talk that moves
+    /// (a clip playing, PowerPoint or a web page live) or another coming in. A timer's or a presenter's clock moves
+    /// by the second, which the window's idle rate keeps up with. Its effects
+    /// are asked about apart.
+    pub fn moves_by_itself(&self) -> bool {
+        match &self.source {
+            DeckSource::Shader { shader, .. } | DeckSource::ComputeShader { shader, .. } => {
+                shader.animates()
+            }
+            DeckSource::Video { handle, .. } | DeckSource::HapVideo { handle, .. } => {
+                handle.playback_snapshot().playing
+            }
+            // A camera, NDI, a capture, a stream, a web page: live — once it
+            // has a picture. A camera not plugged in, a screen not there, is
+            // a black layer that stands still. Another input shown as a layer
+            // (a tap) moves with what it shows, which is asked about itself.
+            DeckSource::ExternalSource { kind, .. } => {
+                !matches!(kind, ExternalSourceKind::Tap) && self.external_source_view.is_some()
+            }
+            DeckSource::Playlist(list) => list.is_playing(),
+            DeckSource::Slides(slides) => slides.moves_by_itself(),
+            DeckSource::Image { .. }
+            | DeckSource::SolidColor { .. }
+            | DeckSource::Timer(_)
+            | DeckSource::Presenter(_)
+            | DeckSource::Offline(_) => false,
+        }
+    }
+
     pub fn playback_snapshot(&self) -> Option<PlaybackSnapshot> {
         match &self.source {
             DeckSource::Video { handle, .. } | DeckSource::HapVideo { handle, .. } => {

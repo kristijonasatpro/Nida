@@ -568,6 +568,18 @@ impl AudioEngine {
         &self.config
     }
 
+    /// Whether any meter moves: a bus heard above `floor_db` dBFS, or a
+    /// source playing above it — heard or not, as its strip shows it.
+    pub fn sounding(&self, floor_db: f32) -> bool {
+        let floor = 10f32.powf(floor_db / 20.0);
+        let Ok(core) = self.core.lock() else {
+            return false;
+        };
+        let loud = |[l, r]: reader::Frame| l.max(r) > floor;
+        core.buses.iter().any(|bus| loud(bus.meter()))
+            || core.sources.iter().any(|source| loud(source.signal()))
+    }
+
     /// How long Stop fades a sound out before it pauses; 0 cuts.
     pub fn stop_fade_secs(&self) -> f32 {
         self.config
@@ -2407,6 +2419,30 @@ mod tests {
         assert_eq!(until(&mut engine, Some(false)), Some(false), "let go");
         assert_eq!(until(&mut engine, Some(true)), Some(true), "found again");
         assert!(tries.load(Ordering::Relaxed) >= 2);
+    }
+
+    /// A meter moving is sound: a source playing above the floor, heard or
+    /// not, or a bus heard above it; quieter, or nothing at all, is not.
+    #[test]
+    fn sound_is_a_meter_above_the_floor() {
+        let engine = AudioEngine::new();
+        assert!(!engine.sounding(-60.0), "nothing at all");
+        engine.core.lock().unwrap().sources.push(Source::new(
+            "mic00001",
+            Feed::Fifo(Arc::new(Mutex::new(std::collections::VecDeque::new()))),
+        ));
+        let set_source = |level: f32| {
+            engine.core.lock().unwrap().sources[0].set_signal_for_tests([level, 0.0]);
+        };
+        set_source(0.0005); // about −66 dBFS
+        assert!(!engine.sounding(-60.0), "below the floor");
+        set_source(0.01); // −40 dBFS
+        assert!(engine.sounding(-60.0), "a source playing");
+        set_source(0.0);
+        let bus = engine.core.lock().unwrap().buses.first().map(|b| b.uuid.clone());
+        assert!(bus.is_some(), "a show starts with Master");
+        engine.core.lock().unwrap().buses[0].set_meter_for_tests([0.0, 0.02]);
+        assert!(engine.sounding(-60.0), "a bus heard");
     }
 
     fn with_clip(uuid: &str) -> AudioEngine {

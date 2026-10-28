@@ -836,6 +836,21 @@ impl Slides {
     }
 
     /// The decks open: the talk on and the one coming.
+    /// Whether what it shows changes by itself: a talk coming in over the
+    /// one live, or a talk that moves — a clip playing, a live capture of
+    /// PowerPoint or a web page (see `Deck::moves_by_itself`). A PDF's page
+    /// or a picture stands still.
+    /// Whether a talk is coming in over the one live.
+    pub fn in_transition(&self) -> bool {
+        self.transition.is_some()
+    }
+
+    pub fn moves_by_itself(&self) -> bool {
+        let mut moves = self.transition.is_some();
+        self.for_each_deck(|deck| moves |= deck.moves_by_itself());
+        moves
+    }
+
     pub fn for_each_deck(&self, mut f: impl FnMut(&Deck)) {
         for open in self.live.iter().chain(self.coming.iter()) {
             f(&open.deck);

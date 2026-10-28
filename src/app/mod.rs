@@ -353,6 +353,8 @@ pub(crate) struct FrameStats {
     /// Where the control window's frames' time goes, and its slow frames.
     pub control_parts: Vec<crate::engine::PartStats>,
     pub control_slow_frames: Vec<crate::engine::SlowFrame>,
+    /// How often the control window is drawn, and why.
+    pub control_rate: crate::engine::ControlRateStats,
     /// Where the GPU's time goes, by part of the app, a second at a time.
     pub gpu_time: crate::renderer::gpu_time::GpuTime,
 }
@@ -1026,6 +1028,7 @@ impl VardaApp {
                 control_on_screen: crate::engine::OnScreenStats::default(),
                 control_parts: Vec::new(),
                 control_slow_frames: Vec::new(),
+                control_rate: crate::engine::ControlRateStats::default(),
                 control_queue: crate::engine::ControlQueueStats::default(),
                 gpu_time: crate::renderer::gpu_time::GpuTime::default(),
             },
@@ -1932,6 +1935,25 @@ impl VardaApp {
     ) {
         self.frame_stats.control_parts = parts;
         self.frame_stats.control_slow_frames = slow;
+    }
+
+    /// How often the control window is drawn now — the runner says the
+    /// wait, the hands and the widgets — with what moves in the show and
+    /// why, worked out here.
+    pub fn set_control_rate(&mut self, period_ms: f32, hands_on: bool, widgets_ms: Option<f32>) {
+        let (motion, why) = self.ui_motion_why();
+        self.frame_stats.control_rate = crate::engine::ControlRateStats {
+            motion: match motion {
+                crate::app::state::ui_motion::UiMotion::Pictures => "pictures",
+                crate::app::state::ui_motion::UiMotion::Sound => "sound",
+                crate::app::state::ui_motion::UiMotion::Still => "still",
+            }
+            .to_string(),
+            why,
+            period_ms,
+            hands_on,
+            widgets_ms,
+        };
     }
 
     /// Whether an output window showed the last frame: its screen's refresh

@@ -875,6 +875,7 @@ fn build_pacing_snapshot(app: &VardaApp) -> crate::engine::PacingSnapshot {
         control_on_screen: stats.control_on_screen.clone(),
         control_parts: stats.control_parts.clone(),
         control_slow_frames: stats.control_slow_frames.clone(),
+        control_rate: stats.control_rate.clone(),
         gpu_busy_pct: stats.system_monitor.gpu_busy(),
         gpu_time: stats.gpu_time.snapshot(),
     }

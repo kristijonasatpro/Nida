@@ -163,6 +163,9 @@ pub struct PacingSnapshot {
     /// The control window's last slow frames, part by part.
     #[serde(default)]
     pub control_slow_frames: Vec<SlowFrame>,
+    /// How often the control window is drawn, and why.
+    #[serde(default)]
+    pub control_rate: ControlRateStats,
     /// How busy the GPU is (0–100), as the OS reports it (macOS: the
     /// accelerator's "Device Utilization %"); absent where it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,6 +297,29 @@ pub struct ControlQueueStats {
     /// Frames presented and not yet reported shown, most over the last ten
     /// frames.
     pub waiting: u64,
+}
+
+/// How often the control window is drawn, and why (see
+/// `app::state::ui_motion`).
+#[derive(Clone, Debug, Default, Serialize, utoipa::ToSchema)]
+pub struct ControlRateStats {
+    /// What moves in the show: `pictures` (drawn every frame), `sound`
+    /// (about 30 a second), `still` (about 15 a second).
+    pub motion: String,
+    /// The first thing found moving, said for a person ("'CAM' in 'Camera'
+    /// moves", "a meter above -60 dBFS"); absent when the show stands still.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// The wait between the window's frames now, milliseconds: 0 is every
+    /// frame.
+    pub period_ms: f32,
+    /// A hand on the window or a panel's window in the last second: drawn
+    /// every frame whatever moves.
+    pub hands_on: bool,
+    /// How soon the window's own widgets asked to be drawn again,
+    /// milliseconds (an animation, a blink); absent for not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widgets_ms: Option<f32>,
 }
 
 /// A live input's frames on their way into the show.

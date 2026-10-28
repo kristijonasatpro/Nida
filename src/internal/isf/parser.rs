@@ -83,6 +83,39 @@ impl ISFShader {
         &self.fragment_source
     }
 
+    /// Whether its picture changes by itself from frame to frame: it reads
+    /// the clock (`TIME`, `TIMEDELTA`, `FRAMEINDEX`, `DATE`, a phase input's
+    /// time) or the sound (`audio_level`…), keeps buffers from frame to frame,
+    /// takes an analyzer's data or `audio`/`audioFFT` inputs. A still
+    /// gradient, a crop or a colour correction does not: run again on the
+    /// same input, it gives the same picture. Every shader declares the clock
+    /// and the sound among its uniforms, so only a use of them counts — a
+    /// line not just declaring one, outside a comment.
+    pub fn animates(&self) -> bool {
+        let m = &self.metadata;
+        // A name pasted together (`PHASE_TIME_ ## i`) cannot be read off the
+        // source: taken as moving.
+        self.fragment_source.contains("##")
+            || uses_any(&self.fragment_source, MOVING_UNIFORMS)
+            || self
+                .vertex_source
+                .as_deref()
+                .is_some_and(|source| uses_any(source, MOVING_UNIFORMS))
+            || m.persistent_buffers.as_ref().is_some_and(|b| !b.is_empty())
+            || m.buffers.iter().any(|b| b.persistent)
+            || m
+                .passes
+                .as_ref()
+                .is_some_and(|passes| passes.iter().any(|p| p.persistent == Some(true)))
+            || !m.preprocessors.is_empty()
+            || m.inputs.as_ref().is_some_and(|inputs| {
+                inputs.iter().any(|i| {
+                    i.input_type.eq_ignore_ascii_case("audio")
+                        || i.input_type.eq_ignore_ascii_case("audioFFT")
+                })
+            })
+    }
+
     /// Whether each pixel this filter puts out depends on the input image at
     /// that same pixel only: a single pass, nothing imported or kept from
     /// frame to frame, and one texture read in all —
@@ -166,6 +199,91 @@ fn extract_json_and_glsl(content: &str) -> Result<(ISFMetadata, String)> {
     let fragment_source = content[glsl_start..].trim().to_string();
 
     Ok((metadata, fragment_source))
+}
+
+/// The uniforms whose values change by themselves from frame to frame.
+const MOVING_UNIFORMS: &[&str] = &[
+    "TIME",
+    "TIMEDELTA",
+    "FRAMEINDEX",
+    "DATE",
+    "PHASE_TIME_0",
+    "PHASE_TIME_1",
+    "PHASE_TIME_2",
+    "PHASE_TIME_3",
+    "audio_level",
+    "audio_bass",
+    "audio_mid",
+    "audio_treble",
+    "audio_bpm",
+    "audio_beat_phase",
+];
+
+/// Whether `source` uses any of `names` as a word: on a line, outside a
+/// `//` comment, that does not just declare it (`float TIME;`).
+fn uses_any(source: &str, names: &[&str]) -> bool {
+    let mut in_block_comment = false;
+    source.lines().any(|line| {
+        let mut code = String::new();
+        let mut rest = line;
+        loop {
+            if in_block_comment {
+                match rest.find("*/") {
+                    Some(end) => {
+                        in_block_comment = false;
+                        rest = &rest[end + 2..];
+                    }
+                    None => break,
+                }
+            } else {
+                let block = rest.find("/*");
+                let line_comment = rest.find("//");
+                match (block, line_comment) {
+                    (Some(b), Some(l)) if l < b => {
+                        code.push_str(&rest[..l]);
+                        break;
+                    }
+                    (Some(b), _) => {
+                        code.push_str(&rest[..b]);
+                        in_block_comment = true;
+                        rest = &rest[b + 2..];
+                    }
+                    (None, Some(l)) => {
+                        code.push_str(&rest[..l]);
+                        break;
+                    }
+                    (None, None) => {
+                        code.push_str(rest);
+                        break;
+                    }
+                }
+            }
+        }
+        let words: Vec<&str> = code
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .collect();
+        // `float TIME;` — or several, `float TIME; uint FRAMEINDEX;` — only
+        // declares them.
+        let declaration = code.contains(';')
+            && code.split(';').map(str::trim).filter(|st| !st.is_empty()).all(|statement| {
+                let parts: Vec<&str> = statement.split_whitespace().collect();
+                parts.len() == 2
+                    && matches!(
+                        parts[0],
+                        "float" | "int" | "uint" | "bool" | "vec2" | "vec3" | "vec4"
+                    )
+            });
+        // The library's keep-alive sums — `float audioSum = audio_level + …`,
+        // `float timeSum = TIMEDELTA + …` — read every uniform only for a
+        // branch never taken, so the compiler keeps them all.
+        let keep_alive = matches!(words.as_slice(), ["float", "audioSum" | "timeSum", ..]);
+        !declaration
+            && !keep_alive
+            && words
+                .iter()
+                .any(|w| names.contains(w) || w.starts_with("PHASE_TIME"))
+    })
 }
 
 #[cfg(test)]

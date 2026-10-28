@@ -183,16 +183,23 @@ impl ApplicationHandler for UIRunner {
         // A panel's window of its own: its egui input (the show's shortcuts
         // run in its pass, on its keys). Nida holding the keyboard in either
         // window, for the clicker.
+        let is_input = !matches!(event, WindowEvent::RedrawRequested);
         if self
             .panel_windows
             .window_event(window_id, &event, self.gpu.as_ref())
         {
+            if is_input {
+                self.note_input();
+            }
             if let WindowEvent::Focused(_) = &event {
                 crate::clicker::set_focused(self.main_focused || self.panel_windows.any_focused());
             }
             return;
         }
         if self.main_window_id == Some(window_id) {
+            if is_input {
+                self.note_input();
+            }
             // A key held since before the window had the keyboard repeats
             // into it: not its press (see `HeldKeys`).
             if !self.main_held.takes(&event) {
@@ -310,17 +317,23 @@ impl ApplicationHandler for UIRunner {
         } else {
             // Windowed: the engine thread paces the show (see
             // `engine_thread`); the control window draws once it has drawn a
-            // frame — or every tenth of a second without one, so the UI
-            // stays live should the engine stop drawing.
+            // frame — every frame while a hand is on it or pictures move,
+            // less often while the show stands still (see `ui_period`) — or
+            // every tenth of a second without one, so the UI stays live
+            // should the engine stop drawing.
             if self.engine.as_ref().is_some_and(|e| e.baton().is_gone()) {
                 log::error!("The engine thread stopped: exiting");
                 self.quit(event_loop);
                 return;
             }
-            let quiet = self
-                .last_ui_frame
-                .is_none_or(|at| at.elapsed() >= UI_FALLBACK);
-            if std::mem::take(&mut self.ui_due) || quiet {
+            let since = self.last_ui_frame.map(|at| at.elapsed());
+            let quiet = since.is_none_or(|since| since >= UI_FALLBACK);
+            let period = self.ui_period();
+            let rested = since.is_none_or(|since| since >= period);
+            if (self.ui_due && rested) || quiet {
+                self.ui_due = false;
+                self.ui_frame_allowance = super::frame_allowance(self.ui_frame_period, period);
+                self.ui_frame_period = period;
                 if let Some(w) = self.window {
                     w.request_redraw();
                 }

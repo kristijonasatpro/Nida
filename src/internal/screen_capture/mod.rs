@@ -87,6 +87,9 @@ struct ActiveCapture {
     /// Of those, the ones from the capture running now — none yet after it
     /// replaced another, though the texture still shows that one's last.
     fresh: u64,
+    /// When the last frame was put in its texture: macOS sends a capture's
+    /// frames only as what it shows changes, so a still slide sends none.
+    last_picture: Option<std::time::Instant>,
 }
 
 /// Manages capture-target enumeration, capture sessions, and shared textures.
@@ -552,6 +555,7 @@ impl ScreenCaptureManager {
                 thread: Some(thread),
                 uploaded: 0,
                 fresh: 0,
+                last_picture: None,
             },
         );
 
@@ -672,6 +676,15 @@ impl ScreenCaptureManager {
     /// shows nothing — a talk starting waits for it.
     pub fn has_picture(&self, id: CaptureId) -> bool {
         self.active.get(&id).is_some_and(|a| a.uploaded > 0)
+    }
+
+    /// Whether the capture sent a new frame within `within`: a screen not
+    /// there sends none, nor one whose picture is not changing.
+    pub fn receiving(&self, id: CaptureId, within: std::time::Duration) -> bool {
+        self.active
+            .get(&id)
+            .and_then(|a| a.last_picture)
+            .is_some_and(|at| at.elapsed() <= within)
     }
 
     /// Whether the capture running now has sent a picture — not only one
@@ -816,6 +829,7 @@ impl ScreenCaptureManager {
             }
             active.uploaded += 1;
             active.fresh += 1;
+            active.last_picture = Some(std::time::Instant::now());
             return;
         }
 
@@ -845,6 +859,7 @@ impl ScreenCaptureManager {
         );
         active.uploaded += 1;
         active.fresh += 1;
+        active.last_picture = Some(std::time::Instant::now());
     }
 }
 

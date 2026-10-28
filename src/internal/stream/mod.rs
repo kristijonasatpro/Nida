@@ -279,6 +279,8 @@ struct StreamReceiver {
     thread: Option<JoinHandle<()>>,
     width: u32,
     height: u32,
+    /// When its last picture was put in its texture.
+    last_picture: Option<std::time::Instant>,
 }
 
 /// Manages stream input receivers (background decode threads + GPU textures).
@@ -412,6 +414,7 @@ impl StreamManager {
             thread,
             width,
             height,
+            last_picture: None,
         });
         self.textures.push((texture, texture_view));
         log::info!("Stream receiver started for '{url}'");
@@ -485,7 +488,17 @@ impl StreamManager {
                     depth_or_array_layers: 1,
                 },
             );
+            receiver.last_picture = Some(std::time::Instant::now());
         }
+    }
+
+    /// Whether receiver `idx` put a new picture in its texture within
+    /// `within`: a listener waiting for its sender has none.
+    pub fn receiving(&self, idx: usize, within: std::time::Duration) -> bool {
+        self.receivers
+            .get(idx)
+            .and_then(|r| r.last_picture)
+            .is_some_and(|at| at.elapsed() <= within)
     }
 
     pub fn texture_view(&self, idx: usize) -> Option<&wgpu::TextureView> {

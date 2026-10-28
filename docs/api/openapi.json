@@ -15366,6 +15366,45 @@
           }
         }
       },
+      "ControlRateStats": {
+        "type": "object",
+        "description": "How often the control window is drawn, and why (see\n`app::state::ui_motion`).",
+        "required": [
+          "motion",
+          "period_ms",
+          "hands_on"
+        ],
+        "properties": {
+          "hands_on": {
+            "type": "boolean",
+            "description": "A hand on the window or a panel's window in the last second: drawn\nevery frame whatever moves."
+          },
+          "motion": {
+            "type": "string",
+            "description": "What moves in the show: `pictures` (drawn every frame), `sound`\n(about 30 a second), `still` (about 15 a second)."
+          },
+          "period_ms": {
+            "type": "number",
+            "format": "float",
+            "description": "The wait between the window's frames now, milliseconds: 0 is every\nframe."
+          },
+          "why": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The first thing found moving, said for a person (\"'CAM' in 'Camera'\nmoves\", \"a meter above -60 dBFS\"); absent when the show stands still."
+          },
+          "widgets_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "How soon the window's own widgets asked to be drawn again,\nmilliseconds (an animation, a blink); absent for not."
+          }
+        }
+      },
       "ConvertEdgeBody": {
         "type": "object",
         "required": [
@@ -18556,6 +18595,10 @@
           "control_queue": {
             "$ref": "#/components/schemas/ControlQueueStats",
             "description": "The control window's frames waiting to be shown."
+          },
+          "control_rate": {
+            "$ref": "#/components/schemas/ControlRateStats",
+            "description": "How often the control window is drawn, and why."
           },
           "control_slow_frames": {
             "type": "array",
