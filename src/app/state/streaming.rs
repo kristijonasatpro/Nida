@@ -165,6 +165,7 @@ impl super::super::VardaApp {
         };
         let behind = falling_behind(&self.streaming.drops, Instant::now());
         StreamStatus {
+            audio_bus: h.audio_bus.clone(),
             live: true,
             live_secs: self
                 .streaming

@@ -9,6 +9,7 @@ mod audio_mixer;
 mod bottom_bar;
 mod channel_settings;
 mod clipboard_menu;
+mod colours;
 mod cue_bank;
 mod deck_adjust;
 mod deck_detail;
@@ -31,6 +32,7 @@ mod modulation;
 mod monitoring;
 mod monitors;
 mod notifications_overlay;
+mod out_meters;
 mod outputs;
 mod playlist;
 mod presentation;
@@ -676,7 +678,9 @@ pub fn render_ui(ui: &mut egui::Ui, data: &UIData) -> UIActions {
     // After the settings window has looked at the selection, which a take
     // changes without moving that window.
     main_desk::swap_preview_after_take(ui.ctx(), data, &mut actions);
-    rename::render_rename(ui.ctx(), data, &mut actions);
+    let own_windows: Vec<egui::ViewportId> =
+        screen.windows.iter().map(|w| dock::window_viewport(w.pane)).collect();
+    rename::render_rename_in(ui.ctx(), data, &mut actions, &own_windows);
     // A Rundown in a window of its own opens its step windows there.
     if !screen.in_window(crate::usecases::ui::screen_layout::Pane::Rundown) {
         rundown::render_windows(ui.ctx(), data, &mut actions);

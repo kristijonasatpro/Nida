@@ -304,6 +304,10 @@ pub async fn set_timer(
 pub struct StepAtBody {
     /// Seconds after midnight — 33300 for 9:15 — or `null` for none.
     pub secs: Option<u32>,
+    /// Taken at its time even when GO would take another step next; left
+    /// as it is when not given.
+    #[serde(default)]
+    pub always: Option<bool>,
 }
 
 #[utoipa::path(put, path = "/api/rundown/steps/{step_uuid}/at", params(("step_uuid" = String, Path, description = "Step UUID")), request_body = StepAtBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "Not a time of day"), (status = 404, description = "No such step")), tag = "Rundown")]
@@ -312,7 +316,15 @@ pub async fn set_at(
     Path(uuid): Path<String>,
     Json(b): Json<StepAtBody>,
 ) -> impl IntoResponse {
-    dispatch(&s, EngineCommand::SetRundownAt { uuid, at_secs: b.secs }).await
+    dispatch(
+        &s,
+        EngineCommand::SetRundownAt {
+            uuid,
+            at_secs: b.secs,
+            always: b.always,
+        },
+    )
+    .await
 }
 
 /// When a step goes on to the next by itself.
@@ -321,6 +333,10 @@ pub struct StepThenBody {
     /// Seconds after the step is taken (more than none, an hour at most; no
     /// sooner than the step's own fade is done) — or `null` to wait for GO.
     pub secs: Option<f32>,
+    /// Instead of a time: the UUID of a clip or playlist the step starts or
+    /// carries on — the next step is taken when it has played to its end.
+    #[serde(default)]
+    pub when_ends: Option<String>,
 }
 
 #[utoipa::path(put, path = "/api/rundown/steps/{step_uuid}/then", params(("step_uuid" = String, Path, description = "Step UUID")), request_body = StepThenBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such step")), tag = "Rundown")]
@@ -329,7 +345,15 @@ pub async fn set_then(
     Path(uuid): Path<String>,
     Json(b): Json<StepThenBody>,
 ) -> impl IntoResponse {
-    dispatch(&s, EngineCommand::SetRundownThen { uuid, secs: b.secs }).await
+    dispatch(
+        &s,
+        EngineCommand::SetRundownThen {
+            uuid,
+            secs: b.secs,
+            when_ends: b.when_ends,
+        },
+    )
+    .await
 }
 
 /// Make the step's picture what is on now, for the parts it sets.

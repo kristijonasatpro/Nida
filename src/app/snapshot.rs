@@ -334,6 +334,7 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                 active_deck_count: ch.active_deck_count,
                 overlay: ch.overlay,
                 on_air: channel_on_air(app, &on_air, ch),
+                color: ch.color,
             }
         })
         .collect();
@@ -785,6 +786,7 @@ fn build_bus_snapshots(app: &VardaApp) -> Vec<crate::engine::types::BusSnapshot>
             audio_mix: bus.audio_mix().clone(),
             auto_duration: bus.auto_duration,
             hidden_layers: bus.hidden_layers().to_vec(),
+            hidden_sources: bus.hidden_sources().to_vec(),
             transition: bus.transition().map(|t| BusTransitionSnapshot {
                 from: t.from.clone(),
                 to: t.to.clone(),
@@ -887,7 +889,11 @@ pub(crate) fn build_engine_state(app: &VardaApp) -> EngineState {
         buses: build_bus_snapshots(app),
         rundown: app.rundown_snapshot(),
         audio: app.audio_snapshot(),
-        audio_mix: app.audio_mix().snapshot(),
+        audio_mix: {
+            let mut mix = app.audio_mix().snapshot();
+            mix.stopping = app.sounds_stopping();
+            mix
+        },
         stream: crate::streaming::StreamSnapshot::of(app.stream_settings(), app.stream_status()),
         record: crate::record::RecordSnapshot {
             options: app.record_settings().options.clone(),

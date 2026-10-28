@@ -59,6 +59,63 @@ fn look(status: &crate::record::RecordStatus, bright: bool) -> (Option<egui::Col
     }
 }
 
+/// Whether NOT RECORDING blinks behind the take buttons: asked for, and
+/// not recording.
+pub(super) fn warns_not_recording(data: &UIData) -> bool {
+    data.record.options.warn_when_off && !data.record.status.recording
+}
+
+/// How long one blink of NOT RECORDING takes, on and off.
+const WARN_BLINK_SECS: f64 = 1.2;
+
+/// Take buttons drawn by `add`, with NOT RECORDING blinking behind them while
+/// [`warns_not_recording`]: its words over them — in a slot `label_height`
+/// tall, in a column — and the space they stand in pulsing red. Without the
+/// reminder, just `add`.
+pub(super) fn with_record_warning<R>(
+    ui: &mut egui::Ui,
+    data: &UIData,
+    label_height: Option<f32>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    if !warns_not_recording(data) {
+        return add(ui);
+    }
+    let behind = ui.painter().add(egui::Shape::Noop);
+    let time = ui.input(|i| i.time);
+    #[allow(clippy::cast_possible_truncation)]
+    let pulse = ((time * std::f64::consts::TAU / WARN_BLINK_SECS).sin() * 0.5 + 0.5) as f32;
+    let inner = ui.scope(|ui| {
+        let words = egui::RichText::new("NOT RECORDING")
+            .strong()
+            .color(egui::Color32::WHITE);
+        let hover = "Recording is off — press REC at the top. \
+                     (This reminder: REC ▸ Reminder.)";
+        match label_height {
+            Some(height) => {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), height),
+                    egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                    |ui| ui.label(words).on_hover_text(hover),
+                );
+            }
+            None => {
+                ui.label(words).on_hover_text(hover);
+            }
+        }
+        add(ui)
+    });
+    let rect = inner.response.rect.expand(4.0);
+    let alpha = 0.18 + 0.62 * pulse * pulse;
+    ui.painter().set(
+        behind,
+        egui::epaint::RectShape::filled(rect, 6.0, LIVE_RED.gamma_multiply(alpha)),
+    );
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(40));
+    inner.inner
+}
+
 /// The top-bar button.
 pub(super) fn render_record_button(ui: &mut egui::Ui, data: &UIData) {
     let status = &data.record.status;
@@ -607,11 +664,32 @@ fn render_options(
                 }
             });
             ui.end_row();
+
+            ui.label("Reminder");
+            let mut warn = options.warn_when_off;
+            if ui
+                .checkbox(&mut warn, "Blink NOT RECORDING behind the take buttons")
+                .on_hover_text(
+                    "While not recording, NOT RECORDING blinks behind Cut and Fade — \
+                     in the middle of a show, Record is easily forgotten",
+                )
+                .changed()
+            {
+                set(
+                    actions,
+                    RecordOptions {
+                        warn_when_off: warn,
+                        ..options.clone()
+                    },
+                );
+            }
+            ui.end_row();
         });
     if recording {
         ui.label(
             egui::RichText::new(
-                "Stop recording to change the settings — the picture can change now",
+                "Stop recording to change the settings — the picture and the reminder can \
+                 change now",
             )
             .small()
             .weak(),
@@ -786,6 +864,7 @@ mod tests {
             dropped: 0,
             fps: 0,
             last_file: None,
+            audio_bus: None,
         }
     }
 

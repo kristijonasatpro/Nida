@@ -449,6 +449,7 @@ impl VardaApp {
             opacity: 1.0,
             blend_mode: crate::scene::BlendModeConfig::default(),
             overlay: false,
+            color: None,
             decks: Vec::new(),
             effects: Vec::new(),
             modulation: Vec::new(),

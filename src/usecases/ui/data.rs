@@ -338,12 +338,22 @@ pub struct ChannelUIInfo {
     /// Where it is on air: "Main", or the name of the bus showing it (see
     /// `ChannelSnapshot::on_air`). `None` off air.
     pub on_air: Option<String>,
+    /// The colour the operator gave it; `None` takes the one its place
+    /// gives (see [`ChannelUIInfo::accent`]).
+    pub color: Option<egui::Color32>,
 }
 
 impl ChannelUIInfo {
     /// Its number: where it is in the Inputs row, as its tile shows it.
     pub fn number(&self) -> usize {
         self.ch_idx + 1
+    }
+
+    /// Its colour: the one the operator gave it, else the one its place
+    /// gives — on its tile, its switcher buttons, its settings.
+    pub fn accent(&self) -> egui::Color32 {
+        self.color
+            .unwrap_or_else(|| crate::usecases::ui::panels::utils::channel_color(self.ch_idx))
     }
 
     /// Its number, then its name — as its tile, the Audio Mixer and the

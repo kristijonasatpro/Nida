@@ -1011,6 +1011,7 @@ impl VardaApp {
             ch.opacity = ch_config.opacity;
             ch.blend_mode = ch_config.blend_mode.into();
             ch.overlay = ch_config.overlay;
+            ch.color = ch_config.color;
 
             for deck_config in &ch_config.decks {
                 // A survivor whose source configuration still matches keeps its
@@ -3236,6 +3237,7 @@ mod tests {
             channels: vec![
                 crate::scene::ChannelConfig {
                     overlay: false,
+                    color: None,
                     uuid: crate::deck::generate_short_uuid(),
                     name: "Ch 0".into(),
                     opacity: 1.0,
@@ -3246,6 +3248,7 @@ mod tests {
                 },
                 crate::scene::ChannelConfig {
                     overlay: false,
+                    color: None,
                     uuid: crate::deck::generate_short_uuid(),
                     name: "Ch 1".into(),
                     opacity: 1.0,

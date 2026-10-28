@@ -374,6 +374,9 @@ pub struct Bus {
     /// Mixer layers (channel UUIDs) this bus leaves out when it shows
     /// [`BusInputRef::Master`]. See [`Bus::hidden_layers`].
     hidden_layers: Vec<String>,
+    /// Sources the bus's switcher row has no button for. See
+    /// [`Bus::hidden_sources`].
+    hidden_sources: Vec<BusInputRef>,
 }
 
 impl Bus {
@@ -398,6 +401,7 @@ impl Bus {
             auto_duration: DEFAULT_AUTO_DURATION,
             easing: CrossfadeEasing::EaseInOut,
             hidden_layers: Vec::new(),
+            hidden_sources: Vec::new(),
         }
     }
 
@@ -510,6 +514,29 @@ impl Bus {
             self.hidden_layers.push(channel_uuid.to_string());
         } else {
             self.hidden_layers.retain(|c| c != channel_uuid);
+        }
+        true
+    }
+
+    /// The sources — Black, Master, channels — the bus's row in the switcher
+    /// has no button for: an LED wall that only ever shows three inputs
+    /// offers those three. Only the buttons: what is on the bus, and taking
+    /// a source to it any other way, are untouched.
+    pub fn hidden_sources(&self) -> &[BusInputRef] {
+        &self.hidden_sources
+    }
+
+    /// Take a source's button off the bus's switcher row, or put it back,
+    /// returning whether that changed anything.
+    pub fn set_source_hidden(&mut self, input: &BusInputRef, hidden: bool) -> bool {
+        let present = self.hidden_sources.contains(input);
+        if hidden == present {
+            return false;
+        }
+        if hidden {
+            self.hidden_sources.push(input.clone());
+        } else {
+            self.hidden_sources.retain(|s| s != input);
         }
         true
     }
@@ -659,6 +686,9 @@ pub struct BusConfig {
     /// Mixer layers (channel UUIDs) left out when the bus shows Master.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_layers: Vec<String>,
+    /// Sources the bus's switcher row has no button for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_sources: Vec<BusInputRef>,
 }
 
 fn default_auto_duration() -> f32 {
@@ -682,6 +712,7 @@ impl Bus {
             auto_duration: self.auto_duration,
             easing: self.easing,
             hidden_layers: self.hidden_layers.clone(),
+            hidden_sources: self.hidden_sources.clone(),
         }
     }
 
@@ -716,6 +747,7 @@ impl Bus {
             auto_duration,
             easing: config.easing,
             hidden_layers: config.hidden_layers,
+            hidden_sources: config.hidden_sources,
         }
     }
 
@@ -737,9 +769,10 @@ impl Bus {
             self.program_resolved = true;
             changed = true;
         }
-        let before = self.hidden_layers.len();
+        let before = self.hidden_layers.len() + self.hidden_sources.len();
         self.hidden_layers.retain(|c| c != uuid);
-        changed || self.hidden_layers.len() != before
+        self.hidden_sources.retain(|s| !s.addresses(uuid));
+        changed || self.hidden_layers.len() + self.hidden_sources.len() != before
     }
 
     /// Mark any Preview/Program reference that `known` cannot resolve,
@@ -793,6 +826,8 @@ pub struct BusStructure {
     pub auto_duration: f32,
     /// Easing curve for `AUTO`.
     pub easing: CrossfadeEasing,
+    /// Sources the bus's switcher row has no button for.
+    pub hidden_sources: Vec<BusInputRef>,
 }
 
 impl Bus {
@@ -803,6 +838,7 @@ impl Bus {
             canvas: self.canvas,
             auto_duration: self.auto_duration,
             easing: self.easing,
+            hidden_sources: self.hidden_sources.clone(),
         }
     }
 
@@ -816,6 +852,7 @@ impl Bus {
         self.canvas = structure.canvas;
         self.auto_duration = structure.auto_duration;
         self.easing = structure.easing;
+        self.hidden_sources = structure.hidden_sources;
     }
 }
 
@@ -986,6 +1023,7 @@ impl BusBank {
                     canvas: config.canvas,
                     auto_duration: config.auto_duration,
                     easing: config.easing,
+                    hidden_sources: config.hidden_sources.clone(),
                 });
                 if live != idx && idx < self.buses.len() {
                     self.buses.swap(live, idx);

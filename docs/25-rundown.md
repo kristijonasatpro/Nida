@@ -46,8 +46,9 @@ putting anything on a screen:
 | **Screens** | For each bus: **Leave as it is**, Black, Master, or a channel |
 | **Main ▸ Takes** | **Leave as it is**, Black, or a channel. Under it, each overlay channel: **Leave as it is**, **On** or **Off** |
 | **Starts and stops** | **+ Clip, playlist or timer** adds one. Each: **Start from the beginning** (a clip from its in-point, a playlist from its first item, a timer from its top), **Carry on**, **Pause**, or **Stop, back to the beginning**. **🗑**, at the head of its row, takes it out (a long name is cut short; hover it for all of it). A clip or playlist it starts or carries on: **Fade out at the next step** — see [Music for one moment](#music-for-one-moment). A timer it starts: **As the timer is set**, **Count down** from a length of the step's own, or **Count up** |
-| **Then go on to the next step after** | Ticked, the step after this one is taken by itself that many seconds later — see [Going on by itself](#going-on-by-itself) |
+| **Then go on to the next step** | Ticked, the step after this one is taken by itself — **after** a time (type `90` or `1:30`), or **when** a clip or playlist this step starts **ends**: see [Going on by itself](#going-on-by-itself) |
 | **Start by itself at** | Ticked, the step is taken by itself at that time of day — faded, as GO takes it — while it is the step GO takes next: see [At a time of day](#at-a-time-of-day) |
+| **Even if it is not next** | Under a time: the step is taken at its time wherever the rundown is |
 | **Update from what is on now** | The screens the step sets, and Main if it sets it, become what is on now |
 
 A step's right-click menu also has **GO takes this next**, **Move earlier**,
@@ -112,13 +113,25 @@ it takes.
 
 ### Going on by itself
 
-A step with **Then go on to the next step after** ticked takes the step after
-it without a press: a walk-on that starts the sting and the wall, then four
+A step with **Then go on to the next step** ticked takes the step after it
+without a press: a walk-on that starts the sting and the wall, then four
 seconds later takes the camera to Main, is two steps, the first going on to
 the second.
 
-- While it waits, the panel counts down — **Then *step* in 3 s** — beside
-  **Hold**.
+It goes on **after** a time — seconds, or minutes and seconds: `90`, `1:30`
+— or **when** a clip or playlist the step starts **ends**: pick which, so a
+clip on screen can loop while the music decides (**when 7 music.mp3 ends**).
+
+- A clip ends when it is set to play once or hold its last frame; a playlist
+  when it does not loop and has played its last item. One that loops never
+  ends, and the step's window says so (**⚠ It loops, so it never ends**).
+- While it waits the panel says how long that one has left: **Then *step*
+  when 7 music.mp3 ends — 1:23 left**.
+- Paused, it waits; taken out of the step or set to pause or stop there, the
+  step goes back to waiting for GO.
+
+- While it waits for a time, the panel counts down — **Then *step* in 3
+  s** — beside **Hold**.
 - **GO** before the time is up goes on at once.
 - **Hold**, any step taken by hand — even one that is refused — or **GO
   takes this next** on another step stops it: the rundown stays where it is
@@ -149,10 +162,26 @@ takes it, while it is the step GO takes next. Its row says **at 09:15**.
   more than a minute late: Nida opened, or the Mac woken, after the time
   leaves it for GO (***step* at 09:15 — that time has gone: GO takes it**).
 - A step that is not next when its time comes is not taken: the show is
-  never sent back, nor on ahead past a step still to come.
+  never sent back, nor on ahead past a step still to come — unless it has
+  **Even if it is not next** ticked (below).
 - If something is still fading when its time comes, it waits for it, for a
   second at most, as a step going on by itself does; one that cannot be
   taken says so.
+
+**Even if it is not next**, ticked under a step's time — the keynote at 9:15
+sharp, whatever is on — takes it at its time wherever the rundown is: the
+steps before it are left out, or it is taken again after them, and GO goes on
+from it. Its row says **at 09:15, even if not next**.
+
+- The panel counts down to the timed step whose time comes first — the next
+  step's, or one of these, the next step first at one time — even while a
+  step's wait runs, and **Hold** holds that one: ***step* at 09:15 — held:
+  not taken by its time**. Its hold stays through the steps taken meanwhile,
+  and beside a hold on the next step; **By its time again**, or changing its
+  time, lets it go.
+- Not while the show is on it already: it is not taken twice.
+- The same minute late at most as any other: Nida opened after its time
+  leaves it be.
 
 ## Clips, playlists and timers
 

@@ -427,6 +427,14 @@ pub enum EngineCommand {
         channel_uuid: String,
         name: String,
     },
+    /// Give a channel a colour of its own — red, green, blue — to find it
+    /// at a glance on its tile and its switcher buttons; `None` gives it
+    /// back the one its place gives.
+    SetChannelColor {
+        channel_uuid: String,
+        #[serde(default)]
+        color: Option<[u8; 3]>,
+    },
     /// Move a channel to just before another, or to the end when
     /// `before_channel_uuid` is left out.
     MoveChannel {
@@ -613,6 +621,20 @@ pub enum EngineCommand {
     SetPlaylistPlaying {
         deck_uuid: String,
         playing: bool,
+    },
+    /// Stop a clip or playlist as its Stop button does — on its tile and in
+    /// the Audio Mixer: its sound faded out, over `secs` or else the Stop
+    /// fade set (`SetStopFade`), then paused. A second Stop while it fades
+    /// stops it at once; `secs` 0 cuts.
+    StopWithFade {
+        deck_uuid: String,
+        #[serde(default)]
+        secs: Option<f32>,
+    },
+    /// How long Stop fades a clip's or playlist's sound before pausing it,
+    /// 0 (a cut) to 10 seconds.
+    SetStopFade {
+        secs: f32,
     },
     /// Show one item of a playlist now — with its transition while playing,
     /// at once while stopped — and play on from it.
@@ -1920,6 +1942,14 @@ pub enum EngineCommand {
         channel_uuid: String,
         hidden: bool,
     },
+    /// Take a source's button off a bus's row in the switcher, or put it
+    /// back: Black, Master or a channel. Only the button — what is on the
+    /// bus is untouched.
+    SetBusSourceHidden {
+        uuid: String,
+        input: crate::bus::BusInputRef,
+        hidden: bool,
+    },
 
     // ── Audio mixer ─────────────────────────────────────────────
     /// Add an audio bus; replies with its UUID.
@@ -2195,12 +2225,19 @@ pub enum EngineCommand {
     SetRundownThen {
         uuid: String,
         secs: Option<f32>,
+        /// Instead of a time: go on when this clip or playlist — one the
+        /// step starts or carries on — ends, by deck UUID.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when_ends: Option<String>,
     },
     /// The time of day a step is taken by itself at while GO would take it
-    /// next, seconds after midnight — or, with `None`, not.
+    /// next, seconds after midnight — or, with `None`, not. `always`, if
+    /// given, is whether it is taken at its time even when not next.
     SetRundownAt {
         uuid: String,
         at_secs: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        always: Option<bool>,
     },
     /// Make a step what is on now, for the parts it sets: the buses it
     /// lists, and Main and the overlays if it sets them.

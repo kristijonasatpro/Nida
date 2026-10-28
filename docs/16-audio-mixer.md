@@ -16,6 +16,20 @@ on the audio thread, so a transient between UI refreshes is not lost. They are
 session telemetry, not saved show settings. Source replacement/show load clears
 them; ordinary fader edits do not.
 
+**Playing but not heard.** An input's meter still moves when nobody hears it,
+showing what it plays — before its fader — in a colour that says why:
+
+| | |
+|---|---|
+| **Blue** | Sent to no bus: none of **M**, **A**, **B**… lit |
+| **Pink** | Silenced: its speaker off, **Auto** keeping it down while its input is off air, or every bus it goes to off |
+
+Pink is not the red of a peak at 0 dBFS. Hover the meter for which it is.
+While it is unheard the number below says **Plays** — the higher of what it
+plays now, L or R — and the white peak markers are hidden: they hold what is
+heard, after the fader. Heard, the meter is green and yellow, after its
+fader, with its **Peak**, as above.
+
 For a target such as −6 dBFS, watch the **output bus** peak readout. A fader at
 0 dB means unity gain, not a signal at 0 dBFS. Internal floating-point inputs
 can exceed full scale without necessarily clipping until delivery; the red
@@ -83,8 +97,13 @@ inputs in vMix's) is laid out as vMix's: **OUTPUTS** — Master and the other
 buses — then **INPUTS**, one upright strip each. Strips keep their own
 size, as vMix's do, whatever the panel's: as many go across as fit, row after
 row, and the panel scrolls up and down. A clip's strip has **▶ / ⏸** at the
-left of its name (green while it plays): what is playing is seen, and paused,
-in the mixer. Each bus has its own fader,
+left of its name, and a playlist's **▶ / ■** (green while it plays): what is
+playing is seen, and stopped, in the mixer. A Stop there — and on an input's
+tile — does not cut the sound dead: it fades it out over 2 seconds, then
+pauses (the button amber while it fades; press again to stop at once).
+Right-click it to choose **Cut** or a fade of 0.5 to 5 seconds: one choice
+for every Stop, saved with the show's sound. A clip the timeline plays (it
+has a lane in the arrangement) is paused at once, as before. Each bus has its own fader,
 On button and delay, and plays on a sound device and/or feeds recordings and
 streams.
 
@@ -193,6 +212,11 @@ a capture device directly (the older passthrough), or **None**. Choose it
 while the output is stopped. The sound is 48 kHz stereo, and a recording made
 while a clip plays carries the clip's sound at the fader levels you set. The
 [STREAM button](17-streaming.md)'s window has its own **Sound** choice.
+
+What each one hears is metered beside the Program picture (and the Main
+Output panel's): **REC**, **STREAM** and every bus that plays on a sound
+device, so a bus sent to the speakers but not to the stream is seen at once
+— see [Screen Layouts](20-layouts.md#broadcast-preview--program-and-inputs).
 
 A typical conference routing:
 

@@ -137,6 +137,32 @@ pub async fn rename(
     }
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct ChannelColorBody {
+    /// Red, green, blue (0–255); left out or null, the channel takes back
+    /// the colour its place gives.
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
+}
+
+#[utoipa::path(put, path = "/api/channels/{channel_uuid}/color", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ChannelColorBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Channels")]
+pub async fn set_color(
+    State(state): State<SharedState>,
+    Path(channel_uuid): Path<String>,
+    Json(body): Json<ChannelColorBody>,
+) -> impl IntoResponse {
+    match state
+        .send_command(EngineCommand::SetChannelColor {
+            channel_uuid,
+            color: body.color,
+        })
+        .await
+    {
+        Ok(result) => command_response(result),
+        Err(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
 #[derive(Deserialize, ToSchema, Default)]
 pub struct ChannelMoveBody {
     /// The channel to go just before; left out, the channel goes last.

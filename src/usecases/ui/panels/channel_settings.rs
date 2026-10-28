@@ -492,7 +492,7 @@ fn render_layer_list(
     data: &UIData,
     actions: &mut UIActions,
 ) {
-    let accent = channel_color(ch.ch_idx);
+    let accent = ch.accent();
     // The result stays in view whatever is being edited.
     let result = super::utils::preview_size(
         egui::vec2(LIST_WIDTH, LIST_WIDTH),
@@ -580,7 +580,7 @@ fn render_layer_row(
     data: &UIData,
     actions: &mut UIActions,
 ) {
-    let accent = channel_color(ch.ch_idx);
+    let accent = ch.accent();
     let selected = open.item == Item::Layer(deck.uuid.clone());
     ui.push_id(("layer_row", &deck.uuid), |ui| {
         let frame = egui::Frame::default()

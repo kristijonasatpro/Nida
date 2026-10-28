@@ -15,7 +15,6 @@
 
 use super::super::{ChannelUIInfo, DeckDrag, DeckUIInfo, LibraryDrag, UIActions, UIData};
 use super::main_desk::{self, NEXT_GREEN, ON_MAIN_RED};
-use super::utils::channel_color;
 use crate::engine::EngineCommand;
 use crate::mixer::{MainSource, MixMode};
 
@@ -201,7 +200,7 @@ fn render_strip(
     data: &UIData,
     actions: &mut UIActions,
 ) {
-    let accent = channel_color(ch.ch_idx);
+    let accent = ch.accent();
     let main_mode = main_desk::in_main_mode(data);
     let on_main = main_mode
         && (main_desk::channel_on_main(data, ch)
@@ -335,7 +334,7 @@ fn render_tile(
     data: &UIData,
     actions: &mut UIActions,
 ) {
-    let accent = channel_color(ch.ch_idx);
+    let accent = ch.accent();
     let main_mode = main_desk::in_main_mode(data);
     let on_main = main_mode && main_desk::channel_on_main(data, ch);
     let next = main_desk::next_channel(data).is_some_and(|n| n.uuid == ch.uuid);
@@ -480,7 +479,7 @@ fn render_tile(
         .data(|d| d.get_temp::<String>(confirm_delete_id()))
         .is_some_and(|asking| asking == ch.uuid);
     if !confirming {
-        super::playlist::overlay_on_picture(ui, picture_rect, ch, actions);
+        super::playlist::overlay_on_picture(ui, picture_rect, ch, data, actions);
         // Rows at the foot of the picture, from the bottom: a timer's, a
         // presentation's, a clip's.
         let timer = usize::from(super::timer::of_channel(ch).is_some());
@@ -491,6 +490,7 @@ fn render_tile(
             picture_rect,
             ch,
             timer + powerpoint + talks,
+            data,
             actions,
         );
         super::timer::overlay_on_picture(ui, picture_rect, ch, actions);

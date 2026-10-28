@@ -612,6 +612,7 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `POST` | `/api/channels` |  |
 | `DELETE` | `/api/channels/{channel_uuid}` |  |
 | `PUT` | `/api/channels/{channel_uuid}/blend-mode` |  |
+| `PUT` | `/api/channels/{channel_uuid}/color` |  |
 | `PUT` | `/api/channels/{channel_uuid}/move` |  |
 | `PUT` | `/api/channels/{channel_uuid}/name` |  |
 | `PUT` | `/api/channels/{channel_uuid}/opacity` |  |

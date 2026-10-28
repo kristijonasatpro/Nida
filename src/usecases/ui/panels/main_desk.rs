@@ -252,33 +252,35 @@ pub(super) fn render_toolbar(ui: &mut egui::Ui, data: &UIData, actions: &mut UIA
                 .background_color(NEXT_GREEN),
         );
         let can_take = next.is_some_and(|ch| ch.overlay || !channel_on_main(data, ch));
-        if ui
-            .add_enabled(
-                can_take,
-                egui::Button::new(big("CUT (Space)")).min_size(egui::vec2(70.0, 30.0)),
-            )
-            .on_hover_text("Put the next channel on Main now (Space)")
-            .clicked()
-        {
-            take_next(data, actions, false);
-        }
-        let transition = data.main.transition;
-        if ui
-            .add_enabled(
-                can_take && data.main.fade.is_none(),
-                egui::Button::new(big(&format!("{} (Enter)", transition.name().to_uppercase())))
-                    .min_size(egui::vec2(70.0, 30.0)),
-            )
-            .on_hover_text(format!(
-                "Take the next channel to Main — {} — over {} (Enter)",
-                transition.name().to_lowercase(),
-                seconds(data.main.fade_secs)
-            ))
-            .clicked()
-        {
-            take_next(data, actions, true);
-        }
-        transition_picker(ui, "main_transition", data, actions);
+        super::record::with_record_warning(ui, data, None, |ui| {
+            if ui
+                .add_enabled(
+                    can_take,
+                    egui::Button::new(big("CUT (Space)")).min_size(egui::vec2(70.0, 30.0)),
+                )
+                .on_hover_text("Put the next channel on Main now (Space)")
+                .clicked()
+            {
+                take_next(data, actions, false);
+            }
+            let transition = data.main.transition;
+            if ui
+                .add_enabled(
+                    can_take && data.main.fade.is_none(),
+                    egui::Button::new(big(&format!("{} (Enter)", transition.name().to_uppercase())))
+                        .min_size(egui::vec2(70.0, 30.0)),
+                )
+                .on_hover_text(format!(
+                    "Take the next channel to Main — {} — over {} (Enter)",
+                    transition.name().to_lowercase(),
+                    seconds(data.main.fade_secs)
+                ))
+                .clicked()
+            {
+                take_next(data, actions, true);
+            }
+            transition_picker(ui, "main_transition", data, actions);
+        });
         egui::ComboBox::from_id_salt("main_fade_time")
             .selected_text(seconds(data.main.fade_secs))
             .width(64.0)

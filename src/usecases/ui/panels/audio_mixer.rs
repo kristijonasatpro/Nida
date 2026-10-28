@@ -616,7 +616,7 @@ fn processing_meters(
                 ui.set_width(100.0);
                 ui.label(label);
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(54.0, 160.0), egui::Sense::hover());
-                let _ = meter(ui, rect, levels, None);
+                let _ = meter(ui, rect, levels, None, None);
                 ui.label(
                     egui::RichText::new(format!("L {:+.1}  R {:+.1}", levels[0], levels[1])).small(),
                 );
@@ -1148,28 +1148,43 @@ fn input_strip(
         AudioSourceKind::Clip { deck_uuid } => Some(deck_uuid.as_str()),
         AudioSourceKind::Live { .. } | AudioSourceKind::Input { .. } => None,
     };
-    // A clip plays and pauses from the left of its name: what plays is seen,
-    // and stopped, in the mixer.
+    // A clip or a playlist plays and stops from the left of its name: what
+    // plays is seen, and stopped, in the mixer. Stopped, its sound fades out
+    // first, as the Stop's right-click sets.
     let playing = clip_deck.and_then(|deck| {
-        data.channels
+        let deck = data
+            .channels
             .iter()
             .flat_map(|c| &c.decks)
-            .find(|d| d.uuid == deck)?
-            .video_playback
-            .as_ref()
-            .map(|vp| vp.playing)
+            .find(|d| d.uuid == deck)?;
+        match (&deck.playlist, &deck.video_playback) {
+            (Some(list), _) => Some((list.playing, true)),
+            (None, Some(vp)) => Some((vp.playing, false)),
+            (None, None) => None,
+        }
     });
     let mut name_rect = layout.header;
-    if let (Some(playing), Some(deck)) = (playing, clip_deck) {
+    if let (Some((playing, playlist)), Some(deck)) = (playing, clip_deck) {
         let play = egui::Rect::from_min_size(layout.header.min, egui::vec2(HEADER, HEADER));
         name_rect.set_left(play.right());
-        let (glyph, hover) = if playing {
-            ("⏸", "Pause the clip")
-        } else {
-            ("▶", "Play the clip")
+        let (glyph, hover, name) = match (playing, playlist) {
+            (true, false) => (
+                "⏸",
+                super::transport::stop_hover(data, deck, "Pause"),
+                "Pause the clip",
+            ),
+            (true, true) => (
+                "■",
+                super::transport::stop_hover(data, deck, "Stop"),
+                "Stop the playlist",
+            ),
+            (false, false) => ("▶", "Play the clip".to_string(), "Play the clip"),
+            (false, true) => ("▶", "Play the playlist".to_string(), "Play the playlist"),
         };
         let response = ui.interact(play, id.with("play"), egui::Sense::click());
-        let back = if playing {
+        let back = if playing && super::transport::stopping(data, deck) {
+            super::transport::FADING_AMBER
+        } else if playing {
             super::transport::PLAYING_GREEN
         } else if response.hovered() {
             egui::Color32::from_gray(60)
@@ -1184,10 +1199,23 @@ fn input_strip(
             egui::FontId::proportional(12.0),
             egui::Color32::WHITE,
         );
-        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, hover));
-        if response.on_hover_text(hover).clicked() {
-            actions.commands.push(EngineCommand::VideoTogglePlay {
-                deck_uuid: deck.to_string(),
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, name));
+        let response = response.on_hover_text(hover);
+        if playing {
+            if response.clicked() {
+                super::transport::stop(actions, deck);
+            }
+            super::transport::stop_menu(&response, data, actions);
+        } else if response.clicked() {
+            actions.commands.push(if playlist {
+                EngineCommand::SetPlaylistPlaying {
+                    deck_uuid: deck.to_string(),
+                    playing: true,
+                }
+            } else {
+                EngineCommand::VideoTogglePlay {
+                    deck_uuid: deck.to_string(),
+                }
             });
         }
     }
@@ -1343,7 +1371,16 @@ fn input_strip(
             gain_db: db,
         });
     }
-    if strip_meter(ui, layout.meter, source.meter_db, source.peak_db, name) {
+    let quiet = unheard(source, &data.audio_mix.buses).map(|why| Quiet {
+        levels: source.signal_db,
+        colour: why.colour(),
+        why: why.said(),
+    });
+    let response = meter(ui, layout.meter, source.meter_db, Some(source.peak_db), quiet.as_ref());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Reset peak {name}"))
+    });
+    if response.clicked() {
         actions.commands.push(EngineCommand::ResetAudioMeter {
             uuid: source.uuid.clone(),
             bus: false,
@@ -2046,11 +2083,11 @@ fn knob(
 }
 
 /// Stereo sample peaks use a dBFS scale independent of fader gain.
-fn meter_travel(db: f32) -> f32 {
+pub(super) fn meter_travel(db: f32) -> f32 {
     ((db + 60.0) / 60.0).clamp(0.0, 1.0)
 }
 
-fn meter_color(db: f32) -> egui::Color32 {
+pub(super) fn meter_color(db: f32) -> egui::Color32 {
     if db >= 0.0 {
         egui::Color32::from_rgb(230, 60, 50)
     } else if db >= -12.0 {
@@ -2068,6 +2105,67 @@ fn peak_text(db: f32) -> String {
     }
 }
 
+/// Why a source that plays is not heard: sent to no bus, or silenced
+/// where it is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unheard {
+    /// None of M, A, B… lit.
+    Nowhere,
+    /// Its own speaker off.
+    Muted,
+    /// Audio Auto keeps it down while its input is off air.
+    Held,
+    /// Every bus it is sent to is off.
+    BusesOff,
+}
+
+impl Unheard {
+    /// Blue for sent nowhere; pink — not the red of a peak — for silenced.
+    fn colour(self) -> egui::Color32 {
+        match self {
+            Self::Nowhere => egui::Color32::from_rgb(80, 150, 240),
+            Self::Muted | Self::Held | Self::BusesOff => egui::Color32::from_rgb(235, 120, 200),
+        }
+    }
+
+    fn said(self) -> &'static str {
+        match self {
+            Self::Nowhere => "Playing, but sent to no bus: nobody hears it",
+            Self::Muted => "Playing, but its sound is off",
+            Self::Held => "Playing, but Audio Auto keeps it down while its input is off air",
+            Self::BusesOff => "Playing, but every bus it is sent to is off",
+        }
+    }
+}
+
+/// Why `source` is not heard, if it is not. A send to a bus that is not
+/// there goes nowhere.
+fn unheard(source: &AudioSourceSnapshot, buses: &[AudioBusSnapshot]) -> Option<Unheard> {
+    let reached: Vec<&AudioBusSnapshot> = source
+        .sends
+        .iter()
+        .filter_map(|send| buses.iter().find(|b| &b.config.uuid == send))
+        .collect();
+    if reached.is_empty() {
+        Some(Unheard::Nowhere)
+    } else if source.muted {
+        Some(Unheard::Muted)
+    } else if source.gate <= 0.001 {
+        Some(Unheard::Held)
+    } else if reached.iter().all(|b| b.config.muted) {
+        Some(Unheard::BusesOff)
+    } else {
+        None
+    }
+}
+
+/// A source's level while it is not heard: in its own colour, with why.
+struct Quiet {
+    levels: [f32; 2],
+    colour: egui::Color32,
+    why: &'static str,
+}
+
 fn strip_meter(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -2075,7 +2173,7 @@ fn strip_meter(
     peaks: [f32; 2],
     name: &str,
 ) -> bool {
-    let response = meter(ui, rect, levels, Some(peaks));
+    let response = meter(ui, rect, levels, Some(peaks), None);
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Reset peak {name}"))
     });
@@ -2087,6 +2185,7 @@ fn meter(
     rect: egui::Rect,
     meter_db: [f32; 2],
     held: Option<[f32; 2]>,
+    quiet: Option<&Quiet>,
 ) -> egui::Response {
     let response = ui.interact(
         rect,
@@ -2145,16 +2244,22 @@ fn meter(
         );
     }
     let half = track.width() / 2.0;
-    for (i, db) in meter_db.iter().enumerate() {
+    // Unheard: what it plays, in the colour that says why, instead of what
+    // is heard of it (nothing).
+    let (shown, bands) = match quiet {
+        Some(q) => (q.levels, vec![(-60.0, 0.0, q.colour)]),
+        None => (
+            meter_db,
+            vec![(-60.0, -12.0, meter_color(-24.0)), (-12.0, 0.0, meter_color(-6.0))],
+        ),
+    };
+    for (i, db) in shown.iter().enumerate() {
         let bar = egui::Rect::from_min_size(
             egui::pos2(track.left() + half * i as f32 + 0.5, track.top()),
             egui::vec2(half - 1.5, track.height()),
         );
         painter.rect_filled(bar, 1.0, egui::Color32::from_rgb(8, 30, 12));
-        for (low, high, color) in [
-            (-60.0, -12.0, meter_color(-24.0)),
-            (-12.0, 0.0, meter_color(-6.0)),
-        ] {
+        for &(low, high, color) in &bands {
             let top = (*db).min(high);
             if top > low {
                 painter.rect_filled(
@@ -2167,7 +2272,7 @@ fn meter(
                 );
             }
         }
-        if held.is_some() && peaks[i] > -60.0 {
+        if held.is_some() && quiet.is_none() && peaks[i] > -60.0 {
             let y = bar.bottom() - meter_travel(peaks[i]) * bar.height();
             painter.line_segment(
                 [egui::pos2(bar.left(), y), egui::pos2(bar.right(), y)],
@@ -2175,26 +2280,34 @@ fn meter(
             );
         }
     }
+    // Unheard, what it plays now — the bars' measure — not the peak of what
+    // was heard of it.
+    let (label, readout) = match quiet {
+        Some(q) => ("Plays", q.levels[0].max(q.levels[1])),
+        None if held.is_some() => ("Peak", maximum),
+        None => ("Now", maximum),
+    };
     painter.text(
         egui::pos2(rect.center().x, rect.bottom() - 19.0),
         egui::Align2::CENTER_CENTER,
-        if held.is_some() { "Peak" } else { "Now" },
+        label,
         egui::FontId::proportional(8.0),
         TICK,
     );
     painter.text(
         egui::pos2(rect.center().x, rect.bottom() - 6.0),
         egui::Align2::CENTER_CENTER,
-        peak_text(maximum),
+        peak_text(readout),
         egui::FontId::proportional(9.0),
-        if maximum >= 0.0 {
+        if readout >= 0.0 {
             meter_color(0.0)
         } else {
             egui::Color32::WHITE
         },
     );
-    response.on_hover_text(format!("Stereo sample peaks, dBFS (not fader gain or true peak).\nNow L {} / R {}\nPeak L {} / R {}{}",
-        peak_text(meter_db[0]),peak_text(meter_db[1]),peak_text(peaks[0]),peak_text(peaks[1]),
+    let why = quiet.map_or_else(String::new, |q| format!("{} — what it plays shown:\n", q.why));
+    response.on_hover_text(format!("{why}Stereo sample peaks, dBFS (not fader gain or true peak).\nNow L {} / R {}\nPeak L {} / R {}{}",
+        peak_text(shown[0]),peak_text(shown[1]),peak_text(peaks[0]),peak_text(peaks[1]),
         if held.is_some(){"\nPeaks and 0 dBFS warning latch on the audio thread. Click to reset; sound is unchanged."}else{""}))
 }
 
@@ -2383,6 +2496,7 @@ mod tests {
             solo: false,
             live: true,
             meter_db: [-96.0, -96.0],
+            signal_db: [-96.0, -96.0],
             refused: None,
         }
     }
@@ -2420,6 +2534,7 @@ mod tests {
                     playing: false,
                 },
             ],
+            ..Default::default()
         };
         data
     }
@@ -2430,6 +2545,80 @@ mod tests {
             // Short frames, so two clicks fall within egui's double-click time.
             .with_step_dt(1.0 / 60.0)
             .build_ui(move |ui| render_audio_mixer_section(ui, data, actions))
+    }
+
+    /// A source that plays but is not heard says why: sent to no bus,
+    /// its sound off, held down by Audio Auto, or every bus it goes to off.
+    #[test]
+    fn a_source_not_heard_says_why() {
+        let buses = vec![bus("amaster1", "Master"), bus("astream1", "Bus A")];
+        let mut source = clip("a0000001", "music.mp3");
+        source.muted = false;
+        source.auto = false;
+        assert_eq!(unheard(&source, &buses), None, "heard");
+        source.sends.clear();
+        assert_eq!(unheard(&source, &buses), Some(Unheard::Nowhere));
+        source.sends = vec!["amaster1".into()];
+        source.muted = true;
+        assert_eq!(unheard(&source, &buses), Some(Unheard::Muted));
+        source.muted = false;
+        source.auto = true;
+        source.gate = 0.0;
+        assert_eq!(unheard(&source, &buses), Some(Unheard::Held));
+        source.gate = 1.0;
+        let mut off = buses.clone();
+        off[0].config.muted = true;
+        assert_eq!(unheard(&source, &off), Some(Unheard::BusesOff));
+        source.sends.push("astream1".into());
+        assert_eq!(unheard(&source, &off), None, "Bus A is on");
+        // A send to a bus that is not there goes nowhere.
+        source.sends = vec!["gone".into()];
+        assert_eq!(unheard(&source, &buses), Some(Unheard::Nowhere));
+        source.sends = vec!["amaster1".into(), "gone".into()];
+        assert_eq!(unheard(&source, &off), Some(Unheard::BusesOff));
+    }
+
+    /// Its meter shows what it plays in the colour that says why — blue for
+    /// sent nowhere, pink for silenced — and the usual colours when heard.
+    #[test]
+    fn a_source_not_heard_shows_what_it_plays_in_its_colour() {
+        let painted = |source: AudioSourceSnapshot| {
+            let mut data = mixer_data();
+            data.audio_mix.sources[0] = source;
+            let mut actions = UIActions::new();
+            let mut harness = harness(&data, &mut actions);
+            harness.run();
+            let colours: Vec<egui::Color32> = harness
+                .output()
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Rect(r) => Some(r.fill),
+                    _ => None,
+                })
+                .collect();
+            let blue = colours.contains(&Unheard::Nowhere.colour());
+            let pink = colours.contains(&Unheard::Muted.colour());
+            // Unheard, its readout is what it plays — "Plays" — not the peak
+            // of what was heard of it.
+            let says_plays = harness.output().shapes.iter().any(|c| {
+                matches!(&c.shape, egui::Shape::Text(t) if t.galley.job.text == "Plays")
+            });
+            assert_eq!(says_plays, blue || pink, "its readout");
+            (blue, pink)
+        };
+        let mut source = clip("a0000001", "music.mp3");
+        source.muted = false;
+        source.auto = false;
+        source.signal_db = [-18.0, -20.0];
+        source.meter_db = [-18.0, -20.0];
+        assert_eq!(painted(source.clone()), (false, false), "heard");
+        source.sends.clear();
+        assert_eq!(painted(source.clone()), (true, false), "sent nowhere");
+        source.sends = vec!["amaster1".into()];
+        source.muted = true;
+        source.meter_db = [-96.0, -96.0];
+        assert_eq!(painted(source), (false, true), "its sound off");
     }
 
     /// A clip's strip is named by its input's number and its name's
@@ -2465,7 +2654,8 @@ mod tests {
     }
 
     /// A clip plays and pauses from its strip, green while it plays: what
-    /// plays is seen, and stopped, in the mixer.
+    /// plays is seen, and stopped, in the mixer — its pause a Stop, which
+    /// fades its sound out first.
     #[test]
     fn a_clip_plays_and_pauses_from_its_strip() {
         let mut data = mixer_data();
@@ -2491,8 +2681,9 @@ mod tests {
         });
         let actions = run(&data, &["Pause the clip"]);
         assert!(
-            actions.commands.iter().any(
-                |c| matches!(c, EngineCommand::VideoTogglePlay { deck_uuid } if *deck_uuid == deck)
+            matches!(
+                actions.commands.as_slice(),
+                [EngineCommand::StopWithFade { deck_uuid, secs: None }] if *deck_uuid == deck
             ),
             "{:?}",
             actions.commands
@@ -2503,6 +2694,64 @@ mod tests {
         harness.run();
         assert_eq!(harness.query_all_by_label("Pause the clip").count(), 1);
         assert_eq!(harness.query_all_by_label("Play the clip").count(), 0);
+    }
+
+    /// A playlist's strip plays it, and stops it with a Stop; a Stop's
+    /// right-click chooses how long it fades — or a cut.
+    #[test]
+    fn a_playlist_plays_and_stops_from_its_strip() {
+        let mut data = mixer_data();
+        let deck = data.channels[0].decks[0].uuid.clone();
+        data.audio_mix.sources[0].kind = AudioSourceKind::Clip {
+            deck_uuid: deck.clone(),
+        };
+        let list = |playing| crate::engine::value::playlist::PlaylistSnapshot {
+            items: vec![crate::engine::value::playlist::PlaylistItem::new("/a.mp3")],
+            settings: crate::engine::value::playlist::PlaylistSettings::default(),
+            playing,
+            shown: Some(0),
+            coming: None,
+            next_ready: None,
+            failed: Vec::new(),
+            remaining: None,
+        };
+        data.channels[0].decks[0].playlist = Some(list(false));
+        let actions = run(&data, &["Play the playlist"]);
+        assert!(
+            matches!(
+                actions.commands.as_slice(),
+                [EngineCommand::SetPlaylistPlaying { deck_uuid, playing: true }] if *deck_uuid == deck
+            ),
+            "{:?}",
+            actions.commands
+        );
+        data.channels[0].decks[0].playlist = Some(list(true));
+        let actions = run(&data, &["Stop the playlist"]);
+        assert!(
+            matches!(
+                actions.commands.as_slice(),
+                [EngineCommand::StopWithFade { deck_uuid, secs: None }] if *deck_uuid == deck
+            ),
+            "{:?}",
+            actions.commands
+        );
+        let mut actions = UIActions::new();
+        {
+            let mut harness = harness(&data, &mut actions);
+            harness.run();
+            harness.get_by_label("Stop the playlist").click_secondary();
+            harness.run();
+            harness.get_by_label("Fade 1 s").click();
+            harness.run();
+        }
+        assert!(
+            matches!(
+                actions.commands.as_slice(),
+                [EngineCommand::SetStopFade { secs }] if (*secs - 1.0).abs() < 1e-6
+            ),
+            "{:?}",
+            actions.commands
+        );
     }
 
     /// The mixer in a panel `size`, drawn.

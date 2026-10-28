@@ -233,6 +233,10 @@ pub struct ChannelConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub overlay: bool,
 
+    /// The colour the operator gave it; left out, the one its place gives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 3]>,
+
     #[serde(default)]
     pub decks: Vec<DeckConfig>,
 
@@ -1602,6 +1606,7 @@ mod tests {
             version: 2,
             channels: vec![ChannelConfig {
                 overlay: false,
+                color: None,
                 uuid: crate::deck::generate_short_uuid(),
                 name: "Ch 0".into(),
                 opacity: 1.0,
@@ -2136,6 +2141,7 @@ mod tests {
             version: 2,
             channels: vec![ChannelConfig {
                 overlay: false,
+                color: None,
                 uuid: crate::deck::generate_short_uuid(),
                 name: "Test Ch".into(),
                 opacity: 0.9,
@@ -2181,6 +2187,7 @@ mod tests {
             version: 2,
             channels: vec![ChannelConfig {
                 overlay: false,
+                color: None,
                 uuid: crate::deck::generate_short_uuid(),
                 name: "Ch 0".into(),
                 opacity: 1.0,
@@ -2289,6 +2296,7 @@ mod tests {
     fn validate_channel_opacity_out_of_range() {
         let ch = ChannelConfig {
             overlay: false,
+            color: None,
             uuid: crate::deck::generate_short_uuid(),
             name: "Bad".into(),
             opacity: 2.0,

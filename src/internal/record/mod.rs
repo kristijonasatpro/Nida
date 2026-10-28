@@ -147,6 +147,10 @@ pub struct RecordOptions {
     /// Frames per second; `None` is Varda's own.
     #[serde(default)]
     pub fps: Option<u32>,
+    /// While not recording, NOT RECORDING blinks behind the take buttons:
+    /// in the middle of a show, Record is easily forgotten.
+    #[serde(default)]
+    pub warn_when_off: bool,
 }
 
 impl Default for RecordOptions {
@@ -162,6 +166,7 @@ impl Default for RecordOptions {
             audio_kbps: default_audio_kbps(),
             size: None,
             fps: None,
+            warn_when_off: false,
         }
     }
 }
@@ -371,6 +376,10 @@ pub struct RecordStatus {
     pub fps: u32,
     /// The last finished recording, for "Show in Finder".
     pub last_file: Option<String>,
+    /// The audio-mixer bus the running recording carries, as chosen when it
+    /// started; none idle, or carrying silence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_bus: Option<String>,
 }
 
 impl RecordStatus {
@@ -386,6 +395,7 @@ impl RecordStatus {
             dropped: 0,
             fps: 0,
             last_file,
+            audio_bus: None,
         }
     }
 

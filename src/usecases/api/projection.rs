@@ -181,6 +181,7 @@ pub(crate) mod tests {
                 channels: vec![ChannelSnapshot {
                     overlay: false,
                     on_air: None,
+                    color: None,
                     idx: 0,
                     uuid: "ch-001".into(),
                     name: "Channel A".into(),

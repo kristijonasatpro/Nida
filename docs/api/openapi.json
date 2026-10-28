@@ -2311,6 +2311,50 @@
         }
       }
     },
+    "/api/channels/{channel_uuid}/color": {
+      "put": {
+        "tags": [
+          "Channels"
+        ],
+        "operationId": "set_color",
+        "parameters": [
+          {
+            "name": "channel_uuid",
+            "in": "path",
+            "description": "Channel UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelColorBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Channel not found"
+          }
+        }
+      }
+    },
     "/api/channels/{channel_uuid}/decks/camera": {
       "post": {
         "tags": [
@@ -15007,6 +15051,23 @@
           }
         }
       },
+      "ChannelColorBody": {
+        "type": "object",
+        "properties": {
+          "color": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "Red, green, blue (0–255); left out or null, the channel takes back\nthe colour its place gives."
+          }
+        }
+      },
       "ChannelMoveBody": {
         "type": "object",
         "properties": {
@@ -19083,6 +19144,10 @@
             "format": "int32",
             "description": "Video bit rate in kbit/s; `None` picks one for the size and frame\nrate. Not used for `ProRes`.",
             "minimum": 0
+          },
+          "warn_when_off": {
+            "type": "boolean",
+            "description": "While not recording, NOT RECORDING blinks behind the take buttons:\nin the middle of a show, Record is easily forgotten."
           }
         }
       },
@@ -19113,6 +19178,13 @@
           "dropped"
         ],
         "properties": {
+          "audio_bus": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The audio-mixer bus the running recording carries, as chosen when it\nstarted; none idle, or carrying silence."
+          },
           "bytes": {
             "type": "integer",
             "format": "int64",
@@ -20060,6 +20132,13 @@
         "type": "object",
         "description": "The time of day a step is taken by itself at.",
         "properties": {
+          "always": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Taken at its time even when GO would take another step next; left\nas it is when not given."
+          },
           "secs": {
             "type": [
               "integer",
@@ -20253,6 +20332,13 @@
             ],
             "format": "float",
             "description": "Seconds after the step is taken (more than none, an hour at most; no\nsooner than the step's own fade is done) — or `null` to wait for GO."
+          },
+          "when_ends": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Instead of a time: the UUID of a clip or playlist the step starts or\ncarries on — the next step is taken when it has played to its end."
           }
         }
       },
@@ -20481,6 +20567,13 @@
                 "description": "The video bit rate following the upload, while it does; `None` while\nit stays as set."
               }
             ]
+          },
+          "audio_bus": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The audio-mixer bus the running stream carries, as chosen when it\nstarted; none stopped, or carrying silence."
           },
           "destinations": {
             "type": "array",

@@ -13,10 +13,33 @@ pub(super) const PREVIEW_GREEN: egui::Color32 = egui::Color32::from_rgb(40, 150,
 /// `AUTO` durations offered, in seconds. A fixed menu rather than a drag
 /// value: one pick is one command, not a stream of them while dragging.
 pub(super) const AUTO_DURATIONS: [f32; 6] = [0.5, 1.0, 1.5, 2.0, 3.0, 5.0];
-/// A source button: big enough to hit without looking twice.
-const SOURCE_BUTTON: egui::Vec2 = egui::vec2(84.0, 40.0);
-/// `CUT` and `AUTO`.
-const TAKE_BUTTON: egui::Vec2 = egui::vec2(76.0, 34.0);
+/// A source button: big enough to hit without looking twice, and every one
+/// the same size — a long name takes two lines, then ends in "…".
+const SOURCE_BUTTON: egui::Vec2 = egui::vec2(112.0, 44.0);
+/// `CUT` and `AUTO`: bigger than a source, apart from them on the right.
+const TAKE_BUTTON: egui::Vec2 = egui::vec2(120.0, 46.0);
+/// The column the take buttons stand in.
+const TAKE_COLUMN: f32 = 128.0;
+/// The coloured band along the top of a channel's button.
+const COLOUR_BAND: f32 = 5.0;
+/// The room the line between the sources and the takes stands in.
+const DIVIDER: f32 = 10.0;
+/// The most of a screen's name the picker shows; the rest is "…".
+const SCREEN_NAME_CHARS: usize = 20;
+
+/// `text` cut to `chars` characters, ending in "…" when cut.
+fn cut_short(text: &str, chars: usize) -> String {
+    if text.chars().count() <= chars {
+        text.to_string()
+    } else {
+        let kept: String = text.chars().take(chars.saturating_sub(1)).collect();
+        format!("{}…", kept.trim_end())
+    }
+}
+
+/// The width a card's menus take beside its name: Buttons, Master and the
+/// Screen picker, at their longest.
+const MENUS_ROOM: f32 = 400.0;
 
 pub(super) fn render_switcher_section(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
     for bus in &data.buses {
@@ -42,7 +65,19 @@ fn render_bus(ui: &mut egui::Ui, bus_ui: &BusUI, data: &UIData, actions: &mut UI
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_width(ui.available_width());
 
-        ui.horizontal(|ui| {
+        // Its name, then its menus — at the right where there is room, else
+        // in lines under it rather than widening the card past the panel.
+        let name_width = ui
+            .painter()
+            .layout_no_wrap(
+                bus.name.clone(),
+                egui::TextStyle::Body.resolve(ui.style()),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x;
+        let roomy = ui.available_width() >= name_width + MENUS_ROOM;
+        let header = |ui: &mut egui::Ui, actions: &mut UIActions| {
             let name = ui
                 .add(egui::Label::new(egui::RichText::new(&bus.name).strong()).sense(egui::Sense::click()))
                 .on_hover_text("Double-click to rename; right-click for more");
@@ -61,11 +96,26 @@ fn render_bus(ui: &mut egui::Ui, bus_ui: &BusUI, data: &UIData, actions: &mut UI
                         ui.close();
                     }
                 });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                render_screen_picker(ui, bus_ui, data, actions);
+            if roomy {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    render_screen_picker(ui, bus_ui, data, actions);
+                    ui.label(egui::RichText::new("Screen:").small());
+                    render_master_menu(ui, bus_ui, data, actions);
+                    render_buttons_menu(ui, bus, data, actions);
+                });
+            }
+        };
+        ui.horizontal(|ui| header(ui, actions));
+        if !roomy {
+            ui.horizontal(|ui| {
+                render_buttons_menu(ui, bus, data, actions);
                 render_master_menu(ui, bus_ui, data, actions);
             });
-        });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Screen:").small());
+                render_screen_picker(ui, bus_ui, data, actions);
+            });
+        }
 
         ui.horizontal(|ui| {
             tally(
@@ -83,86 +133,308 @@ fn render_bus(ui: &mut egui::Ui, bus_ui: &BusUI, data: &UIData, actions: &mut UI
             );
         });
 
-        ui.horizontal_wrapped(|ui| {
-            for (input, label) in sources(data) {
-                let fill = if input == bus.program {
-                    Some(PROGRAM_RED)
-                } else if input == bus.preview {
-                    Some(PREVIEW_GREEN)
-                } else {
-                    None
-                };
-                let mut text = egui::RichText::new(&label).strong();
-                if fill.is_some() {
-                    text = text.color(egui::Color32::WHITE);
-                }
-                let mut button = egui::Button::new(text).min_size(SOURCE_BUTTON);
-                if let Some(fill) = fill {
-                    button = button.fill(fill);
-                }
-                if ui
-                    .add(button)
-                    .on_hover_text(format!("Put {label} on {}'s Preview", bus.name))
-                    .clicked()
-                {
-                    actions.commands.push(EngineCommand::SetBusPreview {
-                        uuid: uuid.clone(),
-                        input,
+        // The sources on the left, the takes on the right: a take is never
+        // mistaken for one more source. Too narrow for both side by side,
+        // the takes go under the sources.
+        let spacing = ui.spacing().item_spacing.x;
+        let room = ui.available_width() - TAKE_COLUMN - DIVIDER - 2.0 * spacing;
+        if room < SOURCE_BUTTON.x {
+            ui.horizontal_wrapped(|ui| render_sources(ui, bus, data, actions));
+            ui.add_space(4.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(TAKE_COLUMN, SOURCE_BUTTON.y),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    super::record::with_record_warning(ui, data, Some(18.0), |ui| {
+                        render_takes(ui, bus, actions);
                     });
-                }
-            }
+                },
+            );
+            return;
+        }
+        let row = ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(room, SOURCE_BUTTON.y),
+                egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
+                |ui| {
+                    ui.set_min_width(room);
+                    render_sources(ui, bus, data, actions);
+                },
+            );
+            // A line between them as tall as the row, drawn once the row's
+            // height is known: a separator would run to the panel's foot.
+            let line = ui.cursor().left() + DIVIDER / 2.0;
+            ui.add_space(DIVIDER);
+            ui.allocate_ui_with_layout(
+                egui::vec2(TAKE_COLUMN, SOURCE_BUTTON.y),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    super::record::with_record_warning(ui, data, Some(18.0), |ui| {
+                        render_takes(ui, bus, actions);
+                    });
+                },
+            );
+            line
         });
+        ui.painter().vline(
+            row.inner,
+            row.response.rect.y_range(),
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+    });
+}
 
-        ui.horizontal(|ui| {
-            let transitioning = bus.transition.is_some();
+/// The bus's source buttons — those it has not had taken off its row — Program
+/// red and Preview green; a click stages one on Preview.
+fn render_sources(
+    ui: &mut egui::Ui,
+    bus: &crate::engine::BusSnapshot,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
+    let uuid = &bus.uuid;
+    let mut shown = 0;
+    for (input, label) in sources(data) {
+        if bus.hidden_sources.contains(&input) {
+            continue;
+        }
+        shown += 1;
+        let fill = if input == bus.program {
+            Some(PROGRAM_RED)
+        } else if input == bus.preview {
+            Some(PREVIEW_GREEN)
+        } else {
+            None
+        };
+        let channel = match &input {
+            BusInputRef::Channel(ch) => data.channels.iter().find(|c| &c.uuid == ch),
+            _ => None,
+        };
+        let response = source_button(ui, &label, fill, channel)
+            .on_hover_text(format!("{label}\nPut it on {}'s Preview", bus.name));
+        if response.clicked() {
+            actions.commands.push(EngineCommand::SetBusPreview {
+                uuid: uuid.clone(),
+                input: input.clone(),
+            });
+        }
+        response.context_menu(|ui| {
             if ui
-                .add_enabled(
-                    !transitioning,
-                    egui::Button::new(egui::RichText::new("CUT").strong()).min_size(TAKE_BUTTON),
-                )
-                .on_hover_text("Swap Preview and Program now")
-                .clicked()
-            {
-                actions
-                    .commands
-                    .push(EngineCommand::BusCut { uuid: uuid.clone() });
-            }
-            if ui
-                .add_enabled(
-                    !transitioning,
-                    egui::Button::new(egui::RichText::new("AUTO").strong()).min_size(TAKE_BUTTON),
-                )
+                .button(format!("Remove from {}", bus.name))
                 .on_hover_text(format!(
-                    "Fade Preview to Program over {}",
-                    seconds(bus.auto_duration)
+                    "Take this button off {}'s row — Buttons ▾ puts it back. \
+                     What is on the bus is not changed.",
+                    bus.name
                 ))
                 .clicked()
             {
-                actions.commands.push(EngineCommand::BusAuto {
+                actions.commands.push(EngineCommand::SetBusSourceHidden {
                     uuid: uuid.clone(),
-                    duration_secs: None,
+                    input: input.clone(),
+                    hidden: true,
                 });
+                ui.close();
             }
-            egui::ComboBox::from_id_salt(format!("bus_auto_{uuid}"))
-                .selected_text(seconds(bus.auto_duration))
-                .width(56.0)
-                .show_ui(ui, |ui| {
-                    for d in AUTO_DURATIONS {
-                        let current = (bus.auto_duration - d).abs() < 1e-3;
-                        if ui.selectable_label(current, seconds(d)).clicked() && !current {
-                            actions.commands.push(EngineCommand::SetBusAutoDuration {
-                                uuid: uuid.clone(),
-                                duration_secs: d,
-                            });
-                        }
-                    }
-                });
-            if let Some(t) = &bus.transition {
-                ui.add(egui::ProgressBar::new(t.progress).desired_width(60.0));
-                ui.ctx().request_repaint();
+            if let Some(ch) = channel {
+                ui.separator();
+                super::colours::palette(ui, ch, actions);
             }
         });
+    }
+    if shown == 0 {
+        ui.label(
+            egui::RichText::new(format!("No buttons on {} — choose some in Buttons ▾", bus.name))
+                .small()
+                .weak(),
+        );
+    }
+}
+
+/// A source button, every one the same size: its name over two lines at
+/// most, then "…"; a channel's colour along its top, and a colour the
+/// operator gave it all over it. Program and Preview fill it red and green.
+fn source_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    fill: Option<egui::Color32>,
+    channel: Option<&super::super::ChannelUIInfo>,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(SOURCE_BUTTON, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let given = channel.and_then(|ch| ch.color);
+        let background = fill.unwrap_or_else(|| match given {
+            Some(colour) => {
+                let dark = colour.gamma_multiply(0.45);
+                egui::Color32::from_rgb(dark.r(), dark.g(), dark.b())
+            }
+            None => visuals.weak_bg_fill,
+        });
+        let painter = ui.painter();
+        painter.rect(
+            rect,
+            visuals.corner_radius,
+            background,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        if let Some(ch) = channel {
+            let band = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), COLOUR_BAND));
+            painter.rect_filled(
+                band,
+                egui::CornerRadius {
+                    nw: 3,
+                    ne: 3,
+                    sw: 0,
+                    se: 0,
+                },
+                ch.accent(),
+            );
+        }
+        let colour = if fill.is_some() || given.is_some() {
+            egui::Color32::WHITE
+        } else {
+            visuals.text_color()
+        };
+        let mut job = egui::text::LayoutJob::simple(
+            label.to_string(),
+            egui::FontId::proportional(13.5),
+            colour,
+            rect.width() - 10.0,
+        );
+        job.wrap = egui::text::TextWrapping {
+            max_width: rect.width() - 10.0,
+            max_rows: 2,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        };
+        job.halign = egui::Align::Center;
+        let galley = painter.layout_job(job);
+        let top = rect.center().y + COLOUR_BAND / 2.0 - galley.size().y / 2.0;
+        painter.galley(egui::pos2(rect.center().x, top), galley, colour);
+    }
+    let label = label.to_string();
+    response.widget_info(move || {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label)
     });
+    response
+}
+
+/// `CUT` and `AUTO`, big, one over the other, with the AUTO time and the
+/// take's progress under them.
+fn render_takes(ui: &mut egui::Ui, bus: &crate::engine::BusSnapshot, actions: &mut UIActions) {
+    let uuid = &bus.uuid;
+    let transitioning = bus.transition.is_some();
+    let big = |text: &str| egui::RichText::new(text).size(18.0).strong();
+    if ui
+        .add_enabled(
+            !transitioning,
+            egui::Button::new(big("CUT")).min_size(TAKE_BUTTON),
+        )
+        .on_hover_text("Swap Preview and Program now")
+        .clicked()
+    {
+        actions
+            .commands
+            .push(EngineCommand::BusCut { uuid: uuid.clone() });
+    }
+    if ui
+        .add_enabled(
+            !transitioning,
+            egui::Button::new(big("AUTO")).min_size(TAKE_BUTTON),
+        )
+        .on_hover_text(format!(
+            "Fade Preview to Program over {}",
+            seconds(bus.auto_duration)
+        ))
+        .clicked()
+    {
+        actions.commands.push(EngineCommand::BusAuto {
+            uuid: uuid.clone(),
+            duration_secs: None,
+        });
+    }
+    egui::ComboBox::from_id_salt(format!("bus_auto_{uuid}"))
+        .selected_text(seconds(bus.auto_duration))
+        .width(TAKE_BUTTON.x - 8.0)
+        .show_ui(ui, |ui| {
+            for d in AUTO_DURATIONS {
+                let current = (bus.auto_duration - d).abs() < 1e-3;
+                if ui.selectable_label(current, seconds(d)).clicked() && !current {
+                    actions.commands.push(EngineCommand::SetBusAutoDuration {
+                        uuid: uuid.clone(),
+                        duration_secs: d,
+                    });
+                }
+            }
+        })
+        .response
+        .on_hover_text("How long AUTO fades");
+    if let Some(t) = &bus.transition {
+        ui.add(egui::ProgressBar::new(t.progress).desired_width(TAKE_BUTTON.x));
+        ui.ctx().request_repaint();
+    }
+}
+
+/// Which sources the bus's row has a button for: an LED wall that only ever
+/// shows three inputs offers those three. Taking one off only takes the
+/// button away; the right-click menu does it too.
+fn render_buttons_menu(
+    ui: &mut egui::Ui,
+    bus: &crate::engine::BusSnapshot,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
+    let all = sources(data);
+    let shown = all
+        .iter()
+        .filter(|(input, _)| !bus.hidden_sources.contains(input))
+        .count();
+    let label = if shown == all.len() {
+        "Buttons: all".to_string()
+    } else {
+        format!("Buttons: {shown} of {}", all.len())
+    };
+    ui.menu_button(egui::RichText::new(label).small(), |ui| {
+        ui.label(egui::RichText::new(format!("Buttons on {}", bus.name)).strong());
+        ui.label(
+            egui::RichText::new(
+                "The sources this bus's row has a button for. \
+                 What is on the bus is not changed.",
+            )
+            .small()
+            .weak(),
+        );
+        for (input, name) in &all {
+            let mut on = !bus.hidden_sources.contains(input);
+            if ui.checkbox(&mut on, name).changed() {
+                actions.commands.push(EngineCommand::SetBusSourceHidden {
+                    uuid: bus.uuid.clone(),
+                    input: input.clone(),
+                    hidden: !on,
+                });
+            }
+        }
+        if ui
+            .add_enabled(shown < all.len(), egui::Button::new("Show all"))
+            .clicked()
+        {
+            for (input, _) in &all {
+                if bus.hidden_sources.contains(input) {
+                    actions.commands.push(EngineCommand::SetBusSourceHidden {
+                        uuid: bus.uuid.clone(),
+                        input: input.clone(),
+                        hidden: false,
+                    });
+                }
+            }
+        }
+    })
+    .response
+    .on_hover_text(format!(
+        "Choose which inputs {}'s row has buttons for — e.g. three on an LED wall",
+        bus.name
+    ));
 }
 
 /// Which channels the bus's Master is made of — vMix's per-output overlay
@@ -227,8 +499,10 @@ fn render_screen_picker(ui: &mut egui::Ui, bus_ui: &BusUI, data: &UIData, action
                 .map_or_else(|| key.to_string(), |m| m.label.clone())
         },
     );
+    // Cut short: a long screen name must not widen the menus past the room
+    // the card's header leaves them. The list shows it whole.
     egui::ComboBox::from_id_salt(format!("bus_screen_{uuid}"))
-        .selected_text(egui::RichText::new(current).small())
+        .selected_text(egui::RichText::new(cut_short(&current, SCREEN_NAME_CHARS)).small())
         .width(120.0)
         .show_ui(ui, |ui| {
             if ui
@@ -279,7 +553,6 @@ fn render_screen_picker(ui: &mut egui::Ui, bus_ui: &BusUI, data: &UIData, action
                 }
             }
         });
-    ui.label(egui::RichText::new("Screen:").small());
 }
 
 /// "Cut to" / "Fade to" every bus, for an input's right-click menu: the quick
@@ -825,5 +1098,229 @@ mod tests {
         for deck in ["test_generator_a", "test_generator_d"] {
             assert!(harness.query_by_label(deck).is_none(), "{deck} listed");
         }
+    }
+
+    fn harness_of(data: UIData, size: egui::Vec2) -> egui_kittest::Harness<'static, UIActions> {
+        egui_kittest::Harness::builder()
+            .with_size(size)
+            .build_ui_state(
+                move |ui, actions: &mut UIActions| render_switcher_section(ui, &data, actions),
+                UIActions::new(),
+            )
+    }
+
+    /// Every source button is the same size, however long its name; the
+    /// name is cut to two lines rather than widening it.
+    #[test]
+    fn source_buttons_are_one_size_whatever_the_name() {
+        let mut data = UIData::test_fixture();
+        data.channels[1].name = "1_Forward-looking statements about the year ahead".into();
+        let long = data.channels[1].numbered();
+        let mut harness = harness_of(data, egui::vec2(700.0, 480.0));
+        harness.run_steps(2);
+        let short = harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "1  Ch A")
+            .rect();
+        let long = harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, &long)
+            .rect();
+        let black = harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Black")
+            .rect();
+        assert_eq!(long.size(), short.size(), "a long name must not widen its button");
+        assert_eq!(black.size(), short.size());
+        assert_eq!(short.size(), SOURCE_BUTTON);
+    }
+
+    /// CUT and AUTO stand apart, right of every source and bigger than one.
+    #[test]
+    fn cut_and_auto_stand_right_of_the_sources_and_bigger() {
+        let data = UIData::test_fixture();
+        let mut harness = harness_of(data, egui::vec2(700.0, 480.0));
+        harness.run_steps(2);
+        let sources_right = ["Black", "Master", "1  Ch A", "2  Ch B"]
+            .iter()
+            .map(|l| {
+                harness
+                    .get_by_role_and_label(egui::accesskit::Role::Button, l)
+                    .rect()
+                    .right()
+            })
+            .fold(f32::MIN, f32::max);
+        for take in ["CUT", "AUTO"] {
+            let rect = harness.get_by_label(take).rect();
+            assert!(rect.left() > sources_right, "{take} at {rect:?}, sources end {sources_right}");
+            assert!(rect.width() > SOURCE_BUTTON.x, "{take} is not bigger: {rect:?}");
+        }
+    }
+
+    /// A source taken off a bus's row has no button there; the Buttons
+    /// menu says how many are left and puts it back.
+    #[test]
+    fn a_bus_row_shows_only_the_buttons_chosen_for_it() {
+        let mut data = UIData::test_fixture();
+        data.buses[0].bus.hidden_sources = vec![
+            BusInputRef::Black,
+            BusInputRef::Channel("ca000001".into()),
+        ];
+        let mut harness = harness_of(data, egui::vec2(700.0, 480.0));
+        harness.run_steps(2);
+        assert!(harness
+            .query_by_role_and_label(egui::accesskit::Role::Button, "Black")
+            .is_none());
+        assert!(harness
+            .query_by_role_and_label(egui::accesskit::Role::Button, "1  Ch A")
+            .is_none());
+        harness.get_by_role_and_label(egui::accesskit::Role::Button, "2  Ch B");
+        harness.get_by_label("Buttons: 2 of 4").click();
+        harness.run_steps(2);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, "1  Ch A")
+            .click();
+        harness.run_steps(2);
+        assert!(
+            harness.state().commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetBusSourceHidden { uuid, input: BusInputRef::Channel(ch), hidden: false }
+                    if uuid == "bus00001" && ch == "ca000001"
+            )),
+            "{:?}",
+            harness.state().commands
+        );
+    }
+
+    /// A source's right-click takes its button off the row, and gives a
+    /// channel its colour.
+    #[test]
+    fn a_sources_right_click_removes_it_or_colours_it() {
+        let data = UIData::test_fixture();
+        let mut harness = harness_of(data, egui::vec2(700.0, 600.0));
+        harness.run_steps(2);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "2  Ch B")
+            .click_secondary();
+        harness.run_steps(2);
+        harness.get_by_label("Teal").click();
+        harness.run_steps(2);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "2  Ch B")
+            .click_secondary();
+        harness.run_steps(2);
+        harness.get_by_label("Remove from TV").click();
+        harness.run_steps(2);
+        let commands = &harness.state().commands;
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetChannelColor { channel_uuid, color: Some([35, 160, 155]) }
+                    if channel_uuid == "cb000001"
+            )),
+            "{commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetBusSourceHidden { uuid, input: BusInputRef::Channel(ch), hidden: true }
+                    if uuid == "bus00001" && ch == "cb000001"
+            )),
+            "{commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|c| matches!(c, EngineCommand::SetBusPreview { .. })),
+            "a right-click stages nothing: {commands:?}"
+        );
+    }
+
+    /// With the reminder on, NOT RECORDING stands over the takes while not
+    /// recording, and goes once recording — or with the reminder off.
+    #[test]
+    fn not_recording_shows_over_the_takes_only_when_asked_and_not_recording() {
+        let shows = |warn: bool, recording: bool| {
+            let mut data = UIData::test_fixture();
+            data.record.options.warn_when_off = warn;
+            data.record.status.recording = recording;
+            let mut harness = harness_of(data, egui::vec2(700.0, 480.0));
+            harness.run_steps(2);
+            harness.query_by_label("NOT RECORDING").is_some()
+        };
+        assert!(shows(true, false));
+        assert!(!shows(true, true));
+        assert!(!shows(false, false));
+    }
+
+    /// In a narrow panel the takes go under the sources, inside the panel;
+    /// wide, beside them, and "+ Bus" stays just under the card.
+    #[test]
+    fn the_takes_stay_inside_a_narrow_panel() {
+        for width in [240.0, 700.0] {
+            let data = UIData::test_fixture();
+            let mut harness = harness_of(data, egui::vec2(width, 600.0));
+            harness.run_steps(2);
+            let black = harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, "Black")
+                .rect();
+            for take in ["CUT", "AUTO"] {
+                let rect = harness.get_by_label(take).rect();
+                assert!(rect.right() <= width, "{take} at {rect:?} in {width}");
+                if width < 300.0 {
+                    assert!(rect.top() > black.bottom(), "{take} under the sources: {rect:?}");
+                } else {
+                    assert!(rect.left() > black.right(), "{take} beside the sources");
+                }
+            }
+            let screen = harness.get_by_value("Off").rect();
+            assert!(screen.right() <= width, "the Screen picker at {screen:?} in {width}");
+            let add = harness.get_by_label("+ Bus").rect();
+            assert!(add.top() < 520.0, "+ Bus at {add:?} in {width}");
+        }
+    }
+
+    /// A long bus name in a middling panel: its menus go under it, not over
+    /// it.
+    #[test]
+    fn a_long_bus_name_keeps_its_menus_off_it() {
+        let mut data = UIData::test_fixture();
+        data.buses[0].bus.name = "Conference Livestream Program".into();
+        let width = 470.0;
+        let mut harness = harness_of(data, egui::vec2(width, 600.0));
+        harness.run_steps(2);
+        let name = harness.get_by_label("Conference Livestream Program").rect();
+        for menu in ["Buttons: all", "Master: all"] {
+            let rect = harness.get_by_label(menu).rect();
+            assert!(
+                rect.left() >= name.right() || rect.top() >= name.bottom(),
+                "{menu} at {rect:?} over the name at {name:?}"
+            );
+            assert!(rect.left() >= 0.0 && rect.right() <= width, "{menu} at {rect:?}");
+        }
+        let screen = harness.get_by_value("Off").rect();
+        assert!(screen.left() >= name.right() || screen.top() >= name.bottom());
+    }
+
+    /// A long screen name is cut to the picker's width, not widening it.
+    #[test]
+    fn a_long_screen_name_is_cut_to_the_picker() {
+        let mut data = UIData::test_fixture();
+        let name = "LG UltraFine 5K Display (5120×2880) on the left of the desk";
+        data.available_monitors = vec![MonitorInfo {
+            name: "lg".into(),
+            index: 1,
+            width: 5120,
+            height: 2880,
+            is_control: false,
+            label: name.into(),
+            model: None,
+            given_name: None,
+            identity: "lg".into(),
+            main: false,
+        }];
+        data.buses[0].screen = Some("lg".into());
+        let mut harness = harness_of(data, egui::vec2(700.0, 600.0));
+        harness.run_steps(2);
+        let picker = harness
+            .get_by_value(&cut_short(name, SCREEN_NAME_CHARS))
+            .rect();
+        assert!(picker.width() <= 140.0, "the picker at {picker:?}");
+        assert_eq!(cut_short("Off", SCREEN_NAME_CHARS), "Off");
     }
 }

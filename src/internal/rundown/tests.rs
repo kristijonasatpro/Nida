@@ -365,7 +365,7 @@ fn a_wait_leads_to_the_next_step_when_it_is_up() {
     let follow = rundown.follow().expect("counting").clone();
     assert_eq!(
         follow,
-        Follow { from: ids[0].clone(), to: ids[1].clone(), due: T0 + 5.0, fade: false }
+        Follow::at(ids[0].clone(), ids[1].clone(), T0 + 5.0, false)
     );
     assert_eq!(rundown.due(T0 + 4.99), None);
     assert_eq!(rundown.due(T0 + 5.0), Some(&follow));
@@ -376,7 +376,7 @@ fn a_wait_leads_to_the_next_step_when_it_is_up() {
     assert!(rundown.follow().is_none(), "B has no wait of its own");
     assert_eq!(rundown.due(T0 + 99.0), None);
     rundown.taken(&ids[0], false, T0, 0.0);
-    assert!(rundown.hold());
+    assert!(rundown.hold(0.0));
     assert_eq!(rundown.due(T0 + 99.0), None);
     // Faded to over longer than its wait, it goes on when its own fade is
     // done; over less, when the wait is up.
@@ -409,8 +409,8 @@ fn a_wait_is_dropped_when_the_operator_steps_in() {
             r.set_next(&ids[3]);
         }),
         ("hold", |r, _| {
-            assert!(r.hold());
-            assert!(!r.hold(), "nothing left to hold");
+            assert!(r.hold(0.0));
+            assert!(!r.hold(0.0), "nothing left to hold");
         }),
         ("a step renamed", |r, ids| {
             r.rename(&ids[1], "B2");
@@ -444,7 +444,7 @@ fn a_wait_is_dropped_when_the_operator_steps_in() {
     }
     // Held, the show is still on A.
     arm(&mut rundown);
-    rundown.hold();
+    rundown.hold(0.0);
     assert_eq!((last(&rundown), next(&rundown)), (Some("A"), Some("B")));
 }
 
@@ -690,8 +690,8 @@ fn a_new_step_is_named_by_the_first_letter_free() {
 fn a_step_is_due_at_its_time_of_day_while_it_is_next() {
     let (mut rundown, [a, b, _, _]) = abcd();
     let nine = 9 * 3600;
-    assert!(rundown.set_at(&a, Some(nine)));
-    assert!(rundown.set_at(&b, Some(nine + 900)));
+    assert!(rundown.set_at(&a, Some(nine), None));
+    assert!(rundown.set_at(&b, Some(nine + 900), None));
     let at = |secs: u32| f64::from(secs);
     let due = |rundown: &Rundown, was: f64, now: f64| rundown.due_at(was, now).map(|s| s.uuid.clone());
 
@@ -708,22 +708,22 @@ fn a_step_is_due_at_its_time_of_day_while_it_is_next() {
     assert!(rundown.taken(&a, true, T0, 0.0));
     assert_eq!(due(&rundown, at(nine + 899), at(nine + 900)), Some(b.clone()));
     // Held: not due, till it is made next again.
-    assert!(rundown.hold());
+    assert!(rundown.hold(at(nine)));
     assert_eq!(rundown.at_held(), Some(b.as_str()));
     assert_eq!(due(&rundown, at(nine + 899), at(nine + 900)), None, "held");
     assert!(rundown.set_next(&b));
     assert_eq!(rundown.at_held(), None);
     assert_eq!(due(&rundown, at(nine + 899), at(nine + 900)), Some(b.clone()));
     // Its time changed lets a hold go too; a step taken does.
-    assert!(rundown.hold());
-    assert!(rundown.set_at(&b, Some(nine + 1800)));
+    assert!(rundown.hold(at(nine)));
+    assert!(rundown.set_at(&b, Some(nine + 1800), None));
     assert_eq!(rundown.at_held(), None);
-    assert!(rundown.hold());
+    assert!(rundown.hold(at(nine)));
     assert!(rundown.taken(&a, false, T0, 0.0));
     assert_eq!(rundown.at_held(), None);
 
     // Across midnight: at 00:00:30, due from 23:59:59 to 00:00:31.
-    assert!(rundown.set_at(&b, Some(30)));
+    assert!(rundown.set_at(&b, Some(30), None));
     assert_eq!(due(&rundown, 86_399.0, 31.0), Some(b.clone()));
     // Due, it is taken as a wait run out is: now, faded.
     assert!(rundown.start_at(&b, T0));
@@ -731,7 +731,7 @@ fn a_step_is_due_at_its_time_of_day_while_it_is_next() {
     assert_eq!(follow.to, b);
     assert!(follow.fade);
     // A time past the day is none.
-    assert!(rundown.set_at(&a, Some(DAY_SECS)));
+    assert!(rundown.set_at(&a, Some(DAY_SECS), None));
     assert_eq!(rundown.step(&a).unwrap().at_secs, None);
 }
 
@@ -773,13 +773,201 @@ fn a_steps_play_keeps_its_fade_out_and_its_timer() {
 #[test]
 fn only_midnight_is_a_step_back_of_the_clock_that_takes_a_step() {
     let (mut rundown, [a, _, _, _]) = abcd();
-    assert!(rundown.set_at(&a, Some(9 * 3600)));
+    assert!(rundown.set_at(&a, Some(9 * 3600), None));
     // From 10:00:05 back to 09:00:10: no forward crossing of 9:00.
     assert!(rundown.due_at(36_005.0, 32_410.0).is_none(), "set back");
     // From 09:00:30 back to 09:00:10 — a nudge back — neither.
     assert!(rundown.due_at(32_430.0, 32_410.0).is_none(), "nudged back");
     // A step at 23:59:59: due from 23:59:58.8 to 00:00:00.1.
-    assert!(rundown.set_at(&a, Some(DAY_SECS - 1)));
+    assert!(rundown.set_at(&a, Some(DAY_SECS - 1), None));
     assert!(rundown.due_at(86_398.8, 0.1).is_some(), "just before midnight");
     assert!(rundown.due_at(86_399.5, 0.1).is_none(), "already past it");
 }
+
+/// A step taken at its time even when not next: due as the clock comes to
+/// it wherever the rundown is — not when the show is on it already, not
+/// while held, and its hold stays through steps taken meanwhile till its
+/// time is set again. The countdown and Hold go by the timed step coming
+/// first. Without a time it is not one.
+#[test]
+fn a_step_at_its_time_even_when_not_next() {
+    let (mut rundown, [a, b, c, _]) = abcd();
+    let at = |secs: u32| f64::from(secs);
+    let quarter = 9 * 3600 + 900;
+    assert!(rundown.set_at(&c, Some(quarter), Some(true)));
+    assert!(rundown.step(&c).unwrap().at_always);
+    assert!(rundown.taken(&a, false, T0, 0.0));
+    let due = |r: &Rundown, was: f64, now: f64| r.due_always(was, now).map(|s| s.uuid.clone());
+    // B is next; C is due at 9:15 all the same, and only C.
+    assert_eq!(rundown.due_at(at(quarter) - 0.5, at(quarter) + 0.1), None, "B has no time");
+    assert_eq!(due(&rundown, at(quarter) - 0.5, at(quarter) + 0.1), Some(c.clone()));
+    assert_eq!(due(&rundown, at(quarter) + 0.1, at(quarter) + 0.2), None, "once");
+    // The countdown: C, B having no time.
+    assert_eq!(rundown.coming_at(at(9 * 3600)).map(|s| s.uuid.clone()), Some(c.clone()));
+    // On it already: not again.
+    assert!(rundown.taken(&c, true, T0, 0.0));
+    assert_eq!(due(&rundown, at(quarter) - 0.5, at(quarter) + 0.1), None, "on it");
+    // Held before its time: not due, held through steps taken meanwhile.
+    assert!(rundown.taken(&a, false, T0, 0.0));
+    assert!(rundown.hold(at(9 * 3600)));
+    assert!(rundown.is_held(&c));
+    assert!(rundown.taken(&b, false, T0, 0.0));
+    assert!(rundown.set_next(&a));
+    assert!(rundown.is_held(&c), "kept");
+    assert_eq!(due(&rundown, at(quarter) - 0.5, at(quarter) + 0.1), None, "held");
+    // Its time set again lets the hold go.
+    assert!(rundown.set_at(&c, Some(quarter), None));
+    assert!(!rundown.is_held(&c));
+    assert!(rundown.step(&c).unwrap().at_always, "None leaves it");
+    assert_eq!(due(&rundown, at(quarter) - 0.5, at(quarter) + 0.1), Some(c.clone()));
+    // The next step's time first, when it comes first.
+    assert!(rundown.set_at(&a, Some(9 * 3600 + 600), None));
+    assert_eq!(rundown.coming_at(at(9 * 3600)).map(|s| s.uuid.clone()), Some(a.clone()));
+    assert_eq!(rundown.coming_at(at(9 * 3600 + 700)).map(|s| s.uuid.clone()), Some(c.clone()));
+    // Not "always" without a time; not "always" any more, not due.
+    assert!(rundown.set_at(&c, None, None));
+    assert!(!rundown.step(&c).unwrap().at_always);
+    assert!(rundown.set_at(&c, Some(quarter), Some(false)));
+    assert_eq!(due(&rundown, at(quarter) - 0.5, at(quarter) + 0.1), None);
+}
+
+/// Saved, a step taken at its time even when not next says so; one that
+/// is not, says nothing of it.
+#[test]
+fn even_when_not_next_is_saved_only_when_so() {
+    let mut step = Step::new("Keynote");
+    step.at_secs = Some(9 * 3600);
+    assert!(!serde_json::to_string(&step).unwrap().contains("at_always"));
+    step.at_always = true;
+    let json = serde_json::to_string(&step).unwrap();
+    assert!(json.contains(r#""at_always":true"#), "{json}");
+    let back: Step = serde_json::from_str(&json).unwrap();
+    assert!(back.at_always);
+    let mut timeless: Step = serde_json::from_str(&json.replace(r#""at_secs":32400,"#, "")).unwrap();
+    timeless.tidy();
+    assert!(!timeless.at_always, "not without a time");
+}
+
+/// Holds side by side: one taken even when not next stays held when the
+/// next step's time is held too. At one time, the step next goes first —
+/// the countdown says the one that is taken.
+#[test]
+fn holds_side_by_side_and_the_next_first_at_one_time() {
+    let (mut rundown, [a, b, c, _]) = abcd();
+    let at = |secs: u32| f64::from(secs);
+    let (ten, quarter) = (9 * 3600 + 600, 9 * 3600 + 900);
+    assert!(rundown.set_at(&c, Some(quarter), Some(true)));
+    assert!(rundown.taken(&a, false, T0, 0.0));
+    assert!(rundown.hold(at(9 * 3600)), "C, B having no time");
+    assert!(rundown.is_held(&c));
+    assert!(rundown.set_at(&b, Some(ten), None));
+    assert!(rundown.hold(at(9 * 3600)), "B now, its time first");
+    assert_eq!(rundown.at_held(), Some(b.as_str()));
+    assert!(rundown.is_held(&c), "C still held");
+    assert_eq!(rundown.due_always(at(quarter) - 0.5, at(quarter) + 0.1), None);
+    assert!(!rundown.hold(at(9 * 3600)), "nothing more to hold");
+
+    // At one time: B, next, goes first; the countdown says B.
+    let (mut rundown, [a, b, c, _]) = abcd();
+    assert!(rundown.set_at(&a, Some(quarter), Some(true)));
+    assert!(rundown.set_at(&c, Some(quarter), None));
+    assert!(rundown.taken(&b, false, T0, 0.0));
+    assert_eq!(rundown.next().map(|s| s.uuid.clone()), Some(c.clone()));
+    assert_eq!(rundown.coming_at(at(9 * 3600)).map(|s| s.uuid.clone()), Some(c.clone()));
+    assert_eq!(
+        rundown.due_at(at(quarter) - 0.5, at(quarter) + 0.1).map(|s| s.uuid.clone()),
+        Some(c),
+        "the one counted down to"
+    );
+    let _ = a;
+}
+
+/// Undo turning "even when not next" back under a hold keeps the hold
+/// where that step's holds are now: made next again lets it go.
+#[test]
+fn undo_moves_a_hold_to_where_the_steps_holds_are() {
+    let (mut rundown, [a, b, _, _]) = abcd();
+    let quarter = 9 * 3600 + 900;
+    assert!(rundown.set_at(&b, Some(quarter), None));
+    assert!(rundown.taken(&a, false, T0, 0.0));
+    let before = rundown.to_config();
+    assert!(rundown.set_at(&b, Some(quarter), Some(true)));
+    assert!(rundown.hold(f64::from(9 * 3600)));
+    assert_eq!(rundown.held_always(), std::slice::from_ref(&b));
+    rundown.restore_steps(&before);
+    assert!(!rundown.step(&b).unwrap().at_always);
+    assert_eq!(rundown.at_held(), Some(b.as_str()), "the next step's hold now");
+    assert!(rundown.held_always().is_empty());
+    assert!(rundown.set_next(&b));
+    assert!(!rundown.is_held(&b), "let go as the next step's is");
+
+    // A hold left on another step does not keep the next step's from
+    // coming over: B held, then moved after C; C ticked, held, untoggled.
+    let (mut rundown, [a, b, c, _]) = abcd();
+    assert!(rundown.set_at(&b, Some(quarter - 300), None));
+    assert!(rundown.set_at(&c, Some(quarter), None));
+    assert!(rundown.taken(&a, false, T0, 0.0));
+    assert!(rundown.hold(f64::from(9 * 3600)));
+    assert_eq!(rundown.at_held(), Some(b.as_str()));
+    let mut moved = rundown.to_config();
+    let at = moved.steps.iter().position(|s| s.uuid == b).unwrap();
+    let step = moved.steps.remove(at);
+    moved.steps.insert(at + 1, step);
+    rundown.restore_steps(&moved);
+    assert_eq!(rundown.next().map(|s| s.uuid.clone()), Some(c.clone()));
+    let before = rundown.to_config();
+    assert!(rundown.set_at(&c, Some(quarter), Some(true)));
+    assert!(rundown.hold(f64::from(9 * 3600)));
+    assert!(rundown.held_always().contains(&c));
+    rundown.restore_steps(&before);
+    assert_eq!(rundown.at_held(), Some(c.as_str()), "C, next, held still");
+    assert_eq!(rundown.due_at(f64::from(quarter) - 0.5, f64::from(quarter) + 0.1), None);
+}
+
+/// A step goes on to the next when a clip or playlist it starts ends: set
+/// only for one it starts or carries on, instead of a time; gone when that
+/// one is taken out or paused. Taken, it waits — no time known — till the
+/// app has seen it playing, then at its end; no sooner than the take's own
+/// fades are done.
+#[test]
+fn a_step_goes_on_when_what_it_plays_ends() {
+    let (mut rundown, [a, b, _, _]) = abcd();
+    assert!(!rundown.set_then_ends(&a, Some("music")), "A does not play it");
+    assert!(rundown.set_play(&a, "music", Some(PlayAction::Start)));
+    assert!(rundown.set_play(&a, "video", Some(PlayAction::Start)));
+    assert!(rundown.set_then(&a, Some(5.0)));
+    assert!(rundown.set_then_ends(&a, Some("music")));
+    let step = rundown.step(&a).unwrap();
+    assert_eq!((step.then_ends.as_deref(), step.then_secs), (Some("music"), None), "not both");
+
+    assert!(rundown.taken(&a, true, T0, 2.0));
+    assert_eq!(rundown.awaited_end(), Some("music"));
+    assert_eq!(rundown.due(T0 + 999.0), None, "no time");
+    assert!(!rundown.end_came(T0 + 0.1), "an end before it was seen playing");
+    rundown.saw_running();
+    assert!(rundown.end_came(T0 + 0.5));
+    assert_eq!(rundown.due(T0 + 1.9), None, "not before the fades are done");
+    assert_eq!(rundown.due(T0 + 2.0).map(|f| f.to.clone()), Some(b.clone()));
+    assert_eq!(rundown.awaited_end(), None, "due now");
+
+    // A time set lets the end go; and taking the clip out, or pausing it.
+    assert!(rundown.set_then(&a, Some(3.0)));
+    assert_eq!(rundown.step(&a).unwrap().then_ends, None);
+    assert!(rundown.set_then_ends(&a, Some("music")));
+    assert!(rundown.set_play(&a, "music", Some(PlayAction::Pause)));
+    assert_eq!(rundown.step(&a).unwrap().then_ends, None, "paused: no end");
+    assert!(rundown.set_play(&a, "music", Some(PlayAction::Start)));
+    assert!(rundown.set_then_ends(&a, Some("music")));
+    assert!(rundown.set_play(&a, "music", None));
+    assert_eq!(rundown.step(&a).unwrap().then_ends, None, "taken out");
+
+    // Saved and read back.
+    let mut step = Step::new("Walk-in");
+    step.plays.push(PlaySet::new("music", PlayAction::Start));
+    step.then_ends = Some("music".into());
+    let json = serde_json::to_string(&step).unwrap();
+    assert!(json.contains(r#""then_ends":"music""#), "{json}");
+    let back: Step = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.then_ends.as_deref(), Some("music"));
+}
+

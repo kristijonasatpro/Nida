@@ -358,6 +358,10 @@ impl VardaApp {
             EngineCommand::RenameChannel { channel_uuid, name } => {
                 self.cmd_rename_channel(&channel_uuid, &name)
             }
+            EngineCommand::SetChannelColor {
+                channel_uuid,
+                color,
+            } => self.cmd_set_channel_color(&channel_uuid, color),
             EngineCommand::MoveChannel {
                 channel_uuid,
                 before_channel_uuid,
@@ -598,6 +602,11 @@ impl VardaApp {
                 channel_uuid,
                 hidden,
             } => self.cmd_set_bus_layer_hidden(&uuid, &channel_uuid, hidden),
+            EngineCommand::SetBusSourceHidden {
+                uuid,
+                input,
+                hidden,
+            } => self.cmd_set_bus_source_hidden(&uuid, &input, hidden),
 
             EngineCommand::AddAudioBus { name } => self.cmd_add_audio_bus(&name),
             EngineCommand::RemoveAudioBus { uuid } => self.cmd_remove_audio_bus(&uuid),
@@ -756,8 +765,16 @@ impl VardaApp {
                 deck_uuid,
                 timer,
             } => self.cmd_set_rundown_timer(&uuid, &deck_uuid, timer),
-            EngineCommand::SetRundownThen { uuid, secs } => self.cmd_set_rundown_then(&uuid, secs),
-            EngineCommand::SetRundownAt { uuid, at_secs } => self.cmd_set_rundown_at(&uuid, at_secs),
+            EngineCommand::SetRundownThen {
+                uuid,
+                secs,
+                when_ends,
+            } => self.cmd_set_rundown_then(&uuid, secs, when_ends.as_deref()),
+            EngineCommand::SetRundownAt {
+                uuid,
+                at_secs,
+                always,
+            } => self.cmd_set_rundown_at(&uuid, at_secs, always),
             EngineCommand::CaptureRundownStep { uuid } => self.cmd_capture_rundown_step(&uuid),
             EngineCommand::TakeRundownStep { uuid, fade } => {
                 self.cmd_take_rundown_step(&uuid, fade)
@@ -1062,6 +1079,22 @@ impl VardaApp {
             } => wire(self.edit_playlist(&deck_uuid, |list| list.set_settings(settings))),
             EngineCommand::SetPlaylistPlaying { deck_uuid, playing } => {
                 wire(self.edit_playlist(&deck_uuid, |list| list.set_playing(playing)))
+            }
+            EngineCommand::StopWithFade { deck_uuid, secs } => {
+                self.cmd_stop_with_fade(&deck_uuid, secs)
+            }
+            EngineCommand::SetStopFade { secs } => {
+                if self.audio_mix.set_stop_fade_secs(secs) {
+                    CommandResult::Ok
+                } else {
+                    CommandResult::Err {
+                        code: ErrorCode::InvalidInput,
+                        message: format!(
+                            "A stop fades for 0 to {} seconds",
+                            crate::audio_mix::MAX_STOP_FADE_SECS
+                        ),
+                    }
+                }
             }
             EngineCommand::ShowPlaylistItem { deck_uuid, index } => {
                 wire(self.edit_playlist(&deck_uuid, |list| list.show_item(index)))
@@ -2447,6 +2480,10 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::VideoSetAutoPlayback { .. }
             // Playlist transport: what plays is live, like a clip's.
             | C::SetPlaylistPlaying { .. }
+            // A Stop is transport too, and how long it fades is the
+            // console's, like the rundown's fade time.
+            | C::StopWithFade { .. }
+            | C::SetStopFade { .. }
             | C::ShowPlaylistItem { .. }
             // Starting and stopping a timer is live, like a clip's transport.
             | C::ControlTimer { .. }
@@ -2683,10 +2720,12 @@ mod tests {
             C::SetRundownThen {
                 uuid: step(),
                 secs: None,
+                when_ends: None,
             },
             C::SetRundownAt {
                 uuid: step(),
                 at_secs: None,
+                always: None,
             },
             C::CaptureRundownStep { uuid: step() },
         ] {

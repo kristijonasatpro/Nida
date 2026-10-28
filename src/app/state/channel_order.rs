@@ -30,6 +30,25 @@ impl VardaApp {
         CommandResult::Ok
     }
 
+    /// Give a channel a colour of its own, or `None` for the one its place
+    /// gives.
+    pub fn cmd_set_channel_color(
+        &mut self,
+        channel_uuid: &str,
+        color: Option<[u8; 3]>,
+    ) -> CommandResult {
+        let Some(idx) = self.mixer.find_channel_by_uuid(channel_uuid) else {
+            return CommandResult::Err {
+                code: ErrorCode::NotFound,
+                message: format!("No channel {channel_uuid}"),
+            };
+        };
+        if let Some(ch) = self.mixer.channel_mut(idx) {
+            ch.color = color;
+        }
+        CommandResult::Ok
+    }
+
     /// Move a channel to just before another, or to the end. A later channel
     /// is drawn over an earlier one in the layered mixer, and it is the order
     /// the tiles, columns and rows show.

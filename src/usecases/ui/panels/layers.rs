@@ -8,7 +8,6 @@
 
 use super::super::{ChannelUIInfo, DeckDrag, LibraryDrag, UIActions, UIData};
 use super::main_desk::{self, NEXT_GREEN, ON_MAIN_RED};
-use super::utils::channel_color;
 use crate::engine::EngineCommand;
 use crate::mixer::MixMode;
 use crate::BlendMode;
@@ -76,7 +75,7 @@ fn cell_width(data: &UIData) -> f32 {
 }
 
 fn render_row(ui: &mut egui::Ui, ch: &ChannelUIInfo, data: &UIData, actions: &mut UIActions) {
-    let accent = channel_color(ch.ch_idx);
+    let accent = ch.accent();
     let main_mode = main_desk::in_main_mode(data);
     let on_main = main_mode && main_desk::channel_on_main(data, ch);
     let selected = data.selected_channel == Some(ch.ch_idx);
@@ -173,7 +172,7 @@ fn render_header(
     data: &UIData,
     actions: &mut UIActions,
 ) {
-    let accent = channel_color(ch.ch_idx);
+    let accent = ch.accent();
     let main_mode = main_desk::in_main_mode(data);
     let name = ui.add(
         egui::Label::new(
@@ -194,7 +193,7 @@ fn render_header(
     if let Some((deck, list)) = super::playlist::of_channel(ch) {
         ui.horizontal(|ui| {
             let size = egui::vec2(28.0, 22.0);
-            super::playlist::play_button(ui, &deck.uuid, list, size, actions);
+            super::playlist::play_button(ui, &deck.uuid, list, size, data, actions);
             super::playlist::list_button(ui, &deck.uuid, size);
         });
     }

@@ -22,6 +22,75 @@ const MARK: egui::Color32 = egui::Color32::from_rgb(240, 200, 80);
 
 /// A clip playing, on its tile and chips.
 pub(super) const PLAYING_GREEN: egui::Color32 = egui::Color32::from_rgb(40, 150, 60);
+/// A Stop fading a clip's or playlist's sound out.
+pub(super) const FADING_AMBER: egui::Color32 = egui::Color32::from_rgb(200, 135, 30);
+
+/// What a Stop can be set to do, for its right-click: cut, or fade out for
+/// so long.
+const STOP_FADES: [f32; 7] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0];
+
+/// Whether a clip's or playlist's sound is fading out to a stop now.
+pub(super) fn stopping(data: &UIData, deck_uuid: &str) -> bool {
+    data.audio_mix.stopping.iter().any(|d| d == deck_uuid)
+}
+
+/// "1 s", "0.5 s".
+fn fade_text(secs: f32) -> String {
+    if (secs - secs.round()).abs() < 1e-3 {
+        format!("{secs:.0} s")
+    } else {
+        format!("{secs} s")
+    }
+}
+
+/// What the Stop on a playing clip or playlist does, said over it: `verb`
+/// it ("Pause", "Stop") after its sound fades out — or at once, set to cut,
+/// or with its fade under way.
+pub(super) fn stop_hover(data: &UIData, deck_uuid: &str, verb: &str) -> String {
+    let secs = data.audio_mix.stop_fade_secs;
+    if stopping(data, deck_uuid) {
+        format!("Fading out — click to {} now", verb.to_lowercase())
+    } else if secs <= 0.0 {
+        format!("{verb} at once (right-click: fade the sound out first)")
+    } else {
+        format!(
+            "{verb} — its sound fades out over {} first (right-click to change)",
+            fade_text(secs)
+        )
+    }
+}
+
+/// A Stop pressed: the engine fades the sound out over the Stop fade set,
+/// then pauses — or, already fading, stops it now.
+pub(super) fn stop(actions: &mut UIActions, deck_uuid: &str) {
+    actions.commands.push(EngineCommand::StopWithFade {
+        deck_uuid: deck_uuid.to_string(),
+        secs: None,
+    });
+}
+
+/// A Stop's right-click: cut, or fade out over 0.5 to 5 seconds — one
+/// choice for every Stop, on the tiles and in the Audio Mixer.
+pub(super) fn stop_menu(response: &egui::Response, data: &UIData, actions: &mut UIActions) {
+    response.context_menu(|ui| {
+        ui.label(egui::RichText::new("Stop").strong());
+        let set = data.audio_mix.stop_fade_secs;
+        for secs in STOP_FADES {
+            let label = if secs <= 0.0 {
+                "Cut".to_string()
+            } else {
+                format!("Fade {}", fade_text(secs))
+            };
+            let chosen = (set - secs).abs() < 1e-3;
+            if ui.selectable_label(chosen, label).clicked() {
+                if !chosen {
+                    actions.commands.push(EngineCommand::SetStopFade { secs });
+                }
+                ui.close();
+            }
+        }
+    });
+}
 
 /// "1:23": a time on a tile, to the second.
 fn short_clock(secs: f64) -> String {
@@ -68,6 +137,7 @@ pub(super) fn overlay_on_picture(
     picture: egui::Rect,
     ch: &ChannelUIInfo,
     rows_below: usize,
+    data: &UIData,
     actions: &mut UIActions,
 ) {
     // A playlist's own controls are there instead.
@@ -133,7 +203,7 @@ pub(super) fn overlay_on_picture(
     );
     row_ui.set_clip_rect(picture.intersect(ui.clip_rect()));
     row_ui.spacing_mut().item_spacing.x = 3.0;
-    let button = |ui: &mut egui::Ui, glyph: &str, hover: &str, lit: bool| {
+    let button = |ui: &mut egui::Ui, glyph: &str, hover: &str, fill: Option<egui::Color32>| {
         ui.add(
             egui::Button::new(
                 egui::RichText::new(glyph)
@@ -142,26 +212,34 @@ pub(super) fn overlay_on_picture(
                     .color(egui::Color32::WHITE),
             )
             .min_size(BUTTON)
-            .fill(if lit {
-                PLAYING_GREEN
-            } else {
-                egui::Color32::from_black_alpha(170)
-            }),
+            .fill(fill.unwrap_or_else(|| egui::Color32::from_black_alpha(170))),
         )
         .on_hover_text(hover)
     };
-    if button(&mut row_ui, "⏮", "Back to the start", false).clicked() {
+    if button(&mut row_ui, "⏮", "Back to the start", None).clicked() {
         actions.commands.push(EngineCommand::VideoSeek {
             deck_uuid: deck.uuid.clone(),
             position_secs: start,
         });
     }
-    let (glyph, hover) = if vp.playing {
-        ("⏸", "Pause")
-    } else {
-        ("▶", "Play")
-    };
-    if button(&mut row_ui, glyph, hover, vp.playing).clicked() {
+    // Pause fades the sound out first (as set by its right-click).
+    if vp.playing {
+        let fill = if stopping(data, &deck.uuid) {
+            FADING_AMBER
+        } else {
+            PLAYING_GREEN
+        };
+        let response = button(
+            &mut row_ui,
+            "⏸",
+            &stop_hover(data, &deck.uuid, "Pause"),
+            Some(fill),
+        );
+        if response.clicked() {
+            stop(actions, &deck.uuid);
+        }
+        stop_menu(&response, data, actions);
+    } else if button(&mut row_ui, "▶", "Play", None).clicked() {
         actions.commands.push(EngineCommand::VideoTogglePlay {
             deck_uuid: deck.uuid.clone(),
         });
@@ -251,14 +329,19 @@ fn clock(secs: f64) -> String {
 }
 
 /// The transport for `clip`, `width` wide; a word of explanation when the
-/// input has none.
+/// input has none. `compact`, where there is no room for the whole row, it
+/// keeps the bar, ⏮ ⏪ ▶ ⏩ and the times — In, Out and Loop are in the
+/// clip's settings. Returns the width its controls take, whatever `width`
+/// is: the room the row needs.
 pub(super) fn render_transport(
     ui: &mut egui::Ui,
     clip: Option<(&DeckUIInfo, &VideoPlaybackUI)>,
     several_layers: bool,
     width: f32,
+    compact: bool,
     actions: &mut UIActions,
-) {
+) -> f32 {
+    let mut needs = 0.0;
     ui.allocate_ui_with_layout(
         egui::vec2(width, HEIGHT),
         egui::Layout::top_down(egui::Align::Min),
@@ -266,11 +349,14 @@ pub(super) fn render_transport(
             ui.set_width(width);
             let Some((deck, vp)) = clip else {
                 ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("No video or sound in this input to play")
-                        .small()
-                        .weak(),
-                );
+                needs = ui
+                    .label(
+                        egui::RichText::new("No video or sound in this input to play")
+                            .small()
+                            .weak(),
+                    )
+                    .rect
+                    .width();
                 return;
             };
             let seek = |actions: &mut UIActions, secs: f64| {
@@ -283,7 +369,7 @@ pub(super) fn render_transport(
                 seek(actions, secs);
             }
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            needs = ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 3.0;
                 if button(ui, "⏮", "To the in-point", "Back to the in-point") {
                     seek(actions, vp.in_point);
@@ -318,6 +404,9 @@ pub(super) fn render_transport(
                         .weak(),
                 )
                 .on_hover_text("Left to play, to the out-point");
+                if compact {
+                    return;
+                }
                 ui.add_space(6.0);
                 if ui
                     .small_button("[ In")
@@ -369,9 +458,13 @@ pub(super) fn render_transport(
                         egui::Label::new(egui::RichText::new(&deck.name).small().weak()).truncate(),
                     );
                 }
-            });
+            })
+            .response
+            .rect
+            .width();
         },
     );
+    needs
 }
 
 /// A transport button: a glyph, named for screen readers and tests.
@@ -463,6 +556,29 @@ fn bar(ui: &mut egui::Ui, vp: &VideoPlaybackUI, width: f32) -> Option<f64> {
 mod tests {
     use super::*;
 
+    /// A Stop says what it will do: fade for so long, cut, or — already
+    /// fading — stop now.
+    #[test]
+    fn a_stop_says_how_it_stops() {
+        let mut data = UIData::test_fixture();
+        data.audio_mix.stop_fade_secs = 2.0;
+        assert_eq!(
+            stop_hover(&data, "deck0001", "Pause"),
+            "Pause — its sound fades out over 2 s first (right-click to change)"
+        );
+        data.audio_mix.stop_fade_secs = 0.5;
+        assert!(stop_hover(&data, "deck0001", "Stop").contains("over 0.5 s"));
+        data.audio_mix.stop_fade_secs = 0.0;
+        assert!(stop_hover(&data, "deck0001", "Stop").starts_with("Stop at once"));
+        data.audio_mix.stopping = vec!["deck0001".into()];
+        assert_eq!(
+            stop_hover(&data, "deck0001", "Pause"),
+            "Fading out — click to pause now"
+        );
+        assert!(stopping(&data, "deck0001"));
+        assert!(!stopping(&data, "deck0002"));
+    }
+
     #[test]
     fn times_read_as_minutes_seconds_and_tenths() {
         assert_eq!(clock(0.0), "00:00.0");
@@ -551,7 +667,7 @@ mod tile_tests {
             vp.position = position;
             let deck = deck.clone();
             let mut harness = egui_kittest::Harness::new_ui(move |ui| {
-                render_transport(ui, Some((&deck, &vp)), false, 400.0, &mut UIActions::new());
+                render_transport(ui, Some((&deck, &vp)), false, 400.0, false, &mut UIActions::new());
             });
             harness.run();
             harness.get_by_label("Playhead");
@@ -566,7 +682,7 @@ mod tile_tests {
         let name = format!("♪ {}", ch.decks[0].name);
         let harness = egui_kittest::Harness::new_ui(move |ui| {
             let picture = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(320.0, 120.0));
-            overlay_on_picture(ui, picture, &ch, 1, &mut UIActions::new());
+            overlay_on_picture(ui, picture, &ch, 1, &UIData::test_fixture(), &mut UIActions::new());
         });
         let label = harness.get_by_label(&name).rect();
         let play = harness.get_by_label("▶").rect();
@@ -585,7 +701,14 @@ mod tile_tests {
             let harness = egui_kittest::Harness::new_ui(move |ui| {
                 let picture =
                     egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(320.0, 180.0));
-                overlay_on_picture(ui, picture, &ch, rows_below, &mut UIActions::new());
+                overlay_on_picture(
+                    ui,
+                    picture,
+                    &ch,
+                    rows_below,
+                    &UIData::test_fixture(),
+                    &mut UIActions::new(),
+                );
             });
             harness.get_by_label("▶").rect().top()
         };
@@ -593,6 +716,47 @@ mod tile_tests {
         assert!(
             raised <= alone - BUTTON.y,
             "a row higher: {raised} against {alone}"
+        );
+    }
+
+    /// A playing clip's pause on its tile is a Stop: its sound fades out
+    /// first. Its right-click sets the fade.
+    #[test]
+    fn a_tiles_pause_fades_the_sound_out() {
+        let mut ch = UIData::test_fixture().channels[1].clone();
+        let mut vp = clip(false);
+        vp.playing = true;
+        ch.decks[1].video_playback = Some(vp);
+        let deck = ch.decks[1].uuid.clone();
+        let mut data = UIData::test_fixture();
+        data.audio_mix.stop_fade_secs = crate::audio_mix::DEFAULT_STOP_FADE_SECS;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(340.0, 200.0))
+            .build_ui_state(
+                move |ui, actions: &mut UIActions| {
+                    let picture =
+                        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(320.0, 180.0));
+                    overlay_on_picture(ui, picture, &ch, 0, &data, actions);
+                },
+                UIActions::new(),
+            );
+        harness.run();
+        harness.get_by_label("⏸").click();
+        harness.run();
+        harness.get_by_label("⏸").click_secondary();
+        harness.run();
+        harness.get_by_label("Cut").click();
+        harness.run();
+        let commands = &harness.state().commands;
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [
+                    EngineCommand::StopWithFade { deck_uuid, secs: None },
+                    EngineCommand::SetStopFade { secs },
+                ] if *deck_uuid == deck && *secs == 0.0
+            ),
+            "{commands:?}"
         );
     }
 }

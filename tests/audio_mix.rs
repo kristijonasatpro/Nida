@@ -239,6 +239,48 @@ fn a_clip_is_heard_only_while_it_is_on_air() {
     assert!(peak(tail(&gone, 0.3)) < 1e-4, "off air, silent");
 }
 
+/// A clip playing off air — Audio Auto keeping it down — is silent on its
+/// buses, and its strip still shows what it plays.
+#[test]
+fn a_clip_off_air_still_shows_what_it_plays() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some(path) = clip(dir.path(), "tone.mp4", "1") else {
+        return;
+    };
+    let Some(Rig {
+        mut app,
+        deck,
+        master,
+        ..
+    }) = rig(&path)
+    else {
+        return;
+    };
+    let source = |app: &VardaApp| {
+        app.build_engine_state()
+            .audio_mix
+            .sources
+            .into_iter()
+            .find(|s| s.uuid == deck)
+            .expect("the clip has a strip")
+    };
+    // Played off air — on no bus, not on Main.
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::VideoTogglePlay {
+            deck_uuid: deck.clone(),
+        },
+    ));
+    let tap = app.audio_mix().tap(&master).expect("Master exists");
+    let off_air = listen(&mut app, &tap, 1.5);
+    assert!(peak(&off_air) < 1e-4, "off air, silent: {}", peak(&off_air));
+    let strip = source(&app);
+    assert!(strip.muted, "off air");
+    assert!(strip.meter_db[0] < -90.0, "nothing heard: {:?}", strip.meter_db);
+    // lavfi's sine is 1/8 of full scale, about −18 dBFS.
+    assert!(strip.signal_db[0] > -30.0, "what it plays: {:?}", strip.signal_db);
+}
+
 #[test]
 fn without_audio_auto_the_on_button_is_the_operators_alone() {
     let dir = tempfile::tempdir().unwrap();

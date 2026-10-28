@@ -157,6 +157,7 @@ impl UIData {
         let channel_a = ChannelUIInfo {
             overlay: false,
             on_air: None,
+            color: None,
             ch_idx: 0,
             uuid: "ca000001".to_string(),
             name: "Ch A".to_string(),
@@ -266,6 +267,7 @@ impl UIData {
         let channel_b = ChannelUIInfo {
             overlay: false,
             on_air: None,
+            color: None,
             ch_idx: 1,
             uuid: "cb000001".to_string(),
             name: "Ch B".to_string(),
@@ -415,6 +417,7 @@ impl UIData {
                     audio_mix: crate::bus::AudioMixId::new("bus00001"),
                     auto_duration: 1.0,
                     hidden_layers: vec![],
+                    hidden_sources: vec![],
                     transition: None,
                     screen: None,
                 },

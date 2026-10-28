@@ -10,6 +10,10 @@ use super::main_desk::{self, NEXT_GREEN, ON_MAIN_RED};
 use crate::engine::EngineCommand;
 use crate::mixer::MixMode;
 
+/// The room a clip's whole transport row takes — buttons, times, In, Out,
+/// Loop and its name. A picture's column narrower than this keeps to the
+/// bar, the buttons and the times.
+const FULL_TRANSPORT: f32 = 540.0;
 /// Width of the column of take buttons between the pictures.
 const TAKE_WIDTH: f32 = 132.0;
 const GAP: f32 = 10.0;
@@ -19,7 +23,9 @@ const FADE_TIMES: [f32; 7] = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0];
 
 pub(super) fn render_monitors(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
     let area = ui.available_rect_before_wrap();
-    let monitor_width = ((area.width() - TAKE_WIDTH - 2.0 * GAP) / 2.0).max(80.0);
+    // Beside Program, what the recording, the stream and the speakers hear.
+    let meters = super::out_meters::width(data);
+    let monitor_width = ((area.width() - TAKE_WIDTH - 3.0 * GAP - meters) / 2.0).max(80.0);
     // Both pictures keep the same size, the transport under Preview's.
     let picture = super::utils::preview_size(
         egui::vec2(
@@ -30,22 +36,54 @@ pub(super) fn render_monitors(ui: &mut egui::Ui, data: &UIData, actions: &mut UI
         data.render_height,
     );
     let next = main_desk::next_channel(data);
+    // The pictures' columns as wide as what is in them — the picture, or a
+    // clip's transport under it if that is wider, as measured last frame —
+    // and the row centred: the meters stand against Program, inside the
+    // panel, not at its edge.
+    let seen = ui.id().with("monitors_column_need");
+    let need = ui
+        .ctx()
+        .memory(|m| m.data.get_temp::<f32>(seen))
+        .unwrap_or(0.0);
+    // Room for a clip's whole transport row, or it keeps to the essentials.
+    let full = monitor_width >= FULL_TRANSPORT;
+    let column = picture.x.max(need).min(monitor_width);
+    let row = 2.0 * column + TAKE_WIDTH + meters + 3.0 * GAP;
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = GAP;
-        ui.allocate_ui_with_layout(
-            egui::vec2(monitor_width, area.height()),
+        let pad = (area.width() - row) / 2.0 - GAP;
+        if pad > 0.0 {
+            ui.add_space(pad);
+        }
+        let preview = ui.allocate_ui_with_layout(
+            egui::vec2(column, area.height()),
             egui::Layout::top_down(egui::Align::Center),
-            |ui| render_preview(ui, next, picture, data, actions),
+            |ui| render_preview(ui, next, picture, column, !full, data, actions),
         );
         ui.allocate_ui_with_layout(
             egui::vec2(TAKE_WIDTH, area.height()),
             egui::Layout::top_down(egui::Align::Center),
             |ui| render_take_column(ui, next, data, actions),
         );
-        ui.allocate_ui_with_layout(
-            egui::vec2(monitor_width, area.height()),
+        let program = ui.allocate_ui_with_layout(
+            egui::vec2(column, area.height()),
             egui::Layout::top_down(egui::Align::Center),
-            |ui| render_program(ui, picture, data, actions),
+            |ui| render_program(ui, picture, column, !full, data, actions),
+        );
+        // What the transports need, not the room they were given: it
+        // shrinks again when a clip goes.
+        let used = preview.inner.max(program.inner);
+        if (used - need).abs() > 0.5 {
+            ui.ctx().memory_mut(|m| m.data.insert_temp(seen, used));
+            ui.ctx().request_repaint();
+        }
+        ui.allocate_ui_with_layout(
+            egui::vec2(meters, area.height()),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.add_space(LABEL_HEIGHT);
+                super::out_meters::render(ui, picture.y, data);
+            },
         );
     });
 }
@@ -111,9 +149,11 @@ fn render_preview(
     ui: &mut egui::Ui,
     next: Option<&ChannelUIInfo>,
     size: egui::Vec2,
+    column: f32,
+    compact: bool,
     data: &UIData,
     actions: &mut UIActions,
-) {
+) -> f32 {
     let what = next.map_or_else(
         || "select a channel".to_string(),
         |ch| {
@@ -143,11 +183,28 @@ fn render_preview(
         response.context_menu(|ui| super::mixer::channel_context_menu(ui, data, actions, ch));
         ui.add_space(6.0);
         let clip = super::transport::clip_of(data, ch);
-        super::transport::render_transport(ui, clip, ch.decks.len() > 1, size.x, actions);
+        return super::transport::render_transport(
+            ui,
+            clip,
+            ch.decks.len() > 1,
+            column,
+            compact,
+            actions,
+        );
     }
+    0.0
 }
 
-fn render_program(ui: &mut egui::Ui, size: egui::Vec2, data: &UIData, actions: &mut UIActions) {
+/// Program: Main's picture, framed red, and the transport of the clip on air
+/// under it, `column` wide.
+fn render_program(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    column: f32,
+    compact: bool,
+    data: &UIData,
+    actions: &mut UIActions,
+) -> f32 {
     let mut what = main_desk::source_name(data, &data.main.program);
     if let Some(fade) = &data.main.fade {
         what = format!("{} → {what}", main_desk::source_name(data, &fade.from));
@@ -184,7 +241,7 @@ fn render_program(ui: &mut egui::Ui, size: egui::Vec2, data: &UIData, actions: &
     // there, and how much of it is left seen.
     ui.add_space(6.0);
     let (clip, several_layers) = on_air_clip(data);
-    super::transport::render_transport(ui, clip, several_layers, size.x, actions);
+    super::transport::render_transport(ui, clip, several_layers, column, compact, actions)
 }
 
 /// The clip Program's transport drives, and whether to name it: Main's
@@ -235,13 +292,30 @@ fn on_air_clip(
     }
 }
 
+/// The take buttons, NOT RECORDING blinking behind them when asked for
+/// (REC ▸ Reminder) and not recording.
 fn render_take_column(
     ui: &mut egui::Ui,
     next: Option<&ChannelUIInfo>,
     data: &UIData,
     actions: &mut UIActions,
 ) {
-    ui.add_space(LABEL_HEIGHT);
+    if super::record::warns_not_recording(data) {
+        super::record::with_record_warning(ui, data, Some(LABEL_HEIGHT), |ui| {
+            render_takes(ui, next, data, actions);
+        });
+    } else {
+        ui.add_space(LABEL_HEIGHT);
+        render_takes(ui, next, data, actions);
+    }
+}
+
+fn render_takes(
+    ui: &mut egui::Ui,
+    next: Option<&ChannelUIInfo>,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
     if !main_desk::in_main_mode(data) {
         ui.label(
             egui::RichText::new("The layered mixer is on: every channel mixes to the output.")
@@ -653,5 +727,151 @@ mod tests {
                 mode: MixMode::Program
             }
         )));
+    }
+
+    /// Beside Program, a meter for the recording, the stream and each bus on
+    /// a sound device; right of the Program picture.
+    #[test]
+    fn meters_stand_beside_program() {
+        let mut data = main_mode_fixture();
+        let mut speakers = crate::audio_mix::AudioBusConfig::new("Bus B");
+        speakers.device = Some("MacBook Pro Speakers".into());
+        data.audio_mix.buses = vec![
+            crate::audio_mix::AudioBusSnapshot {
+                peak_db: [-96.0; 2],
+                dynamics: crate::audio_mix::DynamicsSnapshot::default(),
+                config: crate::audio_mix::AudioBusConfig::new("Master"),
+                device_ok: None,
+                meter_db: [-12.0; 2],
+            },
+            crate::audio_mix::AudioBusSnapshot {
+                peak_db: [-96.0; 2],
+                dynamics: crate::audio_mix::DynamicsSnapshot::default(),
+                config: speakers,
+                device_ok: Some(true),
+                meter_db: [-6.0; 2],
+            },
+        ];
+        // Wide, the pictures held back by the height: room to spare.
+        let data = std::rc::Rc::new(data);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(2200.0, 420.0))
+            .build_ui(move |ui| render_monitors(ui, &data, &mut UIActions::new()));
+        harness.run_steps(2);
+        let program = harness.get_by_label("Program picture").rect();
+        for meter in ["REC meter", "STREAM meter", "Bus B meter"] {
+            let rect = harness.get_by_label(meter).rect();
+            assert!(rect.left() >= program.right(), "{meter} at {rect:?}, Program {program:?}");
+            assert!(
+                rect.left() - program.right() < 3.0 * GAP + 52.0 * 3.0,
+                "{meter} beside Program, not at the edge: {rect:?}, Program {program:?}"
+            );
+        }
+    }
+
+    /// With the reminder on and nothing recording, NOT RECORDING stands over
+    /// the take buttons; recording, it goes.
+    #[test]
+    fn not_recording_blinks_over_the_takes() {
+        let reminded = || {
+            let mut data = main_mode_fixture();
+            data.record.options.warn_when_off = true;
+            data
+        };
+        let mut harness = unrun(reminded());
+        harness.run_steps(2);
+        let words = harness.get_by_label("NOT RECORDING").rect();
+        let cut = harness.get_by_label("CUT").rect();
+        assert!(words.bottom() <= cut.top(), "{words:?} over {cut:?}");
+        let mut data = reminded();
+        data.record.status.recording = true;
+        let mut harness = unrun(data);
+        harness.run_steps(2);
+        assert!(harness.query_by_label("NOT RECORDING").is_none());
+    }
+
+    /// A short pane makes narrow pictures; with clips under both, their
+    /// transports keep their room, and the meters still stand against
+    /// Program, inside the pane.
+    #[test]
+    fn meters_stay_by_program_over_narrow_pictures() {
+        let (mut data, _) = with_clip();
+        let vp = data.channels[1].decks.last().unwrap().video_playback.clone();
+        data.channels[0].decks.last_mut().unwrap().video_playback = vp;
+        // Room for both transports, not much more: a row worked out from
+        // the pictures alone would end past the pane.
+        let width = 1300.0;
+        let data = std::rc::Rc::new(data);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(width, 260.0))
+            .build_ui(move |ui| render_monitors(ui, &data, &mut UIActions::new()));
+        harness.run_steps(2);
+        let program = harness.get_by_label("Program picture").rect();
+        let rec = harness.get_by_label("REC meter").rect();
+        let last = harness.get_by_label("STREAM meter").rect();
+        assert!(last.right() <= width, "inside the pane: {last:?}");
+        assert!(rec.left() >= program.right(), "right of Program: {rec:?} {program:?}");
+        assert!(
+            rec.left() - program.right() < 200.0,
+            "against Program, not past its transport: {rec:?} {program:?}"
+        );
+    }
+
+    /// Both pictures with a clip under them, in a panel as narrow as a
+    /// detached window opens: the transports keep to the essentials and
+    /// every meter stays inside, against Program. Wide, the whole row.
+    #[test]
+    fn narrow_transports_keep_to_the_essentials() {
+        let clips = || {
+            let (mut data, _) = with_clip();
+            let vp = data.channels[1].decks.last().unwrap().video_playback.clone();
+            data.channels[0].decks.last_mut().unwrap().video_playback = vp;
+            std::rc::Rc::new(data)
+        };
+        for (width, full) in [(960.0, false), (1800.0, true)] {
+            let data = clips();
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(width, 420.0))
+                .build_ui(move |ui| render_monitors(ui, &data, &mut UIActions::new()));
+            harness.run_steps(3);
+            let program = harness.get_by_label("Program picture").rect();
+            let last = harness.get_by_label("STREAM meter").rect();
+            assert!(last.right() <= width, "inside {width}: {last:?}");
+            assert!(last.left() >= program.right(), "right of Program: {last:?}");
+            assert_eq!(
+                harness.query_all_by_label("[ In").count() > 0,
+                full,
+                "the whole row at {width}"
+            );
+        }
+    }
+
+    /// Clips gone, the columns shrink back to the pictures: the meters come
+    /// back against Program.
+    #[test]
+    fn the_columns_shrink_when_the_clips_go() {
+        let (mut data, _) = with_clip();
+        let vp = data.channels[1].decks.last().unwrap().video_playback.clone();
+        data.channels[0].decks.last_mut().unwrap().video_playback = vp;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1800.0, 260.0))
+            .build_ui_state(
+                |ui, data: &mut UIData| render_monitors(ui, data, &mut UIActions::new()),
+                data,
+            );
+        harness.run_steps(3);
+        let gap = |h: &egui_kittest::Harness<'_, UIData>| {
+            h.get_by_label("REC meter").rect().left() - h.get_by_label("Program picture").rect().right()
+        };
+        let with_clips = gap(&harness);
+        for ch in &mut harness.state_mut().channels {
+            for deck in &mut ch.decks {
+                deck.video_playback = None;
+            }
+        }
+        harness.run_steps(3);
+        let without = gap(&harness);
+        assert!(without < with_clips, "shrunk: {without} after {with_clips}");
+        assert!(without <= 2.0 * GAP, "against Program: {without}");
     }
 }

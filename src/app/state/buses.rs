@@ -250,6 +250,39 @@ impl VardaApp {
         }
     }
 
+    /// Take a source's button off a bus's switcher row, or put it back. The
+    /// row offers Black, Master and channels, so a deck is refused; so is a
+    /// channel that is not there to hide.
+    pub fn cmd_set_bus_source_hidden(
+        &mut self,
+        uuid: &str,
+        input: &BusInputRef,
+        hidden: bool,
+    ) -> CommandResult {
+        match input {
+            BusInputRef::Deck(_) => {
+                return CommandResult::Err {
+                    code: ErrorCode::InvalidInput,
+                    message: "A bus's row has buttons for Black, Master and channels, not layers"
+                        .into(),
+                };
+            }
+            BusInputRef::Channel(channel_uuid) if hidden => {
+                if let Err(unknown) = self.resolve_channel(channel_uuid) {
+                    return unknown.into();
+                }
+            }
+            _ => {}
+        }
+        match self.production_buses.get_mut(uuid) {
+            Some(bus) => {
+                bus.set_source_hidden(input, hidden);
+                CommandResult::Ok
+            }
+            None => no_such_bus(uuid),
+        }
+    }
+
     /// Put one bus fullscreen on a monitor, or take it off screen with `None`.
     ///
     /// A bus's screen is an output window showing a single full-frame surface

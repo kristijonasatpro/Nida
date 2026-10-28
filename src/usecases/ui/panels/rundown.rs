@@ -131,11 +131,15 @@ fn summary(data: &UIData, step: &Step) -> String {
         }
         said
     }));
-    if let Some(secs) = step.then_secs {
+    if let Some(deck) = step.then_ends.as_deref() {
+        let name = deck_name(data, deck).unwrap_or_else(|| MISSING.into());
+        parts.push(format!("then the next when {name} ends"));
+    } else if let Some(secs) = step.then_secs {
         parts.push(format!("then the next after {}", seconds(secs)));
     }
     if let Some(at) = step.at_secs {
-        parts.insert(0, format!("at {}", target_text(at)));
+        let always = if step.at_always { ", even if not next" } else { "" };
+        parts.insert(0, format!("at {}{always}", target_text(at)));
     }
     if parts.is_empty() {
         "Sets nothing yet — double-click to say what".to_string()
@@ -173,19 +177,37 @@ fn render_due_at(
     at: u32,
     actions: &mut UIActions,
 ) {
-    let held = data.rundown.at_held.as_deref() == Some(next.step.uuid.as_str());
+    let uuid = next.step.uuid.as_str();
+    let held = data.rundown.at_held.as_deref() == Some(uuid)
+        || data.rundown.held_always.iter().any(|h| h == uuid);
     let left = f64::from(at) - crate::deck::timer::time_of_day();
     let (name, when) = (&next.step.name, target_text(at));
     ui.horizontal(|ui| {
         if held {
-            ui.label(egui::RichText::new(format!("{name} at {when} — held: GO takes it")).weak());
+            // GO takes it only when it is the step next.
+            let then = if data.rundown.next.as_deref() == Some(uuid) {
+                "held: GO takes it"
+            } else {
+                "held: not taken by its time"
+            };
+            ui.label(egui::RichText::new(format!("{name} at {when} — {then}")).weak());
             if ui
                 .small_button("By its time again")
                 .on_hover_text("Taken by itself at its time after all")
                 .clicked()
             {
-                actions.commands.push(EngineCommand::SetRundownNext {
-                    uuid: next.step.uuid.clone(),
+                // One taken even when not next keeps the rundown where it is;
+                // its own time, set again, lets its hold go.
+                actions.commands.push(if next.step.at_always {
+                    EngineCommand::SetRundownAt {
+                        uuid: next.step.uuid.clone(),
+                        at_secs: Some(at),
+                        always: None,
+                    }
+                } else {
+                    EngineCommand::SetRundownNext {
+                        uuid: next.step.uuid.clone(),
+                    }
                 });
             }
         } else if left > 0.0 {
@@ -236,11 +258,21 @@ pub(super) fn render_rundown(ui: &mut egui::Ui, data: &UIData, actions: &mut UIA
     if let Some(wait) = &data.rundown.wait {
         ui.horizontal(|ui| {
             let to = step_called(data, Some(&wait.to)).map_or("the next step", |s| &s.step.name);
-            ui.label(
-                egui::RichText::new(format!("Then {to} in {:.0} s", wait.secs_left.ceil()))
-                    .strong()
-                    .color(WARN),
-            );
+            let text = match wait.until.as_deref() {
+                Some(deck) => {
+                    let name = deck_name(data, deck).unwrap_or_else(|| MISSING.into());
+                    let left = if wait.secs_left > 0.0 {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let left = span_text(wait.secs_left.ceil() as u64, TimeFormat::Auto);
+                        format!(" — {left} left")
+                    } else {
+                        String::new()
+                    };
+                    format!("Then {to} when {name} ends{left}")
+                }
+                None => format!("Then {to} in {:.0} s", wait.secs_left.ceil()),
+            };
+            ui.label(egui::RichText::new(text).strong().color(WARN));
             if ui
                 .small_button("Hold")
                 .on_hover_text("Do not go on by itself: stay on this step until GO")
@@ -249,9 +281,20 @@ pub(super) fn render_rundown(ui: &mut egui::Ui, data: &UIData, actions: &mut UIA
                 actions.commands.push(EngineCommand::RundownHold);
             }
         });
-    } else if let Some(next) = step_called(data, data.rundown.next.as_deref()) {
-        if let Some(at) = next.step.at_secs {
-            render_due_at(ui, data, next, at, actions);
+    }
+    // The timed step coming first — counted down while a wait runs too when
+    // it is one taken even when not next: it may come before the wait's.
+    if let Some(coming) = crate::rundown::coming_at(
+        data.rundown.steps.iter().map(|s| &s.step),
+        data.rundown.next.as_deref(),
+        data.rundown.last.as_deref(),
+        crate::deck::timer::time_of_day(),
+    ) {
+        let off_next = coming.at_always && data.rundown.next.as_deref() != Some(&coming.uuid);
+        if data.rundown.wait.is_none() || off_next {
+            if let (Some(at), Some(step)) = (coming.at_secs, step_called(data, Some(&coming.uuid))) {
+                render_due_at(ui, data, step, at, actions);
+            }
         }
     }
     ui.add_space(4.0);
@@ -1289,6 +1332,7 @@ fn edit_at(ui: &mut egui::Ui, step: &Step, actions: &mut UIActions) {
     let set = |at_secs: Option<u32>| EngineCommand::SetRundownAt {
         uuid: step.uuid.clone(),
         at_secs,
+        always: None,
     };
     ui.horizontal(|ui| {
         let mut on = step.at_secs.is_some();
@@ -1328,34 +1372,92 @@ fn edit_at(ui: &mut egui::Ui, step: &Step, actions: &mut UIActions) {
             }
         }
     });
+    if let Some(at) = step.at_secs {
+        ui.horizontal(|ui| {
+            ui.add_space(24.0);
+            let mut always = step.at_always;
+            if ui
+                .checkbox(&mut always, "Even if it is not next")
+                .on_hover_text(
+                    "At its time it is taken wherever the rundown is — the steps before it \
+                     left out — and GO goes on from it. Hold stops it.",
+                )
+                .changed()
+            {
+                actions.commands.push(EngineCommand::SetRundownAt {
+                    uuid: step.uuid.clone(),
+                    at_secs: Some(at),
+                    always: Some(always),
+                });
+            }
+        });
+    }
 }
 
 /// Whether the step goes on to the next by itself, and after how long.
 fn edit_then(ui: &mut egui::Ui, step: &Step, data: &UIData, actions: &mut UIActions) {
-    let set = |secs: Option<f32>| EngineCommand::SetRundownThen {
+    let set = |secs: Option<f32>, when_ends: Option<String>| EngineCommand::SetRundownThen {
         uuid: step.uuid.clone(),
         secs,
+        when_ends,
+    };
+    // What it can go on at the end of: the clips and playlists it starts or
+    // carries on.
+    let endable: Vec<&str> = step
+        .plays
+        .iter()
+        .filter(|p| step.plays_on(&p.deck) && runs_of(data, &p.deck) == Some(Runs::Media))
+        .map(|p| p.deck.as_str())
+        .collect();
+    let ends_name = |deck: &str| {
+        format!("when {} ends", deck_name(data, deck).unwrap_or_else(|| MISSING.into()))
     };
     ui.horizontal(|ui| {
-        let mut on = step.then_secs.is_some();
+        let mut on = step.then_secs.is_some() || step.then_ends.is_some();
         if ui
-            .checkbox(&mut on, "Then go on to the next step after")
+            .checkbox(&mut on, "Then go on to the next step")
             .on_hover_text("By itself, without GO — GO sooner goes on at once")
             .changed()
         {
-            actions.commands.push(set(on.then_some(5.0)));
+            actions.commands.push(set(on.then_some(5.0), None));
         }
+        if !on {
+            return;
+        }
+        let shown = step.then_ends.as_deref().map_or_else(|| "after".to_string(), ends_name);
+        egui::ComboBox::from_id_salt(("rundown_then", &step.uuid))
+            .selected_text(shown)
+            .width(if step.then_ends.is_some() { 260.0 } else { 70.0 })
+            .show_ui(ui, |ui| {
+                let after = step.then_ends.is_none();
+                if ui.selectable_label(after, "after a time").clicked() && !after {
+                    actions.commands.push(set(Some(5.0), None));
+                }
+                for deck in &endable {
+                    let current = step.then_ends.as_deref() == Some(*deck);
+                    if ui.selectable_label(current, ends_name(deck)).clicked() && !current {
+                        actions.commands.push(set(None, Some((*deck).to_string())));
+                    }
+                }
+            })
+            .response
+            .on_hover_text(
+                "After a time from when the step is taken, or when a clip or playlist it starts \
+                 has played to its end — the music, say, while a clip on screen loops",
+            );
         if let Some(now) = step.then_secs {
             let mut secs = now;
-            let drag = ui.add(
-                egui::DragValue::new(&mut secs)
-                    .speed(0.1)
-                    .range(0.1..=MAX_THEN_SECS)
-                    .max_decimals(1)
-                    .suffix(" s"),
-            );
+            let drag = ui
+                .add(
+                    egui::DragValue::new(&mut secs)
+                        .speed(0.1)
+                        .range(0.1..=MAX_THEN_SECS)
+                        .custom_formatter(|v, _| wait_text(v))
+                        .custom_parser(parse_wait),
+                )
+                .on_hover_text("Drag, or click and type: 90, 1:30 or 4.5");
             if drag.changed() && (secs - now).abs() > f32::EPSILON {
-                actions.commands.push(set(Some(secs)));
+                actions.commands.push(set(Some(secs), None));
             }
         }
     });
@@ -1368,6 +1470,58 @@ fn edit_then(ui: &mut egui::Ui, step: &Step, data: &UIData, actions: &mut UIActi
             .small(),
         );
     }
+    if let Some(deck) = step.then_ends.as_deref() {
+        if loops(data, deck) {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "⚠ It loops, so it never ends: set it to play once (its Loop setting), \
+                         or pick what ends",
+                    )
+                    .small()
+                    .color(WARN),
+                )
+                .wrap(),
+            );
+        }
+    }
+}
+
+/// Whether the clip or playlist `deck` starts again at its end — and so
+/// never ends.
+fn loops(data: &UIData, deck: &str) -> bool {
+    use crate::video::LoopMode;
+    let Some(deck) = data.channels.iter().flat_map(|ch| &ch.decks).find(|d| d.uuid == deck) else {
+        return false;
+    };
+    if let Some(list) = &deck.playlist {
+        return list.settings.loop_list;
+    }
+    deck.video_playback
+        .as_ref()
+        .is_some_and(|v| matches!(v.loop_mode, LoopMode::Loop | LoopMode::PingPong))
+}
+
+/// A wait as it is shown: "4.5 s", or "1:30" from a minute.
+fn wait_text(secs: f64) -> String {
+    if secs >= 60.0 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let whole = secs.round() as u64;
+        format!("{}:{:02}", whole / 60, whole % 60)
+    } else {
+        format!("{secs:.1} s")
+    }
+}
+
+/// A wait as typed: seconds ("90", "4.5", "4.5 s") or minutes and seconds
+/// ("1:30", "2:37").
+fn parse_wait(text: &str) -> Option<f64> {
+    let text = text.trim().trim_end_matches('s').trim();
+    let secs = match text.split_once(':') {
+        Some((m, s)) => m.trim().parse::<f64>().ok()? * 60.0 + s.trim().parse::<f64>().ok()?,
+        None => text.parse::<f64>().ok()?,
+    };
+    (secs.is_finite() && secs > 0.0).then_some(secs)
 }
 
 /// The windows the panel opens: a new step, and what a step sets.
@@ -1411,6 +1565,7 @@ mod tests {
             next: Some("s1".into()),
             wait: None,
             at_held: None,
+            held_always: vec![],
         };
         data
     }
@@ -1563,6 +1718,7 @@ mod tests {
             to: "s2".into(),
             secs_left: 2.4,
             fade: true,
+            until: None,
         });
         let mut harness = harness(&data);
         harness.get_by_label("Then B in 3 s");
@@ -1713,13 +1869,13 @@ mod tests {
         settle(&mut harness);
         harness.get_by_label("1  Ch A ▸ test_generator_a").click();
         settle(&mut harness);
-        harness.get_by_label("Then go on to the next step after").click();
+        harness.get_by_label("Then go on to the next step").click();
         settle(&mut harness);
         harness.get_by_label("Update from what is on now").click();
         settle(&mut harness);
         assert_eq!(
             sent(&harness),
-            r#"[SetRundownScreen { uuid: "s2", bus_uuid: "bus00001", input: Some(Channel("ca000001")) }, SetRundownMain { uuid: "s2", main: Some(Black) }, SetRundownOverlay { uuid: "s2", channel_uuid: "cb000001", on: Some(false) }, SetRundownPlay { uuid: "s2", deck_uuid: "a0000001", action: Some(Start) }, SetRundownThen { uuid: "s2", secs: Some(5.0) }, CaptureRundownStep { uuid: "s2" }]"#
+            r#"[SetRundownScreen { uuid: "s2", bus_uuid: "bus00001", input: Some(Channel("ca000001")) }, SetRundownMain { uuid: "s2", main: Some(Black) }, SetRundownOverlay { uuid: "s2", channel_uuid: "cb000001", on: Some(false) }, SetRundownPlay { uuid: "s2", deck_uuid: "a0000001", action: Some(Start) }, SetRundownThen { uuid: "s2", secs: Some(5.0), when_ends: None }, CaptureRundownStep { uuid: "s2" }]"#
         );
         // An overlay is not offered for Main: Ch B is not on Main's list.
         let mut menus: Vec<_> = harness.get_all_by_value(LEAVE).collect();
@@ -1758,11 +1914,11 @@ mod tests {
         settle(&mut harness);
         harness.get_by_label("×").click();
         settle(&mut harness);
-        harness.get_by_label("Then go on to the next step after").click();
+        harness.get_by_label("Then go on to the next step").click();
         settle(&mut harness);
         assert_eq!(
             sent(&harness),
-            r#"[SetRundownScreen { uuid: "s2", bus_uuid: "bus00001", input: None }, SetRundownScreen { uuid: "s2", bus_uuid: "gone", input: None }, SetRundownPlay { uuid: "s2", deck_uuid: "a0000001", action: Some(Stop) }, SetRundownPlay { uuid: "s2", deck_uuid: "a0000001", action: None }, SetRundownThen { uuid: "s2", secs: None }]"#
+            r#"[SetRundownScreen { uuid: "s2", bus_uuid: "bus00001", input: None }, SetRundownScreen { uuid: "s2", bus_uuid: "gone", input: None }, SetRundownPlay { uuid: "s2", deck_uuid: "a0000001", action: Some(Stop) }, SetRundownPlay { uuid: "s2", deck_uuid: "a0000001", action: None }, SetRundownThen { uuid: "s2", secs: None, when_ends: None }]"#
         );
     }
 
@@ -1918,6 +2074,7 @@ mod tests {
             solo: false,
             live: true,
             meter_db: [-96.0, -96.0],
+            signal_db: [-96.0, -96.0],
             peak_db: [-96.0;2],
             refused: None,
         };
@@ -2235,6 +2392,7 @@ mod tests {
             solo: false,
             live: true,
             meter_db: [-96.0, -96.0],
+            signal_db: [-96.0, -96.0],
             peak_db: [-96.0; 2],
             refused: None,
         }];
@@ -2265,6 +2423,150 @@ mod tests {
         harness.get_by_label("Remove step").click();
         settle(&mut harness);
         assert!(sent(&harness).contains(r#"RemoveRundownStep { uuid: "s2" }"#), "{}", sent(&harness));
+    }
+    /// A step at a time of day can be taken at it even when not next: a tick
+    /// in its window, there only with a time; its row says so; with another
+    /// step next, the panel counts down to it and Hold holds it.
+    #[test]
+    fn a_step_at_its_time_even_when_not_next_is_set_said_and_counted_down() {
+        let mut data = show();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let now = crate::deck::timer::time_of_day().max(0.0) as u32;
+        let soon = now + 600;
+        data.rundown.steps[2].step.at_secs = Some(soon % DAY_SECS);
+        data.rundown.last = Some("s1".into());
+        data.rundown.next = Some("s2".into());
+        {
+            let mut harness = harness(&data);
+            open_editor_of(&mut harness, "C");
+            harness.get_by_label("Even if it is not next").click();
+            settle(&mut harness);
+            let want = format!(
+                r#"SetRundownAt {{ uuid: "s3", at_secs: Some({}), always: Some(true) }}"#,
+                soon % DAY_SECS
+            );
+            assert!(sent(&harness).contains(&want), "{}", sent(&harness));
+            let timeless = harness_of_step_without_time(&data);
+            assert!(timeless.query_by_label("Even if it is not next").is_none(), "only with a time");
+        }
+
+        data.rundown.steps[2].step.at_always = true;
+        let mut harness = harness(&data);
+        harness.get_by_label_contains(", even if not next");
+        // Ten minutes from now, unless that is past midnight.
+        if soon < DAY_SECS {
+            harness.get_by_label_contains("C at ");
+            harness.get_by_label("Hold").click();
+            settle(&mut harness);
+            assert!(sent(&harness).contains("RundownHold"), "{}", sent(&harness));
+        }
+    }
+
+    fn harness_of_step_without_time(data: &UIData) -> Harness<'_> {
+        let mut harness = harness(data);
+        open_editor_of(&mut harness, "B");
+        harness
+    }
+    /// One taken even when not next is counted down while a wait runs too;
+    /// held, it says it is not taken by its time — GO takes the next.
+    #[test]
+    fn a_step_even_when_not_next_counts_down_in_a_wait_and_says_it_is_held() {
+        use crate::engine::RundownWaitSnapshot;
+        let mut data = show();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let now = crate::deck::timer::time_of_day().max(0.0) as u32;
+        let soon = now + 600;
+        if soon >= DAY_SECS {
+            return;
+        }
+        data.rundown.steps[2].step.at_secs = Some(soon);
+        data.rundown.steps[2].step.at_always = true;
+        data.rundown.last = Some("s1".into());
+        data.rundown.next = Some("s2".into());
+        data.rundown.wait = Some(RundownWaitSnapshot {
+            from: "s1".into(),
+            to: "s2".into(),
+            secs_left: 60.0,
+            fade: true,
+            until: None,
+        });
+        {
+            let harness = harness(&data);
+            harness.get_by_label_contains("Then B in");
+            harness.get_by_label_contains("C at ");
+        }
+        data.rundown.wait = None;
+        data.rundown.held_always = vec!["s3".into()];
+        let harness = harness(&data);
+        harness.get_by_label_contains("— held: not taken by its time");
+    }
+    /// A step goes on when what it plays ends: picked among the clips it
+    /// starts; a looping one is said never to end; its row and the wait say
+    /// what it waits for.
+    #[test]
+    fn a_step_goes_on_when_a_clip_it_starts_ends() {
+        use crate::engine::RundownWaitSnapshot;
+        let mut data = show();
+        let mut clip = music();
+        clip.loop_mode = crate::video::LoopMode::OneShot;
+        data.channels[1].decks[0].video_playback = Some(clip);
+        data.channels[1].decks[0].name = "music.mp3".into();
+        let deck = data.channels[1].decks[0].uuid.clone();
+        data.rundown.steps[1].step.plays = vec![PlaySet::new(deck.clone(), PlayAction::Start)];
+        data.rundown.steps[1].step.then_secs = Some(5.0);
+        let ends = "when 2  music.mp3 ends";
+        {
+            let mut harness = harness(&data);
+            open_editor_of(&mut harness, "B");
+            harness.get_by_value("after").click();
+            settle(&mut harness);
+            harness.get_by_label(ends).click();
+            settle(&mut harness);
+            let want = format!(
+                r#"SetRundownThen {{ uuid: "s2", secs: None, when_ends: Some({deck:?}) }}"#
+            );
+            assert!(sent(&harness).contains(&want), "{}", sent(&harness));
+            assert!(harness.query_by_label_contains("It loops").is_none(), "plays once");
+        }
+        // Set so, and looping: said. Its row says what it waits for.
+        data.rundown.steps[1].step.then_secs = None;
+        data.rundown.steps[1].step.then_ends = Some(deck.clone());
+        if let Some(v) = data.channels[1].decks[0].video_playback.as_mut() {
+            v.loop_mode = crate::video::LoopMode::Loop;
+        }
+        {
+            let mut harness = harness(&data);
+            harness.get_by_label_contains("then the next when 2  music.mp3 ends");
+            open_editor_of(&mut harness, "B");
+            harness.get_by_value(ends);
+            harness.get_by_label_contains("It loops, so it never ends");
+        }
+        // Waiting: how long it has left.
+        data.rundown.last = Some("s2".into());
+        data.rundown.next = Some("s3".into());
+        data.rundown.wait = Some(RundownWaitSnapshot {
+            from: "s2".into(),
+            to: "s3".into(),
+            secs_left: 83.0,
+            fade: true,
+            until: Some(deck),
+        });
+        let harness = harness(&data);
+        harness.get_by_label_contains("Then C when 2  music.mp3 ends — 1:23 left");
+    }
+
+    /// A wait is typed in seconds or in minutes and seconds, and shown so.
+    #[test]
+    fn a_wait_is_typed_as_seconds_or_minutes_and_seconds() {
+        assert_eq!(parse_wait("90"), Some(90.0));
+        assert_eq!(parse_wait("1:30"), Some(90.0));
+        assert_eq!(parse_wait(" 2:37 "), Some(157.0));
+        assert_eq!(parse_wait("4.5 s"), Some(4.5));
+        assert_eq!(parse_wait("0"), None);
+        assert_eq!(parse_wait("soon"), None);
+        assert_eq!(wait_text(90.0), "1:30");
+        assert_eq!(wait_text(157.0), "2:37");
+        assert_eq!(wait_text(4.5), "4.5 s");
     }
 }
 

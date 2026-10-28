@@ -2066,6 +2066,7 @@ fn click_remove_channel_with_three_channels() {
         effects: vec![],
         overlay: false,
         on_air: None,
+        color: None,
     });
     data.channel_count = 3;
     let mut harness = make_harness(data);

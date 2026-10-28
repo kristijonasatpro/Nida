@@ -320,6 +320,7 @@ mod tests {
     fn sample_channel_config() -> ChannelConfig {
         ChannelConfig {
             overlay: false,
+            color: None,
             uuid: crate::deck::generate_short_uuid(),
             name: "test_channel".to_string(),
             opacity: 1.0,

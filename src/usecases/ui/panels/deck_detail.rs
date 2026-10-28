@@ -5,7 +5,7 @@ use super::super::{
     PointCloudUI, ScreenCaptureUI, ShaderParamsUI, TapUI, UIActions, UIData,
 };
 use super::utils::{
-    channel_color, format_time, render_collapsed_column, render_effect_drag_ghost,
+    format_time, render_collapsed_column, render_effect_drag_ghost,
     render_effect_drag_handle, render_effect_drop_zone_row,
 };
 use crate::channel::DeckRenderFps;
@@ -681,7 +681,7 @@ pub(super) fn render_selected_deck_detail(
         return;
     };
 
-    let accent = channel_color(ch_idx);
+    let accent = ch.accent();
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(format!(
@@ -899,7 +899,7 @@ pub(super) fn render_selected_deck_detail(
                         ui.set_min_width(160.0);
                         ui.set_max_width(240.0);
                         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                            super::playlist::render_deck_column(ui, deck, list, actions);
+                            super::playlist::render_deck_column(ui, data, deck, list, actions);
                         });
                     });
                 ui.separator();

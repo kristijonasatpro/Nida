@@ -301,6 +301,10 @@ fn render_window(
             egui_dock::TabViewer::ui(viewer, ui, &mut tab);
         }
     });
+    // A rename asked in this window opens in it.
+    if own {
+        super::rename::render_rename(ui.ctx(), viewer.data, viewer.actions);
+    }
     // The Rundown's step windows open beside it, in its window; files from
     // Finder land on the Presentations panel in its.
     if own && pane == Pane::Rundown {

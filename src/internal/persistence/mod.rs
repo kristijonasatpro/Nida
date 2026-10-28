@@ -814,6 +814,7 @@ pub fn snapshot_scene(
                 opacity: ch.opacity,
                 blend_mode: ch.blend_mode.into(),
                 overlay: ch.overlay,
+                color: ch.color,
                 decks,
                 effects,
                 // A scene serializes the modulation engine whole, so recipes are
@@ -1335,6 +1336,7 @@ pub fn restore_scene(
         channel.opacity = ch_config.opacity;
         channel.blend_mode = ch_config.blend_mode.into();
         channel.overlay = ch_config.overlay;
+        channel.color = ch_config.color;
 
         for deck_config in &ch_config.decks {
             // Externally-owned Syphon decks are resolved at runtime, not at

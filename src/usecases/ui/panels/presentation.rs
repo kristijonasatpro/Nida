@@ -868,6 +868,7 @@ mod tests {
             solo: false,
             live: true,
             meter_db: [-96.0, -96.0],
+            signal_db: [-96.0, -96.0],
             refused: None,
         });
         let after = harness(&data);

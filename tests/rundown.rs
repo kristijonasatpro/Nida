@@ -719,6 +719,7 @@ fn a_step_is_not_made_against_what_is_not_there() {
         EngineCommand::SetRundownThen {
             uuid: step.clone(),
             secs: Some(0.0),
+            when_ends: None,
         },
         EngineCommand::RenameRundownStep {
             uuid: step.clone(),
@@ -822,6 +823,7 @@ fn a_step_goes_on_by_itself_and_hold_stops_it() {
         EngineCommand::SetRundownThen {
             uuid: steps[0].clone(),
             secs: Some(0.15),
+            when_ends: None,
         },
     ));
     let wait = |app: &mut VardaApp, secs: f64| {
@@ -902,6 +904,7 @@ fn a_wait_that_cannot_go_on_says_so_and_does_not_try_again() {
         EngineCommand::SetRundownThen {
             uuid: steps[0].clone(),
             secs: Some(0.05),
+            when_ends: None,
         },
     ));
     ok(take(&mut show.app, &steps[0], true));
@@ -1033,6 +1036,7 @@ fn a_step_that_fades_main_goes_on_when_main_has_landed() {
         EngineCommand::SetRundownThen {
             uuid: steps[0].clone(),
             secs: Some(0.05),
+            when_ends: None,
         },
     ] {
         ok(send(&mut show.app, cmd));
@@ -1078,6 +1082,7 @@ fn a_wait_outlasts_a_fade_the_step_did_not_start() {
         EngineCommand::SetRundownThen {
             uuid: steps[0].clone(),
             secs: Some(0.05),
+            when_ends: None,
         },
         EngineCommand::SetRundownFade { secs: 0.6 },
     ] {
@@ -1116,6 +1121,7 @@ fn a_late_press_does_not_stop_the_step_it_was_late_for() {
             EngineCommand::SetRundownThen {
                 uuid: step.clone(),
                 secs: Some(0.2),
+                when_ends: None,
             },
         ));
     }
@@ -1229,6 +1235,7 @@ fn a_step_takes_main_and_switches_overlays() {
         EngineCommand::SetRundownThen {
             uuid: logo_only.clone(),
             secs: Some(0.1),
+            when_ends: None,
         },
         EngineCommand::MoveRundownStep {
             uuid: logo_only.clone(),
@@ -1334,6 +1341,7 @@ fn a_step_is_updated_from_what_is_on_and_copied() {
         EngineCommand::SetRundownThen {
             uuid: step.clone(),
             secs: Some(7.0),
+            when_ends: None,
         },
     ));
     let wall = show.wall.clone();
@@ -1560,6 +1568,7 @@ fn the_rundown_is_there_after_a_restart() {
         EngineCommand::SetRundownThen {
             uuid: steps[1].clone(),
             secs: Some(30.0),
+            when_ends: None,
         },
         EngineCommand::SetRundownFade { secs: 1.5 },
         EngineCommand::SetMixMode {
@@ -1619,6 +1628,7 @@ fn a_wait_does_not_outlive_its_show() {
         EngineCommand::SetRundownThen {
             uuid: steps[0].clone(),
             secs: Some(0.05),
+            when_ends: None,
         },
     ));
     ok(take(&mut app, &steps[0], false));
@@ -1649,6 +1659,7 @@ fn a_wait_does_not_outlive_its_show() {
             EngineCommand::SetRundownThen {
                 uuid: steps[0].clone(),
                 secs: Some(0.05),
+                when_ends: None,
             },
         ));
         ok(take(&mut other, &steps[0], false));
@@ -1668,6 +1679,7 @@ fn a_wait_does_not_outlive_its_show() {
         EngineCommand::SetRundownThen {
             uuid: steps[0].clone(),
             secs: Some(0.05),
+            when_ends: None,
         },
     ));
     ok(take(&mut app, &steps[0], false));
@@ -2395,6 +2407,7 @@ fn an_overlay_fading_on_is_seen_before_the_next_step_takes_it_off() {
         EngineCommand::SetRundownThen {
             uuid: steps[0].clone(),
             secs: Some(0.05),
+            when_ends: None,
         },
     ));
     frame(&mut show.app);
@@ -2861,3 +2874,185 @@ fn a_step_sets_the_timer_it_starts() {
     ));
     assert!(elsewhere.contains("timer"), "{elsewhere}");
 }
+
+/// A step set to go on when its playlist ends: the list played through,
+/// the next step is taken by itself; a list that loops never ends.
+#[test]
+fn a_step_goes_on_when_its_playlist_ends() {
+    use varda::engine::value::playlist::{PlaylistItem, PlaylistSettings, PlaylistTransition};
+    let Some(mut show) = show() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let items: Vec<PlaylistItem> = [("one.png", [255u8, 0, 0]), ("two.png", [0, 255, 0])]
+        .into_iter()
+        .map(|(name, rgb)| {
+            let path = dir.path().join(name);
+            image::RgbaImage::from_pixel(16, 9, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
+                .save(&path)
+                .unwrap();
+            PlaylistItem::new(path.to_string_lossy())
+        })
+        .collect();
+    let settings = |loop_list: bool| PlaylistSettings {
+        transition: PlaylistTransition::Cut,
+        picture_secs: 0.4,
+        loop_list,
+        ..PlaylistSettings::default()
+    };
+    let list = id(send(
+        &mut show.app,
+        EngineCommand::AddPlaylistDeck {
+            channel_uuid: show.c.clone(),
+            items,
+            settings: Some(settings(false)),
+        },
+    ));
+    let first = add_step(&mut show, "Walk-in");
+    let then = add_step(&mut show, "Welcome");
+    ok(send(
+        &mut show.app,
+        EngineCommand::SetRundownPlay {
+            uuid: first.clone(),
+            deck_uuid: list.clone(),
+            action: Some(PlayAction::Start),
+        },
+    ));
+    ok(send(
+        &mut show.app,
+        EngineCommand::SetRundownThen {
+            uuid: first.clone(),
+            secs: None,
+            when_ends: Some(list.clone()),
+        },
+    ));
+    let taken_last = |app: &VardaApp| rundown(app).last;
+    ok(take(&mut show.app, &first, false));
+    let wait = rundown(&show.app).wait.expect("a wait");
+    assert_eq!(wait.until.as_deref(), Some(list.as_str()));
+    // On its first item, the list's time left is not that item's.
+    run(&mut show.app, 0.15);
+    let wait = rundown(&show.app).wait.expect("still waiting");
+    assert!(wait.secs_left.abs() < f32::EPSILON, "not the first item's: {}", wait.secs_left);
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while taken_last(&show.app).as_deref() != Some(then.as_str()) {
+        assert!(std::time::Instant::now() < until, "never went on");
+        run(&mut show.app, 0.05);
+    }
+
+    // Looping: still on the first step after the list has gone round.
+    ok(send(
+        &mut show.app,
+        EngineCommand::SetPlaylistSettings {
+            deck_uuid: list.clone(),
+            settings: settings(true),
+        },
+    ));
+    ok(take(&mut show.app, &first, false));
+    run(&mut show.app, 2.5);
+    assert_eq!(taken_last(&show.app).as_deref(), Some(first.as_str()), "a looping list never ends");
+}
+
+/// A step set to go on when its clip ends: a clip played once ends, and
+/// the next step is taken; the same clip looping never ends.
+#[test]
+fn a_step_goes_on_when_its_clip_ends_and_not_while_it_loops() {
+    use varda::engine::value::video::LoopMode;
+    let Some(mut show) = show() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("short.mp4");
+    let made = ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=red:s=64x36:r=25:d=1",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=1000:duration=1",
+        "-c:v",
+        "mpeg4",
+        "-c:a",
+        "aac",
+        "-shortest",
+        path.to_str().unwrap(),
+    ]);
+    if !made {
+        eprintln!("ffmpeg not available — skipping");
+        return;
+    }
+    let channel = id(send(&mut show.app, EngineCommand::AddChannel));
+    let deck = id(send(
+        &mut show.app,
+        EngineCommand::AddVideoDeck {
+            channel_uuid: channel,
+            path,
+        },
+    ));
+    let set_mode = |app: &mut VardaApp, mode: LoopMode| {
+        ok(send(
+            app,
+            EngineCommand::VideoSetLoopMode {
+                deck_uuid: deck.clone(),
+                mode,
+            },
+        ));
+    };
+    set_mode(&mut show.app, LoopMode::OneShot);
+    let first = add_step(&mut show, "Sting");
+    let then = add_step(&mut show, "After");
+    ok(send(
+        &mut show.app,
+        EngineCommand::SetRundownPlay {
+            uuid: first.clone(),
+            deck_uuid: deck.clone(),
+            action: Some(PlayAction::Start),
+        },
+    ));
+    ok(send(
+        &mut show.app,
+        EngineCommand::SetRundownThen {
+            uuid: first.clone(),
+            secs: None,
+            when_ends: Some(deck.clone()),
+        },
+    ));
+    let taken_last = |app: &VardaApp| rundown(app).last;
+    ok(take(&mut show.app, &first, false));
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while taken_last(&show.app).as_deref() != Some(then.as_str()) {
+        assert!(std::time::Instant::now() < until, "never went on at the clip's end");
+        run(&mut show.app, 0.05);
+    }
+
+    // The app busy while it ends — no frame drawn across its end, so its
+    // end is seen only from where it stopped: it goes on all the same.
+    ok(take(&mut show.app, &first, false));
+    run(&mut show.app, 0.3);
+    std::thread::sleep(Duration::from_millis(1800));
+    run(&mut show.app, 0.5);
+    assert_eq!(taken_last(&show.app).as_deref(), Some(then.as_str()), "its end seen after all");
+
+    // Taken again near its end: it goes on at the end of the run it started,
+    // not at the end of the one before.
+    ok(take(&mut show.app, &first, false));
+    run(&mut show.app, 0.8);
+    ok(take(&mut show.app, &first, false));
+    let again = std::time::Instant::now();
+    let until = again + Duration::from_secs(10);
+    while taken_last(&show.app).as_deref() != Some(then.as_str()) {
+        assert!(std::time::Instant::now() < until, "never went on after the second take");
+        run(&mut show.app, 0.02);
+    }
+    let after = again.elapsed().as_secs_f64();
+    assert!(after > 0.7, "at the end of its second run, not the first: {after:.2} s");
+
+    // Looping, it reaches its end each time round, and never ends.
+    set_mode(&mut show.app, LoopMode::Loop);
+    ok(take(&mut show.app, &first, false));
+    run(&mut show.app, 3.0);
+    assert_eq!(taken_last(&show.app).as_deref(), Some(first.as_str()), "a looping clip never ends");
+}
+

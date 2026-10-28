@@ -41,9 +41,10 @@ second later — `… (2).mp4` — and the window says the take is in two files.
 | **Size** | Nida's own resolution, or 720p, 1080p, 1440p, 4K |
 | **Frame rate** | Nida's own, or 24, 25, 30, 50, 60 fps |
 | **Audio** | AAC 128–320 kbps; uncompressed PCM beside ProRes, as editors expect |
+| **Reminder** | **Blink NOT RECORDING behind the take buttons**: while nothing is being recorded, NOT RECORDING blinks red behind Cut and Fade — in the middle of a show, Record is easily forgotten. Off to start with |
 
-Only the picture can change while recording; the rest waits for a stop. The
-settings are saved with the stage.
+Only the picture and the reminder can change while recording; the rest waits
+for a stop. The settings are saved with the stage.
 
 ## Sound and picture in step
 

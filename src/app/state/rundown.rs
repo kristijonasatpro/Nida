@@ -15,6 +15,61 @@ use crate::engine::{CommandResult, ErrorCode};
 use crate::mixer::{MainSource, MixMode};
 use crate::rundown::{OverlaySet, PlayAction, PlaySet, ScreenSet, Step, TimerSet};
 
+/// What a clip or playlist is doing, for a wait on its end.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PlayState {
+    /// Playing, and not at its end.
+    pub running: bool,
+    /// Played to its end, and staying there: a clip played once or holding
+    /// its last frame, a playlist not looping at its last item.
+    pub ended: bool,
+    /// For a clip, where it is.
+    pub clip: Option<ClipAt>,
+}
+
+/// A clip's playhead: how many times it has been sent somewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClipAt {
+    pub seeks: u64,
+}
+
+/// What a clip is doing, from its playhead. At its end is where it stands:
+/// a clip played once stops at its out-point, one holding its last frame
+/// stays there — not the end flag, set for one decoder tick, and left over
+/// from before a seek while the clip is suspended.
+pub(crate) fn clip_state(snap: &crate::video::PlaybackSnapshot) -> PlayState {
+    let once = matches!(
+        snap.loop_mode,
+        crate::video::LoopMode::OneShot | crate::video::LoopMode::HoldLast
+    );
+    let half_frame = 0.5 / snap.frame_rate.max(1.0);
+    // A clip whose length is not known yet is at no end.
+    let out = snap.effective_out();
+    let at_end = out > 0.0 && snap.position >= out - half_frame;
+    PlayState {
+        running: snap.playing && !at_end,
+        ended: once && at_end,
+        clip: Some(ClipAt { seeks: snap.seeks }),
+    }
+}
+
+/// Whether what a wait awaits counts as seen playing now. See
+/// [`VardaApp::watch_awaited_end`].
+pub(crate) fn seen_playing(follow: &crate::rundown::Follow, state: &PlayState) -> bool {
+    match state.clip {
+        // Sent to its beginning by the take: once that seek has been dealt
+        // with — its run since then, playing or played out already. A clip
+        // not open at the take: once seen playing.
+        Some(clip) if follow.restarted => match follow.seeks_before {
+            Some(before) => clip.seeks != before,
+            None => state.running,
+        },
+        // Carried on: its end, even one it is at already, is the one awaited.
+        Some(_) => true,
+        None => state.running,
+    }
+}
+
 /// A clip or playlist a step is fading out: its sound goes down over the
 /// step's fade, then it is stopped or paused — and its sound is kept down a
 /// moment longer, so what its decoder had ready is not heard at full level.
@@ -32,6 +87,9 @@ pub(crate) struct SoundFade {
     start: f32,
     /// When it was stopped or paused: the sound is let go a moment after.
     done_at: Option<f64>,
+    /// A clip's Stop pressed by hand: its pause is a gesture an armed
+    /// automation pass takes, when it lands at the fade's end.
+    by_hand: bool,
 }
 
 impl SoundFade {
@@ -292,13 +350,21 @@ impl VardaApp {
                 .collect(),
             last: rundown.last().map(str::to_string),
             next: rundown.next().map(|step| step.uuid.clone()),
-            wait: rundown.follow().map(|follow| RundownWaitSnapshot {
-                from: follow.from.clone(),
-                to: follow.to.clone(),
-                secs_left: (follow.due - now).max(0.0) as f32,
-                fade: follow.fade,
+            wait: rundown.follow().map(|follow| {
+                let left = match &follow.until {
+                    Some(deck) if follow.due.is_infinite() => self.left_to_play(deck).unwrap_or(0.0),
+                    _ => (follow.due - now).max(0.0),
+                };
+                RundownWaitSnapshot {
+                    from: follow.from.clone(),
+                    to: follow.to.clone(),
+                    secs_left: left as f32,
+                    fade: follow.fade,
+                    until: follow.until.clone(),
+                }
             }),
             at_held: rundown.at_held().map(str::to_string),
+            held_always: rundown.held_always().to_vec(),
         }
     }
 
@@ -372,6 +438,13 @@ impl VardaApp {
         for deck in leaving {
             self.fade_out(&deck, now, fade.then_some(fade_secs), PlayAction::Stop);
         }
+        // The clip it goes on at the end of, before it is sent to its
+        // beginning: how many seeks it had had.
+        let seeks_before = step
+            .then_ends
+            .as_deref()
+            .and_then(|deck| self.video_playback_snapshot(deck))
+            .map(|snap| snap.seeks);
         for play in &step.plays {
             // Sound alone — a clip or playlist on no screen and not on Main,
             // music — paused or stopped by a step faded to fades out with it,
@@ -391,6 +464,9 @@ impl VardaApp {
         // before then.
         self.rundown_till_next = till_next(&step);
         self.rundown.taken(uuid, fade, now, settle);
+        if let Some(seeks) = seeks_before {
+            self.rundown.set_seeks_before(seeks);
+        }
         log::info!(
             "Rundown: '{}' taken with a {}",
             step.name,
@@ -450,6 +526,117 @@ impl VardaApp {
         Some((deck.to_string(), identity, HELD_FOR_UPDATES))
     }
 
+    /// Stop a clip or playlist as its Stop button does: its sound faded out
+    /// — over `secs`, else the Stop fade set — then paused. One already
+    /// fading out is stopped at once: a second Stop is not a slower one. One
+    /// the timeline plays (it has a lane, or chases the transport) is paused
+    /// at once, as its pause always did, the timeline deciding after. One not
+    /// playing is left as it is.
+    pub fn cmd_stop_with_fade(&mut self, deck_uuid: &str, secs: Option<f32>) -> CommandResult {
+        let Ok((ch, dk)) = self.resolve_deck(deck_uuid) else {
+            return CommandResult::Err {
+                code: ErrorCode::NotFound,
+                message: format!("No input {deck_uuid}"),
+            };
+        };
+        if let Some(secs) = secs {
+            if !secs.is_finite() || !(0.0..=crate::audio_mix::MAX_STOP_FADE_SECS).contains(&secs) {
+                return CommandResult::Err {
+                    code: ErrorCode::InvalidInput,
+                    message: format!(
+                        "A stop fades for 0 to {} seconds",
+                        crate::audio_mix::MAX_STOP_FADE_SECS
+                    ),
+                };
+            }
+        }
+        let deck = &self.mixer.channels()[ch].decks[dk].deck;
+        let playlist = deck.playlist().map(crate::deck::playlist::Playlist::is_playing);
+        let clip = deck.playback_snapshot().map(|snap| snap.playing);
+        let Some(playing) = playlist.or(clip) else {
+            return CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                message: format!("'{}' has no sound to stop", deck.source_name()),
+            };
+        };
+        let is_playlist = playlist.is_some();
+        if !playing {
+            // Not playing as far as can be seen — a Play sent a moment ago
+            // may not have reached the decoder yet: paused all the same. Its
+            // pause noted only where there is a Play to undo — a curve, or a
+            // take this pass — so a Stop on an idle clip leaves no curve to
+            // hold it paused later.
+            let key = format!("deck_{deck_uuid}:{}", crate::video::modulation::PLAY);
+            let pending =
+                self.mixer.modulation().has_modulation(&key) || self.recording_take(&key);
+            self.pause_now(deck_uuid, is_playlist, pending);
+            return CommandResult::Ok;
+        }
+        if !matches!(self.runs(deck_uuid), Ok(Runs::Clip | Runs::Playlist)) {
+            // The timeline's: paused at once, as its pause always did.
+            self.pause_now(deck_uuid, is_playlist, true);
+            return CommandResult::Ok;
+        }
+        let fading = self
+            .rundown_fades
+            .iter()
+            .any(|fade| fade.deck == deck_uuid && fade.done_at.is_none());
+        let secs = (!fading)
+            .then(|| secs.unwrap_or_else(|| self.audio_mix.stop_fade_secs()))
+            .filter(|secs| *secs > 0.0);
+        let now = self.frame_stats.now_secs();
+        self.fade_out(deck_uuid, now, secs, PlayAction::Pause);
+        match self
+            .rundown_fades
+            .iter_mut()
+            .find(|fade| fade.deck == deck_uuid && fade.done_at.is_none())
+        {
+            // Its pause noted for an armed pass when it lands, not now: a
+            // value written now would pause the clip at once.
+            Some(fade) => fade.by_hand = true,
+            None if !is_playlist => {
+                self.note_live_video_write(deck_uuid, crate::video::modulation::PLAY, 0.0);
+            }
+            None => {}
+        }
+        CommandResult::Ok
+    }
+
+    /// A clip's Stop by hand landed: its pause noted for an armed automation
+    /// pass, as its own pause button's is. A playlist has no such curve.
+    fn note_hand_stop(&mut self, deck: &str) {
+        let clip = self.resolve_deck(deck).is_ok_and(|(ch, dk)| {
+            self.mixer.channels()[ch].decks[dk].deck.playlist().is_none()
+        });
+        if clip {
+            self.note_live_video_write(deck, crate::video::modulation::PLAY, 0.0);
+        }
+    }
+
+    /// Pause a clip or playlist now — told to pause, not toggled, so a Stop
+    /// can never start it. A clip's pause by hand (`gesture`) is noted for an
+    /// armed automation pass, as its own pause button's is.
+    fn pause_now(&mut self, deck_uuid: &str, playlist: bool, gesture: bool) {
+        if playlist {
+            let _ = self.edit_playlist(deck_uuid, |list| list.set_playing(false));
+        } else {
+            self.exec_on_deck(deck_uuid, |d| d.video_set_playing(false));
+            if gesture {
+                self.note_live_video_write(deck_uuid, crate::video::modulation::PLAY, 0.0);
+            }
+        }
+    }
+
+    /// The clips and playlists whose sound is fading out to a stop now, by
+    /// deck UUID: a Stop pressed, or the rundown's fade.
+    pub(crate) fn sounds_stopping(&self) -> Vec<String> {
+        self.rundown_fades
+            .iter()
+            .filter(|fade| fade.done_at.is_none())
+            .map(|fade| fade.deck.clone())
+            .collect()
+    }
+
     /// Fade a clip or playlist's sound out over `secs` from `now`, then do
     /// `then` to it — at once with no fade.
     fn fade_out(&mut self, deck: &str, now: f64, secs: Option<f32>, then: PlayAction) {
@@ -459,6 +646,12 @@ impl VardaApp {
             .iter()
             .find(|f| f.deck == deck)
             .map_or(1.0, |f| f.level_at(now));
+        // A Stop by hand still to land keeps its gesture through the fade
+        // that takes over from it.
+        let by_hand = self
+            .rundown_fades
+            .iter()
+            .any(|f| f.deck == deck && f.done_at.is_none() && f.by_hand);
         self.rundown_fades.retain(|f| f.deck != deck);
         match secs.filter(|secs| *secs > 0.0) {
             Some(secs) if start > 0.0 => self.rundown_fades.push(SoundFade {
@@ -468,9 +661,13 @@ impl VardaApp {
                 then,
                 start,
                 done_at: None,
+                by_hand,
             }),
             _ => {
                 self.run_play(&PlaySet::new(deck, then));
+                if by_hand {
+                    self.note_hand_stop(deck);
+                }
                 // Down already: kept down a moment, as at a fade's end.
                 if start < 1.0 {
                     self.rundown_fades.push(SoundFade {
@@ -480,6 +677,7 @@ impl VardaApp {
                         then,
                         start: 0.0,
                         done_at: Some(now),
+                        by_hand: false,
                     });
                 }
             }
@@ -542,6 +740,7 @@ impl VardaApp {
         self.rundown_fades.retain(|fade| !gone.contains(&fade.deck));
         let mut levels = std::collections::HashMap::new();
         let mut done = Vec::new();
+        let mut by_hand = Vec::new();
         self.rundown_fades.retain_mut(|fade| {
             if let Some(at) = fade.done_at {
                 if now - at >= QUIET_AFTER_SECS {
@@ -553,6 +752,9 @@ impl VardaApp {
             let gone = (now - fade.from) / f64::from(fade.secs);
             if gone >= 1.0 {
                 done.push(PlaySet::new(fade.deck.clone(), fade.then));
+                if fade.by_hand {
+                    by_hand.push(fade.deck.clone());
+                }
                 fade.done_at = Some(now);
                 levels.insert(fade.deck.clone(), 0.0);
             } else {
@@ -562,6 +764,10 @@ impl VardaApp {
         });
         for play in &done {
             self.run_play(play);
+        }
+        // A clip's Stop by hand lands now: its pause noted for an armed pass.
+        for deck in by_hand {
+            self.note_hand_stop(&deck);
         }
         self.audio_mix.set_step_fades(levels);
     }
@@ -700,16 +906,90 @@ impl VardaApp {
                 .rundown
                 .due_at(was, day)
                 .filter(|_| next_then == next)
-                .map(|step| (step.uuid.clone(), step.name.clone()));
-            if let Some((uuid, name)) = due {
-                log::info!("Rundown: '{name}' is due at its time of day");
+                .map(|step| (step.uuid.clone(), step.name.clone(), false))
+                .or_else(|| {
+                    self.rundown
+                        .due_always(was, day)
+                        .map(|step| (step.uuid.clone(), step.name.clone(), true))
+                });
+            if let Some((uuid, name, always)) = due {
+                if always {
+                    log::info!("Rundown: '{name}' is due at its time of day, wherever the rundown is");
+                } else {
+                    log::info!("Rundown: '{name}' is due at its time of day");
+                }
                 self.rundown.start_at(&uuid, now);
             }
         }
+        self.watch_awaited_end(now);
         self.run_wait(now);
         // Kept with the step next now — after what this frame took — so a
         // step this frame made next goes by its time from here.
         self.rundown_day_was = Some((day, self.rundown.next().map(|step| step.uuid.clone())));
+    }
+
+    /// A wait for a clip or playlist's end: seen playing, then seen at its
+    /// end, it is due. Gone from the show, the wait is dropped.
+    ///
+    /// A clip the step started from its beginning is seen playing only once
+    /// the seek there has happened (its count of seeks moved on since just
+    /// before the take) — the seek is not at once, and the run before may
+    /// still say it is near its end. A clip carried on counts at once: its
+    /// end, even one it is at already, is the one awaited. A playlist is
+    /// seen playing when it plays and is not at its end: carried on from
+    /// its end, it starts again from its first item.
+    fn watch_awaited_end(&mut self, now: f64) {
+        let Some(follow) = self.rundown.awaited().cloned() else {
+            return;
+        };
+        let Some(deck) = follow.until.as_deref() else {
+            return;
+        };
+        let Some(state) = self.play_state(deck) else {
+            self.rundown.drop_wait();
+            return;
+        };
+        if !follow.seen_running && seen_playing(&follow, &state) {
+            self.rundown.saw_running();
+        }
+        if state.ended && self.rundown.end_came(now) {
+            log::info!("Rundown: what the step waited for has ended — on to the next");
+        }
+    }
+
+    /// Whether the clip or playlist `deck` is playing, has played to its end
+    /// — a clip set to play once or hold its last frame, a list that does
+    /// not loop — or neither; `None` when it is not a clip or playlist in
+    /// the show.
+    pub(crate) fn play_state(&self, deck: &str) -> Option<PlayState> {
+        let (ch, dk) = self.resolve_deck(deck).ok()?;
+        let deck = &self.mixer.channels()[ch].decks[dk].deck;
+        if let Some(list) = deck.playlist() {
+            let ended = list.is_finished();
+            return Some(PlayState {
+                running: list.is_playing() && !ended,
+                ended,
+                clip: None,
+            });
+        }
+        deck.playback_snapshot().map(|snap| clip_state(&snap))
+    }
+
+    /// About how long the clip or playlist `deck` has left to play, if
+    /// known: what a wait for its end says.
+    fn left_to_play(&self, deck: &str) -> Option<f64> {
+        let (ch, dk) = self.resolve_deck(deck).ok()?;
+        let deck = &self.mixer.channels()[ch].decks[dk].deck;
+        // A playlist's time left is its shown item's: the whole list's only
+        // on its last.
+        if let Some(list) = deck.playlist() {
+            let snap = list.snapshot();
+            let last = snap.shown.is_some_and(|i| i + 1 >= snap.items.len());
+            return snap.remaining.filter(|_| last);
+        }
+        let snap = deck.playback_snapshot()?;
+        let speed = snap.effective_speed.abs();
+        (speed > 0.0).then(|| ((snap.effective_out() - snap.position_now()) / speed).max(0.0))
     }
 
     /// A wait run out — a step going on by itself, or one due at its time of
@@ -991,17 +1271,37 @@ impl VardaApp {
     }
 
     /// The time of day a step is taken by itself at, seconds after
-    /// midnight, or with `None` not.
-    pub fn cmd_set_rundown_at(&mut self, uuid: &str, at_secs: Option<u32>) -> CommandResult {
+    /// midnight, or with `None` not; `always`, if given, whether even when
+    /// not next.
+    pub fn cmd_set_rundown_at(
+        &mut self,
+        uuid: &str,
+        at_secs: Option<u32>,
+        always: Option<bool>,
+    ) -> CommandResult {
         if at_secs.is_some_and(|secs| secs >= crate::rundown::DAY_SECS) {
             return invalid("A time of day is before midnight");
         }
-        self.edited(uuid, |rundown| rundown.set_at(uuid, at_secs))
+        self.edited(uuid, |rundown| rundown.set_at(uuid, at_secs, always))
     }
 
     /// How long after a step the next is taken by itself, or with `None`
     /// not until the operator says.
-    pub fn cmd_set_rundown_then(&mut self, uuid: &str, secs: Option<f32>) -> CommandResult {
+    pub fn cmd_set_rundown_then(
+        &mut self,
+        uuid: &str,
+        secs: Option<f32>,
+        when_ends: Option<&str>,
+    ) -> CommandResult {
+        if let Some(deck) = when_ends {
+            if self.rundown.step(uuid).is_some_and(|step| !step.plays_on(deck)) {
+                return invalid("The step does not start or carry on that clip or playlist");
+            }
+            if !matches!(self.runs(deck), Ok(Runs::Clip | Runs::Playlist)) {
+                return invalid("Only a clip or a playlist ends: a timer or anything else does not");
+            }
+            return self.edited(uuid, |rundown| rundown.set_then_ends(uuid, Some(deck)));
+        }
         if secs.is_some_and(|secs| crate::rundown::valid_then(secs).is_none()) {
             return invalid("the wait must be more than no seconds");
         }
@@ -1045,7 +1345,7 @@ impl VardaApp {
     /// Drop the wait of a step that goes on by itself, and hold the time of
     /// day of the step next.
     pub fn cmd_rundown_hold(&mut self) -> CommandResult {
-        if self.rundown.hold() {
+        if self.rundown.hold(crate::deck::timer::time_of_day()) {
             log::info!("Rundown: held — it goes on when the operator says");
         }
         CommandResult::Ok
@@ -1088,6 +1388,7 @@ impl VardaApp {
 
 #[cfg(test)]
 mod tests {
+    use super::{seen_playing, ClipAt, PlayState};
     use crate::bus::BusInputRef;
     use crate::engine::{CommandResult, EngineCommand};
     use crate::rundown::PlayAction;
@@ -1279,6 +1580,136 @@ mod tests {
         });
         assert!(matches!(refused, CommandResult::Err { .. }), "{refused:?}");
     }
+    /// A step taken at its time even when not next: the clock comes to it
+    /// with another step next, and the show goes there; GO goes on from it.
+    #[test]
+    fn a_step_at_its_time_even_when_not_next_is_taken_wherever_the_rundown_is() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let (_, _, a) = step(&mut app);
+        let mut add = |name: &str| {
+            id(app.execute_command(EngineCommand::AddRundownStep {
+                name: name.into(),
+                buses: Some(vec![]),
+                main: false,
+            }))
+        };
+        let (b, c, d) = (add("B"), add("C"), add("D"));
+        let quarter = 9 * 3600 + 900;
+        assert!(matches!(
+            app.execute_command(EngineCommand::SetRundownAt {
+                uuid: d.clone(),
+                at_secs: Some(quarter),
+                always: Some(true),
+            }),
+            CommandResult::Ok
+        ));
+        assert!(matches!(
+            app.execute_command(EngineCommand::TakeRundownStep {
+                uuid: a.clone(),
+                fade: false,
+            }),
+            CommandResult::Ok
+        ));
+        assert_eq!(app.rundown.next().map(|s| s.uuid.clone()), Some(b.clone()));
+        let now = app.frame_stats.now_secs();
+        app.advance_rundown_by(now, f64::from(quarter) - 1.0);
+        assert_eq!(app.rundown.last(), Some(a.as_str()), "not yet");
+        app.advance_rundown_by(now + 0.5, f64::from(quarter) + 0.2);
+        for i in 0..20 {
+            app.advance_rundown_by(now + 1.0 + f64::from(i) * 0.1, f64::from(quarter) + 0.3);
+        }
+        assert_eq!(app.rundown.last(), Some(d.as_str()), "taken at 9:15, B and C left out");
+        let _ = c;
+    }
+
+    /// What a wait for an end counts as playing: a clip started from its
+    /// beginning only once that seek has happened (the run before, near its
+    /// end, does not — however long the app was busy); one carried on at
+    /// once — at its end already too; a playlist while it plays and is not
+    /// at its end.
+    #[test]
+    fn a_wait_for_an_end_counts_a_clip_as_playing_once_it_has_been_sent_back() {
+        let follow = |restarted: bool, seeks_before: Option<u64>| crate::rundown::Follow {
+            until: Some("clip".into()),
+            restarted,
+            seeks_before,
+            ..crate::rundown::Follow::at_for_tests()
+        };
+        let clip = |running: bool, ended: bool, seeks: u64| PlayState {
+            running,
+            ended,
+            clip: Some(ClipAt { seeks }),
+        };
+        assert!(!seen_playing(&follow(true, Some(3)), &clip(true, false, 3)), "the run before");
+        assert!(seen_playing(&follow(true, Some(3)), &clip(true, false, 4)), "sent back");
+        // The app busy through the whole new run: played out already.
+        assert!(seen_playing(&follow(true, Some(3)), &clip(false, true, 4)), "its own end");
+        assert!(!seen_playing(&follow(true, None), &clip(false, true, 0)), "not seen at all");
+        assert!(seen_playing(&follow(true, None), &clip(true, false, 0)), "not open before");
+        assert!(seen_playing(&follow(false, Some(3)), &clip(false, true, 3)), "carried on");
+        let list = |running: bool| PlayState { running, ended: !running, clip: None };
+        assert!(seen_playing(&follow(false, None), &list(true)));
+        assert!(!seen_playing(&follow(false, None), &list(false)));
+    }
+
+    /// A clip is at its end where its playhead stands — at its out-point —
+    /// not by the end flag: left over from before a seek, it says nothing.
+    #[test]
+    fn a_clip_is_at_its_end_where_its_playhead_stands() {
+        use crate::video::LoopMode;
+        let mut snap = crate::video::PlaybackSnapshot::stopped();
+        snap.duration = 10.0;
+        snap.frame_rate = 25.0;
+        snap.loop_mode = LoopMode::OneShot;
+        snap.position = 10.0;
+        snap.playing = false;
+        assert!(super::clip_state(&snap).ended, "at its out-point");
+        snap.position = 0.0;
+        snap.playing = true;
+        snap.reached_end = true;
+        let state = super::clip_state(&snap);
+        assert!(!state.ended && state.running, "back at its start: the old flag says nothing");
+        snap.loop_mode = LoopMode::Loop;
+        snap.position = 10.0;
+        assert!(!super::clip_state(&snap).ended, "a loop never ends");
+        // Its length not known yet: at no end.
+        snap.loop_mode = LoopMode::OneShot;
+        snap.duration = 0.0;
+        snap.position = 0.0;
+        assert!(!super::clip_state(&snap).ended, "no length yet");
+    }
+
+    /// Only a clip or a playlist ends: a timer is refused as what a step
+    /// goes on at the end of.
+    #[test]
+    fn a_timer_is_not_what_a_step_goes_on_at_the_end_of() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let (_, channel, step) = step(&mut app);
+        let timer = id(app.execute_command(EngineCommand::AddTimerDeck {
+            channel_uuid: channel,
+            settings: None,
+        }));
+        assert!(matches!(
+            app.execute_command(EngineCommand::SetRundownPlay {
+                uuid: step.clone(),
+                deck_uuid: timer.clone(),
+                action: Some(PlayAction::Start),
+            }),
+            CommandResult::Ok
+        ));
+        let refused = app.execute_command(EngineCommand::SetRundownThen {
+            uuid: step.clone(),
+            secs: Some(5.0),
+            when_ends: Some(timer),
+        });
+        assert!(matches!(refused, CommandResult::Err { .. }), "{refused:?}");
+        assert_eq!(app.rundown.step(&step).unwrap().then_ends, None);
+    }
+
     /// A step at a time of day is taken as the clock comes to it while it is
     /// next — faded, as GO takes it — and not while it is held.
     #[test]
@@ -1301,6 +1732,7 @@ mod tests {
                 app.execute_command(EngineCommand::SetRundownAt {
                     uuid: step.clone(),
                     at_secs: Some(at),
+                    always: None,
                 }),
                 CommandResult::Ok
             ));
@@ -1359,6 +1791,7 @@ mod tests {
             app.execute_command(EngineCommand::SetRundownAt {
                 uuid: e.clone(),
                 at_secs: Some(nine + 240),
+                always: None,
             }),
             CommandResult::Ok
         ));
@@ -1389,7 +1822,389 @@ mod tests {
             then: PlayAction::Stop,
             start: 1.0,
             done_at: None,
+            by_hand: false,
         }
+    }
+
+    fn list_playing(app: &App, deck: &str) -> bool {
+        let (ch, dk) = app.resolve_deck(deck).unwrap();
+        app.mixer.channels()[ch].decks[dk]
+            .deck
+            .playlist()
+            .unwrap()
+            .is_playing()
+    }
+
+    /// Stop pressed on a playing playlist fades its sound out over the
+    /// Stop fade set — 2 s unless chosen — then pauses it where it is, and
+    /// says it is stopping meanwhile.
+    #[test]
+    fn a_stop_fades_the_sound_out_then_pauses() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let music = playlist(&mut app);
+        assert!(matches!(
+            app.execute_command(EngineCommand::SetPlaylistPlaying {
+                deck_uuid: music.clone(),
+                playing: true,
+            }),
+            CommandResult::Ok
+        ));
+        assert!(list_playing(&app, &music));
+        assert!(matches!(
+            app.execute_command(EngineCommand::StopWithFade {
+                deck_uuid: music.clone(),
+                secs: None,
+            }),
+            CommandResult::Ok
+        ));
+        let fade = app.rundown_fades.iter().find(|f| f.deck == music).unwrap();
+        assert!((fade.secs - crate::audio_mix::DEFAULT_STOP_FADE_SECS).abs() < 1e-6);
+        assert_eq!(fade.then, PlayAction::Pause, "paused where it is, not rewound");
+        let from = fade.from;
+        assert_eq!(app.sounds_stopping(), vec![music.clone()]);
+        assert!(list_playing(&app, &music), "still playing while it fades");
+        app.run_sound_fades(from + 1.0);
+        let half = app.audio_mix.step_fade(&music).unwrap();
+        assert!((half - 0.5).abs() < 1e-3, "half way: {half}");
+        // Just past its end: from + 2.0 - from can come out a hair short of 2.
+        app.run_sound_fades(from + 2.01);
+        assert!(!list_playing(&app, &music), "paused at the fade's end");
+        assert!(app.sounds_stopping().is_empty());
+    }
+
+    /// A second Stop while it fades stops it at once; a Stop set to cut, or
+    /// given 0, stops it at once; one not playing changes nothing.
+    #[test]
+    fn a_second_stop_or_a_cut_stops_at_once() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let music = playlist(&mut app);
+        let play = |app: &mut App| {
+            app.execute_command(EngineCommand::SetPlaylistPlaying {
+                deck_uuid: music.clone(),
+                playing: true,
+            });
+        };
+        let stop = |app: &mut App, secs: Option<f32>| {
+            assert!(matches!(
+                app.execute_command(EngineCommand::StopWithFade {
+                    deck_uuid: music.clone(),
+                    secs,
+                }),
+                CommandResult::Ok
+            ));
+        };
+        play(&mut app);
+        stop(&mut app, None);
+        assert!(list_playing(&app, &music), "fading");
+        stop(&mut app, None);
+        assert!(!list_playing(&app, &music), "a second Stop: at once");
+        assert!(app.sounds_stopping().is_empty());
+
+        app.rundown_fades.clear();
+        play(&mut app);
+        stop(&mut app, Some(0.0));
+        assert!(!list_playing(&app, &music), "0 cuts");
+
+        app.rundown_fades.clear();
+        assert!(matches!(
+            app.execute_command(EngineCommand::SetStopFade { secs: 0.0 }),
+            CommandResult::Ok
+        ));
+        play(&mut app);
+        stop(&mut app, None);
+        assert!(!list_playing(&app, &music), "set to cut");
+        assert!(app.rundown_fades.iter().all(|f| f.done_at.is_some()));
+
+        app.rundown_fades.clear();
+        stop(&mut app, None);
+        assert!(app.rundown_fades.is_empty(), "not playing: nothing to fade");
+    }
+
+    /// The Stop fade is 0 to 10 seconds, kept with the show's sound
+    /// settings; a Stop is refused on what has no sound to stop.
+    #[test]
+    fn the_stop_fade_is_kept_and_checked() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        for secs in [-1.0, 10.5, f32::NAN] {
+            assert!(matches!(
+                app.execute_command(EngineCommand::SetStopFade { secs }),
+                CommandResult::Err { .. }
+            ));
+        }
+        assert!((app.audio_mix.stop_fade_secs() - 2.0).abs() < 1e-6, "unchanged");
+        assert!(matches!(
+            app.execute_command(EngineCommand::SetStopFade { secs: 3.0 }),
+            CommandResult::Ok
+        ));
+        let saved = serde_json::to_string(app.audio_mix.config()).unwrap();
+        let loaded: crate::audio_mix::AudioMixConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded.stop_fade_secs, Some(3.0), "{saved}");
+        let older: crate::audio_mix::AudioMixConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(older.stop_fade_secs, None, "a show from before: the default");
+        assert!((build_engine_state_stop(&app) - 3.0).abs() < 1e-6);
+
+        let (_, channel, _) = step(&mut app);
+        let deck = id(app.execute_command(EngineCommand::AddSolidColorDeck {
+            channel_uuid: channel,
+            color: [1.0, 0.0, 0.0, 1.0],
+        }));
+        for (deck, why) in [(deck.as_str(), "a picture"), ("nosuchdk", "none")] {
+            assert!(
+                matches!(
+                    app.execute_command(EngineCommand::StopWithFade {
+                        deck_uuid: deck.to_string(),
+                        secs: None,
+                    }),
+                    CommandResult::Err { .. }
+                ),
+                "{why}"
+            );
+        }
+    }
+
+    /// A 6-second 64x36 clip with a tone, or `None` without the ffmpeg tool.
+    fn tone_clip(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let path = dir.join("tone.mp4");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("color=c=red:s=64x36:r=25:d=6")
+            .args(["-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=44100:duration=6"])
+            .args(["-c:v", "mpeg4", "-c:a", "aac", "-shortest"])
+            .arg(&path)
+            .status()
+            .is_ok_and(|s| s.success());
+        made.then_some(path)
+    }
+
+    /// A clip deck on the show's first channel, playing.
+    fn playing_clip(app: &mut App, path: std::path::PathBuf) -> Option<String> {
+        let (_, channel, _) = step(app);
+        let deck = id(app.execute_command(EngineCommand::AddVideoDeck {
+            channel_uuid: channel,
+            path,
+        }));
+        app.execute_command(EngineCommand::VideoTogglePlay {
+            deck_uuid: deck.clone(),
+        });
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < until {
+            app.render_mixer_frame();
+            if app.video_playback_snapshot(&deck).is_some_and(|s| s.playing) {
+                return Some(deck);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        None
+    }
+
+    /// Whether the clip still plays once the decoder has had a moment.
+    fn still_playing(app: &mut App, deck: &str) -> bool {
+        for _ in 0..30 {
+            app.render_mixer_frame();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        app.video_playback_snapshot(deck).is_some_and(|s| s.playing)
+    }
+
+    /// A clip the timeline has a lane for is not the Stop's to fade: it is
+    /// paused at once, as its pause always did — not refused.
+    #[test]
+    fn a_clip_on_the_timeline_is_paused_at_once() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = tone_clip(dir.path()) else {
+            return;
+        };
+        let Some(deck) = playing_clip(&mut app, path) else {
+            panic!("the clip did not start");
+        };
+        assert!(matches!(
+            app.execute_command(EngineCommand::AddLane {
+                deck_uuid: deck.clone(),
+            }),
+            CommandResult::Ok | CommandResult::OkWithId { .. }
+        ));
+        assert!(app.runs(&deck).is_err(), "precondition: the timeline's");
+        let result = app.execute_command(EngineCommand::StopWithFade {
+            deck_uuid: deck.clone(),
+            secs: None,
+        });
+        assert!(matches!(result, CommandResult::Ok), "{result:?}");
+        assert!(app.rundown_fades.is_empty(), "no fade of its own");
+        assert!(!still_playing(&mut app, &deck), "paused at once");
+    }
+
+    /// A clip stopped by hand during an armed pass leaves its stop on the
+    /// curve, as its pause did.
+    #[test]
+    fn a_stop_by_hand_is_taken_by_an_armed_pass() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = tone_clip(dir.path()) else {
+            return;
+        };
+        let Some(deck) = playing_clip(&mut app, path) else {
+            panic!("the clip did not start");
+        };
+        // Its own clock, not the transport's: with the transport rolling a
+        // clip on Auto follows it, and its Stop is the timeline's pause.
+        assert!(matches!(
+            app.execute_command(EngineCommand::VideoSetTransportSync {
+                deck_uuid: deck.clone(),
+                sync: crate::engine::value::video::DeckTransportSync {
+                    mode: crate::engine::value::video::TransportSyncMode::Never,
+                    ..Default::default()
+                },
+            }),
+            CommandResult::Ok
+        ));
+        app.set_record_armed(true);
+        app.transport.tick(1.0);
+        app.tick_recorder();
+        let key = format!("deck_{deck}:{}", crate::video::modulation::PLAY);
+        assert!(app.mixer_ref().modulation().assignments_for(&key).is_empty());
+        assert!(matches!(
+            app.execute_command(EngineCommand::StopWithFade {
+                deck_uuid: deck.clone(),
+                secs: None,
+            }),
+            CommandResult::Ok
+        ));
+        assert_eq!(app.sounds_stopping(), vec![deck.clone()], "the fade's way");
+        assert!(
+            still_playing(&mut app, &deck),
+            "an armed pass does not cut the fade short"
+        );
+        let from = app.rundown_fades[0].from;
+        app.transport.tick(1.0);
+        app.run_sound_fades(from + f64::from(app.rundown_fades[0].secs) + 0.01);
+        assert!(!still_playing(&mut app, &deck), "paused at the fade's end");
+        app.tick_recorder();
+        app.set_record_armed(false);
+        assert!(
+            !app.mixer_ref().modulation().assignments_for(&key).is_empty(),
+            "the stop is on a curve for {key}"
+        );
+    }
+
+    /// A clip of its own clock (not the transport's) during an armed pass.
+    fn armed_free_clip(app: &mut App, deck: &str) {
+        app.execute_command(EngineCommand::VideoSetTransportSync {
+            deck_uuid: deck.to_string(),
+            sync: crate::engine::value::video::DeckTransportSync {
+                mode: crate::engine::value::video::TransportSyncMode::Never,
+                ..Default::default()
+            },
+        });
+        app.set_record_armed(true);
+        app.transport.tick(1.0);
+        app.tick_recorder();
+    }
+
+    fn play_curve(app: &App, deck: &str) -> bool {
+        let key = format!("deck_{deck}:{}", crate::video::modulation::PLAY);
+        !app.mixer_ref().modulation().assignments_for(&key).is_empty()
+    }
+
+    /// The PLAY curve recorded for a clip, as (position, value) points.
+    fn play_points(app: &App, deck: &str) -> Vec<f32> {
+        let key = format!("deck_{deck}:{}", crate::video::modulation::PLAY);
+        let modulation = app.mixer_ref().modulation();
+        let Some(source) = modulation.assignments_for(&key).first().map(|m| m.source_id.clone())
+        else {
+            return Vec::new();
+        };
+        match modulation.find_source_by_uuid(&source).map(|e| &e.source) {
+            Some(crate::modulation::ModulationSource::Envelope { breakpoints, .. }) => {
+                breakpoints.iter().map(|p| p.value).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// A Stop on a paused clip in an armed pass: noted only when there is a
+    /// Play to undo — one noted this pass — never as a curve of its own,
+    /// which would hold the clip paused when something later starts it.
+    #[test]
+    fn a_stop_on_a_paused_clip_is_noted_only_over_a_play() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = tone_clip(dir.path()) else {
+            return;
+        };
+        let Some(deck) = playing_clip(&mut app, path) else {
+            panic!("the clip did not start");
+        };
+        // Paused before the pass, by its own button.
+        app.execute_command(EngineCommand::VideoTogglePlay {
+            deck_uuid: deck.clone(),
+        });
+        assert!(!still_playing(&mut app, &deck));
+        armed_free_clip(&mut app, &deck);
+        let stop = |app: &mut App| {
+            app.execute_command(EngineCommand::StopWithFade {
+                deck_uuid: deck.clone(),
+                secs: None,
+            });
+        };
+        stop(&mut app);
+        assert!(!play_curve(&app, &deck), "an idle Stop leaves no curve");
+
+        // A Play noted this pass, its decoder not caught up: the Stop
+        // undoes it on the curve too.
+        app.note_live_video_write(&deck, crate::video::modulation::PLAY, 1.0);
+        app.transport.tick(1.0);
+        stop(&mut app);
+        app.transport.tick(1.0);
+        app.tick_recorder();
+        app.set_record_armed(false);
+        let points = play_points(&app, &deck);
+        assert_eq!(points.last().copied(), Some(0.0), "ends paused: {points:?}");
+    }
+
+    /// A rundown fade that takes over from a Stop by hand before it lands
+    /// keeps its gesture: the pause is noted when it lands.
+    #[test]
+    fn a_rundown_fade_over_a_hand_stop_keeps_its_gesture() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = tone_clip(dir.path()) else {
+            return;
+        };
+        let Some(deck) = playing_clip(&mut app, path) else {
+            panic!("the clip did not start");
+        };
+        armed_free_clip(&mut app, &deck);
+        app.execute_command(EngineCommand::StopWithFade {
+            deck_uuid: deck.clone(),
+            secs: None,
+        });
+        let now = app.rundown_fades[0].from + 0.5;
+        app.fade_out(&deck, now, Some(1.0), PlayAction::Stop);
+        assert!(app.rundown_fades[0].by_hand, "kept through the takeover");
+        app.run_sound_fades(now + 1.01);
+        app.transport.tick(1.0);
+        app.tick_recorder();
+        app.set_record_armed(false);
+        assert!(play_curve(&app, &deck), "noted when it landed");
+    }
+
+    fn build_engine_state_stop(app: &App) -> f32 {
+        crate::app::snapshot::build_engine_state(app).audio_mix.stop_fade_secs
     }
 
     /// A sound faded out goes down with its fade, is stopped at its end and
@@ -1515,6 +2330,7 @@ mod tests {
             app.execute_command(EngineCommand::SetRundownAt {
                 uuid: b.clone(),
                 at_secs: Some(nine),
+                always: None,
             }),
             CommandResult::Ok
         ));
@@ -1551,10 +2367,12 @@ mod tests {
             EngineCommand::SetRundownThen {
                 uuid: first.clone(),
                 secs: Some(0.1),
+                when_ends: None,
             },
             EngineCommand::SetRundownAt {
                 uuid: b.clone(),
                 at_secs: Some(nine),
+                always: None,
             },
             EngineCommand::TakeRundownStep {
                 uuid: first,

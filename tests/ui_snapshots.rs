@@ -404,8 +404,10 @@ fn snapshot_rundown_panel_and_step_window() {
             to: "s3".into(),
             secs_left: 2.6,
             fade: true,
+            until: None,
         }),
         at_held: None,
+        held_always: vec![],
     };
     // The wait repaints the panel, so it never settles: stepped instead.
     let Some(mut harness) = unsettled_snapshot_harness(data) else {
@@ -463,6 +465,7 @@ fn broadcast_audio_mix(data: &UIData) -> varda::audio_mix::AudioMixSnapshot {
             solo: false,
             live: true,
             meter_db: [meter, meter - 1.5],
+            signal_db: [meter, meter - 1.5],
             peak_db: [meter, meter - 1.5],
             refused: None,
         };
@@ -497,6 +500,8 @@ fn broadcast_audio_mix(data: &UIData) -> varda::audio_mix::AudioMixSnapshot {
         output_devices: vec!["BMD HDMI".into()],
         input_devices: vec![],
         apps: vec![],
+        stop_fade_secs: varda::audio_mix::DEFAULT_STOP_FADE_SECS,
+        stopping: vec![],
     }
 }
 
@@ -784,7 +789,13 @@ fn snapshot_stream_window_live() {
         return;
     };
     harness.run_steps(2);
-    harness.get_by_label_contains("STREAM").click();
+    // The top bar's button, not the STREAM meter beside the output.
+    harness
+        .get_by(|node| {
+            node.role() == egui::accesskit::Role::Button
+                && node.label().is_some_and(|label| label.contains("STREAM"))
+        })
+        .click();
     // Live, the button keeps repainting (clock, blink): step, don't settle.
     harness.run_steps(3);
     harness.snapshot("stream_window_live");

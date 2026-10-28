@@ -98,7 +98,11 @@ to Main at once. A tile's red frame means ON MAIN, green means Preview.
 A tile holding a clip (video or sound) has its own controls on the picture,
 as a playlist has: **⏮** back to the start, **▶ / ⏸** (green while it plays),
 and the time gone and left, with the playhead along the foot of the picture —
-start, stop and watch a clip without putting it in Preview. A sound, which
+start, stop and watch a clip without putting it in Preview. **⏸** there does
+not stop the sound dead: it fades it out over 2 seconds, then pauses (amber
+while it fades; press again to pause at once). Right-click it to choose
+**Cut** or a fade of 0.5 to 5 seconds — one choice for every Stop, on the
+tiles and in the [Audio Mixer](16-audio-mixer.md). A sound, which
 has no picture, shows a **♪** and its name. The chips under a tile mark each
 clip, **▶** a video and **♪** a sound (green while it plays); a picture has no
 mark. A layer that is covered (under a full-screen one) still has its chip's
@@ -111,6 +115,21 @@ not in a closed panel), only when it has been drawn since (a channel's),
 and at the size it is shown at — a tile's is a fraction of the Program
 picture's: making every preview full size every frame, shown or not, was the
 GPU's biggest cost on a MacBook.
+
+Beside the Program picture stand meters for each place the sound goes:
+**REC**, **STREAM**, and every audio bus that plays on a sound device (the
+speakers), named over its meter, with the bus a recording or stream carries —
+or the device a bus plays on — under it. REC and STREAM show their bus even
+before they start, dimmed, and turn red while recording or live; meanwhile
+they meter the bus they started with (a bus removed since reads silence, as
+its sound has stopped). A source
+sent to the speakers' bus but not to the stream's shows as a STREAM meter
+standing still while the speakers' moves. The **Main Output** panel has the
+same meters beside its picture.
+
+With **REC ▸ Reminder** ticked, **NOT RECORDING** blinks red behind the take
+buttons — between Preview and Program, on each Switcher card and in the
+channel desk's toolbar — for as long as nothing is being recorded.
 
 Under the Preview picture is the transport of its clip (video or sound) —
 the selected layer when it is a clip, else the input's top clip — and under
@@ -127,6 +146,10 @@ can be paused there and its time left seen (none in a layered mix):
 | **[ In**, **Out ]** | Start or end the clip where the playhead is |
 | **×** | Clear the in and out points: play all of it |
 | **Loop** | Play it round and round; off, it stops at its end |
+
+In a panel too narrow for the whole row — a Preview / Program window on a
+small screen, say — the transport keeps the bar, ⏮ ⏪ ▶ ⏩ and the times; In,
+Out and Loop are then in the clip's settings.
 
 Along the foot of each tile are the decks layered in the channel: click one
 for its settings, double-click to adjust it, right-click to take it to Main on
@@ -149,8 +172,11 @@ A tile's **name bar** is its handle:
 | Right-click | Fold the tile to a narrow strip with its name down it, to make room for the channels in use; right-click the strip to open it out. A strip is framed red on Main and green in Preview, takes clicks, double-clicks and drops like a tile, and stays folded when Nida opens again |
 | × | Delete the channel, at once: **Undo** brings it back. One that is on air — on Main or a bus's Program, itself or inside another input there, fading or not — asks first, saying where ("Ch 24 is on Main"). The last two channels stay |
 
-A channel's right-click menu (in any layout) also has **Rename…**, **Move
-earlier** and **Move later**.
+A channel's right-click menu (in any layout) also has **Rename…**, **Colour**,
+**Move earlier** and **Move later**. **Colour** gives the input a colour of its
+own from ten — its tile, its settings and its switcher buttons wear it —
+and **Automatic** gives it back the one its place gives. The colour is saved
+with the show.
 
 ## VJ: Layers
 

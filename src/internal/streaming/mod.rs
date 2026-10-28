@@ -872,6 +872,10 @@ pub struct StreamStatus {
     pub stream_kbps: Option<u32>,
     /// One per destination, in order.
     pub destinations: Vec<DestinationStatus>,
+    /// The audio-mixer bus the running stream carries, as chosen when it
+    /// started; none stopped, or carrying silence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_bus: Option<String>,
 }
 
 /// A stream's video bit rate following its upload.
@@ -913,6 +917,7 @@ impl StreamStatus {
             rate_note: None,
             stream_kbps: None,
             destinations: vec![DestinationStatus::off(); DESTINATIONS],
+            audio_bus: None,
         }
     }
 

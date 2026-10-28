@@ -295,6 +295,7 @@ mod tests {
     fn a_channel_reidentifies_everything_under_it() {
         let mut config = ChannelConfig {
             overlay: false,
+            color: None,
             uuid: "chan0001".to_string(),
             name: "A".to_string(),
             opacity: 1.0,
@@ -333,6 +334,7 @@ mod tests {
         };
         let mut config = ChannelConfig {
             overlay: false,
+            color: None,
             uuid: "chan0001".to_string(),
             name: "Talk".to_string(),
             opacity: 1.0,

@@ -567,7 +567,7 @@ pub(super) fn render_channel_column(
     data: &UIData,
     actions: &mut UIActions,
 ) {
-    let accent = channel_color(ch.ch_idx);
+    let accent = ch.accent();
     let ch_idx = ch.ch_idx;
 
     ui.push_id(format!("ch_{ch_idx}"), |ui| {
@@ -663,7 +663,7 @@ pub(super) fn render_channel_column(
                         header_resp.context_menu(|ui| channel_context_menu(ui, data, actions, ch));
                         if let Some((deck, list)) = super::playlist::of_channel(ch) {
                             let size = egui::vec2(26.0, 20.0);
-                            super::playlist::play_button(ui, &deck.uuid, list, size, actions);
+                            super::playlist::play_button(ui, &deck.uuid, list, size, data, actions);
                             super::playlist::list_button(ui, &deck.uuid, size);
                         }
                         if let Some((deck, timer)) = super::timer::of_channel(ch) {
@@ -915,6 +915,9 @@ pub(super) fn channel_context_menu(
         super::rename::open(ui.ctx(), ch);
         ui.close();
     }
+    ui.menu_button("Colour", |ui| super::colours::palette(ui, ch, actions))
+        .response
+        .on_hover_text("A colour to find it by: its tile and its switcher buttons wear it");
     let earlier = ch.ch_idx.checked_sub(1).and_then(|i| data.channels.get(i));
     if ui
         .add_enabled(earlier.is_some(), egui::Button::new("Move earlier"))

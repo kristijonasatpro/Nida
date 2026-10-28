@@ -428,6 +428,9 @@ pub struct BusSnapshot {
     pub auto_duration: f32,
     /// Mixer layers (channel UUIDs) this bus leaves out when it shows Master.
     pub hidden_layers: Vec<String>,
+    /// Sources its switcher row has no button for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_sources: Vec<BusInputRef>,
     /// In-flight transition, if any.
     pub transition: Option<BusTransitionSnapshot>,
     /// Where the bus is shown from its card's Screen: picker: a monitor, by
@@ -454,6 +457,10 @@ pub struct RundownSnapshot {
     /// The step whose time of day was held, by UUID: it waits for GO.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at_held: Option<String>,
+    /// Steps taken at their time even when not next whose time was held,
+    /// by UUID: each waits till its time is set again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_always: Vec<String>,
 }
 
 /// One step of the rundown, and whether it can be taken now.
@@ -484,6 +491,10 @@ pub struct RundownWaitSnapshot {
     pub secs_left: f32,
     /// Whether that step is faded to, or cut.
     pub fade: bool,
+    /// The clip or playlist it waits to end, by deck UUID, instead of a
+    /// time; `secs_left` is then about how long it has left to play.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
 }
 
 /// Snapshot of an in-flight bus transition.
@@ -717,6 +728,10 @@ pub struct ChannelSnapshot {
     /// shown there, fading or not. Absent off air.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_air: Option<String>,
+    /// The colour the operator gave it, red, green, blue. Absent when it
+    /// has the one its place gives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 3]>,
 }
 
 // Serialized DTO: the flags mirror independent deck toggles, not a state enum.
@@ -1639,6 +1654,7 @@ mod tests {
         let ch = ChannelSnapshot {
             overlay: false,
             on_air: None,
+            color: None,
             idx: 0,
             uuid: "test0001".into(),
             name: "Ch 0".into(),

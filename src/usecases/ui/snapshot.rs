@@ -165,6 +165,7 @@ pub(crate) fn build_ui_data(
                 decks,
                 effects,
                 overlay: ch.overlay,
+                color: ch.color.map(|[r, g, b]| egui::Color32::from_rgb(r, g, b)),
                 on_air: ch.on_air.as_deref().map(|at| {
                     if at == "main" {
                         "Main".to_string()

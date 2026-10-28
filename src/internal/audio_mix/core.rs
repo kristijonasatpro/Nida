@@ -174,6 +174,9 @@ pub struct Source {
     pub delay_ms: f32,
     current: Frame,
     meter: Frame,
+    /// Its level before its fader, mute and gate: what it plays, heard or
+    /// not.
+    signal: Frame,
     delay: DelayLine,
 }
 
@@ -194,8 +197,15 @@ impl Source {
             delay_ms: 0.0,
             current: [0.0; 2],
             meter: [0.0; 2],
+            signal: [0.0; 2],
             delay: DelayLine::default(),
         }
+    }
+
+    /// Its level before its fader, mute and gate, per channel, linear: what
+    /// it plays, whether or not anyone hears it.
+    pub fn signal(&self) -> Frame {
+        self.signal
     }
 
     /// Post-fader peak level per channel, linear.
@@ -483,6 +493,7 @@ impl MixCore {
                 add_into(&mut self.solo_sum, &self.scratch);
             }
             source.delay.run(&mut self.scratch, source.delay_ms);
+            source.signal = fall(source.signal, peak_of(&self.scratch));
             let target = source.target_gain();
             let peak = ramp_sides(&mut self.scratch, source.current, target);
             source.current = target;
@@ -1030,6 +1041,21 @@ mod tests {
             core.source("mic").unwrap().meter()[0] < 0.1,
             "a second later it has fallen"
         );
+    }
+
+    /// What a source plays is measured before its fader, mute and gate: a
+    /// muted one, or one its gate holds down, still shows it.
+    #[test]
+    fn a_muted_or_gated_source_still_shows_what_it_plays() {
+        let (mut src, _fifo) = fifo_source("mic", 0.8, 4);
+        src.sends = vec!["m".into()];
+        src.muted = true;
+        let mut core = core_with(vec![src], &["m"]);
+        core.process_block();
+        core.process_block();
+        let mic = core.source("mic").unwrap();
+        assert!(mic.meter()[0] < 1e-3, "nothing heard");
+        assert!((mic.signal()[0] - 0.8).abs() < 1e-3, "what it plays: {:?}", mic.signal());
     }
 
     #[test]

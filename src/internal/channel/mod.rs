@@ -456,6 +456,10 @@ pub struct Channel {
     /// instead of being taken to Main itself.
     pub overlay: bool,
 
+    /// The colour the operator gave it, to find it at a glance: its tile,
+    /// its switcher buttons. `None` is the colour it gets by its place.
+    pub color: Option<[u8; 3]>,
+
     /// Composite output texture (all decks blended together)
     pub composite_texture: wgpu::Texture,
     pub composite_view: wgpu::TextureView,
@@ -608,6 +612,7 @@ impl Channel {
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
             overlay: false,
+            color: None,
             composite_texture,
             composite_view,
             effect_ping_texture,

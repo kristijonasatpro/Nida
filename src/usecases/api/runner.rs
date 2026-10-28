@@ -58,6 +58,7 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::channels::add_input,
         routes::channels::set_opacity, routes::channels::set_blend_mode,
         routes::channels::rename, routes::channels::move_channel,
+        routes::channels::set_color,
         // Decks
         routes::decks::add_shader_deck, routes::decks::remove_deck,
         routes::decks::set_opacity, routes::decks::set_blend_mode, routes::decks::set_layer_mask,
@@ -442,6 +443,10 @@ pub fn build_router(shared: SharedState) -> Router {
         .route(
             "/api/channels/{channel_uuid}/name",
             axum::routing::put(routes::channels::rename),
+        )
+        .route(
+            "/api/channels/{channel_uuid}/color",
+            axum::routing::put(routes::channels::set_color),
         )
         .route(
             "/api/channels/{channel_uuid}/move",

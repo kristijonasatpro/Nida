@@ -170,6 +170,23 @@ source on its own:
   column, beside the channel's preview, has the same **Cut** and **Fade** for
   every bus as buttons.
 
+The source buttons are all one size, whatever the name: a long one takes two
+lines and ends in "…" (point at the button for all of it). **CUT** and
+**AUTO** stand apart on the right of the card, bigger, so a take is never
+mistaken for one more source. A channel's button has its colour along the
+top — the colour its tile has — and a colour you gave the input
+(right-click → **Colour**) fills the whole button, so the cameras, the slides
+and the clips are told apart at a glance.
+
+**Buttons: all** on the card chooses which sources that bus's row has buttons
+for: an LED wall that only ever shows three inputs can offer just those three
+(the menu then reads **Buttons: 3 of 12**). Untick a source to take its
+button off, tick it to put it back, or **Show all**. Right-click a button for
+**Remove from LED** (and, for a channel, its colour). Only the button goes:
+what is on the bus stays, and a source can still be sent to the bus from its
+right-click menu. A new input gets a button on every bus. The choice is
+saved with the show, and **Undo** takes it back.
+
 A new bus shows **Main** — Master on its Preview and Program — until you take
 something else to it, so a bus sent to a screen shows the show straight away.
 A new show has one, **PGM**, covering the whole picture at the show's size.
