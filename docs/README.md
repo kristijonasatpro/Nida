@@ -90,6 +90,7 @@ New to Nida? Start with [Main mode](18-main.md), [Screen Layouts](20-layouts.md)
   - [Moving it on](26-presentations.md#moving-it-on) — ◀ ▶, PageDown / PageUp and B, black and white
   - [It stays up](26-presentations.md#it-stays-up) — a show ended in PowerPoint comes back; kept with the show
   - [Over the API](26-presentations.md#over-the-api) — `StartTalk`, `AddTalks`, `PresentationGo`, `slides` and `presentation` in the state
+- **27. [The dot on output screens](27-privacy-dot.md)** — macOS's green, orange and purple capture dot, and Apple's switch that keeps it off LED walls and stage monitors
 
 Parts III–VI are the engine underneath, from Varda, with Nida's additions.
 
