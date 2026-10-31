@@ -186,6 +186,8 @@ impl VardaApp {
             counter.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
                 let build_ticket = ticket;
+                // Release captured GPU handles before the shutdown ticket.
+                let work_context = ctx;
                 if !build_ticket.start() {
                     counter.fetch_sub(1, Ordering::Relaxed);
                     return;
@@ -196,7 +198,7 @@ impl VardaApp {
                         .and_then(|f| f.to_str())
                         .unwrap_or("image")
                         .to_string();
-                    let deck = Deck::new_from_image(&ctx, &path, w, h);
+                    let deck = Deck::new_from_image(&work_context, &path, w, h);
                     (name, deck)
                 }));
                 let (name, deck) = match result {
@@ -221,6 +223,8 @@ impl VardaApp {
             counter.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
                 let build_ticket = ticket;
+                // Release captured GPU handles before the shutdown ticket.
+                let work_context = ctx;
                 if !build_ticket.start() {
                     counter.fetch_sub(1, Ordering::Relaxed);
                     return;
@@ -231,7 +235,7 @@ impl VardaApp {
                         .and_then(|f| f.to_str())
                         .unwrap_or("video")
                         .to_string();
-                    let deck = Deck::new_from_video(&ctx, &path, w, h);
+                    let deck = Deck::new_from_video(&work_context, &path, w, h);
                     (name, deck)
                 }));
                 let (name, deck) = match result {
@@ -256,6 +260,8 @@ impl VardaApp {
             counter.fetch_add(1, Ordering::Relaxed);
             std::thread::spawn(move || {
                 let build_ticket = ticket;
+                // Release captured GPU handles before the shutdown ticket.
+                let work_context = ctx;
                 if !build_ticket.start() {
                     counter.fetch_sub(1, Ordering::Relaxed);
                     return;
@@ -263,9 +269,9 @@ impl VardaApp {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let name = shader.name();
                     let deck = if shader.metadata.is_compute() {
-                        Deck::new_from_compute_shader(&ctx, shader, w, h)
+                        Deck::new_from_compute_shader(&work_context, shader, w, h)
                     } else {
-                        Deck::new(&ctx, shader, w, h)
+                        Deck::new(&work_context, shader, w, h)
                     };
                     (name, deck)
                 }));
@@ -2128,6 +2134,8 @@ impl VardaApp {
         counter.fetch_add(files.len(), Ordering::Relaxed);
         std::thread::spawn(move || {
             let build_ticket = ticket;
+            // Release captured GPU handles before the shutdown ticket.
+            let work_context = ctx;
             let mut remaining = files.len();
             for (token, file) in files {
                 if !build_ticket.start() {
@@ -2144,24 +2152,24 @@ impl VardaApp {
                     match file {
                         DeckFile::Image(path) => (
                             file_name(&path),
-                            Deck::new_from_image(&ctx, &path, render_width, render_height),
+                            Deck::new_from_image(&work_context, &path, render_width, render_height),
                         ),
                         DeckFile::Video(path) => (
                             file_name(&path),
-                            Deck::new_from_video(&ctx, &path, render_width, render_height),
+                            Deck::new_from_video(&work_context, &path, render_width, render_height),
                         ),
                         DeckFile::Shader(shader) => {
                             let shader = *shader;
                             let name = shader.name();
                             let deck = if shader.metadata.is_compute() {
                                 Deck::new_from_compute_shader(
-                                    &ctx,
+                                    &work_context,
                                     shader,
                                     render_width,
                                     render_height,
                                 )
                             } else {
-                                Deck::new(&ctx, shader, render_width, render_height)
+                                Deck::new(&work_context, shader, render_width, render_height)
                             };
                             (name, deck)
                         }
