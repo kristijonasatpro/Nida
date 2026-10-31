@@ -1,13 +1,7 @@
-/// Audio analysis hot-path benchmarks.
-///
-/// Two functions run inside the cpal audio callback (~every 5ms at 48kHz/256):
-///   `onset_threshold`  — median computation over spectral flux history (8 values)
-///   `bpm_estimation`   — median + outlier rejection over beat intervals (4-16 values)
-///
-/// Both currently clone + full-sort their input to compute a median.
-/// Benchmarks measure per-invocation cost at realistic window sizes.
+/// Audio onset and autocorrelation tempo-estimation benchmarks.
+/// Tempo analysis runs on its own worker, outside the device callback.
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use varda::audio::{compute_onset_threshold, estimate_bpm};
+use varda::audio::{compute_onset_threshold, estimate_bpm, TempoRange};
 
 /// Realistic spectral flux values (positive, varying magnitude)
 fn make_flux_history(n: usize) -> Vec<f32> {
@@ -16,11 +10,17 @@ fn make_flux_history(n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Realistic beat intervals centered around 120 BPM (0.5s) with slight jitter
-fn make_beat_intervals(n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|i| 0.5 + 0.02 * (i as f32 * 1.3).sin())
-        .collect()
+/// A 120 BPM onset envelope sampled at the device hop rate.
+fn make_envelope(seconds: usize) -> Vec<f32> {
+    let rate = 48000.0 / 256.0;
+    let mut envelope = vec![0.0; (seconds as f32 * rate) as usize];
+    for beat in 0..seconds * 2 {
+        let at = (beat as f32 * rate / 2.0).round() as usize;
+        if let Some(v) = envelope.get_mut(at) {
+            *v = 1.0;
+        }
+    }
+    envelope
 }
 
 fn bench_onset_threshold(c: &mut Criterion) {
@@ -30,7 +30,7 @@ fn bench_onset_threshold(c: &mut Criterion) {
     // ONSET_MEDIAN_WINDOW = 8, but test a range
     for n in [4, 8, 16] {
         let flux = make_flux_history(n);
-        g.bench_with_input(BenchmarkId::new("clone_sort", n), &flux, |b, flux| {
+        g.bench_with_input(BenchmarkId::new("analysis", n), &flux, |b, flux| {
             b.iter(|| compute_onset_threshold(flux));
         });
     }
@@ -39,15 +39,15 @@ fn bench_onset_threshold(c: &mut Criterion) {
 
 fn bench_bpm_estimation(c: &mut Criterion) {
     let mut g = c.benchmark_group("bpm_estimation");
-    g.sample_size(1000);
+    g.sample_size(100);
 
-    // BPM_HISTORY_SIZE = 16, but test a range
-    for n in [4, 8, 16] {
-        let intervals = make_beat_intervals(n);
+    // Increasing lengths of onset history.
+    for n in [4, 6, 8] {
+        let envelope = make_envelope(n);
         g.bench_with_input(
-            BenchmarkId::new("clone_sort", n),
-            &intervals,
-            |b, intervals| b.iter(|| estimate_bpm(intervals)),
+            BenchmarkId::new("autocorrelation_seconds", n),
+            &envelope,
+            |b, envelope| b.iter(|| estimate_bpm(envelope, 48000.0 / 256.0, TempoRange::default())),
         );
     }
     g.finish();

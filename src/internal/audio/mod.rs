@@ -1,13 +1,12 @@
 //! Audio input and analysis for audio-reactive shaders
 
+mod analysis;
 pub mod app_sound;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::Sample;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use rustfft::{num_complex::Complex, FftPlanner};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -113,22 +112,102 @@ fn fan_out_pcm(subs: &[PcmSubscriber], samples: &[f32]) {
 pub const AUDIO_BUFFER_SIZE: usize = 256;
 /// FFT size — 2048 @ 48kHz = 23Hz/bin resolution for clean bass separation
 pub const FFT_SIZE: usize = 2048;
-/// Hop size for overlapping analysis frames
+/// Hop between overlapping analysis frames.
 const FFT_HOP: usize = AUDIO_BUFFER_SIZE;
-/// Number of beat intervals to keep for BPM calculation
-const BPM_HISTORY_SIZE: usize = 16;
-/// Minimum time between beats (in seconds) to avoid double-triggering
-const MIN_BEAT_INTERVAL: f32 = 0.2; // Max ~300 BPM
-/// Maximum time between beats before we reset BPM tracking
-const MAX_BEAT_INTERVAL: f32 = 2.0; // Min ~30 BPM
-/// Window size for adaptive onset threshold (median of recent spectral flux)
+/// Band (Hz) whose spectral flux drives onsets: the kick, not hats, snare or
+/// voice.
+const ONSET_BAND_HZ: (f32, f32) = (30.0, 150.0);
+/// Minimum seconds between onsets, so one kick's attack, spread over several
+/// hops by the 2048-sample frame, fires once.
+const MIN_ONSET_INTERVAL: f32 = 0.05;
+/// Window for the adaptive onset threshold (median of recent onset strength).
 const ONSET_MEDIAN_WINDOW: usize = 8;
-/// Spectral flux must exceed median * this multiplier + offset to trigger onset
+/// Onset fires when onset strength exceeds median * this + offset.
 const ONSET_THRESHOLD_MULTIPLIER: f32 = 1.5;
-/// Minimum spectral flux to trigger onset (prevents triggers in silence)
-const ONSET_THRESHOLD_OFFSET: f32 = 0.01;
-/// Reject beat intervals that deviate >15% from median
-const TEMPO_TOLERANCE: f32 = 0.15;
+/// Minimum onset strength for an onset. Onset strength is flux relative to the
+/// band's recent level, so this doesn't depend on input gain.
+const ONSET_THRESHOLD_OFFSET: f32 = 0.1;
+/// RMS level below which input counts as silent (-60 dBFS).
+const SILENCE_LEVEL: f32 = 1e-3;
+/// Seconds of silence, or without an onset, before tempo tracking resets.
+const SILENCE_RESET_SECS: f32 = 2.0;
+/// Seconds of onset strength kept for tempo estimation.
+const TEMPO_WINDOW_SECS: f32 = 8.0;
+/// Seconds of onset strength needed before the first tempo estimate.
+const TEMPO_MIN_SECS: f32 = 4.0;
+/// Seconds between tempo estimates.
+const TEMPO_UPDATE_SECS: f32 = 0.5;
+/// Tempo range (BPM) searched for the beat period, before folding into the
+/// user's [`TempoRange`].
+const TEMPO_SEARCH_BPM: (f32, f32) = (40.0, 320.0);
+/// Multiples of a candidate period the comb sums over the autocorrelation.
+const TEMPO_COMB_HARMONICS: usize = 4;
+/// Minimum comb score, relative to a perfectly periodic envelope, for an
+/// estimate to count.
+const TEMPO_MIN_CONFIDENCE: f32 = 0.2;
+/// Estimates within this relative distance agree.
+const TEMPO_TOLERANCE: f32 = 0.04;
+/// Agreeing estimates needed before a different tempo replaces the current one.
+const TEMPO_CONFIRMATIONS: u32 = 3;
+/// How far each agreeing estimate moves the current tempo toward it.
+const TEMPO_SMOOTHING: f32 = 0.3;
+
+/// Tempo range (BPM) that detected tempos are folded into by octaves, set from
+/// the clock popover. `max` is at least twice `min`, so every tempo has an
+/// octave inside it.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct TempoRange {
+    pub min: f32,
+    pub max: f32,
+}
+
+impl Default for TempoRange {
+    fn default() -> Self {
+        Self {
+            min: 70.0,
+            max: 240.0,
+        }
+    }
+}
+
+impl TempoRange {
+    /// Bounds either end can take: the tempos the estimator searches.
+    pub const LIMITS: (f32, f32) = TEMPO_SEARCH_BPM;
+
+    /// A range within [`Self::LIMITS`], widened to an octave by moving `max`
+    /// up. Non-finite ends fall back to the default.
+    pub fn new(min: f32, max: f32) -> Self {
+        let default = Self::default();
+        let min = if min.is_finite() { min } else { default.min };
+        let max = if max.is_finite() { max } else { default.max };
+        let min = min.clamp(Self::LIMITS.0, Self::LIMITS.1 / 2.0);
+        let max = max.clamp(2.0 * min, Self::LIMITS.1);
+        Self { min, max }
+    }
+
+    /// Doubles or halves a positive `bpm` into the range.
+    fn fold(self, mut bpm: f32) -> f32 {
+        while bpm < self.min {
+            bpm *= 2.0;
+        }
+        while bpm > self.max {
+            bpm /= 2.0;
+        }
+        bpm
+    }
+
+    /// Both ends packed into one word, for the analysis threads.
+    pub(crate) fn to_bits(self) -> u64 {
+        (u64::from(self.min.to_bits()) << 32) | u64::from(self.max.to_bits())
+    }
+
+    pub(crate) fn from_bits(bits: u64) -> Self {
+        Self {
+            min: f32::from_bits((bits >> 32) as u32),
+            max: f32::from_bits(bits as u32),
+        }
+    }
+}
 
 /// Information about a detected audio input device.
 /// What `list` returns, if it does within `wait` — run on a thread of its own
@@ -298,61 +377,106 @@ impl AudioData {
     }
 }
 
-/// Compute the adaptive onset threshold from a window of spectral flux values.
-/// Returns `median(flux_history) * ONSET_THRESHOLD_MULTIPLIER + ONSET_THRESHOLD_OFFSET`.
-///
-/// Uses `select_nth_unstable_by` (quickselect, O(n)) instead of a full sort
-/// to find the median without allocating a new Vec.
-///
-/// # Panics
-///
-/// Panics if `flux_history` contains a NaN, since the median selection compares
-/// samples with `partial_cmp`. Spectral flux is computed from finite magnitudes,
-/// so this cannot happen for well-formed input.
+fn finite_values(values: &[f32]) -> Vec<f32> {
+    // Non-short-circuiting, so the common all-finite case stays a memcpy.
+    if values.iter().fold(true, |ok, v| ok & v.is_finite()) {
+        values.to_vec()
+    } else {
+        values.iter().copied().filter(|v| v.is_finite()).collect()
+    }
+}
+
+/// Comparison for values known to be finite.
+fn cmp_finite(a: f32, b: f32) -> std::cmp::Ordering {
+    a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// Adaptive onset threshold for a window of spectral flux values:
+/// `median(flux_history) * ONSET_THRESHOLD_MULTIPLIER + ONSET_THRESHOLD_OFFSET`.
+/// The median uses quickselect (`select_nth_unstable_by`). Non-finite values
+/// are skipped, so the comparison is a total order.
 pub fn compute_onset_threshold(flux_history: &[f32]) -> f32 {
-    if flux_history.is_empty() {
+    let mut buf: Vec<f32> = finite_values(flux_history);
+    if buf.is_empty() {
         return ONSET_THRESHOLD_OFFSET;
     }
-    let mut buf = flux_history.to_vec();
     let mid = buf.len() / 2;
-    buf.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+    buf.select_nth_unstable_by(mid, |a, b| cmp_finite(*a, *b));
     buf[mid] * ONSET_THRESHOLD_MULTIPLIER + ONSET_THRESHOLD_OFFSET
 }
 
-/// Estimate BPM from a history of beat intervals using median-based outlier rejection.
-/// Returns `None` if fewer than 4 intervals, or if the resulting BPM is outside 30-300.
+/// Estimates BPM from an onset strength envelope sampled at `hop_rate` Hz.
 ///
-/// Uses `select_nth_unstable_by` (quickselect, O(n)) for the median, then
-/// filters outliers using the original (unsorted) slice to avoid a second allocation.
-///
-/// # Panics
-///
-/// Panics if `beat_intervals` contains a NaN, since the median selection compares
-/// intervals with `partial_cmp`. Intervals are derived from monotonic timestamps,
-/// so this cannot happen for well-formed input.
-pub fn estimate_bpm(beat_intervals: &[f32]) -> Option<f32> {
-    if beat_intervals.len() < 4 {
+/// Scores each candidate period in [`TEMPO_SEARCH_BPM`] by summing the
+/// envelope's autocorrelation at its first [`TEMPO_COMB_HARMONICS`] multiples.
+/// Missing or stray onsets only lower some terms, the true period beats its
+/// double (fewer multiples fit the window) and its half (every other multiple
+/// misses). The best candidate is folded by octaves into `range`.
+/// `None` without a clear periodicity. Non-finite values count as zero.
+pub fn estimate_bpm(envelope: &[f32], hop_rate: f32, range: TempoRange) -> Option<f32> {
+    const STEP_BPM: f32 = 0.5;
+    let range = TempoRange::new(range.min, range.max);
+    let n = envelope.len();
+    if n < 2 || !(hop_rate.is_finite() && hop_rate > 0.0) {
         return None;
     }
-    let mut buf = beat_intervals.to_vec();
-    let mid = buf.len() / 2;
-    buf.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
-    let median = buf[mid];
-    // Filter outliers and compute average in a single pass — no intermediate Vec.
-    let (sum, count) = beat_intervals.iter().fold((0.0f32, 0u32), |(s, c), &iv| {
-        if (iv - median).abs() / median < TEMPO_TOLERANCE {
-            (s + iv, c + 1)
-        } else {
-            (s, c)
-        }
-    });
-    if count >= 2 {
-        let bpm = 60.0 / (sum / count as f32);
-        if (30.0..=300.0).contains(&bpm) {
-            return Some(bpm);
-        }
+    let finite = |v: &f32| if v.is_finite() { *v } else { 0.0 };
+    let mean = envelope.iter().map(finite).sum::<f32>() / n as f32;
+    let centered: Vec<f32> = envelope.iter().map(|v| finite(v) - mean).collect();
+
+    let period = |bpm: f32| hop_rate * 60.0 / bpm;
+    let max_lag =
+        ((TEMPO_COMB_HARMONICS as f32 * period(TEMPO_SEARCH_BPM.0)).ceil() as usize + 1).min(n - 1);
+    let acf: Vec<f32> = (0..=max_lag)
+        .map(|lag| {
+            centered[..n - lag]
+                .iter()
+                .zip(&centered[lag..])
+                .map(|(a, b)| a * b)
+                .sum::<f32>()
+        })
+        .collect();
+    if !(acf[0].is_finite() && acf[0] > 0.0) {
+        return None;
     }
-    None
+    // Linear interpolation; lags past the window contribute nothing.
+    let acf_at = |lag: f32| {
+        let i = lag as usize;
+        if i >= max_lag {
+            return 0.0;
+        }
+        let t = lag - i as f32;
+        acf[i] * (1.0 - t) + acf[i + 1] * t
+    };
+    let comb = |bpm: f32| {
+        (1..=TEMPO_COMB_HARMONICS)
+            .map(|k| acf_at(k as f32 * period(bpm)))
+            .sum::<f32>()
+    };
+    let candidate = |i: usize| TEMPO_SEARCH_BPM.0 + i as f32 * STEP_BPM;
+
+    let steps = ((TEMPO_SEARCH_BPM.1 - TEMPO_SEARCH_BPM.0) / STEP_BPM) as usize;
+    let scores: Vec<f32> = (0..=steps).map(|i| comb(candidate(i))).collect();
+    let (best, &score) = scores
+        .iter()
+        .enumerate()
+        .max_by(|a, b| cmp_finite(*a.1, *b.1))?;
+    if score / (TEMPO_COMB_HARMONICS as f32 * acf[0]) < TEMPO_MIN_CONFIDENCE {
+        return None;
+    }
+    // Parabolic refinement between grid steps.
+    let offset = if best > 0 && best < steps {
+        let (l, r) = (scores[best - 1], scores[best + 1]);
+        let curvature = l - 2.0 * score + r;
+        if curvature < 0.0 {
+            (0.5 * (l - r) / curvature).clamp(-0.5, 0.5)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+    Some(range.fold(candidate(best) + offset * STEP_BPM))
 }
 
 /// How long a capture that has called back may go without a callback
@@ -448,6 +572,7 @@ pub struct AudioManager {
     mod_refs: HashSet<AudioSourceId>,
     /// When opening each device last failed (see [`OPEN_RETRY`]).
     failed: HashMap<AudioSourceId, Instant>,
+    tempo_range: Arc<AtomicU64>,
 }
 
 impl Default for AudioManager {
@@ -457,6 +582,18 @@ impl Default for AudioManager {
 }
 
 impl AudioManager {
+    /// Range into which automatic audio tempos are folded.
+    pub fn tempo_range(&self) -> TempoRange {
+        TempoRange::from_bits(self.tempo_range.load(Ordering::Relaxed))
+    }
+    /// Changes the detector range for all current and future audio sources.
+    pub fn set_tempo_range(&mut self, range: TempoRange) {
+        self.tempo_range.store(
+            TempoRange::new(range.min, range.max).to_bits(),
+            Ordering::Relaxed,
+        );
+    }
+
     pub fn new() -> Self {
         let mut mgr = Self {
             devices: Vec::new(),
@@ -465,6 +602,7 @@ impl AudioManager {
             manual_pins: HashSet::new(),
             mod_refs: HashSet::new(),
             failed: HashMap::new(),
+            tempo_range: Arc::new(AtomicU64::new(TempoRange::default().to_bits())),
         };
         // Enumerate devices and cache the default input, but open nothing —
         // capture starts only when a holder appears (issue #76).
@@ -498,6 +636,7 @@ impl AudioManager {
             manual_pins: HashSet::new(),
             mod_refs: HashSet::new(),
             failed: HashMap::new(),
+            tempo_range: Arc::new(AtomicU64::new(TempoRange::default().to_bits())),
         }
     }
 
@@ -517,6 +656,7 @@ impl AudioManager {
             manual_pins: HashSet::new(),
             mod_refs: HashSet::new(),
             failed: HashMap::new(),
+            tempo_range: Arc::new(AtomicU64::new(TempoRange::default().to_bits())),
         };
         match within(wait, Self::list_inputs) {
             Ok(listing) => {
@@ -668,6 +808,7 @@ impl AudioManager {
                 sender,
                 sample_rate,
                 pcm_subs.clone(),
+                self.tempo_range.clone(),
                 Arc::clone(&liveness),
             )?,
             cpal::SampleFormat::I16 => Self::build_stream::<i16>(
@@ -676,6 +817,7 @@ impl AudioManager {
                 sender,
                 sample_rate,
                 pcm_subs.clone(),
+                self.tempo_range.clone(),
                 Arc::clone(&liveness),
             )?,
             cpal::SampleFormat::U16 => Self::build_stream::<u16>(
@@ -684,6 +826,7 @@ impl AudioManager {
                 sender,
                 sample_rate,
                 pcm_subs.clone(),
+                self.tempo_range.clone(),
                 Arc::clone(&liveness),
             )?,
             _ => anyhow::bail!("Unsupported sample format"),
@@ -980,150 +1123,27 @@ impl AudioManager {
         sender: Sender<AudioData>,
         sample_rate: f32,
         pcm_subs: Arc<ArcSwap<Vec<PcmSubscriber>>>,
+        tempo_range: Arc<AtomicU64>,
         liveness: Arc<Liveness>,
     ) -> Result<cpal::Stream>
     where
         T: cpal::Sample + cpal::SizedSample,
         f32: cpal::FromSample<T>,
     {
-        let channels = config.channels as usize;
-        let mut sample_buffer: Vec<f32> = Vec::with_capacity(AUDIO_BUFFER_SIZE);
-        let mut fft_planner = FftPlanner::new();
-        let fft = Arc::new(fft_planner.plan_fft_forward(FFT_SIZE));
-
-        // Pre-compute Hann window to reduce spectral leakage
-        let hann_window: Vec<f32> = (0..FFT_SIZE)
-            .map(|i| {
-                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (FFT_SIZE - 1) as f32).cos())
-            })
-            .collect();
-
-        // Ring buffer for overlapping FFT frames
-        let mut ring_buffer: Vec<f32> = vec![0.0; FFT_SIZE];
-        let mut ring_write_pos: usize = 0;
-
-        // Spectral flux onset detection state
-        let mut prev_fft_magnitudes: Vec<f32> = vec![0.0; FFT_SIZE / 2];
-        let mut flux_history: Vec<f32> = Vec::with_capacity(ONSET_MEDIAN_WINDOW + 1);
-
-        // Pre-allocated FFT input buffer (H4: avoid per-callback allocation)
-        let mut fft_input: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); FFT_SIZE];
-
-        // BPM detection state
-        let mut last_beat_time = Instant::now();
-        let mut beat_intervals: Vec<f32> = Vec::with_capacity(BPM_HISTORY_SIZE);
-        let mut current_bpm: Option<f32> = None;
-
+        let mut capture = analysis::CaptureState::new(
+            config.channels as usize,
+            sample_rate,
+            sender,
+            pcm_subs,
+            tempo_range,
+        )
+        .context("Failed to start audio analysis")?;
         let callback_liveness = Arc::clone(&liveness);
         let stream = device.build_input_stream(
             config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
                 callback_liveness.heard();
-                // Passthrough tee: forward raw interleaved PCM, untouched by the
-                // FFT pipeline, to every subscriber. Skipped entirely when there
-                // are no subscribers so the video-only path pays nothing.
-                let subs = pcm_subs.load();
-                if !subs.is_empty() {
-                    let pcm: Vec<f32> = data
-                        .iter()
-                        .map(|s| <f32 as Sample>::from_sample(*s))
-                        .collect();
-                    fan_out_pcm(&subs, &pcm);
-                }
-
-                for chunk in data.chunks(channels) {
-                    let sample: f32 = chunk
-                        .iter()
-                        .map(|s| <f32 as Sample>::from_sample(*s))
-                        .sum::<f32>()
-                        / channels as f32;
-                    sample_buffer.push(sample);
-                }
-
-                while sample_buffer.len() >= FFT_HOP {
-                    const NOISE_FLOOR: f32 = 1e-4;
-
-                    // Extract waveform chunk for GPU (256 samples)
-                    let waveform: Vec<f32> = sample_buffer.drain(..FFT_HOP).collect();
-                    let level =
-                        (waveform.iter().map(|s| s * s).sum::<f32>() / FFT_HOP as f32).sqrt();
-
-                    // Write hop into ring buffer (wrapping)
-                    for (i, &s) in waveform.iter().enumerate() {
-                        ring_buffer[(ring_write_pos + i) % FFT_SIZE] = s;
-                    }
-                    ring_write_pos = (ring_write_pos + FFT_HOP) % FFT_SIZE;
-
-                    // Extract linearized 2048-sample frame, apply Hann window
-                    // Reuse pre-allocated fft_input buffer (H4 optimisation)
-                    for i in 0..FFT_SIZE {
-                        let idx = (ring_write_pos + i) % FFT_SIZE;
-                        fft_input[i] = Complex::new(ring_buffer[idx] * hann_window[i], 0.0);
-                    }
-                    fft.process(&mut fft_input);
-
-                    // Magnitude scaling with noise floor
-                    let scale = 2.0 / FFT_SIZE as f32;
-                    let fft_magnitudes: Vec<f32> = fft_input[..FFT_SIZE / 2]
-                        .iter()
-                        .map(|c: &Complex<f32>| {
-                            let mag = c.norm() * scale;
-                            if mag < NOISE_FLOOR {
-                                0.0
-                            } else {
-                                mag
-                            }
-                        })
-                        .collect();
-
-                    // Spectral flux onset detection
-                    let spectral_flux: f32 = fft_magnitudes
-                        .iter()
-                        .zip(prev_fft_magnitudes.iter())
-                        .map(|(curr, prev)| (curr - prev).max(0.0))
-                        .sum();
-
-                    flux_history.push(spectral_flux);
-                    if flux_history.len() > ONSET_MEDIAN_WINDOW {
-                        flux_history.remove(0);
-                    }
-                    let onset_threshold = compute_onset_threshold(&flux_history);
-
-                    let now = Instant::now();
-                    let elapsed = now.duration_since(last_beat_time).as_secs_f32();
-                    let is_onset = spectral_flux > onset_threshold && elapsed > MIN_BEAT_INTERVAL;
-                    prev_fft_magnitudes.clone_from(&fft_magnitudes);
-
-                    // BPM estimation with outlier rejection
-                    if is_onset {
-                        if elapsed < MAX_BEAT_INTERVAL {
-                            beat_intervals.push(elapsed);
-                            if beat_intervals.len() > BPM_HISTORY_SIZE {
-                                beat_intervals.remove(0);
-                            }
-                            if let Some(bpm) = estimate_bpm(&beat_intervals) {
-                                current_bpm = Some(bpm);
-                            }
-                        } else {
-                            beat_intervals.clear();
-                            current_bpm = None;
-                        }
-                        last_beat_time = now;
-                    }
-
-                    let time_since_beat = now.duration_since(last_beat_time).as_secs_f32();
-
-                    let data = AudioData {
-                        waveform,
-                        fft: fft_magnitudes,
-                        level,
-                        bpm: current_bpm,
-                        time_since_beat,
-                        sample_rate,
-                    };
-
-                    let _ = sender.try_send(data);
-                }
+                capture.process(data);
             },
             move |err| {
                 log::error!("Audio stream error: {err}");
@@ -1133,7 +1153,6 @@ impl AudioManager {
             },
             None,
         )?;
-
         Ok(stream)
     }
 }
@@ -1407,58 +1426,150 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bpm_outlier_rejection() {
-        // Simulate beat intervals: mostly ~0.5s (120 BPM) with one outlier
-        let intervals: Vec<f32> = vec![0.50, 0.51, 0.49, 0.50, 0.52, 0.48, 1.2, 0.50];
-        let mut sorted = intervals.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = sorted[sorted.len() / 2];
+    /// Hop rate at 48 kHz.
+    const HOP_RATE: f32 = 48_000.0 / FFT_HOP as f32;
 
-        let stable: Vec<f32> = intervals
-            .iter()
-            .filter(|&&iv| (iv - median).abs() / median < TEMPO_TOLERANCE)
-            .copied()
-            .collect();
+    /// An 8 s onset envelope with a short pulse at each time in `beats`
+    /// (seconds) of the given strength.
+    fn pulse_envelope(beats: impl IntoIterator<Item = (f32, f32)>) -> Vec<f32> {
+        let mut env = vec![0.0; (TEMPO_WINDOW_SECS * HOP_RATE) as usize];
+        for (t, strength) in beats {
+            let i = (t * HOP_RATE).round() as usize;
+            for (j, w) in [0.5, 1.0, 0.5].into_iter().enumerate() {
+                if let Some(v) = env.get_mut(i + j) {
+                    *v += strength * w;
+                }
+            }
+        }
+        env
+    }
 
-        // Outlier (1.2s) should be rejected
-        assert!(
-            !stable.contains(&1.2),
-            "Outlier interval should be rejected"
-        );
-        assert!(stable.len() >= 6, "Most intervals should survive filtering");
-
-        let avg = stable.iter().sum::<f32>() / stable.len() as f32;
-        let bpm = 60.0 / avg;
-        assert!((bpm - 120.0).abs() < 5.0, "BPM should be ~120, got {bpm}");
+    fn beat_times(bpm: f32) -> impl Iterator<Item = f32> {
+        (0..)
+            .map(move |i| i as f32 * 60.0 / bpm)
+            .take_while(|t| *t < 8.0)
     }
 
     #[test]
-    fn bpm_stability_consistent_beats() {
-        // All consistent intervals at 128 BPM (0.46875s)
-        let interval = 60.0 / 128.0;
-        let intervals: Vec<f32> = vec![interval; BPM_HISTORY_SIZE];
-        let mut sorted = intervals.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = sorted[sorted.len() / 2];
+    fn bpm_estimate_survives_non_finite_envelope() {
+        let mut env = pulse_envelope(beat_times(120.0).map(|t| (t, 1.0)));
+        env[3] = f32::NAN;
+        env[40] = f32::NEG_INFINITY;
+        let range = TempoRange::default();
+        let bpm = estimate_bpm(&env, HOP_RATE, range).expect("still periodic");
+        assert!((bpm - 120.0).abs() < 1.0, "got {bpm}");
+        assert_eq!(estimate_bpm(&[f32::NAN; 64], HOP_RATE, range), None);
+        assert_eq!(estimate_bpm(&env, f32::NAN, range), None);
+    }
 
-        let stable: Vec<f32> = intervals
-            .iter()
-            .filter(|&&iv| (iv - median).abs() / median < TEMPO_TOLERANCE)
-            .copied()
-            .collect();
+    #[test]
+    fn bpm_estimate_steady_beats() {
+        for truth in [75.0, 100.0, 128.0, 140.0, 174.0, 200.0, 230.0] {
+            let env = pulse_envelope(beat_times(truth).map(|t| (t, 1.0)));
+            let bpm = estimate_bpm(&env, HOP_RATE, TempoRange::default()).expect("periodic");
+            assert!((bpm - truth).abs() < 1.0, "{truth} BPM: got {bpm}");
+        }
+    }
 
+    /// Missing beats and weaker off-beat onsets don't move the estimate,
+    /// including to its double or half.
+    #[test]
+    fn bpm_estimate_tolerates_missing_and_stray_onsets() {
+        let truth = 128.0;
+        let beats = beat_times(truth)
+            .enumerate()
+            .filter(|(i, _)| i % 5 != 3)
+            .map(|(_, t)| (t, 1.0));
+        let strays = beat_times(truth)
+            .step_by(3)
+            .map(|t| (t + 30.0 / truth, 0.4));
+        let env = pulse_envelope(beats.chain(strays));
+        let bpm = estimate_bpm(&env, HOP_RATE, TempoRange::default()).expect("periodic");
+        assert!((bpm - truth).abs() < 1.0, "got {bpm}");
+    }
+
+    /// A kick with three softer bass notes per beat, on the other 16ths, gives
+    /// the kick's tempo, not its double.
+    #[test]
+    fn bpm_estimate_kick_and_rolling_bass() {
+        for truth in [145.0, 190.0, 210.0] {
+            let kicks = beat_times(truth).map(|t| (t, 1.0));
+            let bass = beat_times(truth)
+                .flat_map(|t| (1..4).map(move |i| (t + i as f32 * 15.0 / truth, 0.5)));
+            let env = pulse_envelope(kicks.chain(bass));
+            let bpm = estimate_bpm(&env, HOP_RATE, TempoRange::default()).expect("periodic");
+            assert!((bpm - truth).abs() < 1.0, "{truth} BPM: got {bpm}");
+        }
+    }
+
+    /// A period outside the range folds into it by octaves.
+    #[test]
+    fn bpm_estimate_folds_into_range() {
+        // Beats at 50 BPM report 100. At 220 BPM, 220 by default and 110 in
+        // 70-180.
+        for (beats, range, want) in [
+            (50.0, TempoRange::default(), 100.0),
+            (220.0, TempoRange::default(), 220.0),
+            (220.0, TempoRange::new(70.0, 180.0), 110.0),
+        ] {
+            let env = pulse_envelope(beat_times(beats).map(|t| (t, 1.0)));
+            let bpm = estimate_bpm(&env, HOP_RATE, range).expect("periodic");
+            assert!((bpm - want).abs() < 1.0, "{beats} BPM beats: got {bpm}");
+        }
+        let range = TempoRange::default();
+        assert!((range.fold(512.0) - 128.0).abs() < 1e-3);
+        assert!((range.fold(30.0) - 120.0).abs() < 1e-3);
+        assert!((range.fold(200.0) - 200.0).abs() < 1e-3);
+    }
+
+    /// A range spans at least an octave within the limits, so folding always
+    /// ends, and survives packing for the analysis threads.
+    #[test]
+    fn tempo_range_spans_an_octave() {
         assert_eq!(
-            stable.len(),
-            BPM_HISTORY_SIZE,
-            "All consistent intervals should pass"
+            TempoRange::new(150.0, 200.0),
+            TempoRange {
+                min: 150.0,
+                max: 300.0
+            }
         );
-        let avg = stable.iter().sum::<f32>() / stable.len() as f32;
-        let bpm = 60.0 / avg;
-        assert!(
-            (bpm - 128.0).abs() < 0.1,
-            "BPM should be exactly ~128, got {bpm}"
+        assert_eq!(
+            TempoRange::new(10.0, 1000.0),
+            TempoRange {
+                min: 40.0,
+                max: 320.0
+            }
         );
+        assert_eq!(
+            TempoRange::new(300.0, 0.0),
+            TempoRange {
+                min: 160.0,
+                max: 320.0
+            }
+        );
+        assert_eq!(
+            TempoRange::new(f32::NAN, f32::INFINITY),
+            TempoRange::default()
+        );
+        let range = TempoRange::new(87.5, 210.0);
+        assert_eq!(TempoRange::from_bits(range.to_bits()), range);
+    }
+
+    #[test]
+    fn bpm_estimate_none_without_periodicity() {
+        let range = TempoRange::default();
+        assert_eq!(estimate_bpm(&vec![0.0; 1500], HOP_RATE, range), None);
+        // Deterministic noise.
+        let mut x = 0x2545_f491_u32;
+        let noise: Vec<f32> = (0..1500)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x >> 8) as f32 / (1 << 24) as f32
+            })
+            .collect();
+        assert_eq!(estimate_bpm(&noise, HOP_RATE, range), None);
     }
 
     #[test]

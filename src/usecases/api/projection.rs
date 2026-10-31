@@ -342,6 +342,7 @@ pub(crate) mod tests {
             timecode: crate::engine::types::TimecodeSnapshot::default(),
             arrangement: None,
             clock: ClockSnapshot {
+                audio_tempo_range: crate::audio::TempoRange::default(),
                 bpm: Some(120.0),
                 beat_phase: 0.0,
                 source_label: "Audio".into(),
