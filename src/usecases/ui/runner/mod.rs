@@ -459,20 +459,11 @@ impl UIRunner {
         let result = event_loop
             .run_app(&mut self)
             .map_err(|e| anyhow::anyhow!("Event loop error: {e:?}"));
-        // The OS may end the loop directly (macOS Quit). Never let compiler
-        // global teardown race work still running outside the event loop.
-        let builds = self.closing_builds.as_ref().map(|(builds, _, _)| builds.clone())
-            .or_else(|| self.gpu.as_ref().map(|gpu| gpu.builds.clone()));
-        if let Some(builds) = builds {
-            builds.close();
-            if !builds.wait(std::time::Duration::from_secs(5)) {
-                log::warn!("Finishing background work before exit ({} jobs)", builds.pending());
-                while !builds.wait(std::time::Duration::from_secs(1)) {}
-            }
-        }
-        if !crate::renderer::subprocess::wait_for_recordings(std::time::Duration::from_secs(5)) {
-            log::warn!("Finishing recording files before exit");
-            while !crate::renderer::subprocess::wait_for_recordings(std::time::Duration::from_secs(1)) {}
+        // The OS may end the loop directly. Complete the same save/output
+        // shutdown phases, including a frame that returns after the loop ended.
+        self.shut_down();
+        while !self.background_builds_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         result
     }
@@ -2671,6 +2662,52 @@ mod tests {
             runner.publish_counter, 0,
             "shutdown returns before the publish gate"
         );
+    }
+
+    #[test]
+    fn shutdown_keeps_a_late_engine_and_saves_it_after_it_returns() {
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        let mut app = runner.varda.take().unwrap();
+        app.execute_command(crate::engine::EngineCommand::SetCrossfader(0.37));
+        let scene = app.session.workspace.scene_path();
+        let gpu = app.gpu_context().clone();
+        runner.gpu = Some(gpu.clone());
+        let (started, reached) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        runner.engine = Some(engine_thread::EngineThread::start(app, gpu, move || {
+            let _ = started.send(());
+            let _ = gate.recv_timeout(std::time::Duration::from_secs(30));
+        }));
+        reached
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let stopping = std::time::Instant::now();
+        runner.shut_down();
+        assert!(
+            stopping.elapsed() < std::time::Duration::from_millis(250),
+            "the window must remain responsive"
+        );
+        assert!(runner.engine.is_some(), "retain the late worker's app");
+        assert!(!runner.background_builds_finished());
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !runner.background_builds_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stopped app never came back"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(runner.engine.is_none());
+        assert!(
+            runner.varda.is_some(),
+            "recover the app before finishing shutdown"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(scene).unwrap()).unwrap();
+        assert!((saved["crossfader"].as_f64().unwrap() - 0.37).abs() < 1e-6);
     }
 
     #[test]

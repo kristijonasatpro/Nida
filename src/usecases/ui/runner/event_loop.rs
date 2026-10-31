@@ -438,29 +438,45 @@ fn output_window_event(varda: &mut VardaApp, window_id: WindowId, event: WindowE
 
 impl UIRunner {
     pub(super) fn background_builds_finished(&mut self) -> bool {
+        if self.shut_down {
+            self.finish_stopping_engine();
+        }
+        let stopping = self.engine.is_some();
         // GPU initialization predates the context and its build tracker. Keep
         // the event loop alive until that driver work has finished too.
-        let initializing = self.gpu_init_handle.as_ref().is_some_and(|h| !h.is_finished());
+        let initializing = self
+            .gpu_init_handle
+            .as_ref()
+            .is_some_and(|h| !h.is_finished());
         if !initializing {
             if let Some(handle) = self.gpu_init_handle.take() {
                 let _ = handle.join();
             }
         }
         let Some((builds, started, warned)) = &mut self.closing_builds else {
-            return !initializing && crate::renderer::subprocess::finalizing_recordings() == 0;
+            return !initializing
+                && !stopping
+                && crate::renderer::subprocess::wait_for_recordings(std::time::Duration::ZERO);
         };
         // A finishing engine can register recording finalizers. Observe its
         // ticket first so those registrations are visible before we exit.
         let pending = builds.pending();
         let recordings = crate::renderer::subprocess::finalizing_recordings();
-        if pending == 0 && recordings == 0 && !initializing {
+        if pending == 0
+            && !initializing
+            && !stopping
+            && crate::renderer::subprocess::wait_for_recordings(std::time::Duration::ZERO)
+        {
             return true;
         }
         if !*warned && started.elapsed() >= std::time::Duration::from_secs(5) {
             *warned = true;
             log::warn!(
                 "Finishing background work before exit ({} jobs)",
-                pending + recordings + usize::from(initializing)
+                pending
+                    + recordings
+                    + usize::from(initializing)
+                    + usize::from(stopping && pending == 0)
             );
         }
         false
@@ -486,11 +502,6 @@ impl UIRunner {
         if !self.config.headless {
             crate::clicker::stop();
         }
-        if let Some(engine) = self.engine.take() {
-            if let Some(app) = engine.stop() {
-                self.varda = Some(app);
-            }
-        }
         if let Some(gpu) = &self.gpu {
             gpu.builds.close();
             self.closing_builds = Some((gpu.builds.clone(), std::time::Instant::now(), false));
@@ -502,17 +513,50 @@ impl UIRunner {
                 std::time::Instant::now(),
                 false,
             ));
+        }
+        self.closing_builds.get_or_insert_with(|| {
+            (
+                crate::renderer::builds::Builds::default(),
+                std::time::Instant::now(),
+                false,
+            )
+        });
+        if let Some(window) = self.window {
+            window.set_title("Nida — Finishing background work…");
+        }
+        if self.engine.is_some() {
+            self.finish_stopping_engine();
+        } else {
+            self.finish_shutdown();
+        }
+    }
+
+    fn finish_stopping_engine(&mut self) {
+        let Some(engine) = self.engine.take() else {
+            return;
+        };
+        match engine.try_stop() {
+            Ok(app) => {
+                self.varda = app;
+                self.finish_shutdown();
+            }
+            Err(engine) => self.engine = Some(engine),
+        }
+    }
+
+    /// Runs once, after the stopped worker has returned the app.
+    fn finish_shutdown(&mut self) {
+        if let Some(varda) = self.varda.as_mut() {
+            let builds = varda.gpu_context().builds.clone();
+            builds.close();
+            if let Some((tracked, _, _)) = &mut self.closing_builds {
+                *tracked = builds;
+            }
             if let Err(e) = varda.save_workspace(&self.layout) {
                 log::error!("{e}");
             }
             varda.refuse_commands();
             varda.finish_outputs();
-        }
-        self.closing_builds.get_or_insert_with(|| {
-            (crate::renderer::builds::Builds::default(), std::time::Instant::now(), false)
-        });
-        if let Some(window) = self.window {
-            window.set_title("Nida — Finishing background work…");
         }
         // A Save As that landed as Nida quit moved the show: it is the one
         // to open next time, the Recent list written before Nida goes.
