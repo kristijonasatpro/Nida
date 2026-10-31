@@ -7,7 +7,8 @@ use std::sync::Mutex;
 use super::ffi;
 
 /// The color format a receiver asks the SDK for: UYVY from a source without
-/// alpha, RGBA from one with it. Neither needs a conversion in the SDK.
+/// alpha, RGBA from one with it. UYVY avoids SDK YUV-to-RGB conversion
+/// for opaque pictures; alpha pictures retain SDK RGB output.
 pub(super) const RECEIVE_COLOR_FORMAT: i32 = 3; // NDIlib_recv_color_format_UYVY_RGBA
 
 /// The deck texture a receiver renders into.
@@ -127,8 +128,9 @@ struct Exchange {
 }
 
 /// The latest captured frame, passed from the receive thread to the render
-/// thread. Two buffers take turns, so once they have grown to the frame's size
-/// neither side allocates.
+/// thread. On the GPU path, two buffers take turns, so once they have grown
+/// to the frame's size the handoff does not allocate. CPU fallback expands to
+/// a newly allocated RGBA frame.
 #[derive(Default)]
 pub(super) struct FrameSlot {
     exchange: Mutex<Exchange>,
@@ -516,6 +518,141 @@ mod tests {
                 None
             }
         }
+    }
+
+    struct SenderGuard(
+        ffi::NDIlib_send_instance_t,
+        unsafe extern "C" fn(ffi::NDIlib_send_instance_t),
+    );
+    impl Drop for SenderGuard {
+        fn drop(&mut self) {
+            // SAFETY: this guard owns the sender, and the manager still owns
+            // the loaded runtime while the guard is alive.
+            unsafe { (self.1)(self.0) };
+        }
+    }
+
+    /// Explicit opt-in: announces one uniquely named local source and requires
+    /// the NDI runtime, a working GPU, and permitted loopback/discovery sockets.
+    #[test]
+    #[ignore = "requires local NDI runtime and networking"]
+    fn local_ndi_sender_reaches_gpu_receiver_with_colour_and_alpha() {
+        use super::super::NdiManager;
+        use std::ffi::CString;
+        use std::time::{Duration, Instant};
+
+        let gpu = gpu().expect("GPU required for NDI loopback");
+        let mut manager = NdiManager::new();
+        let sdk = manager.sdk.as_ref().expect("NDI runtime required");
+        eprintln!(
+            "Loopback runtime: {}; adapter: {:?}",
+            sdk.runtime_version,
+            gpu.adapter.get_info()
+        );
+        let send = sdk.send_send_video_v2;
+        let destroy = sdk.send_destroy;
+        let name = format!("Nida port validation {}", std::process::id());
+        let c_name = CString::new(name.clone()).unwrap();
+        let settings = ffi::NDIlib_send_create_t {
+            p_ndi_name: c_name.as_ptr(),
+            p_groups: std::ptr::null(),
+            clock_video: false,
+            clock_audio: false,
+        };
+        // SAFETY: settings/name live through the synchronous SDK create call.
+        let sender = unsafe { (sdk.send_create)(&raw const settings) };
+        assert!(!sender.is_null());
+        let _sender = SenderGuard(sender, destroy);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let source = loop {
+            manager.discover();
+            if let Some(source) = manager.sources().iter().find(|s| s.name.contains(&name)) {
+                break source.name.clone();
+            }
+            assert!(Instant::now() < deadline, "local sender was not discovered");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let receiver = manager
+            .start_receive(&source, &gpu.device)
+            .expect("receiver");
+        assert!(
+            manager.unpacker.is_some(),
+            "test must exercise GPU conversion"
+        );
+        for alpha in [false, true] {
+            let mut bytes = if alpha {
+                [200, 80, 40, 128].repeat(640 * 360)
+            } else {
+                [90, 100, 200, 140].repeat(640 * 360 / 2)
+            };
+            let vf = frame(
+                if alpha {
+                    ffi::NDIlib_FourCC_video_type_e::RGBA
+                } else {
+                    ffi::NDIlib_FourCC_video_type_e::UYVY
+                },
+                &mut bytes,
+                640,
+                360,
+                if alpha { 640 * 4 } else { 640 * 2 },
+            );
+            let mut expected = vec![0; 640 * 360 * 4];
+            if alpha {
+                expected.copy_from_slice(&bytes);
+            } else {
+                super::super::uyvy_to_rgba(&bytes, &mut expected, 640, 360, 640 * 2);
+            }
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut observed = None;
+            loop {
+                // SAFETY: buffers remain live through this synchronous send.
+                unsafe { send(sender, &raw const vf) };
+                let format = manager.receivers[receiver]
+                    .frame_data
+                    .exchange
+                    .lock()
+                    .unwrap()
+                    .ready
+                    .format;
+                manager.update(&gpu);
+                if manager.receiving(receiver, Duration::from_secs(1))
+                    && manager.receiver_dimensions(receiver) == Some((640, 360))
+                    && if alpha {
+                        matches!(format, ReceivedFormat::Rgba | ReceivedFormat::Bgra)
+                    } else {
+                        format == ReceivedFormat::Uyvy
+                    }
+                {
+                    let target = manager.textures[receiver].as_ref().unwrap();
+                    let actual = read_rgba(&gpu, &target.texture, 640, 360);
+                    let center = (180 * 640 + 320) * 4;
+                    let mut actual = actual[center..center + 4].to_vec();
+                    // This runtime can return BGRA even for the requested
+                    // UYVY/RGBA mode. Raw readback keeps native byte order; a
+                    // BGRA texture samples as RGBA in the rendering pipeline.
+                    if format == ReceivedFormat::Bgra {
+                        actual.swap(0, 2);
+                    }
+                    observed = Some((format, actual.clone()));
+                    let expected = &expected[center..center + 4];
+                    if actual
+                        .iter()
+                        .zip(expected)
+                        .all(|(a, b)| a.abs_diff(*b) <= 6)
+                    {
+                        assert_eq!(actual[3], expected[3], "alpha is preserved exactly");
+                        eprintln!("NDI alpha={alpha}: format={format:?}, center={actual:?}, expected={expected:?}");
+                        break;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "NDI picture/alpha never reached the GPU texture (alpha={alpha}, observed={observed:?})"
+                );
+                std::thread::sleep(Duration::from_millis(16));
+            }
+        }
+        manager.stop_receive(receiver);
     }
 
     #[test]
