@@ -140,6 +140,11 @@ impl Baton {
         }
     }
 
+    fn request_close(&self) {
+        self.lock().closed = true;
+        self.turn.notify_all();
+    }
+
     /// Take the engine for good once the engine thread has put it down —
     /// waiting at most `patience` — that thread's next [`Self::take`]
     /// returns `None`, and it stops. `None` if the engine thread went with
@@ -324,6 +329,11 @@ impl EngineThread {
         gpu: crate::renderer::context::GpuContext,
         wake_ui: impl Fn() + Send + 'static,
     ) -> Self {
+        // Keep driver work and resources tracked through worker completion.
+        let ticket = gpu
+            .builds
+            .reserve()
+            .expect("engine started before shutdown");
         let baton = Arc::new(Baton::new(app));
         let signal = Arc::new(Signal::default());
         let phase = Arc::new(std::sync::atomic::AtomicU8::new(Phase::Waiting as u8));
@@ -337,7 +347,14 @@ impl EngineThread {
             let baton = Arc::clone(&baton);
             std::thread::Builder::new()
                 .name("nida-engine".into())
-                .spawn(move || engine.run(&baton))
+                .spawn(move || {
+                    let _ticket = ticket;
+                    engine.run(&baton);
+                    // A late engine may still own outputs in the baton. Drop
+                    // them (and register recording finalizers) before releasing
+                    // the ticket that permits process shutdown.
+                    drop(baton);
+                })
                 .expect("start the engine thread")
         };
         log::info!("Engine running on a thread of its own");
@@ -365,28 +382,41 @@ impl EngineThread {
         &self.baton
     }
 
-    /// Stop the thread, once its frame is done, and have the engine back —
-    /// `None` if the thread went with it (a panic), or kept it past
-    /// [`STOP_PATIENCE`] (then left to end on its own).
-    pub(super) fn stop(mut self) -> Option<Box<VardaApp>> {
+    /// Ask the worker to stop without blocking the window thread. Keep this
+    /// owner (and its baton) until it has ended, so a late frame's app can still
+    /// be saved and its outputs finalized instead of being discarded.
+    pub(super) fn try_stop(mut self) -> Result<Option<Box<VardaApp>>, Self> {
         self.signal.stop();
-        let app = self.baton.close(STOP_PATIENCE);
-        if app.is_none() && !self.baton.is_gone() {
-            log::error!(
-                "The engine thread did not stop within {STOP_PATIENCE:?} (it was at {:?})",
-                self.phase()
-            );
-            // Not joined: it may be waiting for this, the main thread.
-            self.handle.take();
-            return None;
+        self.baton.request_close();
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return Err(self);
         }
+        let app = self.baton.close(Duration::ZERO);
         if let Some(handle) = self.handle.take() {
             if handle.join().is_err() {
                 log::error!("The engine thread panicked");
             }
         }
-        app
+        Ok(app)
     }
+
+    #[cfg(test)]
+    fn stop(mut self) -> Option<Box<VardaApp>> {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            self = match self.try_stop() {
+                Ok(app) => return app,
+                Err(thread) => thread,
+            };
+            assert!(Instant::now() < until, "test engine did not stop");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
 }
 
 impl Drop for EngineThread {
@@ -433,7 +463,7 @@ const GPU_PATIENCE: Duration = Duration::from_millis(100);
 /// How often it looks, meanwhile.
 const GPU_CHECK: Duration = Duration::from_micros(200);
 
-/// How long quitting waits for the engine thread to finish its frame.
+/// Last-resort Drop patience; orderly Quit polls `try_stop` without blocking.
 const STOP_PATIENCE: Duration = Duration::from_secs(2);
 
 /// How long the engine thread waits for a refresh before looking again at

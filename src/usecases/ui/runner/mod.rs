@@ -23,6 +23,7 @@ mod event_loop;
 mod panel_windows;
 mod preview;
 mod shows;
+mod shutdown_view;
 mod vsync;
 
 pub(crate) use event_loop::WindowHost;
@@ -110,6 +111,7 @@ pub struct UIRunner {
     /// `crate::screen_rate`).
     screen_rate: crate::screen_rate::ScreenRate,
     night_shift: crate::night_shift::NightShift,
+    closing_builds: Option<(crate::renderer::builds::Builds, std::time::Instant, bool)>,
     /// Shows opened lately, for the Show menu.
     recent_shows: std::sync::Arc<Vec<std::path::PathBuf>>,
     /// The show folder the window is named after (see `show_changed`).
@@ -265,6 +267,7 @@ impl UIRunner {
             ui_waiting_most: 0,
             screen_rate: crate::screen_rate::ScreenRate::default(),
             night_shift: crate::night_shift::NightShift::default(),
+            closing_builds: None,
             recent_shows: std::sync::Arc::default(),
             named_after: std::path::PathBuf::new(),
             // A test's runner never reads or writes this computer's Recent
@@ -453,10 +456,16 @@ impl UIRunner {
 
         let event_loop = EventLoop::new()?;
         self.proxy = Some(event_loop.create_proxy());
-        event_loop
+        let result = event_loop
             .run_app(&mut self)
-            .map_err(|e| anyhow::anyhow!("Event loop error: {e:?}"))?;
-        Ok(())
+            .map_err(|e| anyhow::anyhow!("Event loop error: {e:?}"));
+        // The OS may end the loop directly. Complete the same save/output
+        // shutdown phases, including a frame that returns after the loop ended.
+        self.shut_down();
+        while !self.background_builds_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        result
     }
 }
 
@@ -783,17 +792,10 @@ impl UIRunner {
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
             log::info!("Shutdown requested, saving workspace and exiting...");
-            if let Err(e) = varda.save_workspace(&self.layout) {
-                log::error!("{e}");
+            self.shut_down();
+            if self.background_builds_finished() {
+                host.exit();
             }
-            varda.refuse_commands();
-            if let Some(api) = self.api_handle.take() {
-                api.shutdown();
-            }
-            if let Some(kept) = self.night_shift.give_back_now() {
-                log::info!("Shutdown: {kept:?}");
-            }
-            host.exit();
             return;
         }
 
@@ -1074,10 +1076,32 @@ impl UIRunner {
         self.ui_parts.add(part, since.elapsed());
     }
 
+    /// Ask winit to exit while the engine is borrowed. `exiting` saves/stops
+    /// it after `with_engine` has put it back, without a recursive borrow.
+    fn exit_if_requested(&self, _host: &dyn WindowHost) -> bool {
+        if self.varda.as_ref().is_some_and(|app| {
+            app.shutdown_requested
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }) || self
+            .shutdown_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            log::info!("Shutdown requested, saving workspace and exiting...");
+            // about_to_wait quits once the engine borrow has been returned.
+            self.shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Before the UI is laid out, with the engine: the control window's
     /// settings, preview textures, windows and screens, and what the UI
     /// shows.
     fn ui_before(&mut self, event_loop: &ActiveEventLoop) -> Option<crate::usecases::ui::UIData> {
+        if self.exit_if_requested(event_loop) {
+            return None;
+        }
         if let (Some(ws), Some(varda)) = (&mut self.window_surface, &self.varda) {
             ws.set_vsync(varda.gpu_context(), varda.control_vsync());
             let hold = varda.frame_hold_secs();
@@ -2638,6 +2662,90 @@ mod tests {
             runner.publish_counter, 0,
             "shutdown returns before the publish gate"
         );
+    }
+
+    #[test]
+    fn shutdown_keeps_a_late_engine_and_saves_it_after_it_returns() {
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        let mut app = runner.varda.take().unwrap();
+        app.execute_command(crate::engine::EngineCommand::SetCrossfader(0.37));
+        let scene = app.session.workspace.scene_path();
+        let gpu = app.gpu_context().clone();
+        runner.gpu = Some(gpu.clone());
+        let (started, reached) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        runner.engine = Some(engine_thread::EngineThread::start(app, gpu, move || {
+            let _ = started.send(());
+            let _ = gate.recv_timeout(std::time::Duration::from_secs(30));
+        }));
+        reached
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let stopping = std::time::Instant::now();
+        runner.shut_down();
+        assert!(
+            stopping.elapsed() < std::time::Duration::from_millis(250),
+            "the window must remain responsive"
+        );
+        assert!(runner.engine.is_some(), "retain the late worker's app");
+        assert!(!runner.background_builds_finished());
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !runner.background_builds_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stopped app never came back"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(runner.engine.is_none());
+        assert!(
+            runner.varda.is_some(),
+            "recover the app before finishing shutdown"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(scene).unwrap()).unwrap();
+        assert!((saved["crossfader"].as_f64().unwrap() - 0.37).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shutdown_waits_for_gpu_initialization_before_a_context_exists() {
+        let mut runner = runner();
+        let (release, wait) = std::sync::mpsc::channel();
+        runner.gpu_init_handle = Some(std::thread::spawn(move || {
+            wait.recv().unwrap();
+            Err(anyhow::anyhow!("initialization cancelled in test"))
+        }));
+        runner.shut_down();
+        assert!(!runner.background_builds_finished());
+        release.send(()).unwrap();
+        while !runner.gpu_init_handle.as_ref().unwrap().is_finished() {
+            std::thread::yield_now();
+        }
+        assert!(runner.background_builds_finished());
+        assert!(runner.gpu_init_handle.is_none());
+    }
+
+    #[test]
+    fn shutdown_keeps_waiting_after_five_seconds_and_is_idempotent() {
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        let builds = runner.varda.as_ref().unwrap().gpu_context().builds.clone();
+        let ticket = builds.reserve().unwrap();
+        assert!(ticket.start());
+        runner.shut_down();
+        runner.shut_down();
+        assert!(builds.reserve().is_none());
+        runner.closing_builds.as_mut().unwrap().1 = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(6))
+            .unwrap();
+        assert!(!runner.background_builds_finished());
+        assert!(runner.closing_builds.as_ref().unwrap().2);
+        drop(ticket);
+        assert!(runner.background_builds_finished());
     }
 
     /// A timeline drag pushes a mutation every frame it moves. Exactly one of

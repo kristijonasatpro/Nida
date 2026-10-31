@@ -167,6 +167,23 @@ impl ApplicationHandler for UIRunner {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        if self.shut_down {
+            if self.main_window_id == Some(window_id) {
+                match event {
+                    WindowEvent::RedrawRequested => {
+                        self.paint_waiting("Finishing background work…");
+                    }
+                    WindowEvent::Resized(size) => {
+                        self.cached_screen_size = size;
+                        if let (Some(surface), Some(gpu)) = (&mut self.window_surface, &self.gpu) {
+                            surface.resize(gpu, size);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
         // The control window taking or losing the keyboard, as it happens —
         // while Nida is still starting too: the clicker read with another
         // app in front stands aside while the window hears its keys (see
@@ -257,6 +274,19 @@ impl ApplicationHandler for UIRunner {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.shut_down {
+            if self.background_builds_finished() {
+                event_loop.exit();
+            } else {
+                if let Some(window) = self.window {
+                    window.request_redraw();
+                }
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                    std::time::Instant::now() + UI_FALLBACK,
+                ));
+            }
+            return;
+        }
         // The API's Shutdown or Ctrl-C: the windowed app saves and quits as
         // on ⌘Q (headless does so in `render_headless`) — Ctrl-C while the
         // GPU is still being set up included. Answered "ok", it went on
@@ -407,10 +437,57 @@ fn output_window_event(varda: &mut VardaApp, window_id: WindowId, event: WindowE
 }
 
 impl UIRunner {
+    pub(super) fn background_builds_finished(&mut self) -> bool {
+        if self.shut_down {
+            self.finish_stopping_engine();
+        }
+        let stopping = self.engine.is_some();
+        // GPU initialization predates the context and its build tracker. Keep
+        // the event loop alive until that driver work has finished too.
+        let initializing = self
+            .gpu_init_handle
+            .as_ref()
+            .is_some_and(|h| !h.is_finished());
+        if !initializing {
+            if let Some(handle) = self.gpu_init_handle.take() {
+                let _ = handle.join();
+            }
+        }
+        let Some((builds, started, warned)) = &mut self.closing_builds else {
+            return !initializing
+                && !stopping
+                && crate::renderer::subprocess::wait_for_recordings(std::time::Duration::ZERO);
+        };
+        // A finishing engine can register recording finalizers. Observe its
+        // ticket first so those registrations are visible before we exit.
+        let pending = builds.pending();
+        let recordings = crate::renderer::subprocess::finalizing_recordings();
+        if pending == 0
+            && !initializing
+            && !stopping
+            && crate::renderer::subprocess::wait_for_recordings(std::time::Duration::ZERO)
+        {
+            return true;
+        }
+        if !*warned && started.elapsed() >= std::time::Duration::from_secs(5) {
+            *warned = true;
+            log::warn!(
+                "Finishing background work before exit ({} jobs)",
+                pending
+                    + recordings
+                    + usize::from(initializing)
+                    + usize::from(stopping && pending == 0)
+            );
+        }
+        false
+    }
+
     /// Save the show and end the app.
     fn quit(&mut self, event_loop: &ActiveEventLoop) {
         self.shut_down();
-        event_loop.exit();
+        if self.background_builds_finished() {
+            event_loop.exit();
+        }
     }
 
     /// Save the show and stop the API — once, however the windowed app ends:
@@ -425,24 +502,69 @@ impl UIRunner {
         if !self.config.headless {
             crate::clicker::stop();
         }
-        if let Some(engine) = self.engine.take() {
-            if let Some(app) = engine.stop() {
-                self.varda = Some(app);
-            }
+        if let Some(gpu) = &self.gpu {
+            gpu.builds.close();
+            self.closing_builds = Some((gpu.builds.clone(), std::time::Instant::now(), false));
         }
         if let Some(varda) = self.varda.as_mut() {
+            varda.gpu_context().builds.close();
+            self.closing_builds = Some((
+                varda.gpu_context().builds.clone(),
+                std::time::Instant::now(),
+                false,
+            ));
+        }
+        self.closing_builds.get_or_insert_with(|| {
+            (
+                crate::renderer::builds::Builds::default(),
+                std::time::Instant::now(),
+                false,
+            )
+        });
+        if let Some(window) = self.window {
+            window.set_title("Nida — Finishing background work…");
+        }
+        if self.engine.is_some() {
+            self.finish_stopping_engine();
+        } else {
+            self.finish_shutdown();
+        }
+    }
+
+    fn finish_stopping_engine(&mut self) {
+        let Some(engine) = self.engine.take() else {
+            return;
+        };
+        match engine.try_stop() {
+            Ok(app) => {
+                self.varda = app;
+                self.finish_shutdown();
+            }
+            Err(engine) => self.engine = Some(engine),
+        }
+    }
+
+    /// Runs once, after the stopped worker has returned the app.
+    fn finish_shutdown(&mut self) {
+        if let Some(varda) = self.varda.as_mut() {
+            let builds = varda.gpu_context().builds.clone();
+            builds.close();
+            if let Some((tracked, _, _)) = &mut self.closing_builds {
+                *tracked = builds;
+            }
             if let Err(e) = varda.save_workspace(&self.layout) {
                 log::error!("{e}");
             }
             varda.refuse_commands();
+            varda.finish_outputs();
         }
         // A Save As that landed as Nida quit moved the show: it is the one
         // to open next time, the Recent list written before Nida goes.
         if !self.config.headless {
             self.show_moved();
-            if let Some(varda) = self.varda.as_mut() {
-                varda.flush_saves();
-            }
+        }
+        if let Some(varda) = self.varda.as_mut() {
+            varda.flush_saves();
         }
         if let Some(api) = self.api_handle.take() {
             api.shutdown();
