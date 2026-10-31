@@ -7,6 +7,7 @@
 #[allow(non_camel_case_types, non_snake_case, dead_code)]
 pub mod ffi;
 mod p216;
+mod receive;
 pub mod sdk;
 
 use std::collections::HashMap;
@@ -51,7 +52,8 @@ pub struct NdiManager {
     receivers: Vec<NdiReceiver>,
     /// Each receiver's texture; `None` once it is stopped, its memory given
     /// back (receivers are kept in place: decks know them by position).
-    textures: Vec<Option<(wgpu::Texture, wgpu::TextureView)>>,
+    textures: Vec<Option<receive::ReceiveTarget>>,
+    unpacker: Option<receive::UyvyUnpacker>,
     /// Active NDI senders keyed by sender name.
     senders: HashMap<String, NdiSender>,
     /// GPU P216 conversion/readback state keyed by sender name.
@@ -66,13 +68,6 @@ pub struct NdiManager {
 // manager owns them and is used by one thread at a time — the engine moves
 // between the main thread and the engine thread with it.
 unsafe impl Send for NdiManager {}
-
-/// Shared frame payload passed from receive thread → main thread.
-struct NdiFrame {
-    data: Vec<u8>,
-    width: u32,
-    height: u32,
-}
 
 /// A receiver's sound: its format once some has arrived, and where it goes.
 #[derive(Default)]
@@ -163,7 +158,7 @@ fn interleave(planes: &[&[f32]]) -> Vec<f32> {
 struct NdiReceiver {
     #[allow(dead_code)]
     source_name: String,
-    frame_data: Arc<Mutex<Option<NdiFrame>>>,
+    frame_data: Arc<receive::FrameSlot>,
     audio: Arc<NdiAudio>,
     stop_flag: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
@@ -314,6 +309,7 @@ impl NdiManager {
             sources: Vec::new(),
             receivers: Vec::new(),
             textures: Vec::new(),
+            unpacker: None,
             senders: HashMap::new(),
             p216_converters: HashMap::new(),
             finder: std::ptr::null_mut(),
@@ -328,6 +324,7 @@ impl NdiManager {
             sources: Vec::new(),
             receivers: Vec::new(),
             textures: Vec::new(),
+            unpacker: None,
             senders: HashMap::new(),
             p216_converters: HashMap::new(),
             finder: std::ptr::null_mut(),
@@ -431,7 +428,10 @@ impl NdiManager {
             return None;
         };
 
-        let frame_data: Arc<Mutex<Option<NdiFrame>>> = Arc::new(Mutex::new(None));
+        if self.unpacker.is_none() {
+            self.unpacker = receive::UyvyUnpacker::try_new(device);
+        }
+        let frame_data = Arc::new(receive::FrameSlot::new(self.unpacker.is_none()));
         let audio = Arc::new(NdiAudio::default());
         let stop_flag = Arc::new(AtomicBool::new(false));
         let (width, height) = (1920u32, 1080u32);
@@ -446,8 +446,12 @@ impl NdiManager {
         let recv_name = std::ffi::CString::new("Nida Receiver").unwrap();
         let recv_settings = ffi::NDIlib_recv_create_v3_t {
             source_to_connect_to: ndi_source,
-            color_format: 0, // BGRX/BGRA — most reliable for conversion
-            bandwidth: 100,  // highest quality
+            color_format: if self.unpacker.is_some() {
+                receive::RECEIVE_COLOR_FORMAT
+            } else {
+                0
+            },
+            bandwidth: 100, // highest quality
             allow_video_fields: false,
             p_ndi_recv_name: recv_name.as_ptr(),
         };
@@ -460,21 +464,12 @@ impl NdiManager {
 
         let width = width.max(1);
         let height = height.max(1);
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(&format!("NDI Receive: {source_name}")),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let target = receive::ReceiveTarget::new(
+            device,
+            &format!("NDI Receive: {source_name}"),
+            width,
+            height,
+        );
 
         let connected = Arc::new(AtomicBool::new(false));
 
@@ -528,10 +523,7 @@ impl NdiManager {
                             frame_count += 1;
                             none_count = 0;
                             connected_clone.store(true, Ordering::SeqCst);
-                            let rgba = convert_ndi_frame_to_rgba(&vf, w, h);
-                            if let Ok(mut guard) = frame_clone.lock() {
-                                *guard = Some(NdiFrame { data: rgba, width: w, height: h });
-                            }
+                            frame_clone.deposit(&vf);
                         }
                         unsafe { free_fn(recv, &raw const vf) };
                     } else if frame_type == ffi::NDIlib_frame_type_e::AUDIO {
@@ -576,87 +568,31 @@ impl NdiManager {
             height,
             last_picture: None,
         });
-        self.textures.push(Some((texture, texture_view)));
+        self.textures.push(Some(target));
         log::info!("NDI receiver started for '{source_name}'");
         Some(idx)
     }
 
     /// Upload latest frames from all receivers to GPU.
     /// Dynamically recreates textures when the received resolution changes.
-    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        for i in 0..self.receivers.len() {
-            let new_frame = {
-                if let Ok(mut guard) = self.receivers[i].frame_data.try_lock() {
-                    guard.take()
-                } else {
-                    None
+    pub fn update(&mut self, context: &crate::renderer::GpuContext) {
+        let mut encoder = None;
+        for (receiver, target) in self.receivers.iter_mut().zip(&mut self.textures) {
+            if let Some(target) = target {
+                if target.update(
+                    &receiver.frame_data,
+                    &context.device,
+                    &context.queue,
+                    &mut self.unpacker,
+                    &mut encoder,
+                ) {
+                    (receiver.width, receiver.height) = target.dimensions();
+                    receiver.last_picture = Some(std::time::Instant::now());
                 }
-            };
-            if let Some(frame) = new_frame {
-                if self.textures[i].is_none() {
-                    continue;
-                }
-                let fw = frame.width;
-                let fh = frame.height;
-                let expected = (fw * fh * 4) as usize;
-                if frame.data.len() < expected {
-                    continue;
-                }
-                // Recreate texture if dimensions changed
-                let fw = fw.max(1);
-                let fh = fh.max(1);
-                if fw != self.receivers[i].width || fh != self.receivers[i].height {
-                    log::info!(
-                        "NDI receiver {}: resolution changed {}×{} → {}×{}",
-                        i,
-                        self.receivers[i].width,
-                        self.receivers[i].height,
-                        fw,
-                        fh
-                    );
-                    let texture = device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("NDI Receive (resized)"),
-                        size: wgpu::Extent3d {
-                            width: fw,
-                            height: fh,
-                            depth_or_array_layers: 1,
-                        },
-                        mip_level_count: 1,
-                        sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
-                    });
-                    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-                    self.textures[i] = Some((texture, texture_view));
-                    self.receivers[i].width = fw;
-                    self.receivers[i].height = fh;
-                }
-                let Some((texture, _)) = &self.textures[i] else {
-                    continue;
-                };
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &frame.data[..expected],
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(fw * 4),
-                        rows_per_image: Some(fh),
-                    },
-                    wgpu::Extent3d {
-                        width: fw,
-                        height: fh,
-                        depth_or_array_layers: 1,
-                    },
-                );
-                self.receivers[i].last_picture = Some(std::time::Instant::now());
             }
+        }
+        if let Some(encoder) = encoder {
+            context.submit([encoder.finish()]);
         }
     }
 
@@ -670,7 +606,10 @@ impl NdiManager {
     }
 
     pub fn texture_view(&self, idx: usize) -> Option<&wgpu::TextureView> {
-        self.textures.get(idx)?.as_ref().map(|(_, v)| v)
+        self.textures
+            .get(idx)?
+            .as_ref()
+            .map(receive::ReceiveTarget::view)
     }
 
     pub fn receiver_dimensions(&self, idx: usize) -> Option<(u32, u32)> {
@@ -933,9 +872,7 @@ impl NdiManager {
             if let Some(t) = r.thread.take() {
                 let _ = t.join();
             }
-            if let Ok(mut frame) = r.frame_data.lock() {
-                frame.take();
-            }
+            r.frame_data.clear();
         }
         if let Some(texture) = self.textures.get_mut(idx) {
             *texture = None;
@@ -1001,6 +938,7 @@ impl Drop for NdiManager {
 }
 
 /// Convert an NDI video frame (UYVY, BGRA, BGRX, or RGBA) to RGBA.
+#[cfg(test)]
 fn convert_ndi_frame_to_rgba(vf: &ffi::NDIlib_video_frame_v2_t, w: u32, h: u32) -> Vec<u8> {
     let pixel_count = (w * h) as usize;
     let mut rgba = vec![0u8; pixel_count * 4];

@@ -612,7 +612,7 @@ impl VardaApp {
         // Update NDI receiver frames
         self.external_io
             .ndi_manager
-            .update(&self.context.device, &self.context.queue);
+            .update(&self.context);
 
         // Periodic Syphon re-discovery + late-bind of deferred decks (~1×/sec).
         // Removes the start/stop-ordering dependency: a producer that joins or
