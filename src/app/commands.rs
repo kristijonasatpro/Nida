@@ -2108,6 +2108,10 @@ impl VardaApp {
                     .set_preference(crate::clock::ClockPreference::ForceManual { bpm });
                 CommandResult::Ok
             }
+            EngineCommand::SetAudioTempoRange { min, max } => {
+                self.audio_manager.set_tempo_range(crate::audio::TempoRange::new(min, max));
+                CommandResult::Ok
+            }
 
             // ── Parameters ─────────────────────────────────────────
             EngineCommand::SetGeneratorParam {
@@ -2578,6 +2582,7 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             // Clock preference / manual BPM (live sync config).
             | C::SetClockPreference { .. }
             | C::SetManualBpm { .. }
+            | C::SetAudioTempoRange { .. }
             // Which cable the show is following is live rig config, like the
             // clock's: undoing an edit must not silently re-patch the room.
             | C::SetTimecodePreference { .. }

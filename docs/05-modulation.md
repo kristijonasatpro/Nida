@@ -327,17 +327,18 @@ Mod-on-mod chains are limited to **4 levels deep** to prevent infinite loops. Th
 
 ### FFT Analysis
 
-Nida runs a 2048-point FFT on the audio input at 48 kHz, producing 1024 magnitude bins with ~23 Hz/bin resolution. A Hann window is applied before analysis.
+Nida runs a 2048-point FFT at the input device’s sample rate, producing 1024 magnitude bins (about 23 Hz/bin at 48 kHz). A Hann window is applied before analysis. A bounded worker analyzes overlapping frames every 256 samples, keeping FFT and tempo estimation off the audio callback.
 
 ### Beat Detection
 
 Beats are detected via **spectral flux onset detection**:
 
-1. Compute the transient energy increase across all frequency bins each frame
-2. Compare against an adaptive threshold (median of recent flux values)
-3. Reject double-triggers within 200ms
+1. Measure positive spectral changes in the 30–150 Hz kick band, normalized against its recent level.
+2. Compare against an adaptive threshold and reject triggers less than 50 ms apart.
+3. Estimate tempo from autocorrelation of up to eight seconds of onset strength. Several agreeing estimates are required before changing tempo.
+4. Lock beat phase to strong onsets near the predicted grid, with relocking when the rhythm moves.
 
-BPM is estimated from the last 16 beat intervals, with outlier rejection (>15% deviation from median discarded) and EMA smoothing.
+Allow about five seconds of rhythmic audio for the first stable tempo. The BPM popover’s **Audio range** selects the expected tempo, folding half/double-time estimates into that range. Its default is 70–240 BPM; limits are 40–320 BPM and the range spans at least one octave. This setting lasts for the current session and does not change the selected clock source. Silence or dropped analysis hops clears stale tempo history.
 
 ### ISF Audio Uniforms
 

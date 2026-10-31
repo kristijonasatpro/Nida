@@ -670,6 +670,32 @@ pub(super) fn render_clock_popover(ui: &mut egui::Ui, data: &UIData, actions: &m
         });
     }
 
+    let range = data.clock_audio_tempo_range;
+    let (mut min, mut max) = (range.min, range.max);
+    ui.horizontal(|ui| {
+        ui.label("    Audio range")
+            .on_hover_text("Detected tempos are halved or doubled into this range");
+        let low = ui.add(
+            egui::DragValue::new(&mut min)
+                .range(40.0..=160.0)
+                .speed(1.0)
+                .max_decimals(0),
+        );
+        ui.label("–");
+        let high = ui.add(
+            egui::DragValue::new(&mut max)
+                .range(2.0 * min..=320.0)
+                .speed(1.0)
+                .max_decimals(0)
+                .suffix(" BPM"),
+        );
+        if low.changed() || high.changed() {
+            actions
+                .commands
+                .push(EngineCommand::SetAudioTempoRange { min, max });
+        }
+    });
+
     // Manual BPM option
     let is_manual = data.clock_preference == "ForceManual";
     let mut manual_bpm = data.clock_manual_bpm.unwrap_or(120.0);

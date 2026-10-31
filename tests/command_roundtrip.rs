@@ -22,6 +22,19 @@ fn headless_app() -> Option<VardaApp> {
     Some(VardaApp::new(gpu, &config).expect("VardaApp::new"))
 }
 
+#[test]
+fn audio_tempo_range_roundtrips_without_changing_clock_preference() {
+    let Some(mut app) = headless_app() else { return };
+    assert!(matches!(send_cmd(&mut app, EngineCommand::SetManualBpm { bpm: 123.0 }), CommandResult::Ok));
+    assert!(matches!(send_cmd(&mut app, EngineCommand::SetAudioTempoRange { min: 150.0, max: 200.0 }), CommandResult::Ok));
+    let clock = app.build_engine_state().clock;
+    assert_eq!((clock.audio_tempo_range.min, clock.audio_tempo_range.max), (150.0, 300.0));
+    assert_eq!(clock.preference_label, "ForceManual");
+    assert_eq!(clock.manual_bpm, Some(123.0));
+    let serialized = serde_json::to_value(clock).unwrap();
+    assert_eq!(serialized["audio_tempo_range"]["min"], 150.0);
+}
+
 fn send_cmd(app: &mut VardaApp, cmd: EngineCommand) -> CommandResult {
     let tx = app.command_sender();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();

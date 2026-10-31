@@ -690,6 +690,7 @@ pub(crate) fn build_clock_snapshot(app: &VardaApp) -> ClockSnapshot {
     };
 
     ClockSnapshot {
+        audio_tempo_range: app.audio_manager.tempo_range(),
         bpm: if clock.active { Some(clock.bpm) } else { None },
         beat_phase: clock.beat_phase,
         source_label,
