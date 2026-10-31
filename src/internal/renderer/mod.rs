@@ -1,4 +1,5 @@
 pub mod blit;
+pub mod builds;
 pub mod camera_profile;
 pub mod compute_pipeline;
 pub mod config;

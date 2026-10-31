@@ -250,6 +250,8 @@ pub fn set_occluded(surface: &wgpu::Surface<'_>, occluded: Option<bool>) {
 /// background thread deck creation.
 #[derive(Clone)]
 pub struct GpuContext {
+    /// Construction lifetimes shared with deck/effect workers.
+    pub builds: super::builds::Builds,
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
@@ -418,6 +420,7 @@ impl GpuContext {
         errors.install(&device);
 
         let gpu = GpuContext {
+            builds: super::builds::Builds::default(),
             instance,
             adapter,
             device,
@@ -545,6 +548,7 @@ impl GpuContext {
         errors.install(&device);
 
         Ok(GpuContext {
+            builds: super::builds::Builds::default(),
             instance,
             adapter,
             device,
