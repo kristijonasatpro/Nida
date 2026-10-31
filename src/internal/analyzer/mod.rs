@@ -477,6 +477,88 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn mixed_analyzers_share_the_largest_capture_and_metadata_only_skips_it() {
+        let gpu = match crate::renderer::GpuContext::new_headless() {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                assert!(
+                    std::env::var_os("VARDA_REQUIRE_GPU").is_none(),
+                    "GPU required: {error}"
+                );
+                return;
+            }
+        };
+        let source = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("mixed analyzer fixture"),
+            size: wgpu::Extent3d {
+                width: 1024,
+                height: 512,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let mut deck = DeckAnalyzers::new();
+        let mut guards = Vec::new();
+        let mut add = |name: &str, frame_size| {
+            let (frame_tx, received) = crossbeam_channel::bounded(4);
+            let (done, done_rx) = crossbeam_channel::bounded(1);
+            guards.push(done);
+            deck.instances.insert(
+                name.into(),
+                AnalyzerInstance {
+                    frame_size,
+                    refcount: 1,
+                    thread: None,
+                    latest: Arc::new(ArcSwap::from_pointee(AnalyzerSnapshot::empty())),
+                    stop: Arc::default(),
+                    frame_tx,
+                    done_rx,
+                },
+            );
+            received
+        };
+        let small = add("small", Some(64));
+        let large = add("large", Some(256));
+        let metadata = add("metadata", None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let first = loop {
+            let encoded = deck.capture_frame(&gpu.device, &source).unwrap();
+            gpu.submit([encoded]);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            if let Ok(frame) = small.try_recv() {
+                break frame;
+            }
+            assert!(Instant::now() < deadline, "capture never arrived");
+        };
+        let second = large.try_recv().unwrap();
+        assert_eq!((first.width, first.height), (256, 128));
+        assert!(
+            Arc::ptr_eq(&first.frame, &second.frame),
+            "one readback serves both workers"
+        );
+        assert_eq!(first.timestamp, second.timestamp);
+        deck.instances.remove("large");
+        assert!(deck.capture_frame(&gpu.device, &source).is_some());
+        assert!(deck.capture.as_ref().unwrap().fits((1024, 512), (64, 32)));
+        deck.instances.remove("small");
+        metadata.try_iter().for_each(drop);
+        assert!(deck.capture_frame(&gpu.device, &source).is_none());
+        assert!(deck.capture.is_none());
+        let frame = metadata.try_recv().unwrap();
+        assert!(frame.frame.is_empty());
+        assert_eq!((frame.width, frame.height), (1024, 512));
+        deck.instances.clear();
+        assert!(deck.capture_frame(&gpu.device, &source).is_none());
+    }
+
+    #[test]
     fn registry_builder_pattern() {
         let registry = default_registry();
         let types = registry.available_types();
