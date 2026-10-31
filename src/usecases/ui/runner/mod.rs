@@ -2674,6 +2674,24 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_waits_for_gpu_initialization_before_a_context_exists() {
+        let mut runner = runner();
+        let (release, wait) = std::sync::mpsc::channel();
+        runner.gpu_init_handle = Some(std::thread::spawn(move || {
+            wait.recv().unwrap();
+            Err(anyhow::anyhow!("initialization cancelled in test"))
+        }));
+        runner.shut_down();
+        assert!(!runner.background_builds_finished());
+        release.send(()).unwrap();
+        while !runner.gpu_init_handle.as_ref().unwrap().is_finished() {
+            std::thread::yield_now();
+        }
+        assert!(runner.background_builds_finished());
+        assert!(runner.gpu_init_handle.is_none());
+    }
+
+    #[test]
     fn shutdown_keeps_waiting_after_five_seconds_and_is_idempotent() {
         let Some(mut runner) = headless_runner() else { return };
         let builds = runner.varda.as_ref().unwrap().gpu_context().builds.clone();

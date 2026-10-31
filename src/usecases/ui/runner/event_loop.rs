@@ -438,21 +438,29 @@ fn output_window_event(varda: &mut VardaApp, window_id: WindowId, event: WindowE
 
 impl UIRunner {
     pub(super) fn background_builds_finished(&mut self) -> bool {
+        // GPU initialization predates the context and its build tracker. Keep
+        // the event loop alive until that driver work has finished too.
+        let initializing = self.gpu_init_handle.as_ref().is_some_and(|h| !h.is_finished());
+        if !initializing {
+            if let Some(handle) = self.gpu_init_handle.take() {
+                let _ = handle.join();
+            }
+        }
         let Some((builds, started, warned)) = &mut self.closing_builds else {
-            return crate::renderer::subprocess::finalizing_recordings() == 0;
+            return !initializing && crate::renderer::subprocess::finalizing_recordings() == 0;
         };
         // A finishing engine can register recording finalizers. Observe its
         // ticket first so those registrations are visible before we exit.
         let pending = builds.pending();
         let recordings = crate::renderer::subprocess::finalizing_recordings();
-        if pending == 0 && recordings == 0 {
+        if pending == 0 && recordings == 0 && !initializing {
             return true;
         }
         if !*warned && started.elapsed() >= std::time::Duration::from_secs(5) {
             *warned = true;
             log::warn!(
                 "Finishing background work before exit ({} jobs)",
-                pending + recordings
+                pending + recordings + usize::from(initializing)
             );
         }
         false
@@ -499,6 +507,12 @@ impl UIRunner {
             }
             varda.refuse_commands();
             varda.finish_outputs();
+        }
+        self.closing_builds.get_or_insert_with(|| {
+            (crate::renderer::builds::Builds::default(), std::time::Instant::now(), false)
+        });
+        if let Some(window) = self.window {
+            window.set_title("Nida — Finishing background work…");
         }
         // A Save As that landed as Nida quit moved the show: it is the one
         // to open next time, the Recent list written before Nida goes.

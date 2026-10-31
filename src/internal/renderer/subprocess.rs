@@ -3069,7 +3069,7 @@ impl FfmpegSubprocess {
             //    thread may be blocked on stdin.write_all() (e.g. SRT listener
             //    with a full pipe buffer). Killing the child breaks the pipe,
             //    which unblocks the write and lets the thread exit.
-            let _ = self.child.kill();
+            let _ = child.kill();
 
             // 3b. Tear down the audio side-channel (socket + writer thread).
             //     Done after the kill so a writer blocked on a full socket sees
