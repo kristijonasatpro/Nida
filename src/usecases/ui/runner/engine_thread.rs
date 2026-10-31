@@ -324,6 +324,11 @@ impl EngineThread {
         gpu: crate::renderer::context::GpuContext,
         wake_ui: impl Fn() + Send + 'static,
     ) -> Self {
+        // Also cover a frame that outlives EngineThread::stop's patience.
+        let ticket = gpu
+            .builds
+            .reserve()
+            .expect("engine started before shutdown");
         let baton = Arc::new(Baton::new(app));
         let signal = Arc::new(Signal::default());
         let phase = Arc::new(std::sync::atomic::AtomicU8::new(Phase::Waiting as u8));
@@ -337,7 +342,14 @@ impl EngineThread {
             let baton = Arc::clone(&baton);
             std::thread::Builder::new()
                 .name("nida-engine".into())
-                .spawn(move || engine.run(&baton))
+                .spawn(move || {
+                    let _ticket = ticket;
+                    engine.run(&baton);
+                    // A late engine may still own outputs in the baton. Drop
+                    // them (and register recording finalizers) before releasing
+                    // the ticket that permits process shutdown.
+                    drop(baton);
+                })
                 .expect("start the engine thread")
         };
         log::info!("Engine running on a thread of its own");
