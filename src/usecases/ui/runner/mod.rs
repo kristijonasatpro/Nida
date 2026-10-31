@@ -2693,7 +2693,9 @@ mod tests {
 
     #[test]
     fn shutdown_keeps_waiting_after_five_seconds_and_is_idempotent() {
-        let Some(mut runner) = headless_runner() else { return };
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
         let builds = runner.varda.as_ref().unwrap().gpu_context().builds.clone();
         let ticket = builds.reserve().unwrap();
         assert!(ticket.start());
@@ -2701,7 +2703,8 @@ mod tests {
         runner.shut_down();
         assert!(builds.reserve().is_none());
         runner.closing_builds.as_mut().unwrap().1 = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(6)).unwrap();
+            .checked_sub(std::time::Duration::from_secs(6))
+            .unwrap();
         assert!(!runner.background_builds_finished());
         assert!(runner.closing_builds.as_ref().unwrap().2);
         drop(ticket);

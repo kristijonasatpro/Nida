@@ -3227,9 +3227,11 @@ mod tests {
                 .spawn()
                 .expect("test child");
             let (release, drain) = mpsc::channel::<()>();
-            let writer_thread = graceful_shutdown.then(|| std::thread::spawn(move || {
-                let _ = drain.recv();
-            }));
+            let writer_thread = graceful_shutdown.then(|| {
+                std::thread::spawn(move || {
+                    let _ = drain.recv();
+                })
+            });
             let mut output = FfmpegSubprocess {
                 child: Some(child),
                 frame_tx: None,
@@ -3252,7 +3254,10 @@ mod tests {
 
             output.stop();
             if graceful_shutdown {
-                assert!(finalizing_recordings() > 0, "the draining writer holds exit open");
+                assert!(
+                    finalizing_recordings() > 0,
+                    "the draining writer holds exit open"
+                );
                 assert!(!wait_for_recordings(std::time::Duration::ZERO));
                 release.send(()).unwrap();
                 assert!(wait_for_recordings(std::time::Duration::from_secs(5)));
