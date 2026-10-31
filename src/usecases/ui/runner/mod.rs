@@ -470,6 +470,10 @@ impl UIRunner {
                 while !builds.wait(std::time::Duration::from_secs(1)) {}
             }
         }
+        if !crate::renderer::subprocess::wait_for_recordings(std::time::Duration::from_secs(5)) {
+            log::warn!("Finishing recording files before exit");
+            while !crate::renderer::subprocess::wait_for_recordings(std::time::Duration::from_secs(1)) {}
+        }
         result
     }
 }

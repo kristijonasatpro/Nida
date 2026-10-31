@@ -19,6 +19,21 @@ use crate::engine::value::render::{
 };
 use crate::renderer::{ReadbackFormat, ReadbackFrame};
 
+// Stop recording stays non-blocking during a show, but process exit must wait
+// for detached finalizers, including takes stopped before Quit was requested.
+fn recording_finalizers() -> &'static super::builds::Builds {
+    static FINALIZERS: std::sync::OnceLock<super::builds::Builds> = std::sync::OnceLock::new();
+    FINALIZERS.get_or_init(super::builds::Builds::default)
+}
+
+pub(crate) fn finalizing_recordings() -> usize {
+    recording_finalizers().pending()
+}
+
+pub(crate) fn wait_for_recordings(timeout: std::time::Duration) -> bool {
+    recording_finalizers().wait(timeout)
+}
+
 #[cfg(target_os = "macos")]
 mod native;
 
@@ -938,7 +953,8 @@ fn write_stream_player(dir: &str, kind: &str, manifest_filename: &str, low_laten
 /// This prevents the render thread from blocking when ffmpeg's stdin pipe is full
 /// (e.g. SRT listener waiting for a client connection).
 pub struct FfmpegSubprocess {
-    child: Child,
+    /// Taken by stop so recording finalization owns the process.
+    child: Option<Child>,
     /// Channel sender for frames, with when each was drawn → writer thread
     frame_tx: Option<mpsc::SyncSender<(std::time::Instant, Vec<u8>)>>,
     /// Writer thread handle
@@ -1882,7 +1898,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, path.to_string())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -1995,7 +2011,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, url.to_string())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -2114,7 +2130,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, name.to_string())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -2224,7 +2240,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, label.clone())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -2457,7 +2473,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, label.clone())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: Some(fanout),
             native,
@@ -2598,7 +2614,7 @@ impl FfmpegSubprocess {
         );
         let audio = finalize_audio(prepared, label.clone())?;
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -2629,7 +2645,9 @@ impl FfmpegSubprocess {
     /// Kill ffmpeg abruptly, as a crash would — for tests of what survives.
     #[doc(hidden)]
     pub fn kill_process(&mut self) {
-        let _ = self.child.kill();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
     }
 
     /// The stream's destinations, when this is the stream's encoder.
@@ -2643,7 +2661,7 @@ impl FfmpegSubprocess {
         !self.stopped
             && !self.write_failed.load(Ordering::SeqCst)
             && !self.native.as_ref().is_some_and(|n| n.shared.stuck())
-            && matches!(self.child.try_wait(), Ok(None))
+            && self.child.as_mut().is_some_and(|child| matches!(child.try_wait(), Ok(None)))
     }
 
     /// Whether this stream's video rate changes while live — to follow the
@@ -2779,7 +2797,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, name.to_string())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -2906,7 +2924,8 @@ impl FfmpegSubprocess {
             return false;
         }
         // Check if ffmpeg already exited (non-blocking)
-        if let Some(status) = self.child.try_wait().ok().flatten() {
+        let Some(child) = self.child.as_mut() else { return false };
+        if let Some(status) = child.try_wait().ok().flatten() {
             if !status.success() {
                 self.drain_stderr();
                 log::error!(
@@ -2955,8 +2974,8 @@ impl FfmpegSubprocess {
     ///
     /// # Panics
     ///
-    /// On the recording path, panics if the placeholder child process or the
-    /// background finalize thread cannot be spawned.
+    /// On the recording path, panics if the background finalize thread cannot
+    /// be spawned.
     pub fn stop(&mut self) {
         if self.stopped {
             return;
@@ -2970,22 +2989,16 @@ impl FfmpegSubprocess {
 
         // 2. Drop the sender to close the channel — no more frames queued
         drop(self.frame_tx.take());
+        let Some(mut child) = self.child.take() else { return };
 
         if self.graceful_shutdown {
+            let finalization = recording_finalizers()
+                .reserve()
+                .expect("finalizer tracking stays open");
             // --- Recording path: finalize on a background thread ---
             // Move all owned resources out of `self` so the thread owns them.
             let mut audio = self.audio.take();
             let writer_thread = self.writer_thread.take();
-            let mut child = std::mem::replace(
-                &mut self.child,
-                // Placeholder — never used again (stopped == true).
-                Command::new("true")
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .expect("failed to spawn placeholder"),
-            );
             let label = self.label.clone();
             let counters = self.counters.clone();
             let stderr = self.stderr_tail.clone();
@@ -2995,6 +3008,7 @@ impl FfmpegSubprocess {
                 .spawn(move || {
                     const FINALIZE_TIMEOUT: std::time::Duration =
                         std::time::Duration::from_secs(30);
+                    let _finalization = finalization;
 
                     // 3a. Tear down the audio writer/socket so ffmpeg sees EOF on
                     //     both inputs.
@@ -3087,7 +3101,7 @@ impl FfmpegSubprocess {
             }
 
             // 5. Reap the child process
-            let _ = self.child.wait();
+            let _ = child.wait();
 
             // 6. The encoder is gone, so its destinations have seen the last
             //    of the stream: let each finish sending and hang up.
@@ -3196,6 +3210,60 @@ impl Drop for FfmpegSubprocess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stopping either output owns the original process until it is reaped,
+    /// without launching a shell command to replace it. Calls after stop are
+    /// harmless while a recording finishes on its background thread.
+    #[test]
+    fn stopped_outputs_release_their_child_without_a_replacement() {
+        for graceful_shutdown in [false, true] {
+            // The test runner can list tests on every platform, without an
+            // installed FFmpeg or a Unix shell.
+            let child = Command::new(std::env::current_exe().expect("test executable"))
+                .arg("--list")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("test child");
+            let (release, drain) = mpsc::channel::<()>();
+            let writer_thread = graceful_shutdown.then(|| std::thread::spawn(move || {
+                let _ = drain.recv();
+            }));
+            let mut output = FfmpegSubprocess {
+                child: Some(child),
+                frame_tx: None,
+                writer_thread,
+                counters: FrameCounters::new(),
+                write_failed: Arc::new(AtomicBool::new(false)),
+                shutting_down: Arc::new(AtomicBool::new(false)),
+                label: "stop regression".into(),
+                start_time: std::time::Instant::now(),
+                stopped: false,
+                audio: None,
+                graceful_shutdown,
+                frame_contract: None,
+                presentation: None,
+                stderr_tail: StderrTail::default(),
+                fanout: None,
+                native: None,
+                rate_plan: None,
+            };
+
+            output.stop();
+            if graceful_shutdown {
+                assert!(finalizing_recordings() > 0, "the draining writer holds exit open");
+                assert!(!wait_for_recordings(std::time::Duration::ZERO));
+                release.send(()).unwrap();
+                assert!(wait_for_recordings(std::time::Duration::from_secs(5)));
+            }
+            assert!(output.child.is_none(), "no replacement process remains");
+            assert!(!output.is_running());
+            assert!(!output.feed_frame(&[]));
+            output.kill_process();
+            output.stop();
+        }
+    }
 
     /// Threads that end in time are joined; one that never does is left,
     /// and the wait for it ends at the bound.

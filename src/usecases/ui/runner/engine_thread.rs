@@ -345,6 +345,10 @@ impl EngineThread {
                 .spawn(move || {
                     let _ticket = ticket;
                     engine.run(&baton);
+                    // A late engine may still own outputs in the baton. Drop
+                    // them (and register recording finalizers) before releasing
+                    // the ticket that permits process shutdown.
+                    drop(baton);
                 })
                 .expect("start the engine thread")
         };

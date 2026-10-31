@@ -171,7 +171,7 @@ impl ApplicationHandler for UIRunner {
             if self.main_window_id == Some(window_id) {
                 match event {
                     WindowEvent::RedrawRequested => {
-                        self.paint_waiting("Finishing background work…")
+                        self.paint_waiting("Finishing background work…");
                     }
                     WindowEvent::Resized(size) => {
                         self.cached_screen_size = size;
@@ -439,16 +439,20 @@ fn output_window_event(varda: &mut VardaApp, window_id: WindowId, event: WindowE
 impl UIRunner {
     pub(super) fn background_builds_finished(&mut self) -> bool {
         let Some((builds, started, warned)) = &mut self.closing_builds else {
-            return true;
+            return crate::renderer::subprocess::finalizing_recordings() == 0;
         };
-        if builds.pending() == 0 {
+        // A finishing engine can register recording finalizers. Observe its
+        // ticket first so those registrations are visible before we exit.
+        let pending = builds.pending();
+        let recordings = crate::renderer::subprocess::finalizing_recordings();
+        if pending == 0 && recordings == 0 {
             return true;
         }
         if !*warned && started.elapsed() >= std::time::Duration::from_secs(5) {
             *warned = true;
             log::warn!(
                 "Finishing background work before exit ({} jobs)",
-                builds.pending()
+                pending + recordings
             );
         }
         false
