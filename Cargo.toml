@@ -322,6 +322,10 @@ name = "audio_analysis"
 harness = false
 
 [[bench]]
+name = "analyzer_capture"
+harness = false
+
+[[bench]]
 name = "polygon_render"
 harness = false
 

@@ -3,6 +3,7 @@
 //! See `/spec/plugin-architecture.md` for the full design.
 
 pub(crate) mod brightness;
+mod capture;
 #[cfg(feature = "face-detection")]
 pub(crate) mod face_detect;
 pub(crate) mod traits;
@@ -128,6 +129,7 @@ impl AnalyzerRegistry {
 // ── Per-Deck Instance Management ────────────────────────────────────────────
 
 struct AnalyzerInstance {
+    frame_size: Option<u32>,
     refcount: usize,
     thread: Option<JoinHandle<()>>,
     latest: Arc<ArcSwap<AnalyzerSnapshot>>,
@@ -146,18 +148,15 @@ const STOP_GRACE: Duration = Duration::from_secs(2);
 /// Manages running analyzer instances for a single deck.
 pub(crate) struct DeckAnalyzers {
     instances: HashMap<String, AnalyzerInstance>,
-    /// Lazy GPU readback buffer — created on first `capture_frame` call.
-    readback: Option<crate::renderer::ReadbackBuffer>,
-    /// Cached dimensions of the current readback buffer.
-    readback_size: (u32, u32),
+    /// Reduction target and asynchronous readback, only while pixels are needed.
+    capture: Option<capture::FrameCapture>,
 }
 
 impl DeckAnalyzers {
     pub(crate) fn new() -> Self {
         Self {
             instances: HashMap::new(),
-            readback: None,
-            readback_size: (0, 0),
+            capture: None,
         }
     }
 
@@ -175,6 +174,7 @@ impl DeckAnalyzers {
         }
 
         let analyzer = registry.create(analyzer_type)?;
+        let frame_size = analyzer.frame_size().map(|size| size.max(1));
 
         // Schema is static and does not require init(), so we can build the
         // initial default snapshot before the worker thread runs.
@@ -214,6 +214,7 @@ impl DeckAnalyzers {
         self.instances.insert(
             analyzer_type.to_owned(),
             AnalyzerInstance {
+                frame_size,
                 refcount: 1,
                 thread: Some(thread),
                 latest,
@@ -306,43 +307,55 @@ impl DeckAnalyzers {
     ) -> Option<wgpu::CommandBuffer> {
         self.prune_dead();
         if self.instances.is_empty() {
+            self.capture = None;
             return None;
         }
 
-        let tex_width = source_texture.width();
-        let tex_height = source_texture.height();
-
-        // Create or recreate readback buffer if dimensions changed
-        if self.readback.is_none() || self.readback_size != (tex_width, tex_height) {
-            self.readback = Some(crate::renderer::ReadbackBuffer::new(
-                device,
-                tex_width,
-                tex_height,
-                crate::renderer::ReadbackFormat::Rgba8,
-            ));
-            self.readback_size = (tex_width, tex_height);
-        }
-
-        // Read the PREVIOUS frame's data (before mutating readback state)
-        let prev_frame = self.readback.as_mut().and_then(|rb| rb.try_read(device));
-
-        // Deliver previous frame data to analyzer threads
-        if let Some(rgba_data) = prev_frame {
-            let input = AnalyzerInput {
-                frame: rgba_data.into_bytes(),
-                width: self.readback_size.0,
-                height: self.readback_size.1,
+        let source_size = (source_texture.width(), source_texture.height());
+        let wanted = self
+            .instances
+            .values()
+            .filter_map(|inst| inst.frame_size)
+            .max();
+        let Some(long_side) = wanted else {
+            self.capture = None;
+            self.send_frame(&AnalyzerInput {
+                frame: Arc::new(Vec::new()),
+                width: source_size.0,
+                height: source_size.1,
                 timestamp: std::time::Instant::now(),
+            });
+            return None;
+        };
+        let size = capture::capture_size(source_size, long_side);
+        if self
+            .capture
+            .as_ref()
+            .is_none_or(|capture| !capture.fits(source_size, size))
+        {
+            self.capture = Some(capture::FrameCapture::new(device, source_size, size));
+        }
+        if let Some(frame) = self
+            .capture
+            .as_mut()
+            .and_then(|capture| capture.try_read(device))
+        {
+            let input = AnalyzerInput {
+                width: frame.width(),
+                height: frame.height(),
+                timestamp: frame.made(),
+                frame: Arc::new(frame.into_bytes()),
             };
             self.send_frame(&input);
         }
 
-        // Enqueue copy for THIS frame (will be read next frame)
-        let readback = self.readback.as_mut().unwrap();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Analyzer readback"),
         });
-        readback.begin_readback(&mut encoder, source_texture, std::time::Instant::now());
+        self.capture
+            .as_mut()
+            .unwrap()
+            .encode(device, &mut encoder, source_texture);
         Some(encoder.finish())
     }
 
@@ -464,6 +477,88 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn mixed_analyzers_share_the_largest_capture_and_metadata_only_skips_it() {
+        let gpu = match crate::renderer::GpuContext::new_headless() {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                assert!(
+                    std::env::var_os("VARDA_REQUIRE_GPU").is_none(),
+                    "GPU required: {error}"
+                );
+                return;
+            }
+        };
+        let source = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("mixed analyzer fixture"),
+            size: wgpu::Extent3d {
+                width: 1024,
+                height: 512,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let mut deck = DeckAnalyzers::new();
+        let mut guards = Vec::new();
+        let mut add = |name: &str, frame_size| {
+            let (frame_tx, received) = crossbeam_channel::bounded(4);
+            let (done, done_rx) = crossbeam_channel::bounded(1);
+            guards.push(done);
+            deck.instances.insert(
+                name.into(),
+                AnalyzerInstance {
+                    frame_size,
+                    refcount: 1,
+                    thread: None,
+                    latest: Arc::new(ArcSwap::from_pointee(AnalyzerSnapshot::empty())),
+                    stop: Arc::default(),
+                    frame_tx,
+                    done_rx,
+                },
+            );
+            received
+        };
+        let small = add("small", Some(64));
+        let large = add("large", Some(256));
+        let metadata = add("metadata", None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let first = loop {
+            let encoded = deck.capture_frame(&gpu.device, &source).unwrap();
+            gpu.submit([encoded]);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            if let Ok(frame) = small.try_recv() {
+                break frame;
+            }
+            assert!(Instant::now() < deadline, "capture never arrived");
+        };
+        let second = large.try_recv().unwrap();
+        assert_eq!((first.width, first.height), (256, 128));
+        assert!(
+            Arc::ptr_eq(&first.frame, &second.frame),
+            "one readback serves both workers"
+        );
+        assert_eq!(first.timestamp, second.timestamp);
+        deck.instances.remove("large");
+        assert!(deck.capture_frame(&gpu.device, &source).is_some());
+        assert!(deck.capture.as_ref().unwrap().fits((1024, 512), (64, 32)));
+        deck.instances.remove("small");
+        metadata.try_iter().for_each(drop);
+        assert!(deck.capture_frame(&gpu.device, &source).is_none());
+        assert!(deck.capture.is_none());
+        let frame = metadata.try_recv().unwrap();
+        assert!(frame.frame.is_empty());
+        assert_eq!((frame.width, frame.height), (1024, 512));
+        deck.instances.clear();
+        assert!(deck.capture_frame(&gpu.device, &source).is_none());
+    }
+
+    #[test]
     fn registry_builder_pattern() {
         let registry = default_registry();
         let types = registry.available_types();
@@ -512,7 +607,7 @@ mod tests {
             .expect("should create");
 
         let input = AnalyzerInput {
-            frame: vec![255u8; 4 * 4 * 4],
+            frame: Arc::new(vec![255u8; 4 * 4 * 4]),
             width: 4,
             height: 4,
             timestamp: Instant::now(),
