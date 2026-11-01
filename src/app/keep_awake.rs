@@ -17,6 +17,7 @@
 //!   behind. Listed in `systemd-inhibit --list`.
 
 /// Why the machine is held awake, as the OS lists it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) const REASON: &str = "Nida: live outputs";
 
 /// Holds the machine awake while wanted, and lets go on drop.
@@ -45,6 +46,11 @@ struct Activity(
 #[cfg(target_os = "macos")]
 unsafe impl Send for Activity {}
 
+// Unsupported platforms retain the same lifecycle API until an inhibitor exists.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    allow(clippy::unused_self)
+)]
 impl KeepAwake {
     /// Hold or let go. Cheap to call every frame: it only reaches the OS when
     /// the answer changes.
@@ -144,7 +150,7 @@ impl Drop for KeepAwake {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
 
@@ -160,8 +166,6 @@ mod tests {
         #[cfg(target_os = "linux")]
         let (program, args, marker) =
             ("systemd-inhibit", ["--list"].as_slice(), format!(" {pid} "));
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        return None;
         let out = std::process::Command::new(program)
             .args(args)
             .output()
@@ -180,7 +184,7 @@ mod tests {
     fn holder(keep: &KeepAwake) -> u32 {
         #[cfg(target_os = "linux")]
         return keep.inhibitor.as_ref().map_or(0, std::process::Child::id);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
             let _ = keep;
             std::process::id()

@@ -145,6 +145,8 @@ fn tell(found: &[DeckLinkDevice], told: &mut Option<Vec<String>>) {
 /// not the format's size. Said in words only when the log is told — the
 /// device's thread runs in real time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// SDK errors are constructed by the macOS backend; other platforms keep its API.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) enum Refused {
     Code(i32),
     TooSmall,
@@ -353,6 +355,7 @@ fn run_on_time(
 
 /// The CPU time the calling thread has had: against how long a step took,
 /// the work in it, not the waiting.
+#[cfg(unix)]
 fn thread_cpu() -> std::time::Duration {
     let mut at = libc::timespec {
         tv_sec: 0,
@@ -366,6 +369,13 @@ fn thread_cpu() -> std::time::Duration {
         u64::try_from(at.tv_sec).unwrap_or(0),
         u32::try_from(at.tv_nsec).unwrap_or(0),
     )
+}
+
+// No POSIX thread clock here. DeckLink output itself is unavailable on these
+// platforms too; leave CPU timing unset rather than treating wall time as CPU.
+#[cfg(not(unix))]
+fn thread_cpu() -> std::time::Duration {
+    std::time::Duration::ZERO
 }
 
 struct Shared {
@@ -1251,6 +1261,8 @@ mod sdk {
     pub(super) struct Converter;
 
     impl Converter {
+        // Match the fallible macOS converter's constructor in this stub backend.
+        #[allow(clippy::unnecessary_wraps)]
         pub(super) fn new(_height: u32, _full_range: bool) -> Result<Self, String> {
             Ok(Self)
         }

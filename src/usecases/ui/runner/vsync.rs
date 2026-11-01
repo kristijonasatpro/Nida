@@ -15,11 +15,14 @@
 //! Elsewhere there is no display clock and the timer stays.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+#[cfg(any(target_os = "macos", test))]
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Callbacks kept for the performance figures: five seconds at 120 Hz.
+#[cfg(any(target_os = "macos", test))]
 const TICKS_KEPT: usize = 600;
 
 /// One display-link callback: when it came, and the refresh it is for —
@@ -37,8 +40,10 @@ struct Shared {
     /// Frames asked for.
     wakes: AtomicU64,
     /// Every how many refreshes a frame is drawn.
+    #[cfg(any(target_os = "macos", test))]
     every: u64,
     /// One refresh, in nanoseconds.
+    #[cfg(any(target_os = "macos", test))]
     period: u64,
     /// When the callback that last asked for a frame came, in nanoseconds
     /// after `origin`.
@@ -50,13 +55,16 @@ struct Shared {
     /// together.
     by_time: AtomicBool,
     /// The last frame slot (refresh ÷ `every`) asked for, by time.
+    #[cfg(any(target_os = "macos", test))]
     last_slot: AtomicI64,
     recent: Mutex<VecDeque<Tick>>,
     origin: Instant,
     /// Wakes the event loop to draw a frame.
+    #[cfg(any(target_os = "macos", test))]
     wake: Box<dyn Fn() + Send + Sync>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl Shared {
     fn new(every: u32, refresh_hz: f64, wake: Box<dyn Fn() + Send + Sync>) -> Self {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -139,9 +147,9 @@ impl DisplayClock {
         refresh_hz: f64,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Option<Self> {
-        let shared = Arc::new(Shared::new(every, refresh_hz, Box::new(wake)));
         #[cfg(target_os = "macos")]
         {
+            let shared = Arc::new(Shared::new(every, refresh_hz, Box::new(wake)));
             let link = mac::Link::start(display, Arc::clone(&shared))?;
             Some(Self {
                 display,
@@ -153,7 +161,7 @@ impl DisplayClock {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (display, refresh_hz, shared);
+            let _ = (display, every, refresh_hz, wake);
             None
         }
     }

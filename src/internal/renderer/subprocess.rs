@@ -942,7 +942,8 @@ fn write_stream_player(dir: &str, kind: &str, manifest_filename: &str, low_laten
 /// This prevents the render thread from blocking when ffmpeg's stdin pipe is full
 /// (e.g. SRT listener waiting for a client connection).
 pub struct FfmpegSubprocess {
-    child: Child,
+    /// Taken by `stop()` so recording finalization can own the process.
+    child: Option<Child>,
     /// Channel sender for frames, with when each was drawn → writer thread
     frame_tx: Option<mpsc::SyncSender<(std::time::Instant, Vec<u8>)>>,
     /// Writer thread handle
@@ -2328,7 +2329,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, path.to_string())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -2441,7 +2442,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, url.to_string())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -2560,7 +2561,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, name.to_string())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -2670,7 +2671,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, label.clone())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -2908,7 +2909,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, label.clone())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: Some(fanout),
             native,
@@ -3089,7 +3090,7 @@ impl FfmpegSubprocess {
         };
         let audio = finalize_audio(prepared, label.clone())?;
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -3120,7 +3121,9 @@ impl FfmpegSubprocess {
     /// Kill ffmpeg abruptly, as a crash would — for tests of what survives.
     #[doc(hidden)]
     pub fn kill_process(&mut self) {
-        let _ = self.child.kill();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
     }
 
     /// The stream's destinations, when this is the stream's encoder.
@@ -3134,7 +3137,10 @@ impl FfmpegSubprocess {
         !self.stopped
             && !self.write_failed.load(Ordering::SeqCst)
             && !self.native.as_ref().is_some_and(|n| n.shared.stuck())
-            && matches!(self.child.try_wait(), Ok(None))
+            && self
+                .child
+                .as_mut()
+                .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
     }
 
     /// Whether this stream's video rate changes while live — to follow the
@@ -3270,7 +3276,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, name.to_string())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -3397,7 +3403,10 @@ impl FfmpegSubprocess {
             return false;
         }
         // Check if ffmpeg already exited (non-blocking)
-        if let Some(status) = self.child.try_wait().ok().flatten() {
+        let Some(child) = self.child.as_mut() else {
+            return false;
+        };
+        if let Some(status) = child.try_wait().ok().flatten() {
             if !status.success() {
                 self.drain_stderr();
                 log::error!(
@@ -3446,8 +3455,8 @@ impl FfmpegSubprocess {
     ///
     /// # Panics
     ///
-    /// On the recording path, panics if the placeholder child process or the
-    /// background finalize thread cannot be spawned.
+    /// On the recording path, panics if the background finalize thread cannot
+    /// be spawned.
     pub fn stop(&mut self) {
         if self.stopped {
             return;
@@ -3461,22 +3470,15 @@ impl FfmpegSubprocess {
 
         // 2. Drop the sender to close the channel — no more frames queued
         drop(self.frame_tx.take());
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
 
         if self.graceful_shutdown {
             // --- Recording path: finalize on a background thread ---
             // Move all owned resources out of `self` so the thread owns them.
             let mut audio = self.audio.take();
             let writer_thread = self.writer_thread.take();
-            let mut child = std::mem::replace(
-                &mut self.child,
-                // Placeholder — never used again (stopped == true).
-                Command::new("true")
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .expect("failed to spawn placeholder"),
-            );
             let label = self.label.clone();
             let counters = self.counters.clone();
             let stderr = self.stderr_tail.clone();
@@ -3567,7 +3569,7 @@ impl FfmpegSubprocess {
             //    thread may be blocked on stdin.write_all() (e.g. SRT listener
             //    with a full pipe buffer). Killing the child breaks the pipe,
             //    which unblocks the write and lets the thread exit.
-            let _ = self.child.kill();
+            let _ = child.kill();
 
             // 3b. Tear down the audio side-channel (socket + writer thread).
             //     Done after the kill so a writer blocked on a full socket sees
@@ -3599,7 +3601,7 @@ impl FfmpegSubprocess {
             }
 
             // 5. Reap the child process
-            let _ = self.child.wait();
+            let _ = child.wait();
 
             // 6. The encoder is gone, so its destinations have seen the last
             //    of the stream: let each finish sending and hang up.
@@ -3730,6 +3732,50 @@ mod tests {
 
     use super::*;
 
+    /// Stopping either output owns the original process until it is reaped,
+    /// without launching a shell command to replace it. Calls after stop are
+    /// harmless while a recording finishes on its background thread.
+    #[test]
+    fn stopped_outputs_release_their_child_without_a_replacement() {
+        for graceful_shutdown in [false, true] {
+            // The test runner can list tests on every platform, without an
+            // installed FFmpeg or a Unix shell.
+            let child = Command::new(std::env::current_exe().expect("test executable"))
+                .arg("--list")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("test child");
+            let mut output = FfmpegSubprocess {
+                child: Some(child),
+                frame_tx: None,
+                writer_thread: None,
+                counters: FrameCounters::new(),
+                write_failed: Arc::new(AtomicBool::new(false)),
+                shutting_down: Arc::new(AtomicBool::new(false)),
+                label: "stop regression".into(),
+                start_time: std::time::Instant::now(),
+                stopped: false,
+                audio: None,
+                graceful_shutdown,
+                frame_contract: None,
+                presentation: None,
+                stderr_tail: StderrTail::default(),
+                fanout: None,
+                native: None,
+                rate_plan: None,
+            };
+
+            output.stop();
+            assert!(output.child.is_none(), "no replacement process remains");
+            assert!(!output.is_running());
+            assert!(!output.feed_frame(&[]));
+            output.kill_process();
+            output.stop();
+        }
+    }
+
     /// Threads that end in time are joined; one that never does is left,
     /// and the wait for it ends at the bound.
     #[test]
@@ -3824,13 +3870,8 @@ mod tests {
     #[test]
     fn a_chatty_ffmpeg_is_not_stalled_by_its_own_log() {
         // More than a pipe holds (64 KB), then the line that matters.
-        let mut child = Command::new("sh")
-            .args([
-                "-c",
-                "i=0; while [ $i -lt 3000 ]; do \
-                 echo \"noise line $i ................................................\" >&2; \
-                 i=$((i+1)); done; echo 'rtmp: Connection refused' >&2",
-            ])
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "stderr_pipe_producer", "--nocapture"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -3851,6 +3892,21 @@ mod tests {
             Some("rtmp: Connection refused")
         );
         assert!(tail.lines().len() <= STDERR_TAIL_LINES);
+    }
+
+    /// Runs in a child test process to exercise a real stderr pipe on every OS.
+    #[test]
+    #[ignore = "helper process for a_chatty_ffmpeg_is_not_stalled_by_its_own_log"]
+    fn stderr_pipe_producer() {
+        let mut stderr = std::io::stderr().lock();
+        for i in 0..3000 {
+            writeln!(
+                stderr,
+                "noise line {i} ................................................"
+            )
+            .unwrap();
+        }
+        writeln!(stderr, "rtmp: Connection refused").unwrap();
     }
 
     #[test]

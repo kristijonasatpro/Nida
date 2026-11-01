@@ -76,11 +76,26 @@ mod sanitize_path_tests {
     }
 
     #[test]
-    fn bare_parent_dir_reduces_to_empty() {
-        let cleaned = sanitize_path(&nonexistent("nope_zzz/.."));
-        // ".." is stripped; only the leading normal component remains.
+    fn unresolved_parent_path_keeps_normal_components() {
+        let root = tempfile::tempdir().unwrap();
+        // Windows can resolve "missing/.." to its parent without visiting
+        // "missing". A missing final component keeps this on the fallback path.
+        let path = root.path().join("missing").join("..").join("still_missing");
+        assert!(path.canonicalize().is_err());
+        let cleaned = sanitize_path(&path);
         assert!(!has_parent_dir(&cleaned));
-        assert_eq!(cleaned, PathBuf::from("nope_zzz"));
+        assert_eq!(cleaned, root.path().join("missing").join("still_missing"));
+    }
+
+    #[test]
+    fn resolvable_parent_path_uses_the_filesystem_result() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        assert_eq!(
+            sanitize_path(&child.join("..")),
+            root.path().canonicalize().unwrap()
+        );
     }
 }
 
