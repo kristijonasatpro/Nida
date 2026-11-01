@@ -868,6 +868,58 @@ impl Deck {
         )
     }
 
+    /// A text input (see [`super::text`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pipeline that places it cannot be made.
+    pub fn new_text(
+        context: &GpuContext,
+        settings: crate::engine::value::text::TextSettings,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let name = settings
+            .text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map_or_else(
+                || "Text".to_string(),
+                |l| l.trim().chars().take(24).collect(),
+            );
+        let text = super::text::Text::new(context, settings, (width, height))?;
+        Ok(Self::build_media_deck(
+            context,
+            format!("T {name}"),
+            None,
+            DeckSource::Text(Box::new(text)),
+            width,
+            height,
+        ))
+    }
+
+    /// A lower third (see [`super::lower_third`]), off air.
+    ///
+    /// # Errors
+    ///
+    /// None as yet; it returns a result as the other sources do.
+    pub fn new_lower_third(
+        context: &GpuContext,
+        settings: crate::engine::value::lower_third::LowerThirdSettings,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let lower = super::lower_third::LowerThird::new(context, settings, (width, height))?;
+        Ok(Self::build_media_deck(
+            context,
+            "▁ Lower third".to_string(),
+            None,
+            DeckSource::LowerThird(Box::new(lower)),
+            width,
+            height,
+        ))
+    }
+
     /// A timer (see [`super::timer`]) that has run `elapsed` seconds, paused.
     ///
     /// # Errors

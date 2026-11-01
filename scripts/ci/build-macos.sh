@@ -18,7 +18,10 @@
 # not mix — so NDI works once the NDI runtime is installed (docs/23).
 #
 # Signed ad hoc, not by Apple: the first time, macOS needs Open Anyway in
-# System Settings → Privacy & Security.
+# System Settings → Privacy & Security. With NIDA_SIGN_IDENTITY set to a
+# code-signing certificate in the keychain (the mini's "Nida Local
+# Signing"), signed by it instead: every build signed alike, macOS keeps the
+# camera, microphone and screen permissions from one to the next.
 #
 # The GPL asks for the corresponding source to be offered beside the DMG:
 # Nida-<version>-third-party-source.tar.gz holds the exact source Homebrew built

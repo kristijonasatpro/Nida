@@ -173,6 +173,11 @@ impl PanelWindows {
     pub fn for_each_drawn(&self, mut f: impl FnMut(egui::TextureId, [u32; 2])) {
         let s = self.shared.borrow();
         for drawn in &s.drawn {
+            // A window minimised or covered is not painted (see `paint`):
+            // what it drew is not seen.
+            if s.windows.get(&drawn.id).is_some_and(|w| w.occluded) {
+                continue;
+            }
             for job in &drawn.jobs {
                 if let egui::epaint::Primitive::Mesh(mesh) = &job.primitive {
                     let size = mesh.calc_bounds().size() * drawn.pixels_per_point;

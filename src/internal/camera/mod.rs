@@ -10,6 +10,8 @@
 
 #[cfg(target_os = "macos")]
 mod avf;
+#[cfg(target_os = "macos")]
+mod blackmagic;
 
 use anyhow::{Context, Result};
 #[cfg(not(target_os = "macos"))]
@@ -62,6 +64,9 @@ pub struct CameraDeviceInfo {
     /// Every size, pixel format and rate on offer, at the rates the device
     /// really runs at.
     pub rates: Vec<Rate>,
+    /// It takes the format that comes in, whatever it was opened at (a
+    /// Blackmagic input that tells it): there is no format to choose.
+    pub follows_signal: bool,
 }
 
 impl CameraDeviceInfo {
@@ -259,7 +264,29 @@ pub(crate) struct Sink {
     pictures: Mutex<FramePicker<Frame>>,
     spare: Mutex<Vec<Vec<u8>>>,
     frames: AtomicU64,
-    last_frame: Mutex<Option<Instant>>,
+    /// When its pictures came (see [`Arrivals`]).
+    arrivals: Mutex<Arrivals>,
+    /// The unique ID its device came back under, plugged into another
+    /// port (see [`moved_device`]), till the camera manager takes it.
+    moved_to: Mutex<Option<String>>,
+    /// When its pictures last stopped and it was started again.
+    stopped: Mutex<Option<Instant>>,
+    /// Asked to close and open again (a Reset input), till its capture
+    /// does.
+    restart: AtomicBool,
+    /// A format asked for since it was opened — `None` within, its best —
+    /// taken as it opens again (see [`Sink::ask_mode`]): none asked, its
+    /// best asked for, or a format.
+    #[allow(clippy::option_option)]
+    mode: Mutex<Option<Option<CameraMode>>>,
+    /// A Blackmagic input's sound (see [`Sink::put_sound`]).
+    sound: Mutex<Sound>,
+    /// Show frames since it opened that showed its picture before again,
+    /// and its pictures left out (see `CameraSignal::shown_again`).
+    shown_again: AtomicU64,
+    left_out: AtomicU64,
+    /// This sink's own number: the mixer tells a camera opened anew by it.
+    sound_key: u64,
     /// How the capture reads the camera's picture into colours (see
     /// [`CameraColour::to_bits`]), read with every frame.
     colour: AtomicU8,
@@ -268,6 +295,62 @@ pub(crate) struct Sink {
     /// Show the newest picture at each pick (see
     /// [`FramePicker::set_newest`]).
     newest: AtomicBool,
+    /// What its pictures say of the signal, lately (see
+    /// [`Sink::note_signal`]).
+    signal: Mutex<Option<SignalSeen>>,
+}
+
+/// What a camera's pictures say of its signal, as its capture reads them
+/// (see [`Sink::note_signal`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SignalSeen {
+    pub width: u32,
+    pub height: u32,
+    /// The pixel format, as macOS names it.
+    pub format: String,
+    /// The colour matrix read with.
+    pub matrix: String,
+    /// Read as full range; none for RGB.
+    pub full_range: Option<bool>,
+    /// Brightness samples below video black, and all taken, lately: each
+    /// look counts a tenth less than the one after it.
+    pub below: f64,
+    pub sampled: f64,
+}
+
+/// How much of a camera's brightness samples to keep at each new look (see
+/// [`SignalSeen`]): a few seconds' worth of looks.
+const SIGNAL_KEEP: f64 = 0.9;
+
+/// Brightness under this, of 255, is well below video black (16): past the
+/// footroom and noise video keeps there.
+const VIDEO_BLACK_LOW: u8 = 8;
+
+/// Of a picture's brightness, sampled on a grid of 64 × 36, how many samples
+/// are well below video black (see [`VIDEO_BLACK_LOW`]), and how many were
+/// taken: each pixel's brightness byte at `first`, a pixel every `step`
+/// bytes, rows `stride` apart.
+pub(crate) fn below_black(
+    bytes: &[u8],
+    stride: usize,
+    (width, height): (usize, usize),
+    (first, step): (usize, usize),
+) -> (u32, u32) {
+    let (mut below, mut taken) = (0u32, 0u32);
+    if width == 0 || height == 0 {
+        return (0, 0);
+    }
+    for gy in 0..36 {
+        let y = (gy * 2 + 1) * height / 72;
+        for gx in 0..64 {
+            let x = (gx * 2 + 1) * width / 128;
+            if let Some(&luma) = bytes.get(y * stride + x * step + first) {
+                taken += 1;
+                below += u32::from(luma < VIDEO_BLACK_LOW);
+            }
+        }
+    }
+    (below, taken)
 }
 
 /// How a capture called back with a picture, for the trace (see
@@ -282,6 +365,157 @@ pub(crate) struct CallBack {
     pub fresh: bool,
 }
 
+/// A wait between pictures longer than this ends a run of them.
+const RUN_GAP: Duration = Duration::from_millis(250);
+
+/// A camera that has sent a run of pictures this long is streaming
+/// steadily (see [`Arrivals::steady`]).
+const STEADY_RUN: Duration = Duration::from_secs(2);
+
+/// Times in a row a camera started again stays steady from its first
+/// picture, with no run of [`STEADY_RUN`] between: an ATEM stalled by ATEM
+/// Setup stalls again within two seconds of starting one time in four, and
+/// was given the five seconds of a camera just opened (an M5 Max,
+/// 2026-10-28). Past it, a camera that cannot keep going is given those.
+const CARRIED_RESTARTS: u32 = 5;
+
+/// A camera taken for one that sends as its picture changes, whose pictures
+/// then come this long with no wait over [`RUN_GAP`], streams at its rate
+/// after all: a pause as it warmed up, or under load, is no sign of the
+/// other.
+const SPARSE_CLEARED: Duration = Duration::from_secs(10);
+
+/// How long a camera just cleared of sending as it changes is not kept
+/// steady through being started again (see [`CARRIED_RESTARTS`]): a source
+/// that does after all, at the end of a long animation, is started again
+/// once, not over and over.
+const CARRY_AFTER_CLEARED: Duration = Duration::from_secs(20);
+
+/// When a camera's pictures came, since it was opened: what tells a camera
+/// streaming at its rate — whose pictures stopping is a stall — from a
+/// source that sends a picture only as it changes.
+#[derive(Debug, Default, Clone, Copy)]
+struct Arrivals {
+    /// Its last picture since it was opened.
+    last: Option<Instant>,
+    /// The first picture of the run its last belongs to: pictures with no
+    /// wait between them longer than [`RUN_GAP`].
+    run_from: Option<Instant>,
+    /// The rate it was opened at.
+    fps: f64,
+    /// It sent a picture after a wait longer than a steady camera of its
+    /// rate is given (see [`steady_limit`]): it sends as its picture
+    /// changes. Kept through being started again, till a run of
+    /// [`SPARSE_CLEARED`].
+    sparse: bool,
+    /// When it was last opened.
+    opened: Option<Instant>,
+    /// How long its last opening took to bring its first picture.
+    open_cost: Option<Duration>,
+    /// It was steady when it was started again: steady again from its
+    /// first picture (see [`CARRIED_RESTARTS`]).
+    carried: bool,
+    /// Times in a row it was started again steady, with no run of
+    /// [`STEADY_RUN`] since.
+    carried_in_a_row: u32,
+    /// When it was last cleared of sending as it changes.
+    cleared: Option<Instant>,
+}
+
+impl Arrivals {
+    /// A picture came at `now`.
+    fn saw(&mut self, now: Instant) {
+        if let Some(last) = self.last {
+            let wait = now.saturating_duration_since(last);
+            if wait > self.limit() + Duration::from_millis(300) {
+                self.sparse = true;
+            }
+            if wait > RUN_GAP {
+                self.run_from = Some(now);
+            }
+        } else {
+            self.run_from = Some(now);
+            self.open_cost = self.opened.map(|at| now.saturating_duration_since(at));
+        }
+        self.last = Some(now);
+        if self.long_run() {
+            self.carried_in_a_row = 0;
+        }
+        if self.sparse && self.run_of(SPARSE_CLEARED) {
+            self.sparse = false;
+            self.cleared = Some(now);
+        }
+    }
+
+    /// It is being opened at `fps`, at `now`: no picture since. Steady as
+    /// it is started again, it is steady again from its first picture —
+    /// at most [`CARRIED_RESTARTS`] times in a row; whether it was is said.
+    fn opening(&mut self, fps: f64, now: Instant) -> bool {
+        let trusted = self
+            .cleared
+            .is_none_or(|at| now.saturating_duration_since(at) >= CARRY_AFTER_CLEARED);
+        self.carried = self.steady() && trusted && self.carried_in_a_row < CARRIED_RESTARTS;
+        if self.carried {
+            self.carried_in_a_row += 1;
+        }
+        self.last = None;
+        self.run_from = None;
+        self.fps = fps;
+        self.opened = Some(now);
+        self.carried
+    }
+
+    /// Its pictures have been coming with no wait between them longer than
+    /// [`RUN_GAP`] for [`STEADY_RUN`] up to its last.
+    fn long_run(&self) -> bool {
+        self.run_of(STEADY_RUN)
+    }
+
+    /// Its pictures have been coming with no wait between them longer than
+    /// [`RUN_GAP`] for `span` up to its last.
+    fn run_of(&self, span: Duration) -> bool {
+        matches!((self.run_from, self.last), (Some(from), Some(last))
+            if last.saturating_duration_since(from) >= span)
+    }
+
+    /// Whether it is streaming steadily: a long run of pictures (see
+    /// [`Arrivals::long_run`]) — or a picture since it was started again
+    /// steady — and never one after a long wait.
+    fn steady(&self) -> bool {
+        !self.sparse && (self.long_run() || (self.carried && self.last.is_some()))
+    }
+
+    /// How long it is given without a picture, steady (see
+    /// [`steady_limit`]).
+    fn limit(&self) -> Duration {
+        steady_limit(self.fps, self.open_cost)
+    }
+
+    /// How long it is given without a picture as it is now: its limit,
+    /// steady; [`STALL`] otherwise.
+    fn stall_limit(&self) -> Duration {
+        if self.steady() {
+            self.limit()
+        } else {
+            STALL
+        }
+    }
+}
+
+/// A camera's own sound, come with its pictures — a Blackmagic input's.
+#[derive(Default)]
+struct Sound {
+    /// Where it goes: the mixer's feed, once the mixer takes it.
+    feed: Option<crossbeam_channel::Sender<crate::audio::PcmChunk>>,
+    /// Channels to a frame, once some has come.
+    channels: Option<u16>,
+    /// Samples thrown away since the last chunk went, the feed full.
+    lost: u64,
+}
+
+/// The rate a Blackmagic input's sound is taken at.
+pub const OWN_SOUND_RATE: u32 = 48_000;
+
 /// Pictures kept waiting for the show at most: 8 MB each at 1080p.
 const SINK_PICTURES: usize = 4;
 
@@ -291,15 +525,74 @@ impl Default for Sink {
             pictures: Mutex::new(FramePicker::keeping(SINK_PICTURES)),
             spare: Mutex::default(),
             frames: AtomicU64::default(),
-            last_frame: Mutex::default(),
+            arrivals: Mutex::default(),
+            moved_to: Mutex::default(),
+            stopped: Mutex::default(),
+            restart: AtomicBool::new(false),
+            mode: Mutex::default(),
+            sound: Mutex::default(),
+            shown_again: AtomicU64::default(),
+            left_out: AtomicU64::default(),
+            sound_key: {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            },
             colour: AtomicU8::default(),
             label: OnceLock::new(),
             newest: AtomicBool::new(false),
+            signal: Mutex::default(),
         }
     }
 }
 
 impl Sink {
+    /// What a picture says of the signal: its size, pixel format, matrix
+    /// and range as read, and `(below, sampled)` of its brightness (see
+    /// [`below_black`]), counted with those of the pictures before it.
+    pub(crate) fn note_signal(&self, mut seen: SignalSeen, (below, sampled): (u32, u32)) {
+        if let Ok(mut signal) = self.signal.lock() {
+            let before = signal.take().unwrap_or_default();
+            seen.below = before.below * SIGNAL_KEEP + f64::from(below);
+            seen.sampled = before.sampled * SIGNAL_KEEP + f64::from(sampled);
+            *signal = Some(seen);
+        }
+    }
+
+    /// What the camera sends, as its pictures say, at the rate its capture
+    /// last opened at; none before its first picture is read.
+    pub(crate) fn signal(&self) -> Option<crate::engine::value::camera::CameraSignal> {
+        let seen = self.signal.lock().ok()?.clone()?;
+        let fps = self
+            .pictures
+            .lock()
+            .ok()
+            .and_then(|pictures| pictures.period())
+            .map_or(0.0, |period| 1.0 / period);
+        #[allow(clippy::cast_possible_truncation)] // A share.
+        let below_black = if seen.sampled > 0.0 {
+            (seen.below / seen.sampled) as f32
+        } else {
+            0.0
+        };
+        Some(crate::engine::value::camera::CameraSignal {
+            width: seen.width,
+            height: seen.height,
+            fps,
+            opened_fps: self
+                .arrivals
+                .lock()
+                .ok()
+                .map(|arrivals| arrivals.fps)
+                .filter(|fps| *fps > 0.0),
+            format: seen.format,
+            matrix: seen.matrix,
+            full_range: seen.full_range,
+            below_black,
+            shown_again: self.shown_again.load(Ordering::Relaxed),
+            left_out: self.left_out.load(Ordering::Relaxed),
+        })
+    }
+
     /// How the camera's pictures are read into colours from the next one.
     pub(crate) fn set_colour(&self, colour: CameraColour) {
         self.colour.store(colour.to_bits(), Ordering::Relaxed);
@@ -354,12 +647,12 @@ impl Sink {
         let let_go = self
             .pictures
             .lock()
-            .map(|mut pictures| pictures.push(at, frame))
+            .map(|mut pictures| pictures.push_came(at, crate::host_clock::host_seconds(), frame))
             .unwrap_or_default();
         drop(let_go);
         self.frames.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut at) = self.last_frame.lock() {
-            *at = Some(Instant::now());
+        if let Ok(mut arrivals) = self.arrivals.lock() {
+            arrivals.saw(Instant::now());
         }
         if TRACE.recording() {
             let input = self.label.get().cloned().unwrap_or_default();
@@ -387,7 +680,16 @@ impl Sink {
         use crate::renderer::present_trace::{Step, TRACE};
         let mut pictures = self.pictures.lock().ok()?;
         pictures.set_newest(self.newest.load(Ordering::Relaxed));
-        let (frame, what) = pictures.pick(show_at);
+        let (frame, what) = pictures.pick_drawn(show_at, crate::host_clock::host_seconds());
+        match what {
+            crate::frame_picker::Picked::Repeated => {
+                self.shown_again.fetch_add(1, Ordering::Relaxed);
+            }
+            crate::frame_picker::Picked::Skipped(n) => {
+                self.left_out.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            crate::frame_picker::Picked::Next => {}
+        }
         if TRACE.recording() {
             let skipped = match what {
                 crate::frame_picker::Picked::Skipped(n) => n,
@@ -430,7 +732,145 @@ impl Sink {
 
     /// How long since the last picture came; `None` before the first.
     fn since_last_frame(&self) -> Option<Duration> {
-        self.last_frame.lock().ok()?.map(|at| at.elapsed())
+        self.arrivals.lock().ok()?.last.map(|at| at.elapsed())
+    }
+
+    /// Ask its capture to close and open again (a Reset input).
+    fn ask_restart(&self) {
+        self.restart.store(true, Ordering::Relaxed);
+    }
+
+    /// Ask its capture to open again at `mode` — `None`, its best.
+    fn ask_mode(&self, mode: Option<CameraMode>) {
+        if let Ok(mut asked) = self.mode.lock() {
+            *asked = Some(mode);
+        }
+        self.ask_restart();
+    }
+
+    /// The format asked for since this was last asked, if one was: its
+    /// best (`Some(None)`) or a format.
+    #[allow(clippy::option_option)]
+    fn take_mode(&self) -> Option<Option<CameraMode>> {
+        self.mode.lock().ok()?.take()
+    }
+
+    /// Sound come with the pictures: `samples` interleaved, `channels` to a
+    /// frame, 32-bit, at [`OWN_SOUND_RATE`] — to the mixer, once it takes it;
+    /// what a full feed throws away is counted, for it to put back as
+    /// silence.
+    pub(crate) fn put_sound(&self, samples: &[i32], channels: usize) {
+        use crossbeam_channel::TrySendError;
+        let Ok(mut sound) = self.sound.lock() else {
+            return;
+        };
+        sound.channels = u16::try_from(channels).ok().filter(|c| *c > 0);
+        let Some(feed) = sound.feed.as_ref() else {
+            return;
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let chunk = crate::audio::PcmChunk {
+            samples: samples
+                .iter()
+                .map(|&s| s as f32 / 2_147_483_648.0)
+                .collect(),
+            lost_before: sound.lost,
+        };
+        match feed.try_send(chunk) {
+            Ok(()) => sound.lost = 0,
+            Err(TrySendError::Full(_)) => sound.lost += samples.len() as u64,
+            Err(TrySendError::Disconnected(_)) => {
+                sound.feed = None;
+                sound.lost = 0;
+            }
+        }
+    }
+
+    /// Its own sound's rate, channels and key, once some has come.
+    fn sound_format(&self) -> Option<(u32, u16, u64)> {
+        let channels = self.sound.lock().ok()?.channels?;
+        Some((OWN_SOUND_RATE, channels, self.sound_key))
+    }
+
+    /// Where its own sound goes from now.
+    fn set_sound_feed(&self, feed: crossbeam_channel::Sender<crate::audio::PcmChunk>) {
+        if let Ok(mut sound) = self.sound.lock() {
+            sound.feed = Some(feed);
+            sound.lost = 0;
+        }
+    }
+
+    /// Whether it was asked to close and open again, since this was last
+    /// asked.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn take_restart(&self) -> bool {
+        self.restart.swap(false, Ordering::Relaxed)
+    }
+
+    /// Its pictures stopped and it is being started again.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn note_stop(&self) {
+        if let Ok(mut at) = self.stopped.lock() {
+            *at = Some(Instant::now());
+        }
+    }
+
+    /// Whether its pictures stopped within `within`.
+    fn stopped_within(&self, within: Duration) -> bool {
+        self.stopped
+            .lock()
+            .is_ok_and(|at| at.is_some_and(|at| at.elapsed() < within))
+    }
+
+    /// The unique ID its device came back under, plugged into another
+    /// port, since this was last asked; `None` if it has not moved.
+    fn take_move(&self) -> Option<String> {
+        self.moved_to.lock().ok()?.take()
+    }
+
+    /// How long it is given without a picture as it is now (see
+    /// [`Arrivals::stall_limit`]).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn stall_limit(&self) -> Duration {
+        self.arrivals.lock().map_or(STALL, |a| a.stall_limit())
+    }
+
+    /// The camera is being opened, at `fps` — at first or started again:
+    /// its pictures before are the capture's before, and the time it was
+    /// out is no wait of its own. Whether it sends as its picture changes
+    /// is kept. Whether it stays steady from its first picture is said
+    /// (see [`Arrivals::opening`]).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn opening(&self, fps: f64) -> bool {
+        // Counted afresh from here, under the pictures' lock: none let go
+        // before is put down to this opening.
+        if let Ok(mut pictures) = self.pictures.lock() {
+            pictures.forget_lost();
+            self.shown_again.store(0, Ordering::Relaxed);
+            self.left_out.store(0, Ordering::Relaxed);
+        }
+        self.arrivals
+            .lock()
+            .is_ok_and(|mut arrivals| arrivals.opening(fps, Instant::now()))
+    }
+}
+
+/// The camera, among `others` open in Nida, that holds the Blackmagic box
+/// camera `name` failed to open on (`why`): the same box as macOS lists
+/// it — named after it. None when more than one could be: which, cannot be
+/// told.
+fn held_by<'a>(name: &str, why: &str, others: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    if !name.ends_with(" (Blackmagic)") || !why.contains("in use") {
+        return None;
+    }
+    let holders: Vec<&str> = others
+        .filter(|other| {
+            !other.ends_with(" (Blackmagic)") && crate::decklink::input::same_box(name, other)
+        })
+        .collect();
+    match holders.as_slice() {
+        [one] => Some(one),
+        _ => None,
     }
 }
 
@@ -442,9 +882,39 @@ const OPEN_WAIT: Duration = Duration::from_secs(8);
 /// device stalled in the OS is left to its thread rather than hanging Nida.
 const STOP_WAIT: Duration = Duration::from_secs(2);
 
-/// A camera sending no pictures for this long is started again.
-#[cfg(target_os = "macos")]
+/// A camera opened sending no picture for this long is started again: one
+/// takes a moment to send its first.
 const STALL: Duration = Duration::from_secs(5);
+
+/// A camera whose pictures have been coming, gone quiet this many of its
+/// frames — [`STEADY_STALL`] at the least — is started again. An ATEM
+/// Mini's webcam stalled by ATEM Setup sends no picture until it is started
+/// again, which takes it 0.15 s (an M5 Max, 2026-10-28, from macOS's own
+/// camera log): each second waited is a second of frozen picture on air.
+const STALL_FRAMES: f64 = 8.0;
+
+/// The least a camera streaming steadily is given without a picture.
+const STEADY_STALL: Duration = Duration::from_millis(250);
+
+/// How long a camera streaming steadily at `fps`, whose last opening took
+/// `open_cost` to bring its first picture, is given without a picture:
+/// [`STALL_FRAMES`] of its frames, [`STEADY_STALL`] at least — and its
+/// opening's time, for a camera slow to start a stall shorter than that is
+/// better waited out — never more than [`STALL`].
+fn steady_limit(fps: f64, open_cost: Option<Duration>) -> Duration {
+    Duration::from_secs_f64(STALL_FRAMES / fps.max(1.0))
+        .max(STEADY_STALL)
+        .max(open_cost.unwrap_or_default())
+        .min(STALL)
+}
+
+/// Whether a camera has stalled: `since_open` since it was opened,
+/// `since_frame` since its last picture, given `limit` (see
+/// [`Arrivals::stall_limit`]).
+#[cfg(any(target_os = "macos", test))]
+fn stalled(since_open: Duration, since_frame: Option<Duration>, limit: Duration) -> bool {
+    since_frame.map_or(since_open, |since| since.min(since_open)) > limit
+}
 
 /// How often a camera gone quiet or unplugged is tried again.
 #[cfg(target_os = "macos")]
@@ -551,6 +1021,9 @@ pub struct CameraManager {
     /// The GPU pipelines converting cameras' pictures, made when a camera
     /// first has a profile.
     profile_passes: Option<ProfilePasses>,
+    /// Blackmagic's devices as last looked for (see
+    /// [`CameraManager::blackmagic_changed`]).
+    blackmagic_seen: u64,
 }
 
 /// The OS camera effects on for this app: macOS Video Effects; none elsewhere.
@@ -572,6 +1045,47 @@ pub fn show_video_effects() {
 }
 
 /// What to say when OS camera `effects` are on while a camera is open.
+/// A camera's frames watched for coming far slower than it was opened at —
+/// a USB capture on a USB 2 link (the user's Magewell: 7.7 of 60 a second):
+/// how many looks in a row found it slow, and whether that was said.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RateWatch {
+    pub slow_looks: u32,
+    pub said: bool,
+}
+
+impl RateWatch {
+    /// A look at its rate, `fps` against the `opened` one: true when it is
+    /// to be said now — under six tenths of it three looks running, once a
+    /// time; said again only after it has come back (nine tenths).
+    pub fn look(&mut self, fps: f64, opened: Option<f64>) -> bool {
+        let Some(opened) = opened.filter(|o| *o >= 20.0) else {
+            return false;
+        };
+        if fps > 0.0 && fps < opened * 0.6 {
+            self.slow_looks += 1;
+            if self.slow_looks >= 3 && !self.said {
+                self.said = true;
+                return true;
+            }
+        } else if fps >= opened * 0.9 {
+            *self = Self::default();
+        } else {
+            // Three looks running: a dip now and then is not one.
+            self.slow_looks = 0;
+        }
+        false
+    }
+}
+
+/// What is said of camera `name` whose frames come at `fps` of `opened`.
+pub fn slow_camera_warning(name: &str, fps: f64, opened: f64) -> String {
+    format!(
+        "{name}: only {fps:.1} of {opened:.0} frames a second arrive — check its cable and \
+         USB port (on a USB 2 link an HD capture cannot keep up)"
+    )
+}
+
 pub fn video_effects_warning(effects: &[&str]) -> String {
     format!(
         "macOS camera effects are on for this app: {}. They change every camera's \
@@ -600,6 +1114,158 @@ fn news(now: &[&'static str], warned: &mut Vec<&'static str>) -> Option<Vec<&'st
 /// camera in another USB port has another) falls back to the name, but only
 /// to a device not already showing: the other of two identical cameras is
 /// not taken for this one.
+/// The device a camera that is not plugged in under `old` is now, among the
+/// cameras plugged in with its name, `candidates`: the first that no
+/// capture holds (`open`) and that was not there already (`known`, the
+/// others of its name plugged in while its pictures came). A USB camera's
+/// unique ID holds the port it is plugged into, so one plugged back into
+/// another port has another — and its capture, trying the old one, waited
+/// for it for ever (an M5 Max, 2026-10-28). One of the same model plugged
+/// in all along is another camera: never taken for it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn moved_device(
+    candidates: &[String],
+    open: &HashMap<String, u32>,
+    known: &std::collections::HashSet<String>,
+    old: &str,
+) -> Option<String> {
+    candidates
+        .iter()
+        .find(|uid| {
+            uid.as_str() != old && !open.contains_key(uid.as_str()) && !known.contains(uid.as_str())
+        })
+        .cloned()
+}
+
+/// The devices the cameras' captures hold, and how many hold each — one
+/// each, but a capture starting and one finding its device moved could
+/// meet — so a camera plugged back into another port does not take
+/// another's. Held from before a capture opens.
+#[cfg(target_os = "macos")]
+static OPEN_DEVICES: std::sync::LazyLock<Mutex<HashMap<String, u32>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// How often a capture whose pictures come notes the others of its name
+/// plugged in (see [`moved_device`]).
+#[cfg(target_os = "macos")]
+const NOTE_OTHERS_EVERY: Duration = Duration::from_secs(5);
+
+/// A capture's hold on its device in [`OPEN_DEVICES`], let go as it ends,
+/// and the others of its name it has seen plugged in.
+#[cfg(target_os = "macos")]
+struct Holding {
+    unique_id: String,
+    name: String,
+    known: std::collections::HashSet<String>,
+    noted: Option<Instant>,
+}
+
+#[cfg(target_os = "macos")]
+fn hold(open: &mut HashMap<String, u32>, unique_id: &str) {
+    *open.entry(unique_id.to_string()).or_default() += 1;
+}
+
+#[cfg(target_os = "macos")]
+fn let_go(open: &mut HashMap<String, u32>, unique_id: &str) {
+    if let Some(count) = open.get_mut(unique_id) {
+        *count -= 1;
+        if *count == 0 {
+            open.remove(unique_id);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Holding {
+    fn new(unique_id: &str, name: &str) -> Self {
+        if let Ok(mut open) = OPEN_DEVICES.lock() {
+            hold(&mut open, unique_id);
+        }
+        Self {
+            unique_id: unique_id.to_string(),
+            name: name.to_string(),
+            known: std::collections::HashSet::new(),
+            noted: None,
+        }
+    }
+
+    /// Its pictures come: note the others of its name plugged in now,
+    /// every [`NOTE_OTHERS_EVERY`].
+    fn note_others(&mut self, now: Instant) {
+        if self
+            .noted
+            .is_some_and(|at| now.saturating_duration_since(at) < NOTE_OTHERS_EVERY)
+        {
+            return;
+        }
+        self.noted = Some(now);
+        self.known = avf::unique_ids_named(&self.name)
+            .into_iter()
+            .filter(|uid| *uid != self.unique_id)
+            .collect();
+    }
+
+    /// It has just stopped: the others of its name plugged in now are
+    /// noted too — one plugged in since the last note is another camera,
+    /// while it, plugged back in, takes seconds to be listed again.
+    fn note_others_as_lost(&mut self) {
+        let others: Vec<String> = avf::unique_ids_named(&self.name)
+            .into_iter()
+            .filter(|uid| *uid != self.unique_id)
+            .collect();
+        self.known.extend(others);
+    }
+
+    /// The device, not plugged in under its unique ID, plugged in again
+    /// under another — into another port — and its rates now: held
+    /// instead.
+    fn find_moved(&mut self) -> Option<Vec<Rate>> {
+        let candidates = avf::unique_ids_named(&self.name);
+        let mut open = OPEN_DEVICES.lock().ok()?;
+        let moved = moved_device(&candidates, &open, &self.known, &self.unique_id)?;
+        let rates = avf::rates_now(&moved)?;
+        let_go(&mut open, &self.unique_id);
+        hold(&mut open, &moved);
+        self.unique_id = moved;
+        Some(rates)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Holding {
+    fn drop(&mut self) {
+        if let Ok(mut open) = OPEN_DEVICES.lock() {
+            let_go(&mut open, &self.unique_id);
+        }
+    }
+}
+
+/// Cameras open and the devices they came back as (`moved`, by camera):
+/// each new unique ID keeps its camera's number, so the camera stays the
+/// one its inputs show — and the old one no longer does: another of the
+/// model plugged in there later is another camera.
+fn keep_moved_ids(ids: &mut HashMap<String, CameraId>, moved: &[(CameraId, String)]) {
+    for (id, uid) in moved {
+        ids.retain(|known, known_id| known_id != id || known == uid);
+        ids.insert(uid.clone(), *id);
+    }
+}
+
+/// The devices listed, as cameras open came back under other unique IDs
+/// (`moved`): listed already under its number, a camera's entry takes the
+/// new ID; listed under the new ID — a scan found it there before its
+/// capture did — that entry takes the camera's number, so choosing it
+/// shows the camera open, not a second capture of one device.
+fn renumber_moved(devices: &mut [CameraDeviceInfo], moved: &[(CameraId, String)]) {
+    for (id, uid) in moved {
+        if let Some(device) = devices.iter_mut().find(|d| d.id == *id) {
+            device.unique_id.clone_from(uid);
+        } else if let Some(device) = devices.iter_mut().find(|d| d.unique_id == *uid) {
+            device.id = *id;
+        }
+    }
+}
+
 fn find_in(
     devices: &[CameraDeviceInfo],
     showing: impl Fn(CameraId) -> bool,
@@ -634,6 +1300,9 @@ struct Opening {
     /// Started for an input just added, whose operator is told if it fails
     /// — not for one waiting since its show opened, tried every two seconds.
     asked: bool,
+    /// The format it was started at; none, its best.
+    #[cfg_attr(not(test), allow(dead_code))]
+    mode: Option<CameraMode>,
 }
 
 /// A camera started in the background that has run, or failed to: the
@@ -653,6 +1322,8 @@ struct Found {
     index: CameraIndex,
     formats: Vec<CameraFormat>,
     rates: Vec<Rate>,
+    /// It takes the format that comes in, whatever it was opened at.
+    follows_signal: bool,
 }
 
 impl Default for CameraManager {
@@ -676,6 +1347,7 @@ impl CameraManager {
             effects_warned: Vec::new(),
             effects_due: None,
             profile_passes: None,
+            blackmagic_seen: 0,
         };
         #[cfg(target_os = "macos")]
         avf::keep_center_stage_off();
@@ -706,6 +1378,7 @@ impl CameraManager {
             effects_warned: Vec::new(),
             effects_due: None,
             profile_passes: None,
+            blackmagic_seen: 0,
         }
     }
 
@@ -724,6 +1397,7 @@ impl CameraManager {
                     index: CameraIndex::String((*unique_id).into()),
                     formats: Vec::new(),
                     rates: Vec::new(),
+                    follows_signal: false,
                 })
                 .collect(),
         );
@@ -783,6 +1457,7 @@ impl CameraManager {
                     index: f.index,
                     formats: f.formats,
                     rates: f.rates,
+                    follows_signal: f.follows_signal,
                 }
             })
             .collect();
@@ -824,7 +1499,11 @@ impl CameraManager {
                     name: d.name,
                     formats: Vec::new(),
                     rates: d.rates,
+                    follows_signal: false,
                 })
+                // Blackmagic inputs as their own API has them, beside the
+                // same boxes as macOS lists them.
+                .chain(blackmagic::found())
                 .collect(),
         )
     }
@@ -868,6 +1547,7 @@ impl CameraManager {
                         index: info.index().clone(),
                         formats,
                         rates,
+                        follows_signal: false,
                     }
                 })
                 .collect(),
@@ -937,6 +1617,33 @@ impl CameraManager {
     }
 
     /// The unique ID of a camera, for an input to find it by next time.
+    /// Have camera `id`'s capture close and open again, as it is (a Reset
+    /// input): its device found afresh — in another USB port too — and its
+    /// formats read again, at the format it was opened with; its inputs
+    /// keep its last picture meanwhile. Whoever else holds it (another
+    /// layer, stage detection) keeps it. Whether it is open.
+    pub fn restart(&mut self, id: CameraId) -> bool {
+        let Some(active) = self.active.get(&id) else {
+            return false;
+        };
+        active.sink.ask_restart();
+        true
+    }
+
+    /// The open cameras whose devices came back under another unique ID —
+    /// plugged into another port — since this was last asked, each with
+    /// its new one, kept under its number from now on.
+    pub fn take_moves(&mut self) -> Vec<(CameraId, String)> {
+        let moves: Vec<(CameraId, String)> = self
+            .active
+            .iter()
+            .filter_map(|(id, active)| Some((*id, active.sink.take_move()?)))
+            .collect();
+        keep_moved_ids(&mut self.ids, &moves);
+        renumber_moved(&mut self.devices, &moves);
+        moves
+    }
+
     pub fn unique_id(&self, id: CameraId) -> Option<&str> {
         self.devices
             .iter()
@@ -964,6 +1671,114 @@ impl CameraManager {
         if let Some(opening) = self.opening.get(&id) {
             opening.sink.set_lowest_latency(on);
         }
+    }
+
+    /// The format camera `id` was started at, while it starts — for tests.
+    #[cfg(test)]
+    pub(crate) fn opening_mode(&self, id: CameraId) -> Option<CameraMode> {
+        self.opening.get(&id)?.mode
+    }
+
+    /// The format camera `id`'s capture was asked to open again at, taken —
+    /// for tests.
+    #[cfg(test)]
+    #[allow(clippy::option_option)]
+    pub(crate) fn take_asked_mode(&self, id: CameraId) -> Option<Option<CameraMode>> {
+        self.active
+            .get(&id)
+            .map(|a| &a.sink)
+            .or_else(|| self.opening.get(&id).map(|o| &o.sink))?
+            .take_mode()
+    }
+
+    /// Camera `id`'s own sound — a Blackmagic input's — once some has come:
+    /// its rate, channels, and a key that changes when it must be picked up
+    /// afresh.
+    pub fn sound_format(&self, id: CameraId) -> Option<(u32, u16, u64)> {
+        self.active.get(&id)?.sink.sound_format()
+    }
+
+    /// Where camera `id`'s own sound goes from now.
+    pub fn set_sound_feed(
+        &self,
+        id: CameraId,
+        feed: crossbeam_channel::Sender<crate::audio::PcmChunk>,
+    ) {
+        if let Some(active) = self.active.get(&id) {
+            active.sink.set_sound_feed(feed);
+        }
+    }
+
+    /// Whether Blackmagic devices arrived or went since this was last asked:
+    /// the cameras are to be looked for again. Blackmagic's discovery tells
+    /// of the devices there a moment after it starts — after the first look
+    /// for cameras, which missed them.
+    pub fn blackmagic_changed(&mut self) -> bool {
+        if !self.initialized {
+            return false;
+        }
+        let now = crate::decklink::input::generation();
+        std::mem::replace(&mut self.blackmagic_seen, now) != now
+    }
+
+    /// The Blackmagic inputs looked for again, the other cameras kept as
+    /// they were: cheap enough for a show frame — Blackmagic's discovery has
+    /// them in memory, and macOS is not asked for its cameras.
+    pub fn refresh_blackmagic(&mut self) {
+        if !self.initialized {
+            return;
+        }
+        let kept = self
+            .devices
+            .iter()
+            .filter(|d| !crate::decklink::input::is_blackmagic(&d.unique_id))
+            .map(|d| Found {
+                unique_id: d.unique_id.clone(),
+                name: d.name.clone(),
+                index: d.index.clone(),
+                formats: d.formats.clone(),
+                rates: d.rates.clone(),
+                follows_signal: d.follows_signal,
+            });
+        #[cfg(target_os = "macos")]
+        let found = kept.chain(blackmagic::found()).collect();
+        #[cfg(not(target_os = "macos"))]
+        let found = kept.collect();
+        self.list(found);
+    }
+
+    /// The cameras that take the format that comes in, whatever they were
+    /// opened at.
+    pub fn following_signal(&self) -> Vec<CameraId> {
+        self.devices
+            .iter()
+            .filter(|d| d.follows_signal)
+            .map(|d| d.id)
+            .collect()
+    }
+
+    /// The cameras whose sound comes with their pictures: Blackmagic inputs.
+    pub fn with_own_sound(&self) -> Vec<CameraId> {
+        self.devices
+            .iter()
+            .filter(|d| crate::decklink::input::is_blackmagic(&d.unique_id))
+            .map(|d| d.id)
+            .collect()
+    }
+
+    /// Open camera `id` again at `mode` — `None`, its best — its inputs
+    /// keeping its last picture meanwhile; one still starting, as soon as it
+    /// has. Whether it was open, or opening.
+    pub fn set_mode(&self, id: CameraId, mode: Option<CameraMode>) -> bool {
+        if let Some(active) = self.active.get(&id) {
+            active.sink.ask_mode(mode);
+            return true;
+        }
+        if let Some(opening) = self.opening.get(&id) {
+            opening.sink.ask_mode(mode);
+            return true;
+        }
+        false
     }
 
     /// [`Self::set_lowest_latency`] for each camera in `cameras`, as its
@@ -1108,6 +1923,21 @@ impl CameraManager {
                 Ok(opened) => Ok(self.finish(id, opening, opened, device)),
                 Err(e) => {
                     opening.stop_flag.store(true, Ordering::Relaxed);
+                    // A Blackmagic box busy because Nida itself shows it, as
+                    // macOS lists it, in another input: said, not "another
+                    // app" (an M5 Max, 2026-10-29).
+                    let others = self
+                        .devices
+                        .iter()
+                        .filter(|d| d.id != id && self.active.contains_key(&d.id))
+                        .map(|d| d.name.as_str());
+                    let e = match held_by(&opening.name, &format!("{e:#}"), others) {
+                        Some(other) => e.context(format!(
+                            "its box is in use by the camera '{other}', which another input \
+                             shows: remove that input, or switch it to this camera"
+                        )),
+                        None => e,
+                    };
                     Err(e.context(format!("Failed to open camera '{}'", opening.name)))
                 }
             };
@@ -1129,8 +1959,12 @@ impl CameraManager {
             .find(|d| d.id == id)
             .context("Camera device not found")?
             .clone();
-        // Asked afresh: access may have been given since the last scan.
-        if self.initialized && !nokhwa::nokhwa_check() {
+        // Asked afresh: access may have been given since the last scan. A
+        // Blackmagic input, read through Blackmagic's API, needs none.
+        if self.initialized
+            && !crate::decklink::input::is_blackmagic(&dev_info.unique_id)
+            && !nokhwa::nokhwa_check()
+        {
             anyhow::bail!(
                 "no camera access for '{}': allow this app in System Settings → Privacy & \
                  Security → Camera (Terminal, when it is started from Terminal), then start \
@@ -1167,6 +2001,7 @@ impl CameraManager {
             since: Instant::now(),
             decks,
             asked: false,
+            mode,
         })
     }
 
@@ -1235,10 +2070,20 @@ impl CameraManager {
         stop: &AtomicBool,
         opened: &mpsc::Sender<Result<CameraMode>>,
     ) {
+        if crate::decklink::input::is_blackmagic(&device.unique_id) {
+            blackmagic::run(device, mode, sink, stop, opened);
+            return;
+        }
         let name = &device.name;
+        // Held before it opens: a camera plugged back into another port
+        // meanwhile does not take it (see `moved_device`).
+        let mut holding = Holding::new(&device.unique_id, name);
         let first = choose(&device.rates, mode)
             .with_context(|| format!("'{name}' offers no picture Nida can read"))
-            .and_then(|rate| avf::Capture::open(&device.unique_id, &rate, Arc::clone(sink)));
+            .and_then(|rate| {
+                sink.opening(rate.fps);
+                avf::Capture::open(&device.unique_id, &rate, Arc::clone(sink))
+            });
         let mut capture = match first {
             Ok(capture) => {
                 let _ = opened.send(Ok(capture.rate.mode()));
@@ -1251,32 +2096,73 @@ impl CameraManager {
         };
         let mut started = Instant::now();
         let mut retry_at = started;
+        let mut mode = mode;
         while !stop.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(50));
             let now = Instant::now();
-            let quiet = sink
-                .since_last_frame()
-                .map_or(now - started, |d| d.min(now - started));
-            let lost = capture
-                .as_ref()
-                .is_none_or(|c| !c.running() || quiet > STALL);
-            if !lost || now < retry_at {
+            // A Reset input, or another format asked for: closed and opened
+            // again at once.
+            let asked = sink.take_restart();
+            if asked {
+                retry_at = now;
+                if let Some(asked_mode) = sink.take_mode() {
+                    mode = asked_mode;
+                }
+                if capture.take().is_some() {
+                    log::info!("Camera '{name}' reset: opening it again");
+                }
+            }
+            let lost = capture.as_ref().is_none_or(|c| {
+                !c.running() || stalled(now - started, sink.since_last_frame(), sink.stall_limit())
+            });
+            if !lost {
+                if sink
+                    .since_last_frame()
+                    .is_some_and(|quiet| quiet < Duration::from_millis(200))
+                {
+                    holding.note_others(now);
+                }
+                continue;
+            }
+            if now < retry_at {
                 continue;
             }
             if capture.take().is_some() {
-                log::warn!("Camera '{name}' stopped: trying it again");
+                // How long its picture stood still before it was started
+                // again: what a stall cost on air.
+                let quiet = sink.since_last_frame().map_or_else(
+                    || "no picture since it was opened".to_string(),
+                    |quiet| format!("{} ms without a picture", quiet.as_millis()),
+                );
+                log::warn!("Camera '{name}' stopped ({quiet}): trying it again");
+                sink.note_stop();
+                holding.note_others_as_lost();
             }
             retry_at = now + RETRY_EVERY;
             // Read afresh: a device plugged back in, or set to another rate,
-            // offers what it offers now.
-            let Some(rate) = avf::rates_now(&device.unique_id).and_then(|r| choose(&r, mode))
-            else {
+            // offers what it offers now. Not plugged in under its unique ID,
+            // it may be under another: plugged into another port.
+            let rates = avf::rates_now(&holding.unique_id).or_else(|| {
+                let rates = holding.find_moved()?;
+                log::info!("Camera '{name}' is plugged into another port: using it there");
+                if let Ok(mut moved) = sink.moved_to.lock() {
+                    *moved = Some(holding.unique_id.clone());
+                }
+                Some(rates)
+            });
+            let Some(rate) = rates.and_then(|r| choose(&r, mode)) else {
                 continue;
             };
-            match avf::Capture::open(&device.unique_id, &rate, Arc::clone(sink)) {
+            let carried = sink.opening(rate.fps);
+            match avf::Capture::open(&holding.unique_id, &rate, Arc::clone(sink)) {
                 Ok(c) => {
                     log::info!("Camera '{name}' is back, at {}", rate.label());
                     started = Instant::now();
+                    // Started again steady: a stall soon after is started
+                    // again as soon as it is seen, not two seconds on.
+                    if carried {
+                        retry_at = started;
+                    }
                     capture = Some(c);
                 }
                 Err(e) => log::debug!("Camera '{name}' is not back yet: {e}"),
@@ -1294,18 +2180,42 @@ impl CameraManager {
         stop: &AtomicBool,
         opened: &mpsc::Sender<Result<CameraMode>>,
     ) {
-        match Self::open_nokhwa(device, mode) {
-            Ok(camera) => {
-                let res = camera.resolution();
-                let _ = opened.send(Ok(CameraMode {
-                    width: res.width_x,
-                    height: res.height_y,
-                    fps: camera.frame_rate(),
-                }));
-                Self::capture_loop(camera, &device.name, sink, stop);
+        let mut first = true;
+        let mut mode = mode;
+        while !stop.load(Ordering::Relaxed) {
+            // Another format asked for: taken before each opening, those
+            // that fail too.
+            if let Some(asked_mode) = sink.take_mode() {
+                mode = asked_mode;
             }
-            Err(e) => {
-                let _ = opened.send(Err(e));
+            match Self::open_nokhwa(device, mode) {
+                Ok(camera) => {
+                    if first {
+                        let res = camera.resolution();
+                        let _ = opened.send(Ok(CameraMode {
+                            width: res.width_x,
+                            height: res.height_y,
+                            fps: camera.frame_rate(),
+                        }));
+                        first = false;
+                    }
+                    // Back from capturing: stopped, or asked to open again
+                    // (a Reset input) — closed as `camera` drops, opened
+                    // again as the loop comes round.
+                    if !Self::capture_loop(camera, &device.name, sink, stop) {
+                        return;
+                    }
+                    sink.take_restart();
+                    log::info!("Camera '{}' reset: opening it again", device.name);
+                }
+                Err(e) if first => {
+                    let _ = opened.send(Err(e));
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("Camera '{}' not opened again: {e:#}", device.name);
+                    std::thread::sleep(Duration::from_secs(2));
+                }
             }
         }
     }
@@ -1364,7 +2274,9 @@ impl CameraManager {
 
     /// Background capture loop — runs on a dedicated thread per camera.
     #[cfg(not(target_os = "macos"))]
-    fn capture_loop(mut camera: Camera, name: &str, sink: &Sink, stop: &AtomicBool) {
+    /// Capture from `camera` until told to stop — `false` — or asked to open
+    /// it again (see [`Sink::ask_restart`]) — `true`.
+    fn capture_loop(mut camera: Camera, name: &str, sink: &Sink, stop: &AtomicBool) -> bool {
         const MAX_BACKOFF_US: u64 = 500_000; // 500ms cap
 
         let res = camera.resolution();
@@ -1374,7 +2286,12 @@ impl CameraManager {
 
         log::info!("Camera '{name}' capture thread started ({w}x{h})");
 
+        let mut again = false;
         while !stop.load(Ordering::Relaxed) {
+            if sink.restart.load(Ordering::Relaxed) {
+                again = true;
+                break;
+            }
             let Ok(buf) = camera.frame() else {
                 std::thread::sleep(std::time::Duration::from_micros(backoff_us));
                 backoff_us = (backoff_us * 2).min(MAX_BACKOFF_US);
@@ -1451,6 +2368,7 @@ impl CameraManager {
 
         let _ = camera.stop_stream();
         log::info!("Camera '{name}' capture thread stopped");
+        again
     }
 
     /// Release a camera reference. Stops capture thread when `ref_count` hits 0.
@@ -1543,6 +2461,12 @@ impl CameraManager {
         self.active.get(&id).and_then(|a| a.mode)
     }
 
+    /// What an open camera sends, as its pictures say (see
+    /// [`Sink::signal`]); none before its first picture is read.
+    pub fn signal(&self, id: CameraId) -> Option<crate::engine::value::camera::CameraSignal> {
+        self.active.get(&id)?.sink.signal()
+    }
+
     /// Get the resolution of an active camera: the size of its latest
     /// picture, which a device set to another size mid-show changes.
     pub fn resolution(&self, id: CameraId) -> Option<(u32, u32)> {
@@ -1565,6 +2489,29 @@ impl CameraManager {
             .get(&id)
             .and_then(|a| a.last_picture)
             .is_some_and(|at| at.elapsed() <= within)
+    }
+
+    /// The names of the cameras open now.
+    pub fn open_names(&self) -> Vec<String> {
+        self.active.keys().map(|id| self.name_of(*id)).collect()
+    }
+
+    /// The names of the cameras open whose pictures stopped, and that were
+    /// started again, within `within`.
+    pub fn stopped_names(&self, within: Duration) -> Vec<String> {
+        self.active
+            .iter()
+            .filter(|(_, active)| active.sink.stopped_within(within))
+            .map(|(id, _)| self.name_of(*id))
+            .collect()
+    }
+
+    /// A camera's name; "Camera N" if it is not listed.
+    fn name_of(&self, id: CameraId) -> String {
+        self.devices
+            .iter()
+            .find(|d| d.id == id)
+            .map_or_else(|| format!("Camera {id}"), |d| d.name.clone())
     }
 
     /// Each open camera's name and how long before its show frame's time
@@ -1749,6 +2696,350 @@ impl CameraManager {
 
 #[cfg(test)]
 mod tests {
+    /// Frames far slower than opened at: said after three looks running,
+    /// once; said again only after coming back. Dips not in a row, or a
+    /// camera of unknown or low rate, never.
+    #[test]
+    fn a_camera_far_below_its_rate_is_said_once_a_time() {
+        let mut watch = super::RateWatch::default();
+        assert!(!watch.look(7.7, Some(60.0)));
+        assert!(!watch.look(7.7, Some(60.0)));
+        assert!(watch.look(7.7, Some(60.0)), "the third slow look");
+        assert!(!watch.look(7.7, Some(60.0)), "said once");
+        assert!(!watch.look(45.0, Some(60.0)), "between: still slow, not said again");
+        assert!(!watch.look(60.0, Some(60.0)), "back");
+        for _ in 0..2 {
+            assert!(!watch.look(10.0, Some(60.0)));
+        }
+        assert!(watch.look(10.0, Some(60.0)), "slow again: said again");
+        // Dips now and then, not three running: never said.
+        let mut dips = super::RateWatch::default();
+        for _ in 0..5 {
+            assert!(!dips.look(10.0, Some(60.0)));
+            assert!(!dips.look(45.0, Some(60.0)));
+        }
+        let mut unknown = super::RateWatch::default();
+        for _ in 0..5 {
+            assert!(!unknown.look(5.0, None));
+            assert!(!unknown.look(5.0, Some(15.0)));
+        }
+    }
+
+    use super::stalled;
+
+    /// A camera plugged back into another port is found by its name: the
+    /// first device with it that no capture holds and that was not plugged
+    /// in already while its pictures came, never its old ID.
+    #[test]
+    fn a_camera_in_another_port_is_a_new_one_of_its_name_not_held() {
+        use super::moved_device;
+        let open: std::collections::HashMap<String, u32> = [("usb-a".to_string(), 1)].into();
+        let known: std::collections::HashSet<String> = ["usb-b".to_string()].into();
+        let none = std::collections::HashSet::new();
+        let ids = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            moved_device(&ids(&["usb-a", "usb-b", "usb-c"]), &open, &known, "usb-old").as_deref(),
+            Some("usb-c"),
+            "one held, one plugged in all along: the new one"
+        );
+        assert_eq!(
+            moved_device(&ids(&["usb-b"]), &open, &known, "usb-old"),
+            None,
+            "the other of the model, plugged in all along, is another camera"
+        );
+        assert_eq!(
+            moved_device(&ids(&["usb-old"]), &open, &none, "usb-old"),
+            None
+        );
+        assert_eq!(
+            moved_device(&ids(&["usb-a"]), &open, &none, "usb-old"),
+            None,
+            "held"
+        );
+        assert_eq!(moved_device(&[], &open, &none, "usb-old"), None);
+    }
+
+    /// A camera's new unique ID keeps its number, over one a scan gave it
+    /// before its capture found it; its old one is let go.
+    #[test]
+    fn a_moved_camera_keeps_its_number() {
+        let mut ids: std::collections::HashMap<String, super::CameraId> = [
+            ("usb-old".to_string(), 3),
+            ("usb-new".to_string(), 7),
+            ("usb-other".to_string(), 4),
+        ]
+        .into();
+        super::keep_moved_ids(&mut ids, &[(3, "usb-new".to_string())]);
+        assert_eq!(ids.get("usb-new"), Some(&3));
+        assert_eq!(ids.get("usb-old"), None, "the old port is free for another");
+        assert_eq!(ids.get("usb-other"), Some(&4));
+    }
+
+    /// A moved camera's entry in the devices listed keeps its number with
+    /// its new ID — found by number, or by the new ID a scan listed first.
+    #[test]
+    fn a_moved_camera_is_listed_under_its_number() {
+        let device = |id, uid: &str| super::CameraDeviceInfo {
+            id,
+            name: "USB Capture HDMI".into(),
+            unique_id: uid.into(),
+            index: CameraIndex::Index(0),
+            formats: Vec::new(),
+            rates: Vec::new(),
+            follows_signal: false,
+        };
+        let mut listed = vec![device(3, "usb-old"), device(5, "usb-x")];
+        super::renumber_moved(&mut listed, &[(3, "usb-new".to_string())]);
+        assert_eq!((listed[0].id, listed[0].unique_id.as_str()), (3, "usb-new"));
+        let mut scanned = vec![device(7, "usb-new"), device(5, "usb-x")];
+        super::renumber_moved(&mut scanned, &[(3, "usb-new".to_string())]);
+        assert_eq!(
+            (scanned[0].id, scanned[0].unique_id.as_str()),
+            (3, "usb-new")
+        );
+        assert_eq!(scanned[1].id, 5);
+    }
+
+    /// A Reset input asks an open camera's capture to close and open
+    /// again — once — keeping its references; a camera not open is not
+    /// asked.
+    #[test]
+    fn a_reset_asks_an_open_cameras_capture_to_open_again() {
+        static ASKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn listens(
+            _: &CameraDeviceInfo,
+            _: Option<CameraMode>,
+            sink: &Arc<Sink>,
+            stop: &AtomicBool,
+            opened: &mpsc::Sender<Result<CameraMode>>,
+        ) {
+            let _ = opened.send(Ok(CameraMode {
+                width: 64,
+                height: 36,
+                fps: 60,
+            }));
+            while !stop.load(Ordering::Relaxed) {
+                if sink.take_restart() {
+                    ASKED.fetch_add(1, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let gpu = crate::renderer::context::GpuContext::new_headless().expect("GPU");
+        let mut mgr = CameraManager::with_devices(&[("a", "ATEM")], listens);
+        let id = mgr.devices()[0].id;
+        assert!(!mgr.restart(id), "not open: nothing to ask");
+        mgr.open_camera(id, &gpu.device, None).unwrap();
+        mgr.open_camera(id, &gpu.device, None).unwrap();
+        assert!(mgr.restart(id));
+        let waited = Instant::now();
+        while ASKED.load(Ordering::Relaxed) == 0 && waited.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(ASKED.load(Ordering::Relaxed), 1, "asked once");
+        assert!(mgr.is_active(id), "still open");
+        mgr.release_camera(id);
+        assert!(mgr.is_active(id), "its other reference kept");
+        mgr.release_camera(id);
+    }
+
+    /// A camera's stop is remembered for as long as asked.
+    #[test]
+    fn a_camera_that_stopped_lately_says_so() {
+        let sink = super::Sink::default();
+        let long = std::time::Duration::from_secs(60);
+        assert!(!sink.stopped_within(long), "never stopped");
+        sink.note_stop();
+        assert!(sink.stopped_within(long));
+        assert!(!sink.stopped_within(std::time::Duration::ZERO));
+    }
+
+    /// Holds are counted: two holding one device, one letting go leaves it
+    /// held.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_device_held_twice_stays_held_till_both_let_go() {
+        let mut open = std::collections::HashMap::new();
+        super::hold(&mut open, "usb-a");
+        super::hold(&mut open, "usb-a");
+        super::let_go(&mut open, "usb-a");
+        assert!(open.contains_key("usb-a"));
+        super::let_go(&mut open, "usb-a");
+        assert!(open.is_empty());
+    }
+
+    /// A steady camera is given 8 of its frames, a quarter second at least,
+    /// and as long as its last opening took, five seconds at most; a camera
+    /// has stalled once its picture has stood still longer than it is
+    /// given, counted from its opening at most.
+    #[test]
+    fn a_steady_camera_is_given_a_quarter_second_or_its_opening() {
+        use super::{steady_limit, STALL};
+        let s = std::time::Duration::from_secs_f64;
+        let near = |a: std::time::Duration, b: f64| (a.as_secs_f64() - b).abs() < 1e-6;
+        assert!(
+            near(steady_limit(60.0, None), 0.25),
+            "60p: a quarter second"
+        );
+        assert!(near(steady_limit(25.0, None), 0.32), "25p: 8 frames");
+        assert!(
+            near(steady_limit(60.0, Some(s(0.15))), 0.25),
+            "an ATEM back in 0.15 s"
+        );
+        assert!(
+            near(steady_limit(60.0, Some(s(1.5))), 1.5),
+            "a camera slow to start"
+        );
+        assert_eq!(steady_limit(1.0, None), STALL, "never over five seconds");
+        assert_eq!(steady_limit(60.0, Some(s(9.0))), STALL);
+        assert!(!stalled(s(20.0), Some(s(0.2)), s(0.25)), "a hiccup");
+        assert!(stalled(s(20.0), Some(s(0.3)), s(0.25)));
+        assert!(
+            !stalled(s(3.0), None, STALL),
+            "its first picture on its way"
+        );
+        assert!(stalled(s(5.5), None, STALL));
+        assert!(
+            !stalled(s(3.0), Some(s(10.0)), STALL),
+            "the last before it opened"
+        );
+    }
+
+    /// Pictures `every` apart from `from` for `span`; the time of the last.
+    fn feed(
+        arrivals: &mut super::Arrivals,
+        from: std::time::Instant,
+        every: std::time::Duration,
+        span: std::time::Duration,
+    ) -> std::time::Instant {
+        let (mut t, mut last) = (from, from);
+        while t <= from + span {
+            arrivals.saw(t);
+            last = t;
+            t += every;
+        }
+        last
+    }
+
+    /// Steady is two seconds of pictures with no wait over a quarter
+    /// second; a burst as it opens is not. Steady, it is given its limit;
+    /// otherwise five seconds.
+    #[test]
+    fn a_camera_is_steady_after_two_seconds_of_pictures() {
+        let ms = std::time::Duration::from_millis;
+        let t0 = std::time::Instant::now();
+        let mut a = super::Arrivals::default();
+        assert!(!a.opening(60.0, t0), "opened at first: not steady");
+        let t = feed(&mut a, t0, ms(17), ms(300));
+        assert!(!a.steady(), "a burst as it opens");
+        assert_eq!(a.stall_limit(), super::STALL);
+        let t = feed(&mut a, t + ms(17), ms(17), ms(1800));
+        assert!(a.steady(), "two seconds at its rate");
+        assert_eq!(a.stall_limit(), ms(250));
+        // A wait over a quarter second starts a new run.
+        let t = feed(&mut a, t + ms(400), ms(17), ms(500));
+        assert!(!a.steady(), "half a second since a wait");
+        feed(&mut a, t + ms(17), ms(17), ms(2000));
+        assert!(a.steady());
+    }
+
+    /// Started again steady, a camera is steady again from its first
+    /// picture — five times in a row at most, till it has run two seconds
+    /// again; started again not steady, it is not.
+    #[test]
+    fn a_camera_started_again_steady_is_steady_from_its_first_picture() {
+        let ms = std::time::Duration::from_millis;
+        let t0 = std::time::Instant::now();
+        let mut a = super::Arrivals::default();
+        a.opening(60.0, t0);
+        let mut t = feed(&mut a, t0, ms(17), ms(2500));
+        assert!(a.steady());
+        for restart in 1..=5 {
+            t += ms(1000);
+            assert!(a.opening(60.0, t), "restart {restart}: carried");
+            assert!(!a.steady(), "no picture yet");
+            assert!(a.last.is_none());
+            // Back in 0.15 s, a few pictures, then a stall again.
+            t = feed(&mut a, t + ms(150), ms(17), ms(300));
+            assert!(
+                a.steady(),
+                "restart {restart}: steady from its first picture"
+            );
+            assert_eq!(a.stall_limit(), ms(250), "back in 0.15 s: a quarter second");
+        }
+        t += ms(1000);
+        assert!(!a.opening(60.0, t), "a sixth time in a row: not carried");
+        t = feed(&mut a, t + ms(150), ms(17), ms(300));
+        assert!(!a.steady(), "five seconds again");
+        // Two seconds of pictures: steady, and carried again.
+        t = feed(&mut a, t + ms(17), ms(17), ms(2000));
+        assert!(a.steady());
+        assert!(
+            a.opening(60.0, t + ms(500)),
+            "after a long run: carried again"
+        );
+        // Started again while not steady: not carried.
+        let mut b = super::Arrivals::default();
+        b.opening(60.0, t0);
+        feed(&mut b, t0, ms(17), ms(500));
+        assert!(!b.opening(60.0, t0 + ms(3000)));
+    }
+
+    /// The time an opening takes to bring the first picture sets how long a
+    /// steady camera is given: a stall shorter than starting it again is
+    /// waited out.
+    #[test]
+    fn a_camera_slow_to_open_is_given_longer() {
+        let ms = std::time::Duration::from_millis;
+        let t0 = std::time::Instant::now();
+        let mut a = super::Arrivals::default();
+        a.opening(60.0, t0);
+        let t = feed(&mut a, t0 + ms(1500), ms(17), ms(2500));
+        assert!(a.steady());
+        assert_eq!(a.stall_limit(), ms(1500), "it took 1.5 s to open");
+        a.opening(60.0, t + ms(500));
+        feed(&mut a, t + ms(650), ms(17), ms(100));
+        assert_eq!(a.stall_limit(), ms(250), "started again in 0.15 s");
+    }
+
+    /// A picture after a longer wait than a steady camera of its rate is
+    /// given makes it a source sending as it changes, for good; a camera
+    /// started again does not count the time it was out as a wait.
+    #[test]
+    fn a_long_wait_makes_a_camera_sparse_for_good() {
+        let ms = std::time::Duration::from_millis;
+        let t0 = std::time::Instant::now();
+        let mut a = super::Arrivals::default();
+        a.opening(30.0, t0);
+        // The time it was out is not a wait of its own.
+        let t = feed(&mut a, t0, ms(33), ms(2500));
+        a.opening(30.0, t + ms(10_000));
+        let t = feed(&mut a, t + ms(10_000), ms(33), ms(2500));
+        assert!(a.steady(), "started again after ten seconds out");
+        // A wait of half a second at 30 fps (given 0.27 s): a hiccup.
+        a.saw(t + ms(500));
+        let t = feed(&mut a, t + ms(533), ms(33), ms(2500));
+        assert!(a.steady(), "a wait within its limit and a little");
+        // 0.7 s: a source that sends as it changes.
+        a.saw(t + ms(700));
+        let t = feed(&mut a, t + ms(733), ms(33), ms(3000));
+        assert!(!a.steady(), "sparse");
+        a.opening(30.0, t + ms(100));
+        let t = feed(&mut a, t + ms(100), ms(33), ms(3000));
+        assert!(!a.steady(), "still sparse after it is started again");
+        // Ten seconds at its rate: it streams after all.
+        let t = feed(&mut a, t + ms(33), ms(33), ms(6000));
+        assert!(!a.steady(), "nine seconds");
+        let t = feed(&mut a, t + ms(33), ms(33), ms(1100));
+        assert!(a.steady(), "ten seconds: steady again");
+        // Just cleared, it is started again once without being kept
+        // steady; twenty seconds on, it is kept steady again.
+        assert!(!a.opening(30.0, t + ms(300)), "just cleared: not carried");
+        let t = feed(&mut a, t + ms(400), ms(33), ms(21_000));
+        assert!(a.opening(30.0, t + ms(300)), "twenty seconds on: carried");
+    }
+
     use super::*;
     use nokhwa::utils::Resolution;
 
@@ -1873,6 +3164,7 @@ mod tests {
                 f(1920, 1080, FrameFormat::NV12, 30),
             ],
             rates: atem.to_vec(),
+            follows_signal: false,
         };
         assert_eq!(
             device.modes(),
@@ -1945,6 +3237,7 @@ mod tests {
                 index: info.index().clone(),
                 formats,
                 rates,
+                follows_signal: false,
             };
             let modes = device.modes();
             println!("{}: {} formats", device.name, device.formats.len());
@@ -1962,6 +3255,7 @@ mod tests {
             index: CameraIndex::String(unique_id.into()),
             formats: Vec::new(),
             rates: Vec::new(),
+            follows_signal: false,
         }
     }
 
@@ -2110,6 +3404,234 @@ mod tests {
         assert!(sink.since_last_frame().unwrap() < Duration::from_secs(1));
     }
 
+    /// Blackmagic's devices told of afresh keep the other cameras as they
+    /// were — numbered as before, macOS not asked again.
+    #[test]
+    fn a_blackmagic_refresh_keeps_the_other_cameras() {
+        let mut mgr = CameraManager::with_devices(&[("a", "ATEM")], |_, _, _, _, _| {});
+        mgr.initialized = true;
+        let id = mgr.devices()[0].id;
+        mgr.refresh_blackmagic();
+        assert!(mgr
+            .devices()
+            .iter()
+            .any(|d| d.id == id && d.unique_id == "a" && d.name == "ATEM"));
+        assert!(mgr
+            .devices()
+            .iter()
+            .all(|d| d.unique_id == "a" || crate::decklink::input::is_blackmagic(&d.unique_id)));
+    }
+
+    /// A Blackmagic box busy because another input shows it as macOS lists
+    /// it is said to be held by that camera; any other failure, or another
+    /// box, is not.
+    #[test]
+    fn a_blackmagic_box_busy_in_another_input_says_which() {
+        let busy = "the device would not start its video input (in use by another app?)";
+        let open = ["FaceTime HD", "Blackmagic UltraStudio Mini Recorder 12G"];
+        let name = "UltraStudio Mini Recorder 12G (Blackmagic)";
+        assert_eq!(
+            held_by(name, busy, open.into_iter()),
+            Some("Blackmagic UltraStudio Mini Recorder 12G")
+        );
+        assert_eq!(held_by(name, "not connected", open.into_iter()), None);
+        assert_eq!(held_by(name, busy, ["FaceTime HD"].into_iter()), None);
+        assert_eq!(held_by("FaceTime HD", busy, open.into_iter()), None);
+        let longer = ["Blackmagic UltraStudio 4K Extreme"];
+        assert_eq!(
+            held_by("UltraStudio 4K (Blackmagic)", busy, longer.into_iter()),
+            None,
+            "another box"
+        );
+        let two = ["Blackmagic UltraStudio Mini Recorder 12G"; 2];
+        assert_eq!(
+            held_by(name, busy, two.into_iter()),
+            None,
+            "which, cannot be told"
+        );
+    }
+
+    /// A show frame that shows the picture before again — none new having
+    /// come — is counted in what the camera sends; opening it again starts
+    /// the count afresh.
+    #[test]
+    fn a_picture_shown_again_is_counted() {
+        let sink = Sink::default();
+        sink.note_signal(SignalSeen::default(), (0, 0));
+        let now = crate::host_clock::host_seconds();
+        sink.put(
+            Frame {
+                data: vec![0; 16],
+                width: 2,
+                height: 2,
+            },
+            now,
+        );
+        for n in 1..=4 {
+            let _ = sink.take(now + f64::from(n) / 60.0, 1);
+        }
+        let signal = sink.signal().expect("its signal");
+        assert!(signal.shown_again >= 1, "{signal:?}");
+        sink.opening(60.0);
+        assert_eq!(sink.signal().expect("its signal").shown_again, 0);
+    }
+
+    /// Pictures let go before a camera is opened again are not put down to
+    /// the new opening as left out.
+    #[test]
+    fn pictures_let_go_before_an_opening_are_not_counted_after() {
+        let sink = Sink::default();
+        sink.note_signal(SignalSeen::default(), (0, 0));
+        let now = crate::host_clock::host_seconds();
+        for n in 0..10 {
+            sink.put(
+                Frame {
+                    data: vec![0; 16],
+                    width: 2,
+                    height: 2,
+                },
+                now + f64::from(n) * 1e-4,
+            );
+        }
+        sink.opening(60.0);
+        let _ = sink.take(now + 1.0 / 60.0, 1);
+        let left_out = sink.signal().expect("its signal").left_out;
+        assert!(left_out < 6, "{left_out} left out, those before counted");
+    }
+
+    /// A camera's own sound (a Blackmagic input's) is said once some has
+    /// come, goes to the mixer once it takes it, as -1 to 1, and what a full
+    /// feed throws away is counted for it to put back as silence; each
+    /// camera opened has its own key.
+    #[test]
+    fn a_cameras_own_sound_goes_to_the_mixer_once_it_takes_it() {
+        let sink = Sink::default();
+        assert!(sink.sound_format().is_none(), "none come yet");
+        sink.put_sound(&[0, 0], 2);
+        let (rate, channels, key) = sink.sound_format().expect("some came");
+        assert_eq!((rate, channels), (48_000, 2));
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        sink.set_sound_feed(tx);
+        sink.put_sound(&[1 << 30, -(1 << 30)], 2);
+        let chunk = rx.try_recv().expect("a chunk");
+        assert_eq!(chunk.samples, vec![0.5, -0.5]);
+        assert_eq!(chunk.lost_before, 0);
+        sink.put_sound(&[0; 4], 2);
+        sink.put_sound(&[0; 4], 2);
+        let _ = rx.try_recv();
+        sink.put_sound(&[0; 2], 2);
+        assert_eq!(rx.try_recv().expect("a chunk").lost_before, 4, "four lost");
+        let other = Sink::default();
+        other.put_sound(&[0, 0], 2);
+        assert_ne!(other.sound_format().map(|f| f.2), Some(key));
+    }
+
+    /// Another format asked for a camera opens it again at that format:
+    /// its capture is told to, and takes the format as it does, once.
+    #[test]
+    fn another_format_asked_for_opens_the_camera_again_at_it() {
+        let sink = Sink::default();
+        assert!(sink.take_mode().is_none());
+        let fifty = CameraMode {
+            width: 1920,
+            height: 1080,
+            fps: 50,
+        };
+        sink.ask_mode(Some(fifty));
+        assert!(sink.take_restart(), "told to open again");
+        assert_eq!(sink.take_mode(), Some(Some(fifty)));
+        assert_eq!(sink.take_mode(), None, "once");
+        sink.ask_mode(None);
+        assert_eq!(sink.take_mode(), Some(None), "its best");
+    }
+
+    /// Brightness is sampled on a grid, at each pixel's brightness byte:
+    /// those well below video black are counted.
+    #[test]
+    fn brightness_below_video_black_is_counted_on_a_grid() {
+        // 128 × 72 'uyvy': brightness at odd bytes; the left half black (0),
+        // the right half just under video black (10: footroom).
+        let (w, h) = (128_usize, 72_usize);
+        let stride = w * 2;
+        let mut bytes = vec![128_u8; stride * h];
+        for y in 0..h {
+            for x in 0..w {
+                bytes[y * stride + x * 2 + 1] = if x < w / 2 { 0 } else { 10 };
+            }
+        }
+        let (below, taken) = below_black(&bytes, stride, (w, h), (1, 2));
+        assert_eq!(taken, 64 * 36);
+        assert_eq!(below, 32 * 36, "the left half");
+        assert_eq!(below_black(&bytes, stride, (0, 0), (1, 2)), (0, 0));
+    }
+
+    /// A camera's signal, as its pictures say: the latest's size and
+    /// format, its rate as its pictures come, and its darks counted over
+    /// the latest looks — older ones counting less.
+    #[test]
+    fn a_cameras_signal_is_what_its_pictures_say_lately() {
+        let sink = Sink::default();
+        assert!(sink.signal().is_none(), "no picture read yet");
+        let _ = sink.opening(60.0); // its capture opened at 60
+        let seen = || SignalSeen {
+            width: 1920,
+            height: 1080,
+            format: "2vuy".into(),
+            matrix: "BT.709".into(),
+            full_range: Some(false),
+            ..SignalSeen::default()
+        };
+        sink.note_signal(seen(), (2304, 2304));
+        for _ in 0..60 {
+            sink.note_signal(seen(), (0, 2304));
+        }
+        for i in 0..120_u32 {
+            sink.put(
+                Frame {
+                    data: vec![0; 16],
+                    width: 2,
+                    height: 2,
+                },
+                10.0 + f64::from(i) / 50.0,
+            );
+        }
+        let signal = sink.signal().expect("a signal");
+        assert_eq!(
+            signal.opened_fps,
+            Some(60.0),
+            "the rate its capture opened at"
+        );
+        assert_eq!((signal.width, signal.format.as_str()), (1920, "2vuy"));
+        assert!(
+            signal.below_black < 0.001,
+            "a dark look long past: {}",
+            signal.below_black
+        );
+        assert!((signal.fps - 50.0).abs() < 0.5, "{} fps", signal.fps);
+        assert_eq!(signal.other_rate().map(f64::round), Some(50.0));
+    }
+
+    /// Each picture is told to the picker with when it came, and each show
+    /// frame with when it was drawn: an input whose pictures keep coming as
+    /// show frames are drawn is known by it, and held a frame at the lowest
+    /// latency (see `FramePicker::set_newest`).
+    #[test]
+    fn pictures_are_picked_knowing_when_they_came_and_were_drawn() {
+        let sink = Sink::default();
+        let now = crate::host_clock::host_seconds();
+        sink.put(
+            Frame {
+                data: vec![0; 16],
+                width: 2,
+                height: 2,
+            },
+            now,
+        );
+        assert!(sink.take(now + 0.03, 0).is_some());
+        let pictures = sink.pictures.lock().expect("pictures");
+        assert_eq!(pictures.told_at_the_draw(), 1, "came as it was drawn");
+    }
+
     /// A camera's pictures are taken by when they were captured, one per
     /// show frame in turn — not the newest to have come, which skipped some
     /// and showed others twice when they came near the moment frames were
@@ -2176,6 +3698,7 @@ mod tests {
                 since: Instant::now(),
                 decks: vec!["deck-1".into()],
                 asked: false,
+                mode: None,
             },
         );
         assert!(mgr.is_opening(7));
@@ -2301,6 +3824,7 @@ mod tests {
                 since: Instant::now(),
                 decks: vec!["deck-1".into()],
                 asked: false,
+                mode: None,
             },
         );
         let full = CameraColour {
@@ -2354,6 +3878,7 @@ mod tests {
                 since: Instant::now(),
                 decks: vec!["deck-1".into()],
                 asked: false,
+                mode: None,
             },
         );
         let start = Instant::now();

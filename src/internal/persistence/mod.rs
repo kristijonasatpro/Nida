@@ -751,6 +751,12 @@ pub fn snapshot_scene(
                                 elapsed: timer.elapsed(),
                             }
                         }
+                        "text" => SourceConfig::Text {
+                            settings: slot.deck.text()?.settings().clone(),
+                        },
+                        "lower_third" => SourceConfig::LowerThird {
+                            settings: slot.deck.lower_third()?.settings().clone(),
+                        },
                         "presenter" => {
                             let presenter = slot.deck.presenter()?;
                             SourceConfig::Presenter {
@@ -2033,6 +2039,12 @@ pub(crate) fn restore_deck(
             render_width,
             render_height,
         )?,
+        SourceConfig::LowerThird { settings } => {
+            Deck::new_lower_third(context, settings.clone(), render_width, render_height)?
+        }
+        SourceConfig::Text { settings } => {
+            Deck::new_text(context, settings.clone(), render_width, render_height)?
+        }
         SourceConfig::Presenter { follows, layout } => {
             let mut deck = Deck::new_presenter(
                 context,
@@ -2524,6 +2536,11 @@ pub(crate) fn source_configs_match(deck: &Deck, config: &SourceConfig) -> bool {
         ("slides", SourceConfig::Slides { .. }) => true,
         // Its settings are patched in place: an undo does not reset it.
         ("timer", SourceConfig::Timer { .. }) => true,
+        // Its rows and look are patched in place: an undo takes nothing off
+        // air.
+        ("lower_third", SourceConfig::LowerThird { .. }) => true,
+        // Its text and look are patched in place.
+        ("text", SourceConfig::Text { .. }) => true,
         // Its layout is patched in place: an undo does not make it again.
         ("presenter", SourceConfig::Presenter { follows, .. }) => {
             deck.presenter().is_some_and(|p| p.follows() == follows)

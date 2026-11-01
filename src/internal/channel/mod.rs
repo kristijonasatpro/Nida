@@ -496,6 +496,10 @@ pub struct Channel {
     /// drawn only now and then (a tile, see `Mixer::tile_previews`): handed
     /// to its next draw, so what runs on time keeps real time.
     pub dt_owed: f32,
+    /// Its decks' auto-transitions ticked by the mixer this frame (a channel
+    /// drawn as a tile is ticked every frame, drawn or not): its render does
+    /// not tick them again.
+    pub transitions_ticked: bool,
     /// Decks blended into the composite last frame — fewer than the active
     /// ones when a deck covering the frame hides those below it.
     pub composited_deck_count: usize,
@@ -626,6 +630,7 @@ impl Channel {
             render_time_ms: 0.0,
             active_deck_count: 0,
             dt_owed: 0.0,
+            transitions_ticked: false,
             composited_deck_count: 0,
             thumbnails_drawn: 0,
             thumbnail_clock: 0,
@@ -758,6 +763,17 @@ impl Channel {
             slot.deck
                 .set_video_suspended(!slot.source_demand.wants_frames());
             if !slot.source_demand.wants_frames() {
+                // A lower third or text sent to buses still comes and goes
+                // there, its deck idle or not.
+                if let Some(lower) = slot.deck.lower_third_mut() {
+                    if lower.has_target_frames() {
+                        lower.tick();
+                    }
+                } else if let Some(text) = slot.deck.text_mut() {
+                    if text.has_target_frames() {
+                        text.tick();
+                    }
+                }
                 continue;
             }
             slot.deck.set_video_output_fps(target_fps);
@@ -931,9 +947,13 @@ impl Channel {
 
         let render_start = std::time::Instant::now();
 
-        // Tick auto-transition state before rendering
-        let bpm = audio_data.bpm.map(f64::from);
-        self.tick_auto_transitions(f64::from(dt), bpm);
+        // Tick auto-transition state before rendering — unless the mixer has
+        // ticked it every frame itself (a channel drawn only now and then, as
+        // a tile: the time it saved up is not one step of a sequence).
+        if !std::mem::take(&mut self.transitions_ticked) {
+            let bpm = audio_data.bpm.map(f64::from);
+            self.tick_auto_transitions(f64::from(dt), bpm);
+        }
 
         // Sort decks by z-index
         let mut deck_indices: Vec<usize> = (0..self.decks.len()).collect();

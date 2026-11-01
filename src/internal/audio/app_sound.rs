@@ -142,10 +142,10 @@ pub fn only_the_tap(channels: &[u32]) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-pub use mac::{app_name, processes, Tap};
+pub use mac::{app_name, process_named, processes, Tap};
 
 #[cfg(not(target_os = "macos"))]
-pub use other::{app_name, processes, Tap};
+pub use other::{app_name, process_named, processes, Tap};
 
 #[cfg(target_os = "macos")]
 mod mac {
@@ -382,6 +382,46 @@ mod mac {
         })
     }
 
+    /// Whether a process named `name` — its program's file name, in any
+    /// case — is running. An app's bundle ID can change from one version to
+    /// the next (ATEM Setup's is com.blackmagic-design.Switchers.Setup on
+    /// one Mac, com.blackmagic-design.atem.utility on another); its
+    /// program's name stays.
+    pub fn process_named(name: &str) -> bool {
+        // SAFETY: with no buffer, proc_listallpids only counts.
+        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        let Ok(count) = usize::try_from(count) else {
+            return false;
+        };
+        // Room for processes started since they were counted.
+        let mut pids: Vec<libc::pid_t> = vec![0; count + 64];
+        let bytes =
+            i32::try_from(pids.len() * std::mem::size_of::<libc::pid_t>()).unwrap_or(i32::MAX);
+        // SAFETY: the buffer holds `bytes` bytes of pids.
+        let listed = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        let Ok(listed) = usize::try_from(listed) else {
+            return false;
+        };
+        pids.truncate(listed);
+        let mut buffer = [0_u8; 256];
+        for pid in pids {
+            // SAFETY: the buffer holds `buffer.len()` bytes.
+            let len =
+                unsafe { libc::proc_name(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+            let Some(found) = usize::try_from(len)
+                .ok()
+                .and_then(|len| buffer.get(..len))
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            else {
+                continue;
+            };
+            if found.eq_ignore_ascii_case(name) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// What an app calls itself, from its bundle; its bundle ID otherwise.
     pub fn app_name(bundle_id: &str) -> String {
         use objc2_app_kit::NSRunningApplication;
@@ -566,6 +606,11 @@ mod other {
         bundle_id.to_string()
     }
 
+    /// No process is looked for here.
+    pub fn process_named(_name: &str) -> bool {
+        false
+    }
+
     /// Only macOS can tap an app's sound.
     pub struct Tap;
 
@@ -585,6 +630,29 @@ mod other {
 
 #[cfg(test)]
 mod tests {
+
+    /// A process is found by its program's name, in any case; a name no
+    /// process has is not.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_is_found_by_its_name_in_any_case() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("sleep starts");
+        // Another started after it: it is not the newest process listed.
+        let mut later = std::process::Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("cat starts");
+        let found = super::process_named("SLEEP");
+        for process in [&mut child, &mut later] {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
+        assert!(found, "sleep, asked for as SLEEP");
+        assert!(!super::process_named("no-such-program-nida"));
+    }
     use super::{
         apps_of, device_name, is_web_talks, is_webkit_helper, only_the_tap, owning_app,
         process_birth, set_web_talk_pids,

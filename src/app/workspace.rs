@@ -1390,7 +1390,9 @@ impl VardaApp {
         current: super::history::HistorySnapshot,
     ) -> Option<super::history::HistoryRestore> {
         let snapshot = self.session.history.undo(current)?;
-        Some(self.restore_history_snapshot(snapshot))
+        Some(crate::deck::lower_third::as_undo(|| {
+            self.restore_history_snapshot(snapshot)
+        }))
     }
 
     /// Redo the most recently undone action. `current` is the live state to
@@ -1588,6 +1590,21 @@ impl VardaApp {
                 }
                 slides.set_settings(settings.clone());
                 slides.set_scaling_mode(*scaling_mode);
+            }
+        }
+        if let crate::scene::SourceConfig::Text { settings } = &config.source {
+            if let Some(text) = slot.deck.text_mut() {
+                if text.settings() != settings {
+                    text.set_settings(settings.clone());
+                }
+            }
+        }
+        if let crate::scene::SourceConfig::LowerThird { settings } = &config.source {
+            if let Some(lower) = slot.deck.lower_third_mut() {
+                if lower.settings() != settings {
+                    // The cue stays live, as a Show left it.
+                    lower.restore_settings(settings.clone());
+                }
             }
         }
         if let crate::scene::SourceConfig::Timer { settings, .. } = &config.source {

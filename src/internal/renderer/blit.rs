@@ -254,7 +254,13 @@ impl BlitPipeline {
 
         let fragment_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Blit Fragment Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/blit.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(
+                    include_str!("shaders/scaled_sample.wgsl"),
+                    include_str!("shaders/blit.wgsl")
+                )
+                .into(),
+            ),
         });
 
         // Create render pipeline
@@ -1448,7 +1454,13 @@ impl PolygonBlitPipeline {
         // Combined vertex + fragment shader with homography support
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Polygon Warp Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/polygon.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(
+                    include_str!("shaders/scaled_sample.wgsl"),
+                    include_str!("shaders/polygon.wgsl")
+                )
+                .into(),
+            ),
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1975,6 +1987,450 @@ fn ear_clip_point_in_tri(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A picture one grey a column, `greys`, four lines high, blitted onto
+    /// a `to` × 4 target: each target column's grey.
+    fn blit_greys(ctx: &GpuContext, greys: &[f32], to: u32) -> Vec<f32> {
+        let columns: Vec<[f32; 4]> = greys.iter().map(|&g| [g, g, g, 1.0]).collect();
+        blit_columns(ctx, &columns, to, None)
+            .iter()
+            .map(|c| c[0])
+            .collect()
+    }
+
+    /// A picture one colour a column, four lines high, blitted onto a `to`
+    /// × 4 target — only the part `part` (UV scale, offset) says, if any:
+    /// each target column's colour.
+    fn blit_columns(
+        ctx: &GpuContext,
+        columns: &[[f32; 4]],
+        to: u32,
+        part: Option<([f32; 2], [f32; 2])>,
+    ) -> Vec<[f32; 4]> {
+        let from = columns.len() as u32;
+        let texture = |label, width, usage| {
+            ctx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height: 4,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let source = texture(
+            "Greys",
+            from,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        );
+        let target = texture(
+            "Greys Blitted",
+            to,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let row: Vec<u16> = columns
+            .iter()
+            .flat_map(|c| c.map(|v| half::f16::from_f32(v).to_bits()))
+            .collect();
+        let words: Vec<u16> = (0..4).flat_map(|_| row.iter().copied()).collect();
+        ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &source,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&words),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(from * 8),
+                rows_per_image: Some(4),
+            },
+            wgpu::Extent3d {
+                width: from,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+        );
+        let pipeline = BlitPipeline::new(&ctx.device, wgpu::TextureFormat::Rgba16Float).unwrap();
+        let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = pipeline.create_bind_group(&ctx.device, &source_view);
+        if let Some((scale, offset)) = part {
+            pipeline.set_uv_transform(&ctx.queue, 1.0, scale, offset);
+        }
+        let row_bytes = (to * 8).div_ceil(256) * 256;
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Greys Readback"),
+            size: u64::from(row_bytes) * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Greys Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pipeline.render(&mut pass, &bind_group);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_bytes),
+                    rows_per_image: Some(4),
+                },
+            },
+            wgpu::Extent3d {
+                width: to,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+        );
+        ctx.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().unwrap().unwrap();
+        let mapped = readback.slice(..).get_mapped_range().unwrap();
+        // The second line, clear of the edges above and below.
+        let line = &mapped[row_bytes as usize..row_bytes as usize + to as usize * 8];
+        bytemuck::cast_slice::<u8, u16>(line)
+            .chunks(4)
+            .map(|pixel| std::array::from_fn(|i| half::f16::from_bits(pixel[i]).to_f32()))
+            .collect()
+    }
+
+    /// Columns black and white by turns, `n` of them.
+    fn stripes(n: usize) -> Vec<f32> {
+        (0..n).map(|x| if x % 2 == 0 { 1.0 } else { 0.0 }).collect()
+    }
+
+    /// How far each column is from the next, on average, away from the
+    /// edges: 1 for stripes kept sharp, 0 for grey.
+    fn contrast(greys: &[f32]) -> f32 {
+        let inner = &greys[4..greys.len() - 4];
+        inner.windows(2).map(|w| (w[0] - w[1]).abs()).sum::<f32>() / (inner.len() - 1) as f32
+    }
+
+    /// An HD picture in a 4K show, back out on an HD screen, keeps its
+    /// finest detail better than two bilinear taps did: drawn twice its size
+    /// bicubic, not blurred, then each pixel the average of the two it
+    /// covers. One-pixel stripes came back half as strong.
+    #[test]
+    fn an_hd_picture_in_a_4k_show_back_on_an_hd_screen_keeps_its_detail() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        let in_4k = blit_greys(&ctx, &stripes(64), 128);
+        let back = blit_greys(&ctx, &in_4k, 64);
+        let kept = contrast(&back);
+        assert!(kept > 0.62, "stripes back at {kept:.3} of their strength");
+    }
+
+    /// A picture drawn smaller by more than half — a 4K show on a screen
+    /// not exactly half its size — is each pixel's texels averaged: its
+    /// finest stripes come out grey, not beating light and dark (moiré).
+    #[test]
+    fn a_picture_drawn_smaller_averages_what_each_pixel_covers() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        let smaller = blit_greys(&ctx, &stripes(160), 64);
+        let inner = &smaller[4..60];
+        let (lowest, highest) = inner
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), &g| (lo.min(g), hi.max(g)));
+        assert!(
+            highest - lowest < 0.3,
+            "between {lowest:.3} and {highest:.3}"
+        );
+    }
+
+    /// Drawn at a half and a quarter size — a 4K show on an HD screen, a
+    /// preview of it — the finest stripes come out grey: every texel a pixel
+    /// covers taken in, two at a time by a tap between them, none skipped to
+    /// beat as moiré.
+    #[test]
+    fn a_picture_drawn_far_smaller_still_averages() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        for to in [128, 64] {
+            let smaller = blit_greys(&ctx, &stripes(256), to);
+            let inner = &smaller[4..to as usize - 4];
+            for (x, g) in inner.iter().enumerate() {
+                assert!((g - 0.5).abs() < 0.08, "{to} wide, column {x}: {g:.3}");
+            }
+        }
+    }
+
+    /// Drawn at half size but offset by half a texel (a slice starting
+    /// between texels), the stripes still come out grey: the fewer taps are
+    /// only for a pixel grid on the texel edges.
+    #[test]
+    fn a_picture_half_a_texel_off_still_averages() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        let columns: Vec<[f32; 4]> = stripes(130)
+            .iter()
+            .map(|&g| [g, g, g, 1.0])
+            .collect();
+        // 128 texels from 0.5 in: two a pixel, the grid half a texel off.
+        let drawn = blit_columns(&ctx, &columns, 64, Some(([128.0 / 130.0, 1.0], [0.5 / 130.0, 0.0])));
+        for (x, c) in drawn[2..62].iter().enumerate() {
+            assert!((c[0] - 0.5).abs() < 0.08, "column {x}: {:.3}", c[0]);
+        }
+    }
+
+    /// What drawing a 4K picture at a quarter size costs, a thousand times
+    /// waited for — a measurement, run by hand (`-- --ignored --nocapture`).
+    #[test]
+    #[ignore = "a measurement"]
+    fn cost_of_drawing_4k_at_a_quarter() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        let texture = |label, width, height, usage| {
+            ctx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let source = texture("4K", 3840, 2160, wgpu::TextureUsages::TEXTURE_BINDING);
+        let target = texture("Quarter", 960, 540, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let blit = BlitPipeline::new(&ctx.device, wgpu::TextureFormat::Rgba16Float).expect("blit");
+        let bind = blit.create_bind_group(&ctx.device, &source_view);
+        let run = |times: u32| {
+            let started = std::time::Instant::now();
+            for _ in 0..times {
+                let mut encoder = ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: None,
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &target_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    blit.render(&mut pass, &bind);
+                }
+                ctx.submit(std::iter::once(encoder.finish()));
+            }
+            ctx.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .ok();
+            started.elapsed()
+        };
+        run(50);
+        let took = run(1000);
+        println!("4K at a quarter: {:.3} ms a draw", took.as_secs_f64() * 1000.0 / 1000.0);
+    }
+
+    /// A hard edge drawn bigger gets no halo: bicubic's overshoot either
+    /// side of it is held within what it samples.
+    #[test]
+    fn an_edge_drawn_bigger_gets_no_halo() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        let edge: Vec<f32> = (0..64).map(|x| if x < 32 { 0.0 } else { 1.0 }).collect();
+        let bigger = blit_greys(&ctx, &edge, 128);
+        for (x, g) in bigger.iter().enumerate() {
+            assert!((-1e-3..=1.001).contains(g), "column {x}: {g}");
+        }
+        assert!(bigger[60] < 0.01 && bigger[67] > 0.99, "still an edge");
+    }
+
+    /// The shaders that draw a picture scaled — a deck into the show, the
+    /// show onto a screen or a surface — build and pass wgpu's checks.
+    #[test]
+    fn the_scaling_shaders_build() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _surface = PolygonBlitPipeline::new(&ctx.device, wgpu::TextureFormat::Bgra8UnormSrgb);
+        let _blit = BlitPipeline::new(&ctx.device, wgpu::TextureFormat::Bgra8UnormSrgb);
+        let error = pollster::block_on(scope.pop());
+        assert!(error.is_none(), "{error:?}");
+    }
+
+    /// A 4K show on an HD screen, exactly half its size, is each pixel the
+    /// two texels it covers, across the whole width: two-pixel stripes come
+    /// out one pixel each, full strength — none taken three texels at a
+    /// time by a derivative rounded a little over two.
+    #[test]
+    fn a_4k_show_on_an_hd_screen_keeps_two_pixel_detail() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        let stripes: Vec<f32> = (0..3840)
+            .map(|x| if x % 4 < 2 { 1.0 } else { 0.0 })
+            .collect();
+        let hd = blit_greys(&ctx, &stripes, 1920);
+        for (x, g) in hd.iter().enumerate() {
+            let want = if x % 2 == 0 { 1.0 } else { 0.0 };
+            assert!((g - want).abs() < 0.01, "column {x}: {g}");
+        }
+    }
+
+    /// A bus — a part of the master — drawn smaller takes nothing of the
+    /// bus beside it: its taps stay inside its part.
+    #[test]
+    fn a_part_drawn_smaller_takes_nothing_from_beside_it() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        // Columns 16–47 black, white either side; the black part drawn.
+        let columns: Vec<[f32; 4]> = (0..64)
+            .map(|x| {
+                if (16..48).contains(&x) {
+                    [0.0, 0.0, 0.0, 1.0]
+                } else {
+                    [1.0; 4]
+                }
+            })
+            .collect();
+        let drawn = blit_columns(&ctx, &columns, 20, Some(([0.5, 1.0], [0.25, 0.0])));
+        for (x, c) in drawn.iter().enumerate() {
+            assert!(c[0] < 0.001, "column {x}: {}", c[0]);
+        }
+    }
+
+    /// A part cut at a fraction of a texel takes no texel whose centre lies
+    /// outside it; one narrower than a texel, the texel its middle is in.
+    #[test]
+    fn a_part_cut_between_texels_takes_nothing_from_beside_it() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        // Columns 17–48 black, white either side; texels 16.75 to 48.75 drawn.
+        let columns: Vec<[f32; 4]> = (0..64)
+            .map(|x| {
+                if (17..=48).contains(&x) {
+                    [0.0, 0.0, 0.0, 1.0]
+                } else {
+                    [1.0; 4]
+                }
+            })
+            .collect();
+        for to in [20, 32] {
+            let drawn = blit_columns(&ctx, &columns, to, Some(([0.5, 1.0], [16.75 / 64.0, 0.0])));
+            for (x, c) in drawn.iter().enumerate() {
+                assert!(c[0] < 0.001, "{to} wide, column {x}: {}", c[0]);
+            }
+        }
+        // Texels 2.25 to 2.75 — inside texel 2, black — drawn bigger.
+        let mut columns = vec![[1.0; 4]; 64];
+        columns[2] = [0.0, 0.0, 0.0, 1.0];
+        let drawn = blit_columns(
+            &ctx,
+            &columns,
+            8,
+            Some(([0.5 / 64.0, 1.0], [2.25 / 64.0, 0.0])),
+        );
+        for (x, c) in drawn.iter().enumerate() {
+            assert!(c[0] < 0.001, "column {x}: {}", c[0]);
+        }
+    }
+
+    /// A picture with transparency drawn bigger keeps its premultiplied
+    /// colour within its alpha: no bright fringe at an edge.
+    #[test]
+    fn transparent_edges_drawn_bigger_get_no_fringe() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        let columns: Vec<[f32; 4]> = (0..64)
+            .map(|x| match x % 4 {
+                0 => [0.0, 0.0, 0.0, 1.0],
+                2 => [1.0, 0.0, 0.0, 1.0],
+                _ => [0.0; 4],
+            })
+            .collect();
+        let bigger = blit_columns(&ctx, &columns, 256, None);
+        for (x, c) in bigger.iter().enumerate() {
+            assert!(
+                c[0] <= c[3] + 1e-3,
+                "column {x}: red {} over alpha {}",
+                c[0],
+                c[3]
+            );
+        }
+    }
+
+    /// A picture drawn at its own size stays exactly as it is.
+    #[test]
+    fn a_picture_drawn_at_its_own_size_is_unchanged() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        let greys: Vec<f32> = (0..64).map(|x| ((x * 37) % 64) as f32 / 63.0).collect();
+        let same = blit_greys(&ctx, &greys, 64);
+        for (x, (a, b)) in greys.iter().zip(&same).enumerate() {
+            assert!((a - b).abs() < 2e-3, "column {x}: {a} became {b}");
+        }
+    }
     use crate::renderer::context::GpuContext;
 
     const QUAD: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];

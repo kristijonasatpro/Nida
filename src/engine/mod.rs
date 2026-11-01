@@ -128,6 +128,17 @@ pub enum InputSource {
         #[serde(default)]
         settings: Option<crate::engine::value::timer::TimerSettings>,
     },
+    /// Lines of text typed in, with a font, a box, an outline, a shadow.
+    Text {
+        #[serde(default)]
+        settings: Option<crate::engine::value::text::TextSettings>,
+    },
+    /// A lower third: names and titles on a plate, brought on air one at a
+    /// time.
+    LowerThird {
+        #[serde(default)]
+        settings: Option<crate::engine::value::lower_third::LowerThirdSettings>,
+    },
     /// A PowerPoint deck, played by PowerPoint on this computer in a window
     /// Nida captures — its transitions, animations and videos as PowerPoint
     /// plays them — and moved on from Nida (macOS).
@@ -160,6 +171,7 @@ impl InputSource {
                 channel_uuid,
                 camera_id,
                 mode,
+                audio: None,
             },
             Self::Ndi { source_name } => EngineCommand::AddNdiDeck {
                 channel_uuid,
@@ -209,6 +221,14 @@ impl InputSource {
                 settings: None,
             },
             Self::Timer { settings } => EngineCommand::AddTimerDeck {
+                channel_uuid,
+                settings,
+            },
+            Self::Text { settings } => EngineCommand::AddTextDeck {
+                channel_uuid,
+                settings,
+            },
+            Self::LowerThird { settings } => EngineCommand::AddLowerThirdDeck {
                 channel_uuid,
                 settings,
             },
@@ -312,6 +332,10 @@ pub enum EngineCommand {
         /// The size and rate to open it at; its best when left out.
         #[serde(default)]
         mode: Option<crate::engine::value::camera::CameraMode>,
+        /// Its own sound, on and off air with it (Audio Auto), as a camera
+        /// input's.
+        #[serde(default)]
+        audio: Option<InputAudio>,
     },
     AddDepthSensorDeck {
         channel_uuid: String,
@@ -753,6 +777,55 @@ pub enum EngineCommand {
     ControlTimer {
         deck_uuid: String,
         action: crate::engine::value::timer::TimerAction,
+    },
+
+    // ── Text ─────────────────────────────────────────────────────
+    /// Add a text input's layer to a channel.
+    AddTextDeck {
+        channel_uuid: String,
+        #[serde(default)]
+        settings: Option<crate::engine::value::text::TextSettings>,
+    },
+    /// A text input's text, look and visibility (a change of visibility
+    /// fades over its fade time).
+    SetTextSettings {
+        deck_uuid: String,
+        settings: crate::engine::value::text::TextSettings,
+    },
+
+    // ── Lower thirds ─────────────────────────────────────────────
+    /// Add a lower third to a channel, off air.
+    AddLowerThirdDeck {
+        channel_uuid: String,
+        #[serde(default)]
+        settings: Option<crate::engine::value::lower_third::LowerThirdSettings>,
+    },
+    /// A lower third's rows, cue and look. A row on air stays on air.
+    SetLowerThirdSettings {
+        deck_uuid: String,
+        settings: crate::engine::value::lower_third::LowerThirdSettings,
+    },
+    /// Bring a lower third's row on air — the cued one when left out —
+    /// taking another out first; the row after it is cued.
+    LowerThirdShow {
+        deck_uuid: String,
+        #[serde(default)]
+        row: Option<usize>,
+    },
+    /// Take a lower third off air.
+    LowerThirdHide {
+        deck_uuid: String,
+    },
+    /// Cue the row `by` rows on (back when negative) from the cued one.
+    LowerThirdStep {
+        deck_uuid: String,
+        by: i64,
+    },
+    /// Read a lower third's rows from a CSV or TSV file (an organiser's
+    /// Excel: UTF-8, or Windows-1257 with `;`), read again as it changes.
+    ImportLowerThirdRows {
+        deck_uuid: String,
+        path: String,
     },
 
     // ── PowerPoint ───────────────────────────────────────────────
@@ -1646,12 +1719,30 @@ pub enum EngineCommand {
         deck_uuid: String,
         colour: crate::engine::value::camera::CameraColour,
     },
-    /// Show a camera layer's newest picture every frame — the lowest latency,
-    /// about a frame sooner, but a judder whenever a picture comes late (a
-    /// camera over USB: about two a second) — or, `false`, each in turn at
-    /// the delay that keeps motion even. Every layer on that camera takes
-    /// it: they share its capture.
+    /// Reset a camera layer's input, as vMix's Reset: its capture closed and
+    /// opened again — the device found afresh, its formats read again, at
+    /// the format chosen — and its sound, taken with it, opened again. Every
+    /// layer on that camera takes it: they share its capture.
+    ResetInput {
+        deck_uuid: String,
+    },
+    /// Show a camera layer's pictures without waiting for the few that come
+    /// much later than the rest — the lowest latency, about a frame sooner,
+    /// but a judder whenever one of those comes (a camera over USB: about
+    /// two a second); a camera whose pictures keep coming as frames are
+    /// drawn is held a frame all the same, to stay smooth — or, `false`,
+    /// each in turn at the delay that keeps motion even. Every layer on
+    /// that camera takes it: they share its capture.
     SetCameraLowestLatency { deck_uuid: String, on: bool },
+    /// Open a camera layer's camera at another format — a size and rate of
+    /// those it offers (`GET /api/state/cameras`), or, left out, its best —
+    /// its inputs keeping its last picture meanwhile. Every layer on that
+    /// camera takes it: they share its capture.
+    SetCameraMode {
+        deck_uuid: String,
+        #[serde(default)]
+        mode: Option<crate::engine::value::camera::CameraMode>,
+    },
     /// What a camera layer's picture is coded as, so the show gets Rec.709
     /// video from it: `normal` (shown as it comes), `sony_hlg`,
     /// `sony_s_log2`, `sony_s_log3_cine`, `sony_s_log3`,
@@ -1991,6 +2082,24 @@ pub enum EngineCommand {
         uuid: String,
         config: crate::audio_mix::LowCutConfig,
     },
+    /// A source's gate: the room turned down in a pause (by its range, not
+    /// cut off), opening the moment the voice comes back.
+    SetAudioSourceGate {
+        uuid: String,
+        config: crate::audio_mix::GateConfig,
+    },
+    /// A source's EQ: a low shelf, two bells and a high shelf, after its
+    /// gate and before its leveler.
+    SetAudioSourceEq {
+        uuid: String,
+        config: crate::audio_mix::EqConfig,
+    },
+    /// A source's de-esser: an "s" over its threshold turns the top down,
+    /// after its compressor.
+    SetAudioSourceDeEsser {
+        uuid: String,
+        config: crate::audio_mix::DeEsserConfig,
+    },
     /// A source's leveler: each speaker brought to the same loudness.
     SetAudioSourceLeveler {
         uuid: String,
@@ -2009,6 +2118,40 @@ pub enum EngineCommand {
     SetAudioBusDelay {
         uuid: String,
         delay_ms: f32,
+    },
+    /// Put an Audio Unit effect first in a bus's processing, before its
+    /// compressor and limiter (`component` as listed in `audio_mix.effects`,
+    /// "aufx:lpas:appl"), or take it out (`None`). The bus plays 20 ms later
+    /// with one; not on a live bus.
+    SetAudioBusInsert {
+        uuid: String,
+        component: Option<String>,
+    },
+    /// Bypass a bus's insert: it still runs, the bus is heard without it.
+    SetAudioBusInsertBypass {
+        uuid: String,
+        bypass: bool,
+    },
+    /// Open the window of a bus's insert on this Mac's screen: the plug-in's
+    /// own, or a generic list of its controls. What is set there is saved
+    /// with the show.
+    OpenAudioBusInsert {
+        uuid: String,
+    },
+    /// Close the window of a bus's insert, if open.
+    CloseAudioBusInsert {
+        uuid: String,
+    },
+    /// Play an audio bus live: the mics on its own sound device mixed inside
+    /// that device, about 7 ms from mic to speakers (for the room's
+    /// speakers and monitors); the rest of the bus at the usual delay.
+    /// `frames`: the device's buffer, 32, 64, 128 or 256 (left as it was
+    /// when not given; 64 at first).
+    SetAudioBusLive {
+        uuid: String,
+        live: bool,
+        #[serde(default)]
+        frames: Option<u32>,
     },
     /// Play an audio bus on a sound device (by name), on the output pair
     /// starting at `first_channel` (0 = outputs 1-2); `None` plays nowhere.
@@ -2050,6 +2193,23 @@ pub enum EngineCommand {
         uuid: String,
         muted: bool,
     },
+    /// A source's send to an audio bus, any of: on or off, its level
+    /// (−96 silent to +10 dB) and where it takes the source (as its bus,
+    /// before or after the fader). Left out, each is as it was; a level
+    /// set does not turn the send on.
+    SetAudioSendSettings {
+        uuid: String,
+        bus_uuid: String,
+        #[serde(default)]
+        on: Option<bool>,
+        #[serde(default)]
+        gain_db: Option<f32>,
+        #[serde(default)]
+        mode: Option<crate::audio_mix::SendMode>,
+    },
+    /// An audio bus as a monitor mix: sources reach it before their faders
+    /// (unless a send says otherwise).
+    SetAudioBusPreFader { uuid: String, pre_fader: bool },
     /// Send a source to an audio bus, or stop.
     SetAudioSend {
         uuid: String,

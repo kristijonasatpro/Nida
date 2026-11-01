@@ -38,6 +38,9 @@ pub enum Pane {
     /// The Presentations panel: a Slides input's talks in running order,
     /// each started with one press.
     Presentations,
+    /// Every lower third in the show: its names, each shown in one press,
+    /// Show/Hide/Next, and its look.
+    LowerThirds,
     /// The audio mixer.
     Audio,
     /// Whatever is selected: a deck's settings, a channel's or the master's
@@ -52,7 +55,7 @@ pub enum Pane {
 }
 
 impl Pane {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Library,
         Self::Channels,
         Self::Layers,
@@ -62,6 +65,7 @@ impl Pane {
         Self::Switcher,
         Self::Rundown,
         Self::Presentations,
+        Self::LowerThirds,
         Self::Audio,
         Self::Details,
         Self::Setup,
@@ -79,6 +83,7 @@ impl Pane {
             Self::Switcher => "Switcher",
             Self::Rundown => "Rundown",
             Self::Presentations => "Presentations",
+            Self::LowerThirds => "Lower thirds",
             Self::Audio => "Audio Mixer",
             Self::Details => "Properties",
             Self::Setup => "Setup",
@@ -101,6 +106,9 @@ impl Pane {
             Self::Presentations => {
                 "The talks in running order — PowerPoint, PDF, web, clips — each started with \
                  one press"
+            }
+            Self::LowerThirds => {
+                "Every lower third: its names, each shown in one press, Show, Hide and Next"
             }
             Self::Audio => "Audio mixer: faders, meters, monitoring",
             Self::Details => "Settings of whatever is selected",
@@ -125,6 +133,7 @@ impl Pane {
                 | Self::Switcher
                 | Self::Rundown
                 | Self::Presentations
+                | Self::LowerThirds
                 | Self::Audio
                 | Self::Timer(_)
         )

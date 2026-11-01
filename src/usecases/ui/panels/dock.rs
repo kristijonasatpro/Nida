@@ -55,6 +55,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
             Pane::Switcher => super::switcher::render_switcher_section(ui, data, actions),
             Pane::Rundown => super::rundown::render_rundown(ui, data, actions),
             Pane::Presentations => super::slides::render_slides_panel(ui, data, actions),
+            Pane::LowerThirds => super::lower_third::render_panel(ui, data, actions),
             Pane::Audio => super::audio_mixer::render_audio_mixer_section(ui, data, actions),
             Pane::Details => super::bottom_bar::render_bottom_panel(ui, data, actions),
             Pane::Setup => super::right_panel::render_setup(ui, data, actions),
@@ -85,6 +86,7 @@ impl egui_dock::TabViewer for Viewer<'_> {
             Pane::Switcher
             | Pane::Rundown
             | Pane::Presentations
+            | Pane::LowerThirds
             | Pane::Audio
             | Pane::Setup
             | Pane::Output

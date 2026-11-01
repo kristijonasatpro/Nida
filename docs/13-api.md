@@ -90,11 +90,48 @@ curl -X POST http://localhost:8080/api/command -H "Content-Type: application/jso
 
 `GET /api/state` shows what it has made. Screens and LED walls have routes too (`/api/outputs`).
 
-It can use only what the Mac running Nida has: pictures and clips are files on that Mac, and cameras, capture cards, NDI sources and calls need the device, the runtime and macOS's permission there. The spec also lists the web-page and depth-sensor routes, which the DMG has no engine for.
+It can use only what the Mac running Nida has: pictures and clips are files on that Mac, and cameras, capture cards, NDI sources and calls need the device, the runtime and macOS's permission there. The spec also lists the web-page and depth-sensor routes, which the DMG has no engine for: a web page is refused with a message saying so (show the page with Desktop Capture instead).
 
 We tried it on a headless Nida. An agent made three named inputs (a camera's stand-in, slides and a logo overlay), switched on Main mode with Merge, and added a bus for the stage screen, a stream destination, HEVC recording and a rundown step. It saved the show, and the show opened again with all of it.
 
 The API has no password (see [Security](#security--network-trust-model)). Keep Nida on a network you trust, and give the agent a stream key only if you want it to set the stream up.
+
+### An agent beside a live show
+
+An agent can also help during an event — put up names, fix a break screen,
+watch the GPU — next to the operator. What keeps that safe:
+
+- **Look before touching.** `GET /api/state` says what is on air:
+  `stream.status.live` and `record.status.recording`, each bus's Program,
+  each input's `on_air`. Change nothing on air that the operator has not asked for, and
+  check the stream and the recording are stopped before quitting or
+  updating Nida.
+- **Measure read-only.** The frame rate is `fps` in the state, late frames
+  `pacing.late_frames`; where the Mac tells, `pacing.gpu_busy_pct` is the
+  whole GPU's use and `pacing.gpu_time` Nida's over the last second, by
+  part of the app and command buffer, in milliseconds a second. Sampling
+  them changes nothing.
+- **Undo is shared.** Edits sent over the API that can be undone go into
+  the same history as the operator's: his Undo can take back the agent's
+  change, and the agent's edit can push his last step further back. Live
+  commands — a cut, `LowerThirdShow`, `LowerThirdHide`, `LowerThirdStep` —
+  make no step. Say what was
+  changed. (A lower third's names list read from a file is never taken
+  away by an Undo.)
+- **Names and text** are made for this:
+  - a lower third: `{"LowerThirdShow": {"deck_uuid": …}}` (add `"row": N`),
+    `{"LowerThirdHide": {"deck_uuid": …}}`, `{"LowerThirdStep": {"deck_uuid":
+    …, "by": 1}}`, `{"ImportLowerThirdRows": {"deck_uuid": …, "path": …}}`
+    (a CSV the organiser keeps, read again whenever it is saved), and
+    `SetLowerThirdSettings` with `targets` — the bus UUIDs it shows on, each
+    in the part of the bus its LED screens show
+    ([Lower thirds](23-adding-inputs.md#lower-thirds));
+  - a text input: `{"SetTextSettings": {"deck_uuid": …, "settings": {…}}}`
+    — the whole settings, `text` edited live with no blank frame
+    ([Text](23-adding-inputs.md#text)).
+- **Kits and permissions** are the operator's: install a new build only
+  when he says so, with nothing on air; macOS asks him, not the agent, for
+  the camera, the microphone and screen recording.
 
 ## Headless Mode
 
@@ -553,11 +590,17 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `PUT` | `/api/audio-buses/{bus_uuid}/delay` |  |
 | `PUT` | `/api/audio-buses/{bus_uuid}/device` |  |
 | `PUT` | `/api/audio-buses/{bus_uuid}/gain` |  |
+| `PUT` | `/api/audio-buses/{bus_uuid}/insert` |  |
+| `PUT` | `/api/audio-buses/{bus_uuid}/insert/bypass` |  |
+| `POST` | `/api/audio-buses/{bus_uuid}/insert/window` |  |
+| `DELETE` | `/api/audio-buses/{bus_uuid}/insert/window` |  |
 | `PUT` | `/api/audio-buses/{bus_uuid}/limiter` | A bus's limiter, after its fader: no sample past its ceiling. |
+| `PUT` | `/api/audio-buses/{bus_uuid}/live` |  |
 | `POST` | `/api/audio-buses/{bus_uuid}/loudness/reset` | Start a bus's loudness readings again — integrated, short-term and |
 | `POST` | `/api/audio-buses/{bus_uuid}/meters/reset` | Reset a bus's held peak (its loudness readings stay). |
 | `PUT` | `/api/audio-buses/{bus_uuid}/mute` |  |
 | `PUT` | `/api/audio-buses/{bus_uuid}/name` |  |
+| `PUT` | `/api/audio-buses/{bus_uuid}/pre-fader` |  |
 | `POST` | `/api/audio-devices/rescan` |  |
 | `POST` | `/api/audio-inputs` |  |
 | `POST` | `/api/audio-inputs/app` | Take an app's sound — a Zoom or Teams call's — as a source, straight from |
@@ -568,9 +611,12 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `PUT` | `/api/audio-sources/{source_uuid}/auto` | Audio Auto: the source's sound switches on as it goes on air and off as |
 | `PUT` | `/api/audio-sources/{source_uuid}/balance` |  |
 | `PUT` | `/api/audio-sources/{source_uuid}/compressor` | A source's compressor, after its leveler. |
+| `PUT` | `/api/audio-sources/{source_uuid}/de-esser` | A source's de-esser: an "s" over its threshold turns the top down. |
 | `PUT` | `/api/audio-sources/{source_uuid}/delay` |  |
+| `PUT` | `/api/audio-sources/{source_uuid}/eq` | A source's EQ: a low shelf, two bells and a high shelf. |
 | `PUT` | `/api/audio-sources/{source_uuid}/follow` |  |
 | `PUT` | `/api/audio-sources/{source_uuid}/gain` |  |
+| `PUT` | `/api/audio-sources/{source_uuid}/gate` | A source's gate: the room turned down in a pause. |
 | `PUT` | `/api/audio-sources/{source_uuid}/leveler` | A source's leveler: each speaker brought slowly to the same loudness. |
 | `PUT` | `/api/audio-sources/{source_uuid}/low-cut` | A source's low cut: rumble and hum under a voice. |
 | `POST` | `/api/audio-sources/{source_uuid}/meters/reset` | Reset a source's held peak. |

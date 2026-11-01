@@ -300,10 +300,12 @@ impl Mixer {
                 // schedule says.
                 let watched = preview_channels.contains(&ch)
                     || self.channels[ch].tapped
-                    || self.main.shows(&super::MainSource::Deck(lane.deck_uuid.clone()))
                     || self
                         .main
-                        .shows(&super::MainSource::Channel(self.channels[ch].uuid().to_string()));
+                        .shows(&super::MainSource::Deck(lane.deck_uuid.clone()))
+                    || self.main.shows(&super::MainSource::Channel(
+                        self.channels[ch].uuid().to_string(),
+                    ));
                 self.channels[ch].decks[dk].source_demand = match transport {
                     Some(t) if !watched => self.opacity_demand(&key, t.position),
                     _ => crate::arrangement::SourceDemand::Unscheduled,
@@ -653,6 +655,83 @@ impl Mixer {
         let t_channels = std::time::Instant::now();
         let mut rendered_channels: u32 = 0;
         let mut per_ch_gpu_us: Vec<(String, u128)> = Vec::new();
+        // The channels needed for what is seen this frame: on air (not
+        // culled), or watched (cued, on a bus), and — down the taps — every
+        // channel one of those shows. A channel shown only in inputs that
+        // are not needed is drawn as a tile, like any off-air channel: an
+        // off-air Presentation showing a camera does not keep it drawn every
+        // frame. (A channel drawn for its tile does not draw what it shows:
+        // its tile shows their last picture.)
+        let count = self.channels.len();
+        // (A channel read the frame before — a feedback loop — is drawn
+        // every frame: its two pictures swap each frame.)
+        let mut needed: Vec<bool> = (0..count)
+            .map(|i| {
+                effective_opacities.get(i).copied().unwrap_or(0.0) >= 0.001
+                    || preview_channels.contains(&i)
+                    || self.tap_loops.contains(&i)
+            })
+            .collect();
+        let mut queue: Vec<usize> = (0..count).filter(|&i| needed[i]).collect();
+        while let Some(at) = queue.pop() {
+            for &shown in self.tap_shows.get(at).map_or(&[][..], Vec::as_slice) {
+                if shown < count && !needed[shown] {
+                    needed[shown] = true;
+                    queue.push(shown);
+                }
+            }
+        }
+        // Drawn for a tile this frame: each tile seen, on its turn, and —
+        // down the taps — what it shows, unless that was drawn within a
+        // tile's while (its last picture is as good for a tile), so a seen
+        // tile shows them as they are rather than frozen, and one shown in
+        // many tiles is not drawn on each one's turn.
+        let every = super::tile_every(target_fps);
+        let frame = self.frame_count;
+        let lately: Vec<bool> = self
+            .channels
+            .iter()
+            .map(|ch| {
+                self.drawn_on
+                    .get(ch.uuid())
+                    .is_some_and(|at| frame.wrapping_sub(*at) < every)
+            })
+            .collect();
+        // Channels removed since: let go.
+        if self.drawn_on.len() > count + 16 {
+            let current: std::collections::HashSet<String> =
+                self.channels.iter().map(|c| c.uuid().to_string()).collect();
+            self.drawn_on.retain(|uuid, _| current.contains(uuid));
+        }
+        let mut tile_now = vec![false; count];
+        if self.tile_previews {
+            let mut queue: Vec<usize> = self
+                .tile_channels
+                .iter()
+                .copied()
+                .filter(|&ch| {
+                    ch < count
+                        && !needed[ch]
+                        && self
+                            .frame_count
+                            .wrapping_add(u32::try_from(ch).unwrap_or(0))
+                            % every
+                            == 0
+                })
+                .collect();
+            for &ch in &queue {
+                tile_now[ch] = true;
+            }
+            while let Some(at) = queue.pop() {
+                for &shown in self.tap_shows.get(at).map_or(&[][..], Vec::as_slice) {
+                    if shown < count && !needed[shown] && !tile_now[shown] && !lately[shown] {
+                        tile_now[shown] = true;
+                        queue.push(shown);
+                    }
+                }
+            }
+        }
+        let bpm = audio_data.bpm.map(f64::from);
         // A channel shown in another renders first (see `prepare_taps`).
         for ch_idx in self.channel_render_order() {
             let channel = &mut self.channels[ch_idx];
@@ -663,18 +742,21 @@ impl Mixer {
             // visible deck reads its composite, so its own opacity says nothing
             // about whether it reaches the program. Culling it would show that
             // deck black. See spec/program-tap.md.
-            let spared = preview_channels.contains(&ch_idx) || channel.tapped;
+            let spared = needed[ch_idx];
             if culled && !spared {
                 // Shown only as a tile in the control window: drawn a few
-                // times a second, the channels taking turns so no frame
-                // carries them all.
+                // times a second while its tile is seen, the channels taking
+                // turns so no frame carries them all; a tile not seen, not
+                // at all — its time kept, so it catches up when seen.
                 if self.tile_previews {
-                    let every = (target_fps / super::TILE_FPS).max(1);
-                    let turn = u32::try_from(ch_idx).unwrap_or(0);
-                    if self.frame_count.wrapping_add(turn) % every != 0 {
+                    // Its decks' timed sequences kept on time every frame,
+                    // drawn or not (time saved up is not one step of one).
+                    channel.tick_auto_transitions(f64::from(dt), bpm);
+                    if !tile_now[ch_idx] {
                         channel.dt_owed += dt;
                         continue;
                     }
+                    channel.transitions_ticked = true;
                 } else {
                     // Reset stats so culled channels don't show stale render metrics
                     channel.render_time_ms = 0.0;
@@ -682,6 +764,14 @@ impl Mixer {
                     channel.dt_owed = 0.0;
                     continue;
                 }
+            }
+            self.drawn_on.insert(channel.uuid().to_string(), frame);
+            // Its timed sequences stepped by this frame's time alone — never
+            // the time saved up while it was drawn only now and then, which
+            // would jump them (ticked already above for a tile).
+            if !channel.transitions_ticked {
+                channel.tick_auto_transitions(f64::from(dt), bpm);
+                channel.transitions_ticked = true;
             }
             let channel_dt = dt + std::mem::take(&mut channel.dt_owed);
             if let Err(e) = channel.render(
@@ -1233,9 +1323,9 @@ impl Mixer {
         let in_transition = |idx: usize| {
             transition_drawn
                 && self.main.fade.as_ref().is_some_and(|fade| {
-                    [&fade.from, &self.main.program]
-                        .into_iter()
-                        .any(|s| matches!(s, MainSource::Channel(u) if u == self.channels[idx].uuid()))
+                    [&fade.from, &self.main.program].into_iter().any(
+                        |s| matches!(s, MainSource::Channel(u) if u == self.channels[idx].uuid()),
+                    )
                 })
         };
         for (idx, ch) in self.channels.iter().enumerate() {

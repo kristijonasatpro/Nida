@@ -671,17 +671,57 @@ pub(super) fn render_take_column(
                     egui::Button::new(egui::RichText::new(text).small())
                         .min_size(egui::vec2(40.0, 20.0))
                 };
+                if on_air {
+                    // Sent here, it took the place of what the bus showed,
+                    // which waits on Preview: Back puts that back.
+                    let back = bus.preview != *input;
+                    let before = input_label(&bus.preview, bus.preview_resolved, bus, data);
+                    let hover = |verb: &str| {
+                        if back {
+                            format!(
+                                "{verb} {before} on {} — what it showed before (waiting on its Preview)",
+                                bus.name
+                            )
+                        } else {
+                            format!("Nothing else on {}'s Preview to go back to", bus.name)
+                        }
+                    };
+                    if ui
+                        .add_enabled(back, button("Back"))
+                        .on_hover_text(hover("Put back"))
+                        .clicked()
+                    {
+                        actions.commands.push(EngineCommand::BusCut {
+                            uuid: bus.uuid.clone(),
+                        });
+                    }
+                    if ui
+                        .add_enabled(back && bus.transition.is_none(), button("Fade back"))
+                        .on_hover_text(hover("Fade back to"))
+                        .clicked()
+                    {
+                        actions.commands.push(EngineCommand::BusAuto {
+                            uuid: bus.uuid.clone(),
+                            duration_secs: None,
+                        });
+                    }
+                    ui.end_row();
+                    continue;
+                }
                 if ui
-                    .add_enabled(!on_air, button("Cut"))
-                    .on_hover_text(format!("Put it on {} now", bus.name))
+                    .add(button("Cut"))
+                    .on_hover_text(format!(
+                        "Put it on {} now, in place of what it shows (that waits on Preview; Back puts it back)",
+                        bus.name
+                    ))
                     .clicked()
                 {
                     take(actions, &bus.uuid, input, true);
                 }
                 if ui
-                    .add_enabled(!on_air && bus.transition.is_none(), button("Fade"))
+                    .add_enabled(bus.transition.is_none(), button("Fade"))
                     .on_hover_text(format!(
-                        "Fade {} to it over {}",
+                        "Fade {} to it over {}, in place of what it shows",
                         bus.name,
                         seconds(bus.auto_duration)
                     ))
@@ -1026,6 +1066,40 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// An input sent to a bus: its row there offers Back — a cut, or a
+    /// fade, to what the bus showed before, waiting on Preview.
+    #[test]
+    fn an_input_on_a_bus_can_be_taken_back_off_it() {
+        let mut data = UIData::test_fixture();
+        let input = BusInputRef::Channel("cb000001".into());
+        data.buses[0].bus.program = input.clone();
+        data.buses[0].bus.preview = BusInputRef::Master;
+        data.buses[0].bus.transition = None;
+        for (label, cut) in [("Back", true), ("Fade back", false)] {
+            let mut actions = UIActions::new();
+            {
+                let mut harness = egui_kittest::Harness::builder()
+                    .with_size(egui::vec2(300.0, 300.0))
+                    .build_ui(|ui| render_take_column(ui, &input, &data, &mut actions));
+                harness.get_by_label(label).click();
+                harness.run_steps(2);
+            }
+            let taken = match actions.commands.as_slice() {
+                [EngineCommand::BusCut { uuid }] if cut => uuid.clone(),
+                [EngineCommand::BusAuto { uuid, .. }] if !cut => uuid.clone(),
+                other => panic!("{label}: {other:?}"),
+            };
+            assert_eq!(taken, data.buses[0].bus.uuid, "{label}");
+        }
+        // Nothing else on Preview: nothing to go back to.
+        data.buses[0].bus.preview = input.clone();
+        let mut actions = UIActions::new();
+        let harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(300.0, 300.0))
+            .build_ui(|ui| render_take_column(ui, &input, &data, &mut actions));
+        assert!(harness.get_by_label("Back").accesskit_node().is_disabled());
     }
 
     #[test]

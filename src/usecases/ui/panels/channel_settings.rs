@@ -304,6 +304,8 @@ pub(super) fn render_channel_settings(
         ctx.memory_mut(|m| m.data.remove::<Open>(open_id()));
         return;
     };
+    // Its picture shown big: drawn at the show's rate, not a tile's.
+    actions.session.shown_full.push(ch.uuid.clone());
     // Keep what is stored in step with what is found.
     open.channel.clone_from(&ch.uuid);
     if layer.is_none() {
@@ -740,6 +742,7 @@ fn render_layer_row(
                 ui.separator();
             }
             super::deck_detail::framing_menu_items(ui, deck, actions);
+            super::deck_detail::reset_menu_item(ui, deck, actions);
             ui.separator();
             let subject = super::clipboard_menu::Subject::deck(&deck.uuid, &deck.name);
             super::clipboard_menu::items(ui, data, actions, &subject);
@@ -1755,6 +1758,19 @@ mod tests {
         current(ctx).map(|o| (o.channel, o.item))
     }
 
+    /// An open window says its channel is shown big — drawn at the show's
+    /// rate, even when the selection has gone elsewhere; a closed one, none.
+    #[test]
+    fn an_open_window_has_its_channel_drawn_at_the_shows_rate() {
+        let mut data = UIData::test_fixture();
+        let ctx = egui::Context::default();
+        assert!(frame(&ctx, &data).session.shown_full.is_empty(), "closed");
+        open_channel(&ctx, &data.channels[1]);
+        data.selected_channel = Some(0);
+        let shown = frame(&ctx, &data).session.shown_full;
+        assert_eq!(shown, vec![data.channels[1].uuid.clone()]);
+    }
+
     #[test]
     fn a_channel_of_several_layers_opens_on_the_channel() {
         let data = UIData::test_fixture();
@@ -2226,6 +2242,7 @@ mod tests {
             value: crate::params::ParamValue::Float(v),
             min: None,
             max: None,
+            choices: None,
         };
         (
             uuid.into(),
@@ -2253,6 +2270,7 @@ mod tests {
             value,
             min: Some(0.0),
             max: Some(1.0),
+            choices: None,
         };
         (
             uuid.into(),
@@ -2482,6 +2500,7 @@ mod tests {
                     value: ParamValue::Float(0.0),
                     min: Some(0.0),
                     max: Some(2.0),
+                    choices: None,
                 }],
             },
         ));
@@ -2517,6 +2536,7 @@ mod tests {
                 value: ParamValue::Float(0.0),
                 min: Some(0.0),
                 max: Some(3.0),
+                choices: None,
             });
         let mut harness = layer_harness(data);
         harness.get_by_label("Source").click();

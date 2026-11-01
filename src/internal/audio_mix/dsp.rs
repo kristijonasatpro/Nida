@@ -18,6 +18,11 @@
 //! click. FFmpeg's filters, tried first (pull request #11), allocate per frame
 //! and could fail mid-show; these are a few hundred lines of arithmetic with
 //! tests that drive them sample by sample.
+//!
+//! The mixer hands them 10 ms blocks; a live bus's callback, 1.3 ms ones. A
+//! glide or a measurement counts samples, not calls ([`Glide`], the
+//! leveler's 10 ms windows), so both sound alike: a bypass glided over one
+//! 1.3 ms callback is a click.
 
 use super::reader::{db_to_gain, Frame};
 use super::{BLOCK_FRAMES, SAMPLE_RATE};
@@ -59,6 +64,67 @@ fn clean(sample: f32) -> f64 {
     }
 }
 
+/// How long a change of setting, or a bypass, glides: 10 ms, a mixer's
+/// block, however the sound comes cut.
+const GLIDE_FRAMES: usize = BLOCK_FRAMES;
+
+/// A value gliding in a straight line to a new one over [`GLIDE_FRAMES`]
+/// samples, from wherever it was when the new one came — the same fed in
+/// 10 ms blocks or 1.3 ms ones.
+#[derive(Debug, Clone, Copy)]
+struct Glide {
+    from: f64,
+    to: f64,
+    /// Samples into the glide; [`GLIDE_FRAMES`] once there.
+    done: usize,
+}
+
+impl Default for Glide {
+    fn default() -> Self {
+        Self::at(0.0)
+    }
+}
+
+// A setting is compared as given: any change, however small, glides anew,
+// and a glide rests exactly where it was sent.
+#[allow(clippy::float_cmp)]
+impl Glide {
+    const fn at(value: f64) -> Self {
+        Self {
+            from: value,
+            to: value,
+            done: GLIDE_FRAMES,
+        }
+    }
+
+    /// The value now.
+    fn now(&self) -> f64 {
+        if self.done >= GLIDE_FRAMES {
+            self.to
+        } else {
+            self.from + (self.to - self.from) * (self.done as f64 / GLIDE_FRAMES as f64)
+        }
+    }
+
+    /// Whether it rests at `value`: there, not gliding.
+    fn rests_at(&self, value: f64) -> bool {
+        self.done >= GLIDE_FRAMES && self.to == value
+    }
+
+    /// The value for the next sample, on its way to `to`.
+    fn next(&mut self, to: f64) -> f64 {
+        if to != self.to {
+            self.from = self.now();
+            self.to = to;
+            self.done = 0;
+        }
+        if self.done < GLIDE_FRAMES {
+            self.done += 1;
+        }
+        self.now()
+    }
+}
+
 /// Check each `(value, min, max)` is a finite number in its range.
 fn in_ranges(checks: &[(f32, f32, f32)], what: &'static str) -> Result<(), &'static str> {
     for &(value, min, max) in checks {
@@ -85,7 +151,7 @@ macro_rules! sanitized {
         }
     )*};
 }
-sanitized!(LowCutConfig, LevelerConfig, CompressorConfig, LimiterConfig);
+sanitized!(LowCutConfig, GateConfig, LevelerConfig, CompressorConfig, LimiterConfig, DeEsserConfig);
 
 // ── Filters ─────────────────────────────────────────────────────────────
 
@@ -179,6 +245,13 @@ impl Svf {
     /// The high-pass output for `v0`, tuned by `g` = tan(π·hz/rate) and
     /// damped by `k` = 1/Q.
     fn highpass(&mut self, channel: usize, v0: f64, g: f64, k: f64) -> f64 {
+        let (v1, v2) = self.run(channel, v0, g, k);
+        v0 - k * v1 - v2
+    }
+
+    /// One sample through: its band-pass (`v1`) and low-pass (`v2`)
+    /// outputs, which a high-pass, a bell or a shelf mixes with the input.
+    fn run(&mut self, channel: usize, v0: f64, g: f64, k: f64) -> (f64, f64) {
         let a1 = 1.0 / (1.0 + g * (g + k));
         let a2 = g * a1;
         let a3 = g * a2;
@@ -192,7 +265,7 @@ impl Svf {
                 *z = 0.0;
             }
         }
-        v0 - k * v1 - v2
+        (v1, v2)
     }
 }
 
@@ -214,9 +287,9 @@ pub struct LowCut {
     k: [f64; 2],
     /// How much of the second stage is heard, 0–1: all of it at 24 dB an
     /// octave, none at 12. It runs either way, so a change of slope fades.
-    second: f64,
-    /// How much of the filtered sound is heard, 0–1, ramping between blocks.
-    mix: f64,
+    second: Glide,
+    /// How much of the filtered sound is heard, 0–1.
+    mix: Glide,
 }
 
 impl Default for LowCut {
@@ -228,8 +301,8 @@ impl Default for LowCut {
             stages: [Svf::default(); 2],
             g,
             k,
-            second,
-            mix: 0.0,
+            second: Glide::at(second),
+            mix: Glide::at(0.0),
         }
     }
 }
@@ -262,15 +335,12 @@ impl LowCut {
         let (g_to, k_to, second_to) = Self::tuning(self.config);
         let glide = 1.0 - coefficient(LOW_CUT_GLIDE_SECS, 1.0 / RATE);
         let target = if self.config.enabled { 1.0 } else { 0.0 };
-        let n = block.len().max(1) as f64;
-        let (mix_from, second_from) = (self.mix, self.second);
-        for (i, frame) in block.iter_mut().enumerate() {
-            let along = (i + 1) as f64 / n;
+        for frame in block.iter_mut() {
             self.g += (g_to - self.g) * glide;
             self.k[0] += (k_to[0] - self.k[0]) * glide;
             self.k[1] += (k_to[1] - self.k[1]) * glide;
-            let second = second_from + (second_to - second_from) * along;
-            let mix = mix_from + (target - mix_from) * along;
+            let second = self.second.next(second_to);
+            let mix = self.mix.next(target);
             for (channel, sample) in frame.iter_mut().enumerate() {
                 let dry = clean(*sample);
                 let one = self.stages[0].highpass(channel, dry, self.g, self.k[0]);
@@ -281,8 +351,651 @@ impl LowCut {
                 }
             }
         }
-        self.mix = target;
-        self.second = second_to;
+    }
+}
+
+// ── Gate ────────────────────────────────────────────────────────────────
+
+/// A source's gate: in a pause it turns the room down — the hum, the
+/// shuffle, the other speakers' spill — and opens the moment the voice
+/// comes back. A range gate, not a hard one: closed, the sound is only
+/// `range_db` down, so a voice's soft tail is turned down, not cut off.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(default)]
+pub struct GateConfig {
+    pub enabled: bool,
+    /// It opens when the sound comes over this, dBFS, −80 to −10; it closes
+    /// once it has stayed 3 dB under it for the hold.
+    pub threshold_db: f32,
+    /// How far down it turns the sound while closed, 0–30 dB.
+    pub range_db: f32,
+    /// How quickly it opens, 0.1–50 ms: a time constant, in dB.
+    pub attack_ms: f32,
+    /// How long it stays open after the sound fell under it, 0–500 ms.
+    pub hold_ms: f32,
+    /// How slowly it closes, 10–2000 ms: a time constant, in dB — two thirds
+    /// of the way down in it, about 95% in three.
+    pub release_ms: f32,
+}
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold_db: -50.0,
+            range_db: 15.0,
+            // Quick: with no look-ahead (no delay), a word's first
+            // millisecond is turned down by what the gain has not yet caught.
+            attack_ms: 0.5,
+            hold_ms: 120.0,
+            release_ms: 250.0,
+        }
+    }
+}
+
+impl GateConfig {
+    /// # Errors
+    /// Returns an error for a value that is not finite or out of its range.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        in_ranges(
+            &[
+                (self.threshold_db, -80.0, -10.0),
+                (self.range_db, 0.0, 30.0),
+                (self.attack_ms, 0.1, 50.0),
+                (self.hold_ms, 0.0, 500.0),
+                (self.release_ms, 10.0, 2000.0),
+            ],
+            "Gate: threshold −80–−10 dBFS, range 0–30 dB, attack 0.1–50 ms, hold 0–500 ms, release 10–2000 ms",
+        )
+    }
+}
+
+/// How far under its threshold the sound must fall before a gate starts
+/// to close: a voice hovering at the threshold does not chatter.
+const GATE_HYSTERESIS_DB: f32 = 3.0;
+
+/// How quickly a gate's key falls back after a peak: its detector follows
+/// the waveform's peaks, not each zero crossing.
+const GATE_KEY_DECAY_SECS: f64 = 0.008;
+
+#[derive(Debug, Clone)]
+pub struct Gate {
+    config: GateConfig,
+    /// The key's peak envelope, linear.
+    key: f64,
+    open: bool,
+    /// Samples it stays open yet, the key under its closing level.
+    hold_left: u64,
+    /// Its gain now, dB: 0 open, minus its range closed. Followed in dB, so
+    /// its release turns a pause down as far in its time whatever the range
+    /// (followed in linear gain, 30 dB took seconds to reach).
+    gain_db: f64,
+    /// The floor, dB, gliding over 10 ms to a new range: moved at once, a
+    /// closed gate's gain followed it at the attack's speed (0.1 ms at the
+    /// quickest) — a click.
+    floor_db: Glide,
+    /// How much of the gated sound is heard, 0–1.
+    mix: Glide,
+    /// The deepest gain heard in the last call.
+    deepest: f64,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self {
+            config: GateConfig::default(),
+            key: 0.0,
+            open: false,
+            hold_left: 0,
+            gain_db: 0.0,
+            floor_db: Glide::at(-f64::from(GateConfig::default().range_db)),
+            mix: Glide::at(0.0),
+            deepest: 1.0,
+        }
+    }
+}
+
+impl Gate {
+    pub fn configure(&mut self, config: GateConfig) {
+        self.config = config;
+    }
+
+    /// How far down it turns the sound now, dB (≥ 0).
+    pub fn reduction_db(&self) -> f32 {
+        -(to_db(self.deepest, false) as f32)
+    }
+
+    /// The mixer stalled: what it was keyed by is long gone. Open, so the
+    /// first word after is not cut.
+    pub fn clear(&mut self) {
+        self.key = 0.0;
+        self.open = false;
+        self.hold_left = 0;
+        self.gain_db = 0.0;
+    }
+
+    /// Gate `block` in place, keyed by `block` itself as it comes (its
+    /// input: after the low cut, before anything after it).
+    pub fn process(&mut self, block: &mut [Frame]) {
+        let c = self.config;
+        let target_mix = if c.enabled { 1.0 } else { 0.0 };
+        let floor_to = -f64::from(c.range_db);
+        let opens = f64::from(db_to_gain(c.threshold_db));
+        let closes = f64::from(db_to_gain(c.threshold_db - GATE_HYSTERESIS_DB));
+        let decay = coefficient(GATE_KEY_DECAY_SECS, 1.0 / RATE);
+        let attack = coefficient(f64::from(c.attack_ms) / 1000.0, 1.0 / RATE);
+        let release = coefficient(f64::from(c.release_ms) / 1000.0, 1.0 / RATE);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // ≤ 24 000.
+        let hold = (f64::from(c.hold_ms) / 1000.0 * RATE).round() as u64;
+        let mut deepest = 1.0_f64;
+        for frame in block.iter_mut() {
+            let peak = clean(frame[0]).abs().max(clean(frame[1]).abs());
+            self.key = peak.max(self.key * decay);
+            if self.key < 1e-30 {
+                self.key = 0.0;
+            }
+            if self.key >= opens {
+                self.open = true;
+                self.hold_left = hold;
+            } else if self.open && self.key >= closes {
+                self.hold_left = hold;
+            } else if self.open {
+                if self.hold_left == 0 {
+                    self.open = false;
+                } else {
+                    self.hold_left -= 1;
+                }
+            }
+            let floor = self.floor_db.next(floor_to);
+            let target = if self.open { 0.0 } else { floor };
+            let k = if target > self.gain_db { attack } else { release };
+            self.gain_db = self.gain_db * k + target * (1.0 - k);
+            if self.gain_db.abs() < 1e-9 {
+                self.gain_db = 0.0;
+            }
+            let gain = if self.gain_db == 0.0 { 1.0 } else { 10f64.powf(self.gain_db / 20.0) };
+            let mix = self.mix.next(target_mix);
+            let g = 1.0 + (gain - 1.0) * mix;
+            deepest = deepest.min(g);
+            if mix > 0.0 {
+                for sample in frame.iter_mut() {
+                    *sample = (clean(*sample) * g) as f32;
+                }
+            }
+        }
+        self.deepest = deepest;
+    }
+}
+
+// ── EQ ──────────────────────────────────────────────────────────────────
+
+/// One band of a source's EQ.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(default)]
+pub struct EqBandConfig {
+    pub enabled: bool,
+    /// Its frequency, 20–20 000 Hz: a bell's middle, a shelf's turn.
+    pub hz: f32,
+    /// How far up or down, −18 to 18 dB.
+    pub gain_db: f32,
+    /// A bell's width, 0.3 (wide) to 10 (narrow); a shelf's is fixed.
+    pub q: f32,
+}
+
+impl Default for EqBandConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hz: 1_000.0,
+            gain_db: 0.0,
+            q: 1.0,
+        }
+    }
+}
+
+impl EqBandConfig {
+    /// # Errors
+    /// Returns an error for a value that is not finite or out of its range.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        in_ranges(
+            &[
+                (self.hz, 20.0, 20_000.0),
+                (self.gain_db, -18.0, 18.0),
+                (self.q, 0.3, 10.0),
+            ],
+            "EQ band: 20–20 000 Hz, −18–18 dB, Q 0.3–10",
+        )
+    }
+}
+
+/// A source's EQ: a low shelf, two bells and a high shelf, in that order.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(default)]
+pub struct EqConfig {
+    pub enabled: bool,
+    pub bands: [EqBandConfig; 4],
+}
+
+impl Default for EqConfig {
+    fn default() -> Self {
+        let band = |hz, q| EqBandConfig {
+            hz,
+            q,
+            ..EqBandConfig::default()
+        };
+        Self {
+            enabled: false,
+            bands: [
+                band(150.0, SHELF_Q as f32),
+                band(350.0, 1.0),
+                band(3_000.0, 1.0),
+                band(8_000.0, SHELF_Q as f32),
+            ],
+        }
+    }
+}
+
+impl EqConfig {
+    /// # Errors
+    /// Returns an error for a band out of its range.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.bands.iter().try_for_each(EqBandConfig::validate)
+    }
+
+    /// A saved or sent setting with a band out of range: that band as new,
+    /// the others kept.
+    #[must_use]
+    pub fn sanitized(self) -> Self {
+        let fresh = Self::default();
+        let mut bands = self.bands;
+        for (band, new) in bands.iter_mut().zip(fresh.bands) {
+            if band.validate().is_err() {
+                *band = EqBandConfig { hz: new.hz, q: new.q, ..EqBandConfig::default() };
+            }
+        }
+        Self { bands, ..self }
+    }
+}
+
+/// A shelf's damping: Butterworth, a slope of 1.
+const SHELF_Q: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
+/// How quickly an EQ band's tuning glides to a new setting: 10 ms, as the
+/// low cut's.
+const EQ_GLIDE_SECS: f64 = 0.01;
+
+/// A band's tuning: the state-variable filter's g and k, and how its
+/// outputs mix (Andy Simper's bell and shelves).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BandTuning {
+    g: f64,
+    k: f64,
+    m: [f64; 3],
+}
+
+impl BandTuning {
+    /// Passes the sound as it is.
+    const FLAT: Self = Self { g: 0.1, k: 1.0, m: [1.0, 0.0, 0.0] };
+
+    /// The tuning for band `index` (0 low shelf, 1–2 bells, 3 high shelf).
+    fn of(index: usize, band: EqBandConfig) -> Self {
+        let hz = f64::from(band.hz.clamp(20.0, 20_000.0)).min(RATE * 0.45);
+        let a = 10f64.powf(f64::from(band.gain_db.clamp(-18.0, 18.0)) / 40.0);
+        let t = (std::f64::consts::PI * hz / RATE).tan();
+        match index {
+            0 => Self { g: t / a.sqrt(), k: 1.0 / SHELF_Q, m: [1.0, (a - 1.0) / SHELF_Q, a * a - 1.0] },
+            3 => Self {
+                g: t * a.sqrt(),
+                k: 1.0 / SHELF_Q,
+                m: [a * a, (1.0 - a) * a / SHELF_Q, 1.0 - a * a],
+            },
+            _ => {
+                let q = f64::from(band.q.clamp(0.3, 10.0));
+                Self { g: t, k: 1.0 / (q * a), m: [1.0, (a * a - 1.0) / (q * a), 0.0] }
+            }
+        }
+    }
+
+    fn glide_to(&mut self, to: &Self, by: f64) {
+        self.g += (to.g - self.g) * by;
+        self.k += (to.k - self.k) * by;
+        for (m, t) in self.m.iter_mut().zip(to.m) {
+            *m += (t - *m) * by;
+        }
+        // Landed: exactly, so a flat band passes the sound bit for bit.
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        if close(self.g, to.g) && close(self.k, to.k) && self.m.iter().zip(to.m).all(|(a, b)| close(*a, b)) {
+            *self = *to;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Eq {
+    config: EqConfig,
+    /// What each band glides to, worked out when the settings change.
+    targets: [BandTuning; 4],
+    /// Each band's tuning now.
+    now: [BandTuning; 4],
+    stages: [Svf; 4],
+}
+
+impl Default for Eq {
+    fn default() -> Self {
+        Self {
+            config: EqConfig::default(),
+            targets: [BandTuning::FLAT; 4],
+            now: [BandTuning::FLAT; 4],
+            stages: [Svf::default(); 4],
+        }
+    }
+}
+
+impl Eq {
+    pub fn configure(&mut self, config: EqConfig) {
+        if config == self.config {
+            return;
+        }
+        self.config = config;
+        for (i, (target, band)) in self.targets.iter_mut().zip(config.bands).enumerate() {
+            // Off, or the whole EQ off: flat, gliding there — the filter runs
+            // on, so it is warm when switched back.
+            let heard = config.enabled && band.enabled;
+            *target = BandTuning::of(i, EqBandConfig { gain_db: if heard { band.gain_db } else { 0.0 }, ..band });
+        }
+    }
+
+    /// The mixer stalled: what the filters held is stale.
+    pub fn clear(&mut self) {
+        self.stages = [Svf::default(); 4];
+    }
+
+    pub fn process(&mut self, block: &mut [Frame]) {
+        // Flat (off, or every band at 0 dB): the sound passes as it is,
+        // whatever the filters hold. Settled there, nothing is worked out;
+        // leaving it, the filters start afresh — kept, a band switched back
+        // on rang with what it heard before — and so the same however the
+        // sound comes cut, flatness falling on the same sample.
+        if self.now.iter().all(|t| t.m == BandTuning::FLAT.m) {
+            if self.now == self.targets {
+                return;
+            }
+            self.stages = [Svf::default(); 4];
+        }
+        let by = 1.0 - coefficient(EQ_GLIDE_SECS, 1.0 / RATE);
+        for frame in block.iter_mut() {
+            for (band, now) in self.now.iter_mut().enumerate() {
+                now.glide_to(&self.targets[band], by);
+                let t = *now;
+                for (channel, sample) in frame.iter_mut().enumerate() {
+                    let v0 = clean(*sample);
+                    let (v1, v2) = self.stages[band].run(channel, v0, t.g, t.k);
+                    *sample = (t.m[0] * v0 + t.m[1] * v1 + t.m[2] * v2) as f32;
+                }
+            }
+        }
+    }
+}
+
+// ── De-esser ────────────────────────────────────────────────────────────
+
+/// A source's de-esser: an "s" over its threshold turns the top down.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(default)]
+pub struct DeEsserConfig {
+    pub enabled: bool,
+    /// Where it listens, 3000–10 000 Hz. The shelf it turns down is
+    /// halfway down half an octave under this: an "s" here loses about 80%
+    /// of the reduction, everything above all of it, the voice's presence
+    /// (an octave under) under a fifth.
+    pub hz: f32,
+    /// It acts once the band around its frequency comes over this, dBFS,
+    /// −60 to 0 (4:1 over it, eased in over 6 dB).
+    pub threshold_db: f32,
+    /// How far down it turns the top at most, 0–20 dB.
+    pub range_db: f32,
+}
+
+impl Default for DeEsserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hz: 6_500.0,
+            threshold_db: -30.0,
+            range_db: 8.0,
+        }
+    }
+}
+
+impl DeEsserConfig {
+    /// # Errors
+    /// Returns an error for a value that is not finite or out of its range.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        in_ranges(
+            &[
+                (self.hz, 3_000.0, 10_000.0),
+                (self.threshold_db, -60.0, 0.0),
+                (self.range_db, 0.0, 20.0),
+            ],
+            "De-esser: 3000–10 000 Hz, threshold −60–0 dBFS, range 0–20 dB",
+        )
+    }
+}
+
+/// Its detector's width: about an octave and a half around its frequency.
+const DE_ESSER_Q: f64 = 1.5;
+/// Over its threshold, the band rises a quarter as much.
+const DE_ESSER_RATIO: f64 = 4.0;
+/// Eased in over 6 dB around its threshold.
+const DE_ESSER_KNEE_DB: f64 = 6.0;
+/// It catches an "s" in about a millisecond…
+const DE_ESSER_ATTACK_SECS: f64 = 0.001;
+/// …and lets go over 60 ms (in dB), before the next vowel is dulled.
+const DE_ESSER_RELEASE_SECS: f64 = 0.06;
+/// Its detector's peak envelope falls back over 3 ms: it follows an "s",
+/// not each of its cycles.
+const DE_ESSER_KEY_DECAY_SECS: f64 = 0.003;
+
+/// Started afresh, its detector runs 2 ms before it may act: a band-pass
+/// starting from silence rings at its frequency for its first millisecond,
+/// and near the threshold that turned the top down for a release (Max5: up
+/// to 2.3 dB at 10 kHz, switched on mid-sound).
+const DE_ESSER_SETTLE_FRAMES: usize = 96;
+
+/// Its meters hold their peak a second, to be read and set by: an "s" is
+/// over in a tenth of that.
+const DE_ESSER_METER_HOLD_FRAMES: usize = 48_000;
+
+#[derive(Debug, Clone)]
+pub struct DeEsser {
+    config: DeEsserConfig,
+    /// Listens: a band-pass around its frequency, unity at the middle.
+    detector: Svf,
+    /// Turns the top down: a high shelf half an octave under its frequency.
+    shelf: Svf,
+    /// tan(π·f/rate) for the detector and the shelf, gliding to a new
+    /// frequency over 10 ms.
+    t: Glide,
+    shelf_t: Glide,
+    /// The band's peak envelope, linear.
+    key: f64,
+    /// How far down it turns the top now, dB (≥ 0).
+    reduction_db: f64,
+    /// How much of the de-essed sound is heard, 0–1.
+    mix: Glide,
+    /// Frames its detector runs yet before it may act (see
+    /// [`DE_ESSER_SETTLE_FRAMES`]); and whether it is waking — switched on —
+    /// so its bypass fades in after the settling too, as it would have
+    /// without it.
+    settle_left: usize,
+    waking: bool,
+    /// The deepest reduction, dB, and the band's loudest, linear — what to
+    /// set the threshold by — each held a second (see
+    /// [`DE_ESSER_METER_HOLD_FRAMES`]), and how long held.
+    deepest_db: f64,
+    deepest_for: usize,
+    loudest: f64,
+    loudest_for: usize,
+}
+
+impl Default for DeEsser {
+    fn default() -> Self {
+        let config = DeEsserConfig::default();
+        Self {
+            config,
+            detector: Svf::default(),
+            shelf: Svf::default(),
+            t: Glide::at(tan_of(config.hz)),
+            shelf_t: Glide::at(tan_of(shelf_hz(config.hz))),
+            key: 0.0,
+            reduction_db: 0.0,
+            mix: Glide::at(0.0),
+            settle_left: 0,
+            waking: false,
+            deepest_db: 0.0,
+            deepest_for: 0,
+            loudest: 0.0,
+            loudest_for: 0,
+        }
+    }
+}
+
+/// A meter's `held` value: `now` if higher, or once held a second.
+fn hold(held: &mut f64, held_for: &mut usize, now: f64, frames: usize) {
+    *held_for += frames;
+    if now >= *held || *held_for >= DE_ESSER_METER_HOLD_FRAMES {
+        *held = now;
+        *held_for = 0;
+    }
+}
+
+/// Where a de-esser listening at `hz` has its shelf halfway down.
+fn shelf_hz(hz: f32) -> f32 {
+    hz * std::f32::consts::FRAC_1_SQRT_2
+}
+
+/// tan(π·hz/rate), the filters' tuning for `hz` (kept under 0.45 of the rate).
+fn tan_of(hz: f32) -> f64 {
+    (std::f64::consts::PI * f64::from(hz.clamp(20.0, 20_000.0)).min(RATE * 0.45) / RATE).tan()
+}
+
+impl DeEsser {
+    pub fn configure(&mut self, config: DeEsserConfig) {
+        self.config = config;
+    }
+
+    /// How far down it turns the top now, dB (≥ 0).
+    pub fn reduction_db(&self) -> f32 {
+        self.deepest_db as f32
+    }
+
+    /// How loud the band it listens to was, dBFS.
+    pub fn band_db(&self) -> f32 {
+        to_db(self.loudest, false) as f32
+    }
+
+    /// The mixer stalled: what it heard is long gone. Its detector settles
+    /// again before it acts.
+    pub fn clear(&mut self) {
+        self.detector = Svf::default();
+        self.shelf = Svf::default();
+        self.key = 0.0;
+        self.reduction_db = 0.0;
+        self.settle_left = DE_ESSER_SETTLE_FRAMES;
+    }
+
+    /// How far it would turn the top down for the band at `key`, dB.
+    fn wanted_db(&self, key: f64) -> f64 {
+        let half = DE_ESSER_KNEE_DB / 2.0;
+        let threshold = f64::from(self.config.threshold_db);
+        // Under the knee: nothing, and no logarithm worked out.
+        if key < 10f64.powf((threshold - half) / 20.0) {
+            return 0.0;
+        }
+        let over = to_db(key, false) - threshold;
+        let slope = 1.0 - 1.0 / DE_ESSER_RATIO;
+        let cut = if over >= half {
+            over * slope
+        } else {
+            (over + half).powi(2) / (2.0 * DE_ESSER_KNEE_DB) * slope
+        };
+        cut.min(f64::from(self.config.range_db))
+    }
+
+    pub fn process(&mut self, block: &mut [Frame]) {
+        let config = self.config;
+        let target_mix = if config.enabled { 1.0 } else { 0.0 };
+        let t_to = tan_of(config.hz);
+        let shelf_to = tan_of(shelf_hz(config.hz));
+        // Bypassed and settled: off, it rests; on, it starts afresh — the
+        // same however the sound comes cut, its bypass settling on the same
+        // sample.
+        if self.mix.rests_at(0.0) && !self.waking {
+            if !config.enabled {
+                self.deepest_db = 0.0;
+                self.loudest = 0.0;
+                self.deepest_for = 0;
+                self.loudest_for = 0;
+                return;
+            }
+            self.clear();
+            self.waking = true;
+            self.t = Glide::at(t_to);
+            self.shelf_t = Glide::at(shelf_to);
+        }
+        let decay = coefficient(DE_ESSER_KEY_DECAY_SECS, 1.0 / RATE);
+        let attack = coefficient(DE_ESSER_ATTACK_SECS, 1.0 / RATE);
+        let release = coefficient(DE_ESSER_RELEASE_SECS, 1.0 / RATE);
+        let kd = 1.0 / DE_ESSER_Q;
+        let ks = 1.0 / SHELF_Q;
+        let mut deepest = 0.0_f64;
+        let mut loudest = 0.0_f64;
+        for frame in block.iter_mut() {
+            let listen = self.t.next(t_to);
+            let turn = self.shelf_t.next(shelf_to);
+            let dry = [clean(frame[0]), clean(frame[1])];
+            let mut peak = 0.0_f64;
+            for (channel, v0) in dry.iter().enumerate() {
+                let (v1, _) = self.detector.run(channel, *v0, listen, kd);
+                peak = peak.max((kd * v1).abs());
+            }
+            if self.settle_left > 0 {
+                self.settle_left -= 1;
+            } else {
+                self.key = peak.max(self.key * decay);
+                self.waking = false;
+            }
+            if self.key < 1e-30 {
+                self.key = 0.0;
+            }
+            loudest = loudest.max(self.key);
+            let wanted = self.wanted_db(self.key);
+            let follow = if wanted > self.reduction_db { attack } else { release };
+            self.reduction_db = self.reduction_db * follow + wanted * (1.0 - follow);
+            if self.reduction_db < 1e-9 {
+                self.reduction_db = 0.0;
+            }
+            let mix = self.mix.next(if self.waking { 0.0 } else { target_mix });
+            deepest = deepest.max(self.reduction_db * mix);
+            // A high shelf down by the reduction (Simper's): flat, it passes
+            // the sound as it is, and runs on to stay warm.
+            let (tuning, outs) = if self.reduction_db == 0.0 {
+                (turn, [1.0, 0.0, 0.0])
+            } else {
+                let a = 10f64.powf(-self.reduction_db / 40.0);
+                (turn * a.sqrt(), [a * a, ks * (1.0 - a) * a, 1.0 - a * a])
+            };
+            for (channel, sample) in frame.iter_mut().enumerate() {
+                let v0 = dry[channel];
+                let (v1, v2) = self.shelf.run(channel, v0, tuning, ks);
+                let wet = outs[0] * v0 + outs[1] * v1 + outs[2] * v2;
+                if mix > 0.0 {
+                    *sample = (v0 + (wet - v0) * mix) as f32;
+                }
+            }
+        }
+        hold(&mut self.deepest_db, &mut self.deepest_for, deepest, block.len());
+        hold(&mut self.loudest, &mut self.loudest_for, loudest, block.len());
     }
 }
 
@@ -344,14 +1057,33 @@ impl LevelerConfig {
 /// The time the leveler averages a voice over, in seconds: a few syllables.
 const LEVELER_WINDOW_SECS: f64 = 0.4;
 
-#[derive(Debug, Clone, Default)]
+/// It measures in windows of a mixer's block, 10 ms, however the sound
+/// comes cut: a live bus's 1.3 ms callbacks ride a voice as the mixer does.
+#[derive(Debug, Clone)]
 pub struct Leveler {
     config: LevelerConfig,
     /// The voice's average power, before the leveler.
     power: f64,
-    /// The gain it applies now, dB, and at the end of the last block.
+    /// The gain it rides to, dB, as of the last window.
     gain_db: f64,
-    applied_db: f64,
+    /// This window's power so far, summed, and its frames.
+    window_power: f64,
+    window_frames: usize,
+    /// The gain applied, linear, gliding to `gain_db`'s.
+    gain: Glide,
+}
+
+impl Default for Leveler {
+    fn default() -> Self {
+        Self {
+            config: LevelerConfig::default(),
+            power: 0.0,
+            gain_db: 0.0,
+            window_power: 0.0,
+            window_frames: 0,
+            gain: Glide::at(1.0),
+        }
+    }
 }
 
 impl Leveler {
@@ -359,18 +1091,55 @@ impl Leveler {
         self.config = config;
     }
 
-    /// The gain it applies, dB.
+    /// The gain it rides to, dB.
     pub fn gain_db(&self) -> f32 {
-        self.applied_db as f32
+        self.gain_db as f32
+    }
+
+    /// Ride on from `gain_db` (within its limits), as a leveler already
+    /// riding this voice: a live bus's callback opened again (its buffer
+    /// changed, Live switched on) picks up where the mixer's own leveler
+    /// for the strip is, rather than starting at 0 dB and climbing for
+    /// seconds. The voice's average is taken as what that gain levels.
+    pub fn start_at(&mut self, gain_db: f32) {
+        let c = self.config;
+        if !c.enabled || !gain_db.is_finite() {
+            return;
+        }
+        let db = f64::from(gain_db).clamp(-f64::from(c.max_cut_db), f64::from(c.max_boost_db));
+        self.gain_db = db;
+        self.gain = Glide::at(f64::from(db_to_gain(db as f32)));
+        self.power = 10f64.powf((f64::from(c.target_db) - db) / 10.0);
     }
 
     pub fn process(&mut self, block: &mut [Frame]) {
-        let n = block.len().max(1);
-        let block_power = block
-            .iter()
-            .map(|f| f64::midpoint(clean(f[0]).powi(2), clean(f[1]).powi(2)))
-            .sum::<f64>()
-            / n as f64;
+        let mut rest = block;
+        while !rest.is_empty() {
+            // Up to the end of this window. The part is measured as it came,
+            // given the gain already decided, and only then is a finished
+            // window's measure taken — for the samples after it: so a window
+            // is heard the same however the sound comes cut (applied to the
+            // part that finished it, a 1.3 ms call heard it a window early).
+            let take = (BLOCK_FRAMES - self.window_frames).min(rest.len());
+            let (part, after) = std::mem::take(&mut rest).split_at_mut(take);
+            let power = part
+                .iter()
+                .map(|f| f64::midpoint(clean(f[0]).powi(2), clean(f[1]).powi(2)))
+                .sum::<f64>();
+            self.apply(part);
+            self.window_power += power;
+            self.window_frames += take;
+            if self.window_frames >= BLOCK_FRAMES {
+                self.measured(self.window_power / self.window_frames as f64);
+                self.window_power = 0.0;
+                self.window_frames = 0;
+            }
+            rest = after;
+        }
+    }
+
+    /// A window's average power: where the gain rides to now.
+    fn measured(&mut self, block_power: f64) {
         let c = self.config;
         // Only a voice is measured: in a pause the average stays where the
         // voice left it, so the next sentence does not start with a jump.
@@ -410,21 +1179,28 @@ impl Leveler {
             // Switched off: back to unity within this block.
             self.gain_db = 0.0;
         }
+    }
 
-        if self.applied_db == 0.0 && self.gain_db == 0.0 {
+    /// The gain to `part`: a straight line from the last window's to this
+    /// one's — no step, and no power function per sample.
+    // Unity exactly: the sound passes untouched, bit for bit.
+    #[allow(clippy::float_cmp)]
+    fn apply(&mut self, part: &mut [Frame]) {
+        // Switched off: back to unity at once, not at the window's end.
+        let to = if !self.config.enabled || self.gain_db == 0.0 {
+            1.0
+        } else {
+            f64::from(db_to_gain(self.gain_db as f32))
+        };
+        if to == 1.0 && self.gain.rests_at(1.0) {
             return;
         }
-        // From the last block's gain to this one's, a straight line: no
-        // step, and no power function per sample.
-        let from = f64::from(db_to_gain(self.applied_db as f32));
-        let to = f64::from(db_to_gain(self.gain_db as f32));
-        for (i, frame) in block.iter_mut().enumerate() {
-            let g = from + (to - from) * (i + 1) as f64 / n as f64;
+        for frame in part.iter_mut() {
+            let g = self.gain.next(to);
             for sample in frame.iter_mut() {
                 *sample = (clean(*sample) * g) as f32;
             }
         }
-        self.applied_db = self.gain_db;
     }
 }
 
@@ -499,9 +1275,9 @@ pub struct Compressor {
     /// The reduction now, dB (≤ 0), smoothed by attack and release.
     envelope_db: f64,
     /// Makeup heard now, dB, gliding to the setting.
-    makeup_db: f64,
+    makeup_db: Glide,
     /// How much of the compressed sound is heard, 0–1.
-    mix: f64,
+    mix: Glide,
     /// The deepest reduction in the last block, dB (≥ 0).
     deepest_db: f64,
 }
@@ -526,19 +1302,16 @@ impl Compressor {
     pub fn process(&mut self, block: &mut [Frame]) {
         let c = self.config;
         let target_mix = if c.enabled { 1.0 } else { 0.0 };
-        if target_mix == 0.0 && self.mix == 0.0 {
+        if target_mix == 0.0 && self.mix.rests_at(0.0) {
             self.envelope_db = 0.0;
             self.deepest_db = 0.0;
             return;
         }
         let attack = coefficient(f64::from(c.attack_ms) / 1000.0, 1.0 / RATE);
         let release = coefficient(f64::from(c.release_ms) / 1000.0, 1.0 / RATE);
-        let n = block.len().max(1) as f64;
-        let (mix_from, makeup_from) = (self.mix, self.makeup_db);
         let makeup_to = f64::from(c.makeup_db);
         let mut deepest = 0.0_f64;
-        for (i, frame) in block.iter_mut().enumerate() {
-            let along = (i + 1) as f64 / n;
+        for frame in block.iter_mut() {
             let peak = clean(frame[0]).abs().max(clean(frame[1]).abs());
             let wanted = c.reduction_db(to_db(peak, false));
             let k = if wanted < self.envelope_db {
@@ -548,18 +1321,16 @@ impl Compressor {
             };
             self.envelope_db = self.envelope_db * k + wanted * (1.0 - k);
             deepest = deepest.min(self.envelope_db);
-            let makeup = makeup_from + (makeup_to - makeup_from) * along;
+            let makeup = self.makeup_db.next(makeup_to);
             let compressed = f64::from(db_to_gain((self.envelope_db + makeup) as f32));
             // One gain, faded between unity and the compressor's: never more
             // than either, whatever the makeup.
-            let mix = mix_from + (target_mix - mix_from) * along;
+            let mix = self.mix.next(target_mix);
             let g = 1.0 + (compressed - 1.0) * mix;
             for sample in frame.iter_mut() {
                 *sample = (clean(*sample) * g) as f32;
             }
         }
-        self.mix = target_mix;
-        self.makeup_db = makeup_to;
         self.deepest_db = -deepest;
     }
 }
@@ -620,13 +1391,13 @@ pub struct Limiter {
     needs: [f64; LIMITER_LOOKAHEAD + 1],
     need_at: usize,
     gain: f64,
-    /// The ceiling now, linear, gliding over a block to a new setting: a
+    /// The ceiling now, linear, gliding over 10 ms to a new setting: a
     /// clamp moved from −1 to −12 dBFS at once jumped half a full scale.
-    ceiling: f64,
+    ceiling: Glide,
     /// How much of the limited sound is heard, 0–1: switching on or off
-    /// crossfades over a block between the sound as it comes and limited,
+    /// crossfades over 10 ms between the sound as it comes and limited,
     /// rather than cutting a loud sound down in one sample.
-    mix: f64,
+    mix: Glide,
     deepest: f64,
 }
 
@@ -639,9 +1410,9 @@ impl Default for Limiter {
             needs: [1.0; LIMITER_LOOKAHEAD + 1],
             need_at: 0,
             gain: 1.0,
-            ceiling: f64::from(db_to_gain(LimiterConfig::default().ceiling_db)),
+            ceiling: Glide::at(f64::from(db_to_gain(LimiterConfig::default().ceiling_db))),
             // On from the start, as a bus is made with it on.
-            mix: 1.0,
+            mix: Glide::at(1.0),
             deepest: 1.0,
         }
     }
@@ -669,16 +1440,13 @@ impl Limiter {
     pub fn process(&mut self, block: &mut [Frame]) {
         let c = self.config;
         let ceiling_to = f64::from(db_to_gain(c.ceiling_db));
-        let ceiling_from = self.ceiling;
         // Down within the look-ahead, so the gain is there before the peak.
         let attack = coefficient(LIMITER_LOOKAHEAD as f64 / 5.0, 1.0);
         let release = coefficient(f64::from(c.release_ms) / 1000.0, 1.0 / RATE);
-        let n = block.len().max(1) as f64;
         let target = if c.enabled { 1.0 } else { 0.0 };
-        let mix_from = self.mix;
         let mut deepest = 1.0_f64;
-        for (i, frame) in block.iter_mut().enumerate() {
-            let ceiling = ceiling_from + (ceiling_to - ceiling_from) * (i + 1) as f64 / n;
+        for frame in block.iter_mut() {
+            let ceiling = self.ceiling.next(ceiling_to);
             let input = [clean(frame[0]), clean(frame[1])];
             let peak = input[0].abs().max(input[1].abs());
             let need = if peak > ceiling { ceiling / peak } else { 1.0 };
@@ -690,7 +1458,7 @@ impl Limiter {
             let wanted = self.needs.iter().copied().fold(1.0_f64, f64::min);
             let k = if wanted < self.gain { attack } else { release };
             self.gain = self.gain * k + wanted * (1.0 - k);
-            let mix = mix_from + (target - mix_from) * (i + 1) as f64 / n;
+            let mix = self.mix.next(target);
             if mix > 0.0 {
                 deepest = deepest.min(1.0 + (self.gain - 1.0) * mix);
             }
@@ -702,8 +1470,6 @@ impl Limiter {
                 *sample = (x + (limited - x) * mix) as f32;
             }
         }
-        self.mix = target;
-        self.ceiling = ceiling_to;
         self.deepest = deepest;
     }
 }
@@ -1071,6 +1837,747 @@ mod tests {
             .chunks(BLOCK_FRAMES)
             .map(<[Frame]>::to_vec)
             .collect()
+    }
+
+    /// `input` through `process` in calls of `size` frames, cut also at
+    /// each of `changes` (where a setting changes, between calls); the
+    /// frame each call starts at, to it.
+    fn cut_run(
+        input: &[Frame],
+        size: usize,
+        changes: &[usize],
+        mut process: impl FnMut(&mut [Frame], usize),
+    ) -> Vec<Frame> {
+        let mut out = input.to_vec();
+        let mut at = 0;
+        while at < out.len() {
+            let change = changes.iter().copied().filter(|&c| c > at).min();
+            let end = (at + size).min(out.len()).min(change.unwrap_or(usize::MAX));
+            process(&mut out[at..end], at);
+            at = end;
+        }
+        out
+    }
+
+    fn largest_difference(a: &[Frame], b: &[Frame]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x[0] - y[0]).abs().max((x[1] - y[1]).abs()))
+            .fold(0.0, f32::max)
+    }
+
+    /// The low cut, compressor and limiter sound the same fed a live bus's
+    /// 64-frame callbacks (or an odd 37) as the mixer's 10 ms blocks, their
+    /// settings switched and changed on the way: each glide takes 10 ms
+    /// either way. Gliding over a call, a bypass in a 1.3 ms callback was
+    /// eight times as steep: a click.
+    #[test]
+    fn small_blocks_sound_as_the_mixers_blocks_do() {
+        let input: Vec<Frame> = (0..48_000)
+            .map(|i| {
+                let t = f64::from(i) / RATE;
+                let a = if t < 0.5 { 0.3 } else { 1.8 };
+                let v = a * (std::f64::consts::TAU * 70.0 * t).sin();
+                [v as f32, (v * 0.5) as f32]
+            })
+            .collect();
+        let changes = [4_800, 14_400, 24_000, 33_600];
+        // The same with an "s" on it, for the de-esser to hear.
+        let hissed: Vec<Frame> = input
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let s = (0.2 * (std::f64::consts::TAU * 7_000.0 * i as f64 / RATE).sin()) as f32;
+                [f[0] * 0.1 + s, f[1] * 0.1 + s]
+            })
+            .collect();
+        let low_cut = |size| {
+            let mut f = LowCut::default();
+            let mut c = LowCutConfig::default();
+            cut_run(&input, size, &changes, |b, at| {
+                match at {
+                    4_800 => c.enabled = true,
+                    14_400 => c.slope_db = 12,
+                    24_000 => c.hz = 150.0,
+                    33_600 => c.enabled = false,
+                    _ => {}
+                }
+                f.configure(c);
+                f.process(b);
+            })
+        };
+        let compressor = |size| {
+            let mut f = Compressor::default();
+            let mut c = CompressorConfig {
+                threshold_db: -20.0,
+                ratio: 4.0,
+                ..CompressorConfig::default()
+            };
+            cut_run(&input, size, &changes, |b, at| {
+                match at {
+                    4_800 => c.enabled = true,
+                    14_400 => c.makeup_db = 6.0,
+                    24_000 => c.makeup_db = -3.0,
+                    33_600 => c.enabled = false,
+                    _ => {}
+                }
+                f.configure(c);
+                f.process(b);
+            })
+        };
+        let limiter = |size| {
+            let mut f = Limiter::default();
+            let mut c = LimiterConfig::default();
+            cut_run(&input, size, &changes, |b, at| {
+                match at {
+                    4_800 => c.ceiling_db = -6.0,
+                    14_400 => c.enabled = false,
+                    24_000 => c.enabled = true,
+                    33_600 => c.ceiling_db = -1.0,
+                    _ => {}
+                }
+                f.configure(c);
+                f.process(b);
+            })
+        };
+        let gate = |size| {
+            let mut f = Gate::default();
+            // The first half (0.3, −10.5 dBFS) under it: closed there.
+            let mut c = GateConfig {
+                threshold_db: -10.0,
+                ..GateConfig::default()
+            };
+            cut_run(&input, size, &changes, |b, at| {
+                match at {
+                    4_800 => c.enabled = true,
+                    14_400 => c.range_db = 25.0,
+                    24_000 => c.hold_ms = 0.0,
+                    33_600 => c.enabled = false,
+                    _ => {}
+                }
+                f.configure(c);
+                f.process(b);
+            })
+        };
+        let eq = |size| {
+            let mut f = Eq::default();
+            let mut c = EqConfig::default();
+            cut_run(&input, size, &changes, |b, at| {
+                match at {
+                    4_800 => {
+                        c.enabled = true;
+                        c.bands[1].gain_db = 9.0;
+                    }
+                    14_400 => c.bands[0].gain_db = -6.0,
+                    24_000 => c.bands[1].hz = 120.0,
+                    33_600 => c.enabled = false,
+                    _ => {}
+                }
+                f.configure(c);
+                f.process(b);
+            })
+        };
+        let de_esser = |size| {
+            let mut f = DeEsser::default();
+            let mut c = DeEsserConfig::default();
+            cut_run(&hissed, size, &changes, |b, at| {
+                match at {
+                    4_800 => c.enabled = true,
+                    14_400 => c.threshold_db = -40.0,
+                    24_000 => c.hz = 4_000.0,
+                    33_600 => c.enabled = false,
+                    _ => {}
+                }
+                f.configure(c);
+                f.process(b);
+            })
+        };
+        {
+            let blocks = de_esser(BLOCK_FRAMES);
+            assert!(largest_difference(&blocks, &hissed) > 0.01, "the de-esser did something");
+            for size in [64, 37] {
+                let d = largest_difference(&de_esser(size), &blocks);
+                assert!(d < 1e-6, "the de-esser in {size}-frame calls differs by {d}");
+            }
+        }
+        for (name, run) in [
+            ("low cut", &low_cut as &dyn Fn(usize) -> Vec<Frame>),
+            ("gate", &gate),
+            ("eq", &eq),
+            ("compressor", &compressor),
+            ("limiter", &limiter),
+        ] {
+            let blocks = run(BLOCK_FRAMES);
+            assert!(largest_difference(&blocks, &input) > 0.01, "{name} did something");
+            for size in [64, 37] {
+                let d = largest_difference(&run(size), &blocks);
+                assert!(d < 1e-6, "{name} in {size}-frame calls differs by {d}");
+            }
+        }
+    }
+
+    /// The leveler rides a voice the same fed 64- or 37-frame calls as 10 ms
+    /// blocks: it measures in 10 ms windows whatever the call, so its gain is
+    /// the same at every 10 ms, and it brings the voice to the same level.
+    /// Measured per call, a 1.3 ms call counted as 10 ms and it rode seven
+    /// times too fast.
+    #[test]
+    fn the_leveler_rides_alike_in_small_blocks() {
+        let speech: Vec<Frame> = talk(-30.0, 12.0).concat();
+        let ride = |size: usize| {
+            let mut leveler = Leveler::default();
+            leveler.configure(LevelerConfig::speech());
+            let mut gains = std::collections::BTreeMap::new();
+            let out = cut_run(&speech, size, &[], |b, at| {
+                leveler.process(b);
+                gains.insert(at + b.len(), leveler.gain_db());
+            });
+            (out, gains)
+        };
+        let (blocks, by_block) = ride(BLOCK_FRAMES);
+        for size in [64, 37] {
+            let (out, by_call) = ride(size);
+            let d = largest_difference(&out, &blocks);
+            assert!(d < 1e-6, "{size}-frame calls differ by {d}");
+            let mut compared = 0;
+            for (at, gain) in &by_call {
+                if let Some(want) = by_block.get(at) {
+                    assert!((gain - want).abs() < 1e-9, "{size}: at {at} {gain} not {want}");
+                    compared += 1;
+                }
+            }
+            assert!(compared >= 25, "{size}: {compared}");
+            // The last phrase, at the same level.
+            let tail = |o: &[Frame]| rms_db(&[o[500_000..560_000].to_vec()]);
+            assert!(
+                (tail(&out) - tail(&blocks)).abs() < 0.1,
+                "{size}: {} not {}",
+                tail(&out),
+                tail(&blocks)
+            );
+        }
+    }
+
+    /// A leveler started at a gain applies it at once and rides on from
+    /// there, not from 0 dB; within its limits; switched off, it stays at
+    /// unity.
+    #[test]
+    fn a_leveler_started_at_a_gain_rides_on_from_it() {
+        let mut leveler = Leveler::default();
+        leveler.configure(LevelerConfig::speech());
+        leveler.start_at(6.0);
+        assert!((leveler.gain_db() - 6.0).abs() < 1e-6);
+        let mut block = vec![[0.1_f32, 0.1]; BLOCK_FRAMES];
+        leveler.process(&mut block);
+        let want = 0.1 * db_to_gain(6.0);
+        assert!((block[0][0] - want).abs() < 1e-4, "{} not {want}", block[0][0]);
+        leveler.start_at(99.0);
+        let most = LevelerConfig::speech().max_boost_db;
+        assert!((leveler.gain_db() - most).abs() < 1e-6, "within its limits");
+        let mut off = Leveler::default();
+        off.start_at(6.0);
+        assert!(off.gain_db().abs() < 1e-6, "switched off: unity");
+    }
+
+    /// A tone at `db` peak for `secs`, both sides.
+    fn tone(db: f32, secs: f64) -> Vec<Frame> {
+        let a = f64::from(db_to_gain(db));
+        (0..(secs * RATE) as usize)
+            .map(|i| {
+                let v = (a * (std::f64::consts::TAU * 440.0 * i as f64 / RATE).sin()) as f32;
+                [v, v]
+            })
+            .collect()
+    }
+
+    fn peak_of(frames: &[Frame]) -> f32 {
+        frames.iter().map(|f| f[0].abs().max(f[1].abs())).fold(0.0, f32::max)
+    }
+
+    fn gated(config: GateConfig, sound: &[Frame]) -> Vec<Frame> {
+        let mut gate = Gate::default();
+        gate.configure(config);
+        cut_run(sound, BLOCK_FRAMES, &[], |b, _| gate.process(b))
+    }
+
+    fn speech_gate() -> GateConfig {
+        GateConfig {
+            enabled: true,
+            threshold_db: -40.0,
+            range_db: 15.0,
+            attack_ms: 2.0,
+            hold_ms: 50.0,
+            release_ms: 100.0,
+        }
+    }
+
+    /// A voice over the threshold passes; the pause after it is turned down
+    /// by the range — not cut off — once the hold and release have passed.
+    #[test]
+    fn a_gate_turns_the_pause_down_by_its_range() {
+        let sound = [tone(-20.0, 0.5), tone(-60.0, 1.0)].concat();
+        let out = gated(speech_gate(), &sound);
+        let voice = peak_of(&out[12_000..24_000]);
+        assert!((voice - db_to_gain(-20.0)).abs() < 0.005, "the voice passes: {voice}");
+        let pause = peak_of(&out[out.len() - 12_000..]);
+        let want = db_to_gain(-60.0 - 15.0);
+        assert!((pause / want - 1.0).abs() < 0.06, "the pause 15 dB down: {pause} not {want}");
+    }
+
+    /// Its release is in dB: a whole 30 dB range is all but reached a second
+    /// into a pause (in linear gain it was only 26 dB down then).
+    #[test]
+    fn a_gates_release_turns_a_pause_down_in_db() {
+        let config = GateConfig {
+            enabled: true,
+            threshold_db: -40.0,
+            range_db: 30.0,
+            hold_ms: 0.0,
+            release_ms: 250.0,
+            ..GateConfig::default()
+        };
+        let sound = [tone(-20.0, 0.3), tone(-60.0, 1.1)].concat();
+        let out = gated(config, &sound);
+        // 1 s after the voice stopped (and its 8 ms key fell away).
+        let at = 14_400 + 48_000;
+        let down = to_db(f64::from(peak_of(&out[at..at + 960]) / db_to_gain(-60.0)), false);
+        assert!(down < -29.0, "a second in: {down:.1} dB");
+    }
+
+    /// Fallen under its threshold, it stays open for its hold, then closes.
+    #[test]
+    fn a_gate_holds_then_closes() {
+        let sound = [tone(-20.0, 0.2), tone(-60.0, 0.6)].concat();
+        let out = gated(speech_gate(), &sound);
+        let at = |ms: usize| peak_of(&out[9_600 + ms * 48..9_600 + (ms + 10) * 48]);
+        let open = db_to_gain(-60.0);
+        assert!((at(30) / open - 1.0).abs() < 0.05, "held open 30 ms in: {}", at(30));
+        assert!(at(450) < open * 0.25, "closed later: {}", at(450));
+    }
+
+    /// A voice hovering at the threshold — a dB over, a dB under, turn by
+    /// turn — keeps it open: it closes only 3 dB under.
+    #[test]
+    fn a_voice_at_the_threshold_does_not_chatter() {
+        let mut config = speech_gate();
+        config.hold_ms = 0.0;
+        let sound: Vec<Frame> = (0..20).flat_map(|i| tone(if i % 2 == 0 { -39.0 } else { -41.0 }, 0.02)).collect();
+        let out = gated(config, &sound);
+        let low = db_to_gain(-41.0);
+        let quietest = (1..20).step_by(2).map(|i| peak_of(&out[i * 960 + 480..(i + 1) * 960])).fold(1.0, f32::min);
+        assert!(quietest > low * 0.95, "never closed: {quietest} against {low}");
+    }
+
+    /// Its range changed while it is closed — at a waveform's peak, with the
+    /// quickest attack — glides: no click.
+    #[test]
+    fn changing_the_gates_range_while_closed_glides() {
+        // 100 Hz peaking at 0.2 (−14 dBFS), under a −10 dBFS threshold:
+        // closed. A peak every 480 frames, at 120 in.
+        let sound: Vec<Frame> = (0..48_000)
+            .map(|i| {
+                let v = (0.2 * (std::f64::consts::TAU * 100.0 * f64::from(i) / RATE).sin()) as f32;
+                [v, v]
+            })
+            .collect();
+        let mut gate = Gate::default();
+        let mut config = GateConfig {
+            enabled: true,
+            threshold_db: -10.0,
+            range_db: 30.0,
+            attack_ms: 0.1,
+            ..GateConfig::default()
+        };
+        let at_peak = 40 * 480 + 120;
+        let out = cut_run(&sound, BLOCK_FRAMES, &[at_peak], |b, at| {
+            if at == at_peak {
+                config.range_db = 0.0;
+            }
+            gate.configure(config);
+            gate.process(b);
+        });
+        let step = out[at_peak - 4..at_peak + 600]
+            .windows(2)
+            .map(|w| (w[1][0] - w[0][0]).abs())
+            .fold(0.0, f32::max);
+        assert!(step < 0.004, "a step of {step}");
+    }
+
+    /// Switched on while the room is quiet, it fades down; switched off, it
+    /// fades back up: no step.
+    #[test]
+    fn switching_the_gate_fades_rather_than_clicks() {
+        // Under its threshold, loud enough that a step would show.
+        let sound = tone(-45.0, 1.0);
+        let mut gate = Gate::default();
+        let mut config = speech_gate();
+        config.range_db = 30.0;
+        config.enabled = false;
+        let mut out = Vec::new();
+        for (i, block) in sound.chunks(BLOCK_FRAMES).enumerate() {
+            // Not where the tone crosses nought (every 30 blocks of 440 Hz):
+            // a step there would not show.
+            if i == 31 {
+                config.enabled = true;
+            }
+            if i == 71 {
+                config.enabled = false;
+            }
+            gate.configure(config);
+            let mut b = block.to_vec();
+            gate.process(&mut b);
+            out.extend(b);
+        }
+        let step = out.windows(2).map(|w| (w[1][0] - w[0][0]).abs()).fold(0.0, f32::max);
+        assert!(step < 0.001, "a step of {step}");
+    }
+
+    /// `hz`'s gain through `eq`, settled, dB.
+    fn gain_through(eq: &mut Eq, hz: f64) -> f64 {
+        let sound: Vec<Frame> = (0..24_000)
+            .map(|i| {
+                let v = (0.1 * (std::f64::consts::TAU * hz * f64::from(i) / RATE).sin()) as f32;
+                [v, v]
+            })
+            .collect();
+        let out = cut_run(&sound, BLOCK_FRAMES, &[], |b, _| eq.process(b));
+        to_db(f64::from(peak_of(&out[12_000..])) / f64::from(peak_of(&sound[12_000..])), false)
+    }
+
+    fn eq_with(index: usize, hz: f32, gain_db: f32, q: f32) -> Eq {
+        let mut config = EqConfig {
+            enabled: true,
+            ..EqConfig::default()
+        };
+        config.bands[index] = EqBandConfig { enabled: true, hz, gain_db, q };
+        let mut eq = Eq::default();
+        eq.configure(config);
+        eq
+    }
+
+    /// A bell lifts or cuts its own frequency by its gain and leaves those
+    /// far from it; a shelf lifts what is past its turn by its gain.
+    #[test]
+    fn the_eqs_bands_shape_as_set() {
+        assert!((gain_through(&mut eq_with(1, 1_000.0, 6.0, 1.0), 1_000.0) - 6.0).abs() < 0.2);
+        assert!((gain_through(&mut eq_with(2, 3_000.0, -9.0, 2.0), 3_000.0) + 9.0).abs() < 0.2);
+        assert!(gain_through(&mut eq_with(1, 1_000.0, 6.0, 1.0), 100.0).abs() < 0.3, "far from it");
+        assert!((gain_through(&mut eq_with(0, 300.0, -6.0, 0.7), 30.0) + 6.0).abs() < 0.3, "low shelf, under it");
+        assert!(gain_through(&mut eq_with(0, 300.0, -6.0, 0.7), 5_000.0).abs() < 0.3, "low shelf, over it");
+        assert!((gain_through(&mut eq_with(3, 4_000.0, 6.0, 0.7), 16_000.0) - 6.0).abs() < 0.4, "high shelf");
+        assert!(gain_through(&mut eq_with(3, 4_000.0, 6.0, 0.7), 200.0).abs() < 0.3);
+    }
+
+    /// Flat, or off, the EQ passes the sound bit for bit.
+    #[test]
+    fn a_flat_or_off_eq_passes_the_sound_untouched() {
+        let sound = tone(-10.0, 0.5);
+        for config in [EqConfig::default(), EqConfig { enabled: true, ..EqConfig::default() }] {
+            let mut eq = Eq::default();
+            eq.configure(config);
+            let out = cut_run(&sound, BLOCK_FRAMES, &[], |b, _| eq.process(b));
+            assert_eq!(out, sound, "{config:?}");
+        }
+        // Lifted, then set flat: untouched again once it has glided there.
+        let mut eq = eq_with(1, 1_000.0, 9.0, 1.0);
+        let mut config = eq.config;
+        let out = cut_run(&sound, BLOCK_FRAMES, &[4_800], |b, at| {
+            if at == 4_800 {
+                config.bands[1].gain_db = 0.0;
+            }
+            eq.configure(config);
+            eq.process(b);
+        });
+        assert_ne!(out[..4_800], sound[..4_800], "lifted at first");
+        assert_eq!(out[19_200..], sound[19_200..], "flat again: untouched");
+    }
+
+    /// A bell dragged across octaves while a loud tone plays, or switched
+    /// off, makes no click: its whole tuning glides.
+    #[test]
+    fn moving_an_eq_band_glides() {
+        let sound = tone(-6.0, 1.0);
+        let mut eq = eq_with(1, 200.0, 12.0, 4.0);
+        let mut config = eq.config;
+        let changes = [9_600, 19_200, 28_800];
+        let out = cut_run(&sound, BLOCK_FRAMES, &changes, |b, at| {
+            match at {
+                9_600 => config.bands[1].hz = 2_000.0,
+                19_200 => config.bands[1].gain_db = -12.0,
+                28_800 => config.enabled = false,
+                _ => {}
+            }
+            eq.configure(config);
+            eq.process(b);
+        });
+        // The second difference: a 440 Hz tone, lifted up to 12 dB as the
+        // bell passes it, bends 0.007 a sample at most; a jump of a hundredth
+        // or more would show here.
+        let bend = out
+            .windows(3)
+            .map(|w| (w[2][0] - 2.0 * w[1][0] + w[0][0]).abs())
+            .fold(0.0, f32::max);
+        assert!(bend < 0.012, "a bend of {bend}");
+    }
+
+    /// Switched off after a loud sound, left resting through silence, then
+    /// switched back on: it does not ring with what it heard before.
+    #[test]
+    fn an_eq_woken_from_rest_does_not_ring_with_the_past() {
+        let mut eq = eq_with(1, 100.0, 18.0, 10.0);
+        let mut config = eq.config;
+        let mut loud: Vec<Frame> = (0..24_000)
+            .map(|i| {
+                let v = (0.1 * (std::f64::consts::TAU * 100.0 * f64::from(i) / RATE).sin()) as f32;
+                [v, v]
+            })
+            .collect();
+        for b in loud.chunks_mut(BLOCK_FRAMES) {
+            eq.process(b);
+        }
+        config.enabled = false;
+        eq.configure(config);
+        let mut quiet = vec![[0.0_f32; 2]; 24_000];
+        for b in quiet.chunks_mut(BLOCK_FRAMES) {
+            eq.process(b);
+        }
+        config.enabled = true;
+        eq.configure(config);
+        let mut woken = vec![[0.0_f32; 2]; 4_800];
+        for b in woken.chunks_mut(BLOCK_FRAMES) {
+            eq.process(b);
+        }
+        assert!(peak_of(&woken) < 1e-6, "rang at {}", peak_of(&woken));
+    }
+
+    fn tone_at(hz: f64, db: f32, secs: f64) -> Vec<Frame> {
+        let a = f64::from(db_to_gain(db));
+        (0..(secs * RATE) as usize)
+            .map(|i| {
+                let v = (a * (std::f64::consts::TAU * hz * i as f64 / RATE).sin()) as f32;
+                [v, v]
+            })
+            .collect()
+    }
+
+    fn de_essed(config: DeEsserConfig, sound: &[Frame]) -> (Vec<Frame>, DeEsser) {
+        let mut d = DeEsser::default();
+        d.configure(config);
+        let out = cut_run(sound, BLOCK_FRAMES, &[], |b, _| d.process(b));
+        (out, d)
+    }
+
+    fn de_esser_at(threshold_db: f32) -> DeEsserConfig {
+        DeEsserConfig {
+            enabled: true,
+            threshold_db,
+            ..DeEsserConfig::default()
+        }
+    }
+
+    /// An "s" well over its threshold is turned down by about its range
+    /// (8 dB): most of it at the frequency it listens at, all of it above.
+    #[test]
+    fn a_de_esser_turns_an_s_down_by_its_range() {
+        // (The detector hears 10 kHz about 6 dB down: −35 is well under both.)
+        for (hz, least, most) in [(6_500.0, 6.0, 7.0), (10_000.0, 7.4, 8.1)] {
+            let s = tone_at(hz, -10.0, 0.5);
+            let (out, d) = de_essed(de_esser_at(-35.0), &s);
+            let down = -to_db(f64::from(peak_of(&out[12_000..]) / peak_of(&s[12_000..])), false);
+            assert!((least..most).contains(&down), "{hz} Hz down by {down:.2} dB");
+            assert!((d.reduction_db() - 8.0).abs() < 0.05, "meter {}", d.reduction_db());
+        }
+        let (_, d) = de_essed(de_esser_at(-35.0), &tone_at(6_500.0, -10.0, 0.5));
+        assert!((d.band_db() + 10.0).abs() < 0.5, "band at its frequency {}", d.band_db());
+    }
+
+    /// The voice under it, as loud as the "s", is not touched: its
+    /// detector hears 1 kHz 20 dB down, under the threshold.
+    #[test]
+    fn a_de_esser_leaves_the_voice_under_it() {
+        let voice = tone_at(1_000.0, -10.0, 0.5);
+        let (out, d) = de_essed(de_esser_at(-25.0), &voice);
+        assert_eq!(out, voice, "untouched, bit for bit");
+        assert!(d.reduction_db() < 0.01);
+    }
+
+    /// After an "s", it lets go over its 60 ms: the next vowel's top is
+    /// back within a few tenths of a second.
+    #[test]
+    fn a_de_esser_lets_go_after_an_s() {
+        let sound = [tone_at(8_000.0, -10.0, 0.3), tone_at(8_000.0, -40.0, 0.4)].concat();
+        let (out, _) = de_essed(de_esser_at(-25.0), &sound);
+        let quiet = &sound[sound.len() - 4_800..];
+        let after = &out[out.len() - 4_800..];
+        let down = -to_db(f64::from(peak_of(after) / peak_of(quiet)), false);
+        assert!(down < 0.1, "still down {down:.2} dB");
+    }
+
+    /// Its meters hold an "s" a second, to read and set the threshold by,
+    /// then show what is there now.
+    #[test]
+    fn a_de_essers_meters_hold_a_second() {
+        let mut s = [tone_at(8_000.0, -10.0, 0.1), tone_at(8_000.0, -40.0, 1.2)].concat();
+        let mut d = DeEsser::default();
+        d.configure(de_esser_at(-25.0));
+        let mut held = (0.0_f32, 0.0_f32);
+        for (i, b) in s.chunks_mut(BLOCK_FRAMES).enumerate() {
+            d.process(b);
+            if i == 40 {
+                // 0.3 s after the "s".
+                held = (d.reduction_db(), d.band_db());
+            }
+        }
+        assert!(held.0 > 7.0 && held.1 > -14.0, "held: {held:?}");
+        assert!(d.reduction_db() < 0.1 && d.band_db() < -35.0, "now: {} {}", d.reduction_db(), d.band_db());
+    }
+
+    /// Switched on mid-sound, a little under its threshold: no dip — its
+    /// detector settles before it acts (from silence, a band-pass rings).
+    #[test]
+    fn a_de_esser_switched_on_near_its_threshold_does_not_dip() {
+        // A low voice, 200 Hz at −10 dBFS, switched on at its peak: the band
+        // hears it near −44, the threshold at −40 — but a band-pass started
+        // from silence on a sample that loud rings well over it.
+        let voice: Vec<Frame> = (0..24_000)
+            .map(|i| {
+                let v = (0.316 * (std::f64::consts::TAU * 200.0 * f64::from(i) / RATE).cos()) as f32;
+                [v, v]
+            })
+            .collect();
+        let mut d = DeEsser::default();
+        let mut c = de_esser_at(-40.0);
+        c.enabled = false;
+        let mut deepest = 0.0_f32;
+        let out = cut_run(&voice, BLOCK_FRAMES, &[9_600], |b, at| {
+            if at == 9_600 {
+                c.enabled = true;
+            }
+            d.configure(c);
+            d.process(b);
+            deepest = deepest.max(d.reduction_db());
+        });
+        assert!(deepest < 0.05, "dipped {deepest:.2} dB");
+        let worst = largest_difference(&out, &voice);
+        assert!(worst < 1e-3, "changed by {worst}");
+    }
+
+    /// Switched on or off while an "s" is being turned down, it glides
+    /// there over 10 ms: no millisecond is more than a dB from the last.
+    #[test]
+    fn switching_a_de_esser_glides() {
+        let s = tone_at(10_000.0, -10.0, 0.6);
+        let mut d = DeEsser::default();
+        let mut c = de_esser_at(-25.0);
+        c.enabled = false;
+        let out = cut_run(&s, BLOCK_FRAMES, &[9_600, 19_200], |b, at| {
+            match at {
+                9_600 => c.enabled = true,
+                19_200 => c.enabled = false,
+                _ => {}
+            }
+            d.configure(c);
+            d.process(b);
+        });
+        let ms: Vec<f64> = out
+            .chunks(48)
+            .zip(s.chunks(48))
+            .map(|(o, i)| to_db(f64::from(peak_of(o) / peak_of(i)), false))
+            .collect();
+        let step = ms.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f64::max);
+        assert!(step < 1.0, "a millisecond's step of {step:.2} dB");
+        assert!(ms[300] < -6.0, "on, it was down: {:.1}", ms[300]);
+    }
+
+    /// Off long enough to rest, then on again: it starts afresh, not
+    /// turning down a quiet top with what it last heard.
+    #[test]
+    fn a_de_esser_woken_from_rest_starts_afresh() {
+        let mut d = DeEsser::default();
+        let mut c = de_esser_at(-25.0);
+        d.configure(c);
+        let mut loud = tone_at(10_000.0, -10.0, 0.3);
+        for b in loud.chunks_mut(BLOCK_FRAMES) {
+            d.process(b);
+        }
+        c.enabled = false;
+        d.configure(c);
+        let mut gap = vec![[0.0_f32; 2]; 4_800];
+        for b in gap.chunks_mut(BLOCK_FRAMES) {
+            d.process(b);
+        }
+        c.enabled = true;
+        d.configure(c);
+        let quiet = tone_at(10_000.0, -50.0, 0.1);
+        let out = cut_run(&quiet, BLOCK_FRAMES, &[], |b, _| d.process(b));
+        assert_eq!(out, quiet, "nothing turned down");
+    }
+
+    /// Bypassed briefly and back, at any point, the EQ and the de-esser
+    /// sound the same in small calls as in the mixer's blocks: whether they
+    /// start afresh does not hang on where the calls fell.
+    #[test]
+    fn a_short_bypass_sounds_the_same_in_any_calls() {
+        let hissed: Vec<Frame> = (0..48_000)
+            .map(|i| {
+                let t = f64::from(i) / RATE;
+                let v = 0.3 * (std::f64::consts::TAU * 150.0 * t).sin()
+                    + 0.2 * (std::f64::consts::TAU * 7_000.0 * t).sin();
+                [v as f32, (v * 0.7) as f32]
+            })
+            .collect();
+        for back in (9_600 + 400..9_600 + 700).step_by(37).chain((9_600 + 12_000..9_600 + 16_000).step_by(250)) {
+            let changes = [4_800, 9_600, back];
+            let de_esser = |size| {
+                let mut f = DeEsser::default();
+                let mut c = DeEsserConfig { threshold_db: -45.0, ..DeEsserConfig::default() };
+                cut_run(&hissed, size, &changes, |b, at| {
+                    if at == 4_800 || at == back {
+                        c.enabled = true;
+                    } else if at == 9_600 {
+                        c.enabled = false;
+                    }
+                    f.configure(c);
+                    f.process(b);
+                })
+            };
+            let eq = |size| {
+                let mut f = Eq::default();
+                let mut c = EqConfig::default();
+                c.bands[1] = EqBandConfig { enabled: true, hz: 150.0, gain_db: 12.0, q: 8.0 };
+                cut_run(&hissed, size, &changes, |b, at| {
+                    if at == 4_800 || at == back {
+                        c.enabled = true;
+                    } else if at == 9_600 {
+                        c.enabled = false;
+                    }
+                    f.configure(c);
+                    f.process(b);
+                })
+            };
+            for (name, run) in [("de-esser", &de_esser as &dyn Fn(usize) -> Vec<Frame>), ("eq", &eq)] {
+                let blocks = run(BLOCK_FRAMES);
+                for size in [64, 37] {
+                    let d = largest_difference(&run(size), &blocks);
+                    assert!(d < 1e-6, "{name}, back at {back}, in {size}-frame calls: {d}");
+                }
+            }
+        }
+    }
+
+    /// A saved EQ with one band out of range keeps the others.
+    #[test]
+    fn an_eq_band_out_of_range_alone_is_reset() {
+        let mut config = EqConfig {
+            enabled: true,
+            ..EqConfig::default()
+        };
+        config.bands[1].gain_db = 6.0;
+        config.bands[2].gain_db = 99.0;
+        let clean = config.sanitized();
+        assert!((clean.bands[1].gain_db - 6.0).abs() < 1e-6, "kept");
+        assert!(clean.bands[2].gain_db.abs() < 1e-6 && (clean.bands[2].hz - 3_000.0).abs() < 1e-3, "reset");
+        assert!(clean.enabled);
     }
 
     #[test]
