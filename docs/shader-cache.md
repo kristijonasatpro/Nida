@@ -1,5 +1,19 @@
 # Shader compilation cache
 
+## Upstream refresh — 1 November 2026
+
+Merged upstream v0.9.7 (`45e6f0b`) into the review branch. The remaining
+proposal is limited to this document, the compiler/cache, its benchmark and
+the Cargo benchmark registration; no Windows backend changes are included.
+
+Fresh validation: all 28 existing compiler/metadata tests pass in an isolated
+Windows harness importing the exact production modules and using the real
+repository shader fixtures, including GLSL-to-SPIR-V-to-Naga/WGSL checks.
+The two changed Rust files pass rustfmt, and the proposal passes diff
+whitespace checks. This isolates the compiler from upstream's existing
+Windows DeckLink build blocker; it is not a full application or Mac/Linux
+qualification. Performance figures below remain historical measurements.
+
 Repeated loads of an identical GLSL shader reuse its compiled SPIR-V within
 the running process. Fragment shaders (generators, filters and transitions)
 and compute shaders use the same cache with distinct stage keys.
