@@ -73,6 +73,9 @@ pub fn headless_config() -> crate::app::AppConfig {
         // hundreds of prompts — which on macOS can also stop unrelated
         // permission requests from being presented at all.
         "--no-camera",
+        // Never PowerPoint itself: a test plays a stand-in (see
+        // `crate::presentation::fake`).
+        "--no-powerpoint",
         "--workspace",
         &temp_workspace(),
     ])

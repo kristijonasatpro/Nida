@@ -38,9 +38,10 @@ open Input Settings window stays where it is. A clip going on or off air
 plays, pauses and sounds as its [On air](21-input-settings.md#on-air)
 settings say.
 
-Space and Enter do nothing while you are typing in a text field. They can be
-re-bound like any shortcut with **KB Learn** (actions *Cut to Main* and *Fade
-to Main*).
+Space and Enter do nothing while you are typing in a text field — nor does
+any key without ⌘, nor the Enter that finishes a name. They can be re-bound
+like any shortcut with **KB Learn** (actions *Cut to Main* and *Fade to
+Main*).
 
 ### Transitions
 
@@ -134,4 +135,6 @@ put the previous speaker back or take a logo off.
 | `PUT /api/channels/{channel_uuid}/overlay` | `{"overlay": true}` |
 | `PUT /api/channels/{channel_uuid}/overlay-on` | `{"on": true, "fade": false}` |
 
-What is on air is in `GET /api/state` under `mixer.main`.
+What is on air is in `GET /api/state` under `mixer.main`; each input in
+`mixer.channels[]` has `on_air` while it is: `"main"`, or the UUID of the
+first bus whose Program shows it — itself, or inside another input there.

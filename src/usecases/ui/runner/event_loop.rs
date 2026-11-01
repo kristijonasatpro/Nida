@@ -167,10 +167,49 @@ impl ApplicationHandler for UIRunner {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        // The control window taking or losing the keyboard, as it happens —
+        // while Nida is still starting too: the clicker read with another
+        // app in front stands aside while the window hears its keys (see
+        // `crate::clicker`).
+        if self.main_window_id == Some(window_id) {
+            if let WindowEvent::Focused(focused) = &event {
+                self.main_focused = *focused;
+                crate::clicker::set_focused(*focused || self.panel_windows.any_focused());
+            }
+            // Minimised or covered — while starting too: its tiles are not
+            // seen, so off-air inputs are not drawn for them.
+            if let WindowEvent::Occluded(hidden) = &event {
+                self.ui_occluded = *hidden;
+            }
+        }
         if self.varda.is_none() && self.engine.is_none() {
             return;
         }
+        // A panel's window of its own: its egui input (the show's shortcuts
+        // run in its pass, on its keys). Nida holding the keyboard in either
+        // window, for the clicker.
+        let is_input = !matches!(event, WindowEvent::RedrawRequested);
+        if self
+            .panel_windows
+            .window_event(window_id, &event, self.gpu.as_ref())
+        {
+            if is_input {
+                self.note_input();
+            }
+            if let WindowEvent::Focused(_) = &event {
+                crate::clicker::set_focused(self.main_focused || self.panel_windows.any_focused());
+            }
+            return;
+        }
         if self.main_window_id == Some(window_id) {
+            if is_input {
+                self.note_input();
+            }
+            // A key held since before the window had the keyboard repeats
+            // into it: not its press (see `HeldKeys`).
+            if !self.main_held.takes(&event) {
+                return;
+            }
             if let (Some(window), Some(egui_state)) = (self.window, &mut self.egui_state) {
                 if egui_state.on_window_event(window, &event).consumed {
                     return;
@@ -183,13 +222,15 @@ impl ApplicationHandler for UIRunner {
                 }
                 WindowEvent::Resized(new_size) => {
                     self.cached_screen_size = new_size;
-                    if let (Some(ws), Some(gpu)) = (&mut self.window_surface, &self.gpu) {
-                        ws.resize(gpu, new_size);
-                    }
+                    self.apply_ui_render_scale();
+                    self.resize_ui_surface(new_size);
                 }
                 WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                     self.cached_scale_factor = scale_factor as f32;
+                    self.apply_ui_render_scale();
                 }
+                // Moved to another screen: drawn at that one's share.
+                WindowEvent::Moved(_) => self.apply_ui_render_scale(),
                 WindowEvent::RedrawRequested => {
                     self.render(event_loop);
                     // Frame pacing: don't request_redraw() here.
@@ -210,7 +251,7 @@ impl ApplicationHandler for UIRunner {
                     | WindowEvent::KeyboardInput { .. }
             ) || cfg!(feature = "html");
             if wanted {
-                let handled = self.with_engine(|this| {
+                let handled = self.with_engine("an output window's event", |this| {
                     if let Some(varda) = this.varda.as_mut() {
                         output_window_event(varda, window_id, event);
                     }
@@ -223,6 +264,20 @@ impl ApplicationHandler for UIRunner {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The API's Shutdown or Ctrl-C: the windowed app saves and quits as
+        // on ⌘Q (headless does so in `render_headless`) — Ctrl-C while the
+        // GPU is still being set up included. Answered "ok", it went on
+        // running.
+        if !self.config.headless
+            && self
+                .shutdown_flag
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            log::info!("Shutdown requested: saving workspace and exiting...");
+            self.quit(event_loop);
+            return;
+        }
+
         // ── Phase 2 of deferred GPU init: poll the background thread ────
         if let Some(handle) = self.gpu_init_handle.as_ref() {
             if handle.is_finished() {
@@ -269,17 +324,23 @@ impl ApplicationHandler for UIRunner {
         } else {
             // Windowed: the engine thread paces the show (see
             // `engine_thread`); the control window draws once it has drawn a
-            // frame — or every tenth of a second without one, so the UI
-            // stays live should the engine stop drawing.
+            // frame — every frame while a hand is on it or pictures move,
+            // less often while the show stands still (see `ui_period`) — or
+            // every tenth of a second without one, so the UI stays live
+            // should the engine stop drawing.
             if self.engine.as_ref().is_some_and(|e| e.baton().is_gone()) {
                 log::error!("The engine thread stopped: exiting");
                 self.quit(event_loop);
                 return;
             }
-            let quiet = self
-                .last_ui_frame
-                .is_none_or(|at| at.elapsed() >= UI_FALLBACK);
-            if std::mem::take(&mut self.ui_due) || quiet {
+            let since = self.last_ui_frame.map(|at| at.elapsed());
+            let quiet = since.is_none_or(|since| since >= UI_FALLBACK);
+            let period = self.ui_period();
+            let rested = since.is_none_or(|since| since >= period);
+            if (self.ui_due && rested) || quiet {
+                self.ui_due = false;
+                self.ui_frame_allowance = super::frame_allowance(self.ui_frame_period, period);
+                self.ui_frame_period = period;
                 if let Some(w) = self.window {
                     w.request_redraw();
                 }
@@ -301,6 +362,15 @@ impl ApplicationHandler for UIRunner {
         if !self.config.headless && !self.shut_down {
             log::info!("Quit: saving workspace and exiting...");
             self.shut_down();
+        }
+        // Blackmagic captures stopped before the process ends — headless
+        // too, whose Quit comes here without its shutdown flag.
+        crate::decklink::input::shutdown();
+        // Night Shift, if Nida holds it off, given back however it ends:
+        // headless too, whose Quit (⌘Q, the Dock) comes here without its
+        // shutdown flag (see `night_shift`).
+        if let Some(kept) = self.night_shift.give_back_now() {
+            log::info!("Quit: {kept:?}");
         }
     }
 }
@@ -360,6 +430,11 @@ impl UIRunner {
         if std::mem::replace(&mut self.shut_down, true) {
             return;
         }
+        // The clicker's keys given back to the other apps (see
+        // `crate::clicker`).
+        if !self.config.headless {
+            crate::clicker::stop();
+        }
         if let Some(engine) = self.engine.take() {
             if let Some(app) = engine.stop() {
                 self.varda = Some(app);
@@ -371,6 +446,9 @@ impl UIRunner {
             }
             varda.refuse_commands();
         }
+        // Blackmagic captures stopped before the process ends: quit from
+        // macOS ends it straight after this, the captures never closed.
+        crate::decklink::input::shutdown();
         // A Save As that landed as Nida quit moved the show: it is the one
         // to open next time, the Recent list written before Nida goes.
         if !self.config.headless {
@@ -381,6 +459,10 @@ impl UIRunner {
         }
         if let Some(api) = self.api_handle.take() {
             api.shutdown();
+        }
+        // Night Shift, if Nida holds it off, given back (see `night_shift`).
+        if let Some(kept) = self.night_shift.give_back_now() {
+            log::info!("Quit: {kept:?}");
         }
     }
 }

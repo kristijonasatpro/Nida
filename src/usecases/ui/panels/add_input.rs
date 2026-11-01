@@ -33,9 +33,14 @@ enum Kind {
     Screen,
     Stream,
     Web,
+    Broadcast,
     Colour,
     Generator,
     Timer,
+    Text,
+    LowerThird,
+    PowerPoint,
+    Presentations,
     Input,
     Audio,
 }
@@ -51,9 +56,14 @@ impl Kind {
             Self::Screen => "Desktop Capture",
             Self::Stream => "Stream / SRT",
             Self::Web => "Web Browser",
+            Self::Broadcast => "Broadcast",
             Self::Colour => "Colour",
             Self::Generator => "Generator",
             Self::Timer => "Timer / Clock",
+            Self::Text => "Text",
+            Self::LowerThird => "Lower third",
+            Self::PowerPoint => "PowerPoint",
+            Self::Presentations => "Presentations",
             Self::Input => "Another input",
             Self::Audio => "Audio Input",
         }
@@ -74,7 +84,21 @@ impl Kind {
         if cfg!(feature = "html") {
             kinds.push(Self::Web);
         }
-        kinds.extend([Self::Colour, Self::Generator, Self::Timer, Self::Input]);
+        kinds.extend([
+            Self::Broadcast,
+            Self::Colour,
+            Self::Generator,
+            Self::Timer,
+            Self::Text,
+            Self::LowerThird,
+        ]);
+        // PowerPoint for Mac plays the deck: macOS only.
+        if cfg!(target_os = "macos") {
+            kinds.push(Self::PowerPoint);
+            // Talks in running order: PowerPoint and PDF play on macOS.
+            kinds.push(Self::Presentations);
+        }
+        kinds.push(Self::Input);
         if !layer {
             kinds.push(Self::Audio);
         }
@@ -122,11 +146,15 @@ struct State {
     colour: [f32; 4],
     /// A generator, by shader name, and the text it is looked for by.
     generator: Option<String>,
+    /// The Broadcast background chosen, by shader name.
+    broadcast: Option<String>,
     generator_search: String,
     /// Another input, by its channel's UUID.
     input: Option<String>,
     /// What a new timer counts.
     timer: crate::engine::value::timer::TimerSettings,
+    /// A text input's lines, as typed here.
+    text: String,
     /// Sound device and the pair of its channels taken, left and right.
     audio: Option<(String, u16, u16)>,
     /// What to call the input; after the source when empty.
@@ -158,9 +186,11 @@ impl Default for State {
             web_url: "https://".into(),
             colour: [0.0, 0.0, 0.0, 1.0],
             generator: None,
+            broadcast: None,
             generator_search: String::new(),
             input: None,
             timer: crate::engine::value::timer::TimerSettings::default(),
+            text: String::new(),
             audio: None,
             name: String::new(),
         }
@@ -186,6 +216,9 @@ pub(super) fn open(ctx: &egui::Context) {
     state.layer_of = None;
     state.scanned = None;
     state.name.clear();
+    // Its camera's format and sound chosen afresh: the mixer may have that
+    // sound now.
+    state.camera_settled = None;
     store(ctx, state);
 }
 
@@ -196,6 +229,7 @@ pub(super) fn open_for_layer(ctx: &egui::Context, channel_uuid: &str) {
     state.open = true;
     state.layer_of = Some(channel_uuid.to_string());
     state.scanned = None;
+    state.camera_settled = None;
     if state.kind == Kind::Audio {
         state.kind = Kind::Video;
     }
@@ -376,8 +410,46 @@ fn kind_body(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions, state: &
             false
         }
         Kind::Generator => generator_body(ui, data, state),
+        Kind::Broadcast => broadcast_body(ui, data, state),
         Kind::Timer => {
             timer_body(ui, state);
+            false
+        }
+        Kind::Text => {
+            ui.label("Lines of text — a break, a room, a time — in any installed font:");
+            ui.add(
+                egui::TextEdit::multiline(&mut state.text)
+                    .hint_text("PERTRAUKA\nTęsiame 14:00")
+                    .desired_rows(3),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Edited live in its Input Settings, with its box, outline, shadow and place.",
+                )
+                .weak(),
+            );
+            false
+        }
+        Kind::LowerThird => {
+            ui.label(
+                "Names and titles on a plate, brought on air one at a time with ▶ on its \
+                 picture, and taken off with ■.",
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Type the names in its Input Settings, or read them from a CSV list \
+                     (an Excel sheet saved as CSV; read again whenever it is saved).",
+                )
+                .weak(),
+            );
+            false
+        }
+        Kind::PowerPoint => {
+            powerpoint_body(ui, state);
+            false
+        }
+        Kind::Presentations => {
+            presentations_body(ui, state);
             false
         }
         Kind::Input => input_body(ui, data, state),
@@ -399,6 +471,10 @@ fn generator_body(ui: &mut egui::Ui, data: &UIData, state: &mut State) -> bool {
         if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
             continue;
         }
+        // The Broadcast backgrounds have a section of their own.
+        if data.broadcast.iter().any(|look| look.name == *name) {
+            continue;
+        }
         let selected = state.generator.as_deref() == Some(name.as_str());
         let (clicked, twice) = row(ui, selected, &super::channel_settings::pretty(name));
         if clicked || twice {
@@ -406,6 +482,43 @@ fn generator_body(ui: &mut egui::Ui, data: &UIData, state: &mut State) -> bool {
         }
         chosen |= twice;
     }
+    chosen
+}
+
+/// The Broadcast backgrounds, by mood: calm, cheap pictures for events,
+/// each with Speed, Density, a Calm centre and a palette. True when one was
+/// double-clicked.
+fn broadcast_body(ui: &mut egui::Ui, data: &UIData, state: &mut State) -> bool {
+    let mut chosen = false;
+    for mood in crate::engine::BROADCAST_MOODS {
+        let looks: Vec<&crate::engine::BroadcastLook> = data
+            .broadcast
+            .iter()
+            .filter(|look| look.mood == mood)
+            .collect();
+        if looks.is_empty() {
+            continue;
+        }
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(mood).strong());
+        for look in looks {
+            let selected = state.broadcast.as_deref() == Some(look.name.as_str());
+            let (clicked, twice) = row(ui, selected, &look.title);
+            if clicked || twice {
+                state.broadcast = Some(look.name.clone());
+            }
+            chosen |= twice;
+        }
+    }
+    if data.broadcast.is_empty() {
+        ui.label(egui::RichText::new("None found.").weak());
+    }
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new("A plain colour: Colour, in the list on the left.")
+            .small()
+            .weak(),
+    );
     chosen
 }
 
@@ -424,13 +537,13 @@ fn input_body(ui: &mut egui::Ui, data: &UIData, state: &mut State) -> bool {
     for other in &data.channels {
         if !input_allowed(data, state, &other.uuid) {
             if state.layer_of.as_deref() != Some(other.uuid.as_str()) {
-                ui.add_enabled(false, egui::Button::selectable(false, other.name.as_str()))
+                ui.add_enabled(false, egui::Button::selectable(false, other.numbered()))
                     .on_disabled_hover_text(format!("{} shows this input already", other.name));
             }
             continue;
         }
         let selected = state.input.as_deref() == Some(other.uuid.as_str());
-        let (clicked, twice) = row(ui, selected, &other.name);
+        let (clicked, twice) = row(ui, selected, &other.numbered());
         if clicked || twice {
             state.input = Some(other.uuid.clone());
         }
@@ -540,6 +653,82 @@ fn playlist_body(ui: &mut egui::Ui, state: &mut State) {
     ui.label(
         egui::RichText::new(
             "Or OK for an empty list, filled in its window. Its tile gets ▶ to start it.",
+        )
+        .small()
+        .weak(),
+    );
+}
+
+/// A PowerPoint deck: chosen, it opens in PowerPoint, which plays it.
+/// A Slides input: the day's talks in running order, each started with
+/// one press, managed in the Presentations panel.
+fn presentations_body(ui: &mut egui::Ui, state: &mut State) {
+    if state.layer_of.is_some() {
+        ui.label(
+            "A Slides layer in this input: talks in running order, one on at a time. OK adds \
+             it empty; its talks are put in order and started in Layout ▸ Panels ▸ \
+             Presentations.",
+        );
+        return;
+    }
+    ui.label(
+        "The day's talks in running order, in one input — PowerPoint decks, PDFs, web \
+         presentations, clips and pictures — prepared before the show and each started with \
+         one press. Whatever shows this input (a picture-in-picture, a presenter view) follows \
+         the talk on.",
+    );
+    ui.add_space(8.0);
+    if ui
+        .add(egui::Button::new(
+            egui::RichText::new("Choose files…").size(15.0),
+        ))
+        .on_hover_text("The talks: added to the show's Slides input, made when there is none")
+        .clicked()
+    {
+        super::slides::choose_talks(ui.ctx());
+        state.open = false;
+    }
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(
+            "OK makes an empty Slides input. Its talks are put in order, named and started in \
+             Layout ▸ Panels ▸ Presentations.",
+        )
+        .small()
+        .weak(),
+    );
+}
+
+fn powerpoint_body(ui: &mut egui::Ui, state: &mut State) {
+    ui.label(match &state.layer_of {
+        None => {
+            "A PowerPoint deck, played by PowerPoint on this Mac in a window Nida shows — \
+             its transitions, animations and videos as PowerPoint plays them. ◀ ▶ on its \
+             tile, PageDown and PageUp (a presentation clicker) move it on."
+        }
+        Some(_) => "A PowerPoint deck, played by PowerPoint, as a layer of this input.",
+    });
+    ui.add_space(8.0);
+    if ui
+        .add(egui::Button::new(
+            egui::RichText::new("Choose a deck…").size(15.0),
+        ))
+        .clicked()
+    {
+        let into = match &state.layer_of {
+            Some(ch) => super::presentation::DeckFor::Layer(ch.clone()),
+            None => super::presentation::DeckFor::NewInput(
+                Some(state.name.trim().to_string()).filter(|n| !n.is_empty()),
+            ),
+        };
+        super::presentation::choose_deck(ui.ctx(), into);
+        state.open = false;
+    }
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new(
+            "Needs Microsoft PowerPoint on this Mac. The first time, macOS asks whether \
+             Nida may control PowerPoint: allow it.",
         )
         .small()
         .weak(),
@@ -663,19 +852,59 @@ fn camera_body(
         );
         return false;
     }
+    // Each Blackmagic box once, read through its own way; its macOS-listed
+    // twin only through "Open through".
+    let listed = data.cameras_listed();
     if state
         .camera
         .is_none_or(|id| !data.cameras.iter().any(|(_, c)| *c == id))
     {
-        state.camera = data.cameras.first().map(|(_, id)| *id);
+        state.camera = listed.first().map(|(_, id)| *id);
     }
+    let row_of = |id: crate::camera::CameraId, chosen: Option<crate::camera::CameraId>| {
+        Some(id) == chosen || data.macos_twin(id).map(|(_, twin)| twin) == chosen
+    };
     let mut double = false;
-    for (name, id) in &data.cameras {
-        let (clicked, twice) = row(ui, state.camera == Some(*id), name);
-        if clicked {
+    for (name, id) in &listed {
+        let chosen = row_of(*id, state.camera);
+        let (clicked, twice) = row(ui, chosen, name);
+        // The box chosen already keeps the way it is opened through.
+        if clicked && !chosen {
             state.camera = Some(*id);
         }
         double |= twice;
+    }
+    let chosen = state.camera;
+    if let Some((row_id, (_, twin))) = listed
+        .iter()
+        .find(|(_, id)| row_of(*id, chosen))
+        .and_then(|(_, id)| Some((*id, data.macos_twin(*id)?)))
+    {
+        ui.horizontal(|ui| {
+            let caption = ui.label("Open through:");
+            let mut through = state.camera.unwrap_or(row_id);
+            egui::ComboBox::from_id_salt("add_input_camera_through")
+                .width(260.0)
+                .selected_text(if through == twin {
+                    "macOS (its sound can come late)"
+                } else {
+                    "Blackmagic (sound with its picture)"
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut through,
+                        row_id,
+                        "Blackmagic (sound with its picture)",
+                    );
+                    ui.selectable_value(&mut through, twin, "macOS (its sound can come late)");
+                })
+                .response
+                .labelled_by(caption.id)
+                .on_hover_text(
+                    "How Nida reads the box: through Blackmagic's own way, or as macOS lists it",
+                );
+            state.camera = Some(through);
+        });
     }
     let Some((camera_name, id)) = data
         .cameras
@@ -686,21 +915,80 @@ fn camera_body(
         return double;
     };
     // A camera chosen afresh starts at its best, with its own sound if a
-    // sound device goes by its name (a capture card's usually does).
+    // sound device goes by its name (a capture card's usually does) — only
+    // if that sound is not in the mixer already: a camera's picture-in-
+    // picture beside its own input, or the camera added again, would have
+    // it twice.
     if state.camera_settled != Some(id) {
         state.camera_settled = Some(id);
         state.camera_mode = None;
-        state.camera_audio = own_sound(&camera_name, data).map(|dev| {
-            let right = u16::from(dev.channels >= 2);
-            (dev.name.clone(), 0, right)
-        });
+        // A Blackmagic input's sound comes with its pictures, into the
+        // mixer by itself: not a sound device's besides.
+        let comes_with_it = data.cameras_with_own_sound.contains(&id);
+        state.camera_audio = own_sound(&camera_name, data)
+            .filter(|_| !comes_with_it)
+            .filter(|dev| !in_the_mixer(&dev.name, data))
+            .map(|dev| {
+                let right = u16::from(dev.channels >= 2);
+                (dev.name.clone(), 0, right)
+            });
     }
     ui.add_space(8.0);
     camera_format(ui, data, id, state);
-    if state.layer_of.is_none() {
-        camera_sound(ui, data, state);
+    camera_sound(ui, data, id, state);
+    if let Some(twin) = blackmagic_twin(&camera_name, id, data) {
+        ui.label(
+            egui::RichText::new(format!(
+                "Its sound can come late through macOS — nearly a second was measured. \
+                 \"{twin}\" reads the same box through Blackmagic's own way, its sound in \
+                 step with its picture."
+            ))
+            .small()
+            .color(egui::Color32::from_rgb(240, 180, 90)),
+        );
     }
     double
+}
+
+/// The camera that reads the same Blackmagic box as camera `id` — listed
+/// as macOS has it — through Blackmagic's own way: named after the box,
+/// with its sound coming with its pictures. None when two boxes go by one
+/// name: which is which cannot be told.
+fn blackmagic_twin<'a>(
+    camera_name: &str,
+    id: crate::camera::CameraId,
+    data: &'a UIData,
+) -> Option<&'a str> {
+    use crate::decklink::input::same_box;
+    if data.cameras_with_own_sound.contains(&id) {
+        return None;
+    }
+    let own = |cid: &crate::camera::CameraId| data.cameras_with_own_sound.contains(cid);
+    let twins: Vec<&str> = data
+        .cameras
+        .iter()
+        .filter(|(name, cid)| own(cid) && same_box(camera_name, name))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let as_macos_lists = data
+        .cameras
+        .iter()
+        .filter(|(name, cid)| !own(cid) && same_box(camera_name, name))
+        .count();
+    match twins.as_slice() {
+        [twin] if as_macos_lists == 1 => Some(twin),
+        _ => None,
+    }
+}
+
+/// Whether the mixer takes sound from device `name` already.
+fn in_the_mixer(name: &str, data: &UIData) -> bool {
+    data.audio_mix.sources.iter().any(|source| {
+        matches!(
+            &source.kind,
+            crate::audio_mix::AudioSourceKind::Input { device, .. } if device == name
+        )
+    })
 }
 
 /// The sound device that is a camera's own: named alike.
@@ -713,6 +1001,16 @@ fn own_sound<'a>(camera: &str, data: &'a UIData) -> Option<&'a crate::audio_mix:
 }
 
 fn camera_format(ui: &mut egui::Ui, data: &UIData, id: crate::camera::CameraId, state: &mut State) {
+    // A camera that takes the format coming in has none to choose.
+    if data.cameras_following_signal.contains(&id) {
+        state.camera_mode = None;
+        ui.horizontal(|ui| {
+            ui.label("Format:");
+            ui.label("follows the signal")
+                .on_hover_text("It takes the size and rate coming in, and changes with them");
+        });
+        return;
+    }
     let modes: &[CameraMode] = data
         .camera_modes
         .iter()
@@ -736,7 +1034,16 @@ fn camera_format(ui: &mut egui::Ui, data: &UIData, id: crate::camera::CameraId, 
     });
 }
 
-fn camera_sound(ui: &mut egui::Ui, data: &UIData, state: &mut State) {
+fn camera_sound(ui: &mut egui::Ui, data: &UIData, id: crate::camera::CameraId, state: &mut State) {
+    // Its sound comes with its pictures: no device to choose.
+    if data.cameras_with_own_sound.contains(&id) {
+        state.camera_audio = None;
+        ui.horizontal(|ui| {
+            ui.label("Audio:");
+            ui.label("its own, with its picture");
+        });
+        return;
+    }
     let label = |audio: &Option<(String, u16, u16)>| match audio {
         None => "None".to_string(),
         Some((dev, l, r)) if l == r => format!("{dev} ({} mono)", l + 1),
@@ -994,6 +1301,10 @@ fn source(data: &UIData, state: &State) -> Option<InputSource> {
         Kind::Colour => Some(InputSource::Colour {
             color: state.colour,
         }),
+        Kind::Broadcast => state
+            .broadcast
+            .clone()
+            .map(|shader_name| InputSource::Generator { shader_name }),
         Kind::Generator => state
             .generator
             .clone()
@@ -1006,10 +1317,23 @@ fn source(data: &UIData, state: &State) -> Option<InputSource> {
             .map(|channel_uuid| InputSource::Input { channel_uuid }),
         // An empty list, filled in its window.
         Kind::Playlist => Some(InputSource::Playlist { items: Vec::new() }),
+        // Its talks added in the Presentations panel.
+        Kind::Presentations => Some(InputSource::Slides { paths: Vec::new() }),
         Kind::Timer => Some(InputSource::Timer {
             settings: Some(state.timer.clone()),
         }),
-        Kind::Video | Kind::Image | Kind::Audio => None,
+        Kind::LowerThird => Some(InputSource::LowerThird { settings: None }),
+        Kind::Text => Some(InputSource::Text {
+            settings: Some(crate::engine::value::text::TextSettings {
+                text: if state.text.trim().is_empty() {
+                    crate::engine::value::text::TextSettings::default().text
+                } else {
+                    state.text.clone()
+                },
+                ..crate::engine::value::text::TextSettings::default()
+            }),
+        }),
+        Kind::Video | Kind::Image | Kind::Audio | Kind::PowerPoint => None,
     }
 }
 
@@ -1038,24 +1362,44 @@ fn add(ctx: &egui::Context, data: &UIData, actions: &mut UIActions, state: &Stat
     let Some(source) = source(data, state) else {
         return false;
     };
+    let camera_audio = || {
+        state
+            .camera_audio
+            .clone()
+            .map(|(device, left, right)| InputAudio {
+                device,
+                left,
+                right,
+            })
+    };
     let command = match &state.layer_of {
-        Some(channel_uuid) => source.deck_command(channel_uuid),
+        // A camera layer takes its own sound as a camera input does.
+        Some(channel_uuid) => match source {
+            InputSource::Camera { camera_id, mode } => EngineCommand::AddCameraDeck {
+                channel_uuid: channel_uuid.clone(),
+                camera_id,
+                mode,
+                audio: camera_audio(),
+            },
+            source => source.deck_command(channel_uuid),
+        },
         None => EngineCommand::AddInput {
             audio: match &source {
-                InputSource::Camera { .. } => {
-                    state
-                        .camera_audio
-                        .clone()
-                        .map(|(device, left, right)| InputAudio {
-                            device,
-                            left,
-                            right,
-                        })
-                }
+                InputSource::Camera { .. } => camera_audio(),
                 _ => None,
             },
             source,
-            name: Some(state.name.trim().to_string()).filter(|n| !n.is_empty()),
+            // A Broadcast background is named as its look is ("Hex field").
+            name: Some(state.name.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .or_else(|| {
+                    (state.kind == Kind::Broadcast).then(|| {
+                        data.broadcast
+                            .iter()
+                            .find(|look| state.broadcast.as_deref() == Some(look.name.as_str()))
+                            .map(|look| look.title.clone())
+                    })?
+                }),
         },
     };
     actions.commands.push(command);
@@ -1202,7 +1546,10 @@ mod tests {
         click(&mut harness, "OK");
         match added(&harness).as_slice() {
             [EngineCommand::AddInput {
-                source: InputSource::Timer { settings: Some(settings) },
+                source:
+                    InputSource::Timer {
+                        settings: Some(settings),
+                    },
                 ..
             }] => assert_eq!(settings.mode, crate::engine::value::timer::TimerMode::Clock),
             other => panic!("{other:?}"),
@@ -1283,6 +1630,230 @@ mod tests {
         }
     }
 
+    /// A camera whose sound comes with its pictures (a Blackmagic input) is
+    /// not given a sound device's besides: it would be there twice.
+    #[test]
+    fn a_camera_with_its_own_sound_is_given_no_sound_device() {
+        let mut with_own = data();
+        with_own.cameras_with_own_sound = vec![1];
+        let mut harness = harness(with_own, None);
+        click(&mut harness, "Camera");
+        click(&mut harness, "Blackmagic Design");
+        assert!(harness
+            .query_by_label("its own, with its picture")
+            .is_some());
+        // No sound device to choose besides: one chosen would be heard
+        // twice — late, through macOS (an echo on air).
+        click(&mut harness, "Audio:");
+        assert!(harness.query_by_label("Scarlett Solo").is_none());
+        click(&mut harness, "OK");
+        match added(&harness).as_slice() {
+            [EngineCommand::AddInput { audio: None, .. }] => {}
+            other => panic!("expected no sound device, got {other:?}"),
+        }
+    }
+
+    /// A Blackmagic box chosen as macOS lists it is pointed to its twin read
+    /// through Blackmagic's own way, whose sound comes in step; the twin
+    /// itself, or a camera with none, is not.
+    #[test]
+    fn a_blackmagic_box_as_macos_lists_it_points_to_its_twin() {
+        let mut data = data();
+        data.cameras = vec![
+            ("Blackmagic UltraStudio Mini Recorder 12G".into(), 1),
+            ("UltraStudio Mini Recorder 12G (Blackmagic)".into(), 2),
+            ("FaceTime HD".into(), 0),
+        ];
+        data.cameras_with_own_sound = vec![2];
+        {
+            let twin = |name: &str, id| blackmagic_twin(name, id, &data).map(str::to_string);
+            assert_eq!(
+                twin("Blackmagic UltraStudio Mini Recorder 12G", 1).as_deref(),
+                Some("UltraStudio Mini Recorder 12G (Blackmagic)")
+            );
+            assert_eq!(twin("UltraStudio Mini Recorder 12G (Blackmagic)", 2), None);
+            assert_eq!(twin("FaceTime HD", 0), None);
+            assert_eq!(
+                twin("Blackmagic UltraStudio Mini Recorder 12G Pro", 3),
+                None,
+                "another box"
+            );
+        }
+        data.audio_mix
+            .input_devices
+            .push(crate::audio_mix::AudioInputDevice {
+                name: "Blackmagic UltraStudio Mini Recorder 12G".into(),
+                channels: 16,
+            });
+        let mut harness = harness(data, None);
+        click(&mut harness, "Camera");
+        // The box is listed once, read its own way; no warning then.
+        assert!(harness
+            .query_by_label("Blackmagic UltraStudio Mini Recorder 12G")
+            .is_none());
+        click(&mut harness, "UltraStudio Mini Recorder 12G (Blackmagic)");
+        assert!(harness
+            .query_by_label_contains("reads the same box through Blackmagic")
+            .is_none());
+        // Opened through macOS on purpose: the warning, and its sound device.
+        click(&mut harness, "Open through:");
+        click(&mut harness, "macOS (its sound can come late)");
+        assert!(harness
+            .query_by_label_contains("reads the same box through Blackmagic")
+            .is_some());
+        // Its row clicked again keeps the way chosen.
+        click(&mut harness, "UltraStudio Mini Recorder 12G (Blackmagic)");
+        assert!(harness
+            .query_by_label_contains("reads the same box through Blackmagic")
+            .is_some());
+        // Back to Blackmagic's own way: its own sound, no device besides — the
+        // one macOS's way had chosen would be heard twice, late (an echo).
+        click(&mut harness, "Open through:");
+        click(&mut harness, "Blackmagic (sound with its picture)");
+        click(&mut harness, "OK");
+        match added(&harness).as_slice() {
+            [EngineCommand::AddInput {
+                source: InputSource::Camera { camera_id: 2, .. },
+                audio: None,
+                ..
+            }] => {}
+            other => panic!("expected the box its own way, no sound device, got {other:?}"),
+        }
+    }
+
+    /// The Broadcast backgrounds are a kind of their own, by mood; one
+    /// chosen is added as its generator, named as its look is — and they are
+    /// not among the Generators besides.
+    #[test]
+    fn a_broadcast_background_is_added_named_as_its_look() {
+        let mut data = data();
+        data.generators = vec![("broadcast_hex_glow".into(), 0), ("plasma".into(), 1)];
+        data.broadcast = vec![crate::engine::BroadcastLook {
+            name: "broadcast_hex_glow".into(),
+            title: "Hex field".into(),
+            mood: "Tech".into(),
+            index: 0,
+        }];
+        let mut harness = harness(data, None);
+        click(&mut harness, "Generator");
+        assert!(harness.query_by_label("Plasma").is_some());
+        assert!(harness.query_by_label("Broadcast hex glow").is_none());
+        click(&mut harness, "Broadcast");
+        assert!(harness.query_by_label("Tech").is_some());
+        click(&mut harness, "Hex field");
+        click(&mut harness, "OK");
+        match added(&harness).as_slice() {
+            [EngineCommand::AddInput {
+                source: InputSource::Generator { shader_name },
+                name: Some(name),
+                ..
+            }] => {
+                assert_eq!(shader_name, "broadcast_hex_glow");
+                assert_eq!(name, "Hex field");
+            }
+            other => panic!("expected the look as an input, got {other:?}"),
+        }
+    }
+
+    /// A camera that follows its signal has no format to choose: it says so,
+    /// and is added at none.
+    #[test]
+    fn a_camera_following_its_signal_has_no_format_to_choose() {
+        let mut data = data();
+        data.cameras_following_signal = vec![1];
+        let mut harness = harness(data, None);
+        click(&mut harness, "Camera");
+        click(&mut harness, "Blackmagic Design");
+        assert!(harness.query_by_label("follows the signal").is_some());
+        click(&mut harness, "OK");
+        match added(&harness).as_slice() {
+            [EngineCommand::AddInput {
+                source:
+                    InputSource::Camera {
+                        camera_id: 1,
+                        mode: None,
+                    },
+                ..
+            }] => {}
+            other => panic!("expected the camera at no format, got {other:?}"),
+        }
+    }
+
+    /// Each opening chooses a camera's format and sound afresh: the camera
+    /// added before, its sound is in the mixer now, not to be added twice.
+    #[test]
+    fn each_opening_chooses_a_cameras_sound_afresh() {
+        let ctx = egui::Context::default();
+        for reopen in [open as fn(&egui::Context), |ctx| open_for_layer(ctx, "ch")] {
+            let mut state = load(&ctx);
+            state.camera_settled = Some(1);
+            store(&ctx, state);
+            reopen(&ctx);
+            assert_eq!(load(&ctx).camera_settled, None);
+        }
+    }
+
+    /// A camera added as a layer takes its own sound, as a camera input
+    /// does — unless the mixer has that sound already (its own input), or
+    /// a picture-in-picture beside it would have it twice.
+    #[test]
+    fn a_camera_layer_takes_its_own_sound_unless_the_mixer_has_it() {
+        let layer_with = |data: UIData, check: &dyn Fn(&[&EngineCommand])| {
+            let channel = data.channels[0].uuid.clone();
+            let mut harness = harness(data, Some(&channel));
+            click(&mut harness, "Camera");
+            click(&mut harness, "Blackmagic Design");
+            click(&mut harness, "OK");
+            check(&added(&harness));
+        };
+        layer_with(data(), &|added| match added {
+            [EngineCommand::AddCameraDeck {
+                camera_id: 1,
+                audio: Some(audio),
+                ..
+            }] => assert_eq!(audio.device, "Blackmagic Design"),
+            other => panic!("expected the layer with its sound, got {other:?}"),
+        });
+        let mut taken = data();
+        taken.audio_mix.sources = vec![crate::audio_mix::AudioSourceSnapshot {
+            dynamics: crate::audio_mix::DynamicsSnapshot::default(),
+            uuid: "strip001".into(),
+            name: "Blackmagic Design".into(),
+            kind: crate::audio_mix::AudioSourceKind::Input {
+                device: "Blackmagic Design".into(),
+                left: 0,
+                right: 1,
+                deck: None,
+                app: None,
+            },
+            gain_db: 0.0,
+            muted: false,
+            sends: vec![],
+            auto: true,
+            follow: None,
+            balance: 0.0,
+            delay_ms: 0.0,
+            on_air: 0.0,
+            gate: 1.0,
+            solo: false,
+            live: true,
+            meter_db: [-96.0; 2],
+            signal_db: [-96.0; 2],
+            peak_db: [-96.0; 2],
+            refused: None,
+            send_settings: std::collections::BTreeMap::default(),
+            sent_before: Vec::new(),
+        }];
+        layer_with(taken, &|added| match added {
+            [EngineCommand::AddCameraDeck {
+                camera_id: 1,
+                audio: None,
+                ..
+            }] => {}
+            other => panic!("expected the layer without a second sound, got {other:?}"),
+        });
+    }
+
     #[test]
     fn double_clicking_a_display_adds_it_at_once() {
         let mut harness = harness(data(), None);
@@ -1355,6 +1926,7 @@ mod tests {
                 channel_uuid,
                 camera_id: 0,
                 mode: None,
+                ..
             }] => assert_eq!(*channel_uuid, channel),
             other => panic!("expected a camera layer in the channel, got {other:?}"),
         }
@@ -1420,14 +1992,14 @@ mod tests {
             fresh.channels[0].uuid.clone(),
             fresh.channels[1].uuid.clone(),
         );
-        let (a_name, b_name) = (
-            fresh.channels[0].name.clone(),
-            fresh.channels[1].name.clone(),
-        );
+        let a_name = fresh.channels[0].name.clone();
+        // Listed by number and name, as their tiles have them.
+        let (a_row, b_row) = (fresh.channels[0].numbered(), fresh.channels[1].numbered());
+        assert_eq!(b_row, format!("2  {}", fresh.channels[1].name));
         let mut harness_ = harness(fresh, Some(&a));
         click(&mut harness_, "Another input");
-        assert!(harness_.query_by_label(&a_name).is_none(), "not itself");
-        click(&mut harness_, &b_name);
+        assert!(harness_.query_by_label(&a_row).is_none(), "not itself");
+        click(&mut harness_, &b_row);
         click(&mut harness_, "OK");
         match added(&harness_).as_slice() {
             [EngineCommand::AddTapDeck {
@@ -1447,13 +2019,13 @@ mod tests {
         });
         let mut looped = harness(shows_a, Some(&a));
         click(&mut looped, "Another input");
-        click(&mut looped, &b_name);
+        click(&mut looped, &b_row);
         click(&mut looped, "OK");
         assert!(added(&looped).is_empty(), "{:?}", added(&looped));
 
         let mut copy = harness(data(), None);
         click(&mut copy, "Another input");
-        click(&mut copy, &a_name);
+        click(&mut copy, &a_row);
         click(&mut copy, "OK");
         match added(&copy).as_slice() {
             [EngineCommand::AddInput {

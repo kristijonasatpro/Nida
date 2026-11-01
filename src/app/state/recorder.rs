@@ -90,6 +90,12 @@ impl VardaApp {
         self.session.recorder.armed()
     }
 
+    /// Whether the pass under way has a take for `param_key`: a gesture on
+    /// it already noted.
+    pub(crate) fn recording_take(&self, param_key: &str) -> bool {
+        self.session.recorder.takes.contains_key(param_key)
+    }
+
     /// Whether a pass is under way and has already pushed its undo entry.
     ///
     /// Everything from the first touch to the end of the pass folds into that

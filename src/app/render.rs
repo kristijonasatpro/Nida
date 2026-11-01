@@ -368,7 +368,11 @@ impl VardaApp {
     /// Write the present trace once its time is up (see `TracePresents`).
     fn finish_present_trace(&self) {
         use crate::renderer::context::UnifiedOutput;
-        let fps = if self.target_fps > 0 { self.target_fps } else { 60 };
+        let fps = if self.target_fps > 0 {
+            self.target_fps
+        } else {
+            60
+        };
         let frame_ms = 1000.0 / f64::from(fps);
         let outputs = || {
             self.output
@@ -426,7 +430,10 @@ impl VardaApp {
         // frame it is chosen (the library is the app's, not the mixer's).
         if let Some((transition, name)) = self.mixer.main_transition_shader_wanted() {
             let shader = self.registry.get(name).cloned();
-            if let Err(e) = self.mixer.set_main_transition_shader(&self.context, transition, shader) {
+            if let Err(e) = self
+                .mixer
+                .set_main_transition_shader(&self.context, transition, shader)
+            {
                 log::warn!(
                     "Main's {} transition could not be made ({e}): it fades instead",
                     transition.name()
@@ -478,6 +485,20 @@ impl VardaApp {
         // off-air. See /spec/channel-preview.md.
         let mut needed_camera_ids = std::collections::HashSet::new();
         let mut needed_capture_ids = std::collections::HashSet::new();
+        // A presenter view needs its PowerPoint input's capture, wanted or not.
+        let show_captures: std::collections::HashMap<String, crate::screen_capture::CaptureId> =
+            self.mixer
+                .channels()
+                .iter()
+                .flat_map(|ch| &ch.decks)
+                .filter_map(|slot| {
+                    let state = slot.deck.screen_capture.as_ref()?;
+                    state
+                        .presentation
+                        .as_ref()
+                        .map(|_| (slot.deck.uuid().to_string(), state.capture_id))
+                })
+                .collect();
         // Counted over every deck, not just the visible ones: this is what the
         // capture manager reconciles its sessions against, so an off-air deck
         // must still count as a holder.
@@ -486,6 +507,7 @@ impl VardaApp {
         // How each camera's pictures are read into colours, as its decks say
         // (see `CameraManager::set_colours`).
         let mut camera_colours = std::collections::HashMap::new();
+        let mut camera_names = std::collections::HashMap::new();
         let mut camera_latencies = std::collections::HashMap::new();
         // What each camera's picture is coded as, a LUT file named in full
         // (see `CameraManager::set_profiles`).
@@ -502,8 +524,23 @@ impl VardaApp {
                 if let Some(cap_id) = slot.deck.screen_capture_id() {
                     *capture_holders.entry(cap_id).or_default() += 1;
                 }
+                // A Slides input's talks on and coming hold their shows'
+                // captures.
+                let talk_captures = slot
+                    .deck
+                    .slides()
+                    .map(crate::deck::slides::Slides::capture_ids)
+                    .unwrap_or_default();
+                for cap_id in &talk_captures {
+                    *capture_holders.entry(*cap_id).or_default() += 1;
+                }
+                // Wanted or not: a talk started while its Slides input is off
+                // air (a camera on, the next speaker coming up) takes over
+                // only once its picture is there, so its capture keeps coming.
+                needed_capture_ids.extend(talk_captures.iter().copied());
                 if let Some(cam_id) = slot.deck.camera_id() {
                     camera_colours.insert(cam_id, slot.deck.camera_colour);
+                    camera_names.insert(cam_id, slot.deck.source_name().to_string());
                     camera_latencies.insert(cam_id, slot.deck.camera_lowest_latency);
                     camera_profiles.insert(cam_id, lut_in_full(&slot.deck.camera_profile, &luts));
                 }
@@ -524,6 +561,13 @@ impl VardaApp {
                 if let Some(cap_id) = slot.deck.screen_capture_id() {
                     needed_capture_ids.insert(cap_id);
                 }
+                if let Some(id) = slot
+                    .deck
+                    .presenter()
+                    .and_then(|p| show_captures.get(p.follows()))
+                {
+                    needed_capture_ids.insert(*id);
+                }
             }
         }
 
@@ -536,7 +580,37 @@ impl VardaApp {
 
         // A camera missing when the show opened is picked up once it is here.
         self.reconcile_cameras();
+        self.follow_lower_third_lists();
+        // PowerPoint inputs: shows opened, closed, their windows captured;
+        // presenter views told where their shows are.
+        self.reconcile_presentations();
+        // Web talks: pages opened, captured and closed.
+        self.reconcile_web_talks();
+        self.feed_presenters();
         // macOS camera effects change a camera's picture on air: say so.
+        // A camera whose frames come far slower than it was opened at (a
+        // USB 2 link): said, every couple of seconds looked at.
+        if self
+            .camera_rates_at
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(2))
+        {
+            self.camera_rates_at = Some(std::time::Instant::now());
+            self.camera_rates.retain(|id, _| camera_names.contains_key(id));
+            for (id, name) in &camera_names {
+                let Some(signal) = self.camera_manager.signal(*id) else {
+                    continue;
+                };
+                if self.camera_rates.entry(*id).or_default().look(signal.fps, signal.opened_fps) {
+                    let text = crate::camera::slow_camera_warning(
+                        name.trim_start_matches(|c: char| !c.is_alphanumeric()).trim(),
+                        signal.fps,
+                        signal.opened_fps.unwrap_or_default(),
+                    );
+                    log::warn!("{text}");
+                    self.session.notifications.warn(text);
+                }
+            }
+        }
         if let Some(effects) = self.camera_manager.poll_video_effects() {
             let text = crate::camera::video_effects_warning(&effects);
             log::warn!("{text}");
@@ -547,13 +621,14 @@ impl VardaApp {
         self.camera_manager.set_profiles(&camera_profiles);
         // Each camera's and capture's frame is picked by when this show
         // frame is due on screen (see `crate::frame_picker`).
-        let show_at = self
-            .frame_stats
-            .refresh_at
-            .map_or_else(crate::host_clock::host_seconds, crate::host_clock::host_seconds_of);
+        let show_at = self.frame_stats.refresh_at.map_or_else(
+            crate::host_clock::host_seconds,
+            crate::host_clock::host_seconds_of,
+        );
         // Update only needed camera frames
         self.camera_manager
             .update_selective(&self.context, &needed_camera_ids, show_at);
+        self.check_atem_setup();
 
         // Upload screen-capture frames for visible/cued decks only. An
         // invisible capture deck costs nothing, which is what makes a
@@ -592,8 +667,68 @@ impl VardaApp {
         // does the GPU texture upload). See spec/depth-sensors.md.
         self.depth_manager.update(&self.context.queue);
 
+        // A presenter view shows its PowerPoint input's slide, straight from
+        // that input's capture.
+        let shows: std::collections::HashMap<String, crate::screen_capture::CaptureId> = self
+            .mixer
+            .channels()
+            .iter()
+            .flat_map(|ch| &ch.decks)
+            .filter_map(|slot| {
+                let state = slot.deck.screen_capture.as_ref()?;
+                state
+                    .presentation
+                    .as_ref()
+                    .map(|_| (slot.deck.uuid().to_string(), state.capture_id))
+            })
+            .collect();
+
+        // A presenter view of a Slides input shows that input's picture —
+        // drawn before it this frame (see `Mixer::prepare_taps`).
+        let slides_pictures: std::collections::HashMap<String, (wgpu::TextureView, (u32, u32))> =
+            self.mixer
+                .channels()
+                .iter()
+                .flat_map(|ch| &ch.decks)
+                .filter(|slot| slot.deck.slides().is_some())
+                .map(|slot| {
+                    let size = (slot.deck.texture.width(), slot.deck.texture.height());
+                    (
+                        slot.deck.uuid().to_string(),
+                        (slot.deck.output_view().clone(), size),
+                    )
+                })
+                .collect();
+
         for channel in self.mixer.channels_mut() {
             for slot in &mut channel.decks {
+                if let Some(presenter) = slot.deck.presenter_mut() {
+                    presenter.slide = shows
+                        .get(presenter.follows())
+                        .and_then(|id| {
+                            let view = self.screen_capture_manager.texture_view(*id)?.clone();
+                            Some((view, self.screen_capture_manager.resolution(*id)?))
+                        })
+                        .or_else(|| slides_pictures.get(presenter.follows()).cloned());
+                }
+                // A Slides input's talks on and coming: each capture's picture,
+                // once it has one — until then the talk is not ready, and what
+                // is on stays on.
+                if let Some(slides) = slot.deck.slides_mut() {
+                    let captures = &self.screen_capture_manager;
+                    slides.for_each_deck_mut(|deck| {
+                        let Some(id) = deck.screen_capture_id() else {
+                            return;
+                        };
+                        if let Some((w, h)) = captures.resolution(id) {
+                            deck.set_external_source_size(w, h);
+                        }
+                        deck.external_source_view = captures
+                            .has_picture(id)
+                            .then(|| captures.texture_view(id).cloned())
+                            .flatten();
+                    });
+                }
                 if let Some(kind) = slot.deck.external_source_kind() {
                     use crate::deck::ExternalSourceKind;
                     slot.deck.external_source_view = match kind {
@@ -745,15 +880,27 @@ impl VardaApp {
         };
 
         let target_fps = self.target_fps;
+        // The show's rate as frames really come, for the recordings' and
+        // streams' timelines: a take at a whole share of it is placed by the
+        // show's own frames.
+        let cadence = self.frame_cadence.unwrap_or(target_fps);
+        crate::renderer::subprocess::set_show_fps(cadence);
+        // Lower thirds sent to buses drawn for each bus's names area.
+        self.prepare_lower_third_targets();
         let watched = self.watched_channels();
         self.mixer.decks_shown_alone = self.decks_shown_alone();
         self.mixer.tile_previews = self.ui_tiles;
+        self.mixer.tile_channels.clone_from(&self.tile_channels);
         // The refresh is taken by the mixer: when the frame was drawn is kept
         // for the outputs first, or the recording timed every frame by when
         // its readback was started — a few milliseconds later each time, by
         // however long the mixer took — and repeated one and left out the
         // next, a pair a second (a laptop, 2026-10-03).
-        self.frame_stats.drawn_at = Some(self.frame_drawn());
+        let drawn = self.frame_drawn();
+        self.frame_stats.drawn_at = Some(drawn);
+        // Numbered for the takes at a share of the show's rate, which count
+        // its frames rather than time them (see `subprocess::Grid`).
+        crate::renderer::subprocess::note_frame_drawn(drawn, cadence);
         self.mixer.frame_timing = crate::mixer::FrameTiming {
             refresh_at: self.frame_stats.refresh_at.take(),
             held: self.frames_follow_a_screen(),
@@ -858,6 +1005,7 @@ impl VardaApp {
         // Resolved once per frame, before any destination renders, so every
         // output following a bus sees the same on-air content this frame.
         let mut bus_feeds = self.bus_feeds();
+        let names_areas = self.bus_names_areas();
 
         // Prepare sub-mixes for any Channels(...) sources: a surface's own, or
         // the master with layers hidden that a bus puts on air.
@@ -937,6 +1085,22 @@ impl VardaApp {
             |source| Self::resolve_direct(mixer, source, None),
             mixer.black_view(),
         );
+        // Lower thirds sent to buses, drawn over what each shows — its
+        // dissolve too.
+        let overlays = super::state::lower_thirds::live_bus_overlays(
+            mixer,
+            &self.production_buses,
+            &names_areas,
+            (self.render_width, self.render_height),
+        );
+        self.output.bus_overlays.render(
+            context,
+            (self.render_width, self.render_height),
+            &mut bus_feeds,
+            |source| Self::resolve_direct(mixer, source, None),
+            mixer.black_view(),
+            &overlays,
+        );
 
         // Run domemaster renderer if enabled (content rotation is updated each frame via set_content_rotation)
         let domemaster_view = if let Some(dome) = &self.output.domemaster {
@@ -966,7 +1130,9 @@ impl VardaApp {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, o)| match o {
-                    UnifiedOutput::Window(w) if w.calibration_mode == CalibrationMode::Projector => {
+                    UnifiedOutput::Window(w)
+                        if w.calibration_mode == CalibrationMode::Projector =>
+                    {
                         let (width, height) =
                             w.rotation.effective_dimensions(w.size.width, w.size.height);
                         Some(WantedCard {
@@ -1000,9 +1166,7 @@ impl VardaApp {
             cards: &self.output.led_cards,
             output_cards: &self.output.output_cards,
         };
-        self.frame_stats
-            .parts
-            .add("outputs prep", t_prep.elapsed());
+        self.frame_stats.parts.add("outputs prep", t_prep.elapsed());
         self.frame_stats.windows_presented = false;
         let hold = self.frame_hold_secs();
         let period = 1.0 / f64::from(self.target_fps.max(1));
@@ -1107,9 +1271,7 @@ impl VardaApp {
             sinks,
             &led,
         );
-        self.frame_stats
-            .parts
-            .add("stream", t_headless.elapsed());
+        self.frame_stats.parts.add("stream", t_headless.elapsed());
 
         // And the recording.
         let sinks = HeadlessDeliverySinks {
@@ -1417,7 +1579,10 @@ impl VardaApp {
         // Sizes read here, on the main thread: the engine thread publishes
         // them, and a screen asked for its size from another thread answers
         // through the main thread — which may be waiting for the engine.
-        self.output.monitor_sizes = handles.iter().map(winit::monitor::MonitorHandle::size).collect();
+        self.output.monitor_sizes = handles
+            .iter()
+            .map(winit::monitor::MonitorHandle::size)
+            .collect();
         let names = super::monitors::names(&handles);
         // What macOS calls each screen, and what a name given to it is kept
         // by, asked here on the main thread too — this runs every frame, so
@@ -1435,6 +1600,9 @@ impl VardaApp {
             .screen_facts_at
             .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1));
         if due || screens != self.output.screen_facts_for {
+            if screens != self.output.screen_facts_for {
+                super::screens::forget_panels();
+            }
             self.output.screen_facts = super::screens::facts(&handles, &names);
             self.output.screen_facts_for = screens;
             self.output.screen_facts_at = Some(std::time::Instant::now());
@@ -1540,9 +1708,9 @@ impl VardaApp {
                 let card = led.output_cards.view(&h.uuid).filter(|_| {
                     h.calibration_mode == crate::renderer::context::CalibrationMode::Projector
                 });
-                let Some(source_view) = card.or_else(|| {
-                    Self::resolve_source(mixer, &h.source, domemaster_view, bus_feeds)
-                }) else {
+                let Some(source_view) = card
+                    .or_else(|| Self::resolve_source(mixer, &h.source, domemaster_view, bus_feeds))
+                else {
                     continue;
                 };
                 // A bus sends only its region of the master, as it does on a
@@ -1571,11 +1739,7 @@ impl VardaApp {
                     )
                     .then(|| {
                         crate::renderer::context::fitted_in_format(
-                            led.master,
-                            region.0,
-                            h.rotation,
-                            h.width,
-                            h.height,
+                            led.master, region.0, h.rotation, h.width, h.height,
                         )
                     })
                 };
@@ -1804,7 +1968,8 @@ impl VardaApp {
                 }
             } else if !is_syphon {
                 // Enqueue readback copy from the now-rendered texture
-                h.readback.begin_readback(&mut encoder, &h.texture, sinks.drawn);
+                h.readback
+                    .begin_readback(&mut encoder, &h.texture, sinks.drawn);
             }
             context.submit(std::iter::once(encoder.finish()));
 
@@ -2172,9 +2337,11 @@ fn lut_in_full(
 ) -> crate::engine::value::camera::CameraProfile {
     use crate::engine::value::camera::CameraProfile;
     match profile {
-        CameraProfile::Lut { file } if !std::path::Path::new(file).is_absolute() => CameraProfile::Lut {
-            file: luts.join(file).to_string_lossy().into_owned(),
-        },
+        CameraProfile::Lut { file } if !std::path::Path::new(file).is_absolute() => {
+            CameraProfile::Lut {
+                file: luts.join(file).to_string_lossy().into_owned(),
+            }
+        }
         other => other.clone(),
     }
 }

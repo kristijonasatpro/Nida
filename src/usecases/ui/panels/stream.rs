@@ -975,6 +975,18 @@ fn render_options(
                     );
             });
             ui.end_row();
+            if let Some(warning) = options
+                .fps
+                .and_then(|sent| super::record::uneven_rate_warning(data.target_fps, sent))
+            {
+                ui.label("");
+                ui.label(
+                    egui::RichText::new(format!("⚠ {warning}"))
+                        .color(super::monitoring::WARN)
+                        .small(),
+                );
+                ui.end_row();
+            }
             if options.codec == VideoCodec::Hevc {
                 ui.label("");
                 ui.label(

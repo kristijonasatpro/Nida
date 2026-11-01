@@ -30,13 +30,30 @@ fn fx_accent() -> egui::Color32 {
 /// The Main Output panel: the picture (click for the master's effects,
 /// right-click to send it to a bus) and, in Main mode, what Main carries.
 pub(super) fn render_main_output(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
-    // As large as the panel allows, leaving room for the lines under it.
+    // As large as the panel allows, leaving room for the lines under it and
+    // the meters beside it: what the recording, the stream and the speakers
+    // hear.
+    let meters = super::out_meters::width(data);
     let budget = egui::vec2(
-        ui.available_width() - 4.0,
+        (ui.available_width() - 12.0 - meters).max(80.0),
         (ui.available_height() - 44.0).max(60.0),
     );
     let preview_size = super::utils::preview_size(budget, data.render_width, data.render_height);
+    ui.horizontal_top(|ui| {
+        render_main_picture(ui, preview_size, data, actions);
+        super::out_meters::render(ui, preview_size.y, data);
+    });
+    render_main_lines(ui, data, actions);
+}
 
+/// The Main output picture: click it for the master effects, right-click to
+/// take Master to a bus.
+fn render_main_picture(
+    ui: &mut egui::Ui,
+    preview_size: egui::Vec2,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
     if let Some(texture_id) = data.main_output_texture {
         let img_response = ui.add(
             egui::Image::new(egui::load::SizedTexture::new(texture_id, preview_size))
@@ -87,7 +104,10 @@ pub(super) fn render_main_output(ui: &mut egui::Ui, data: &UIData, actions: &mut
             master_take_menu(&response, data, actions);
         });
     }
+}
 
+/// Under the picture: what Main carries, and the hint to click it.
+fn render_main_lines(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
     // What Main carries, in Main mode.
     if super::main_desk::in_main_mode(data) {
         let overlays: Vec<&str> = data
@@ -175,6 +195,22 @@ pub(super) fn render_setup(ui: &mut egui::Ui, data: &UIData, actions: &mut UIAct
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Main Output panel has the REC and STREAM meters beside its
+    /// picture.
+    #[test]
+    fn the_main_output_has_its_meters_beside_it() {
+        use egui_kittest::kittest::Queryable;
+        let data = UIData::test_fixture();
+        let harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(640.0, 400.0))
+            .build_ui(|ui| render_main_output(ui, &data, &mut UIActions::new()));
+        let picture = harness.get_by_label("Main output").rect();
+        for meter in ["REC meter", "STREAM meter"] {
+            let rect = harness.get_by_label(meter).rect();
+            assert!(rect.left() >= picture.right(), "{meter} at {rect:?}");
+        }
+    }
 
     #[test]
     fn render_main_output_and_setup_smoke() {

@@ -304,6 +304,8 @@ pub(super) fn render_channel_settings(
         ctx.memory_mut(|m| m.data.remove::<Open>(open_id()));
         return;
     };
+    // Its picture shown big: drawn at the show's rate, not a tile's.
+    actions.session.shown_full.push(ch.uuid.clone());
     // Keep what is stored in step with what is found.
     open.channel.clone_from(&ch.uuid);
     if layer.is_none() {
@@ -334,9 +336,11 @@ pub(super) fn render_channel_settings(
         });
     if let Some(inner) = &window {
         let rect = inner.response.rect;
-        // Files and Library items dropped on the window go into this channel.
+        // Files and Library items dropped on the window go into this channel
+        // — where nothing is in front of it.
+        let on = inner.response.layer_id;
         ctx.memory_mut(|m| {
-            m.data.insert_temp(drop_window_id(), (ch.ch_idx, rect));
+            m.data.insert_temp(drop_window_id(), (ch.ch_idx, rect, on));
         });
         // Effects dropped on it go on what it is editing.
         if let Some(layer) = layer {
@@ -355,8 +359,8 @@ pub(super) fn render_channel_settings(
 }
 
 /// Where the open window takes drops, for the drop handlers: which channel,
-/// and the window's rect. It is checked before the channel views, since the
-/// window is drawn over them.
+/// the window's rect, and its layer. It is checked before the channel views,
+/// since the window is drawn over them — unless another is in front of it.
 pub(super) fn drop_window_id() -> egui::Id {
     egui::Id::new("ch_drop_window")
 }
@@ -490,7 +494,7 @@ fn render_layer_list(
     data: &UIData,
     actions: &mut UIActions,
 ) {
-    let accent = channel_color(ch.ch_idx);
+    let accent = ch.accent();
     // The result stays in view whatever is being edited.
     let result = super::utils::preview_size(
         egui::vec2(LIST_WIDTH, LIST_WIDTH),
@@ -539,7 +543,7 @@ fn render_layer_list(
     ui.add_space(4.0);
     ui.label(
         egui::RichText::new(format!(
-            "Layers ({}) — 1 is at the back, higher ones over it",
+            "Layers ({}) — the top one is in front, 1 at the back",
             ch.decks.len()
         ))
         .small()
@@ -550,8 +554,9 @@ fn render_layer_list(
         .max_height((ui.available_height() - 40.0).max(80.0))
         .auto_shrink([false, true])
         .show(ui, |ui| {
-            // Later decks are drawn over earlier ones.
-            for (pos, deck) in ch.decks.iter().enumerate() {
+            // Later decks are drawn over earlier ones: listed front first,
+            // as in Premiere.
+            for (pos, deck) in ch.decks.iter().enumerate().rev() {
                 render_layer_row(ui, ch, pos, deck, open, data, actions);
             }
             if ch.decks.is_empty() {
@@ -577,7 +582,7 @@ fn render_layer_row(
     data: &UIData,
     actions: &mut UIActions,
 ) {
-    let accent = channel_color(ch.ch_idx);
+    let accent = ch.accent();
     let selected = open.item == Item::Layer(deck.uuid.clone());
     ui.push_id(("layer_row", &deck.uuid), |ui| {
         let frame = egui::Frame::default()
@@ -622,8 +627,9 @@ fn render_layer_row(
                         }
                         ui.vertical(|ui| {
                             let name = format!(
-                                "{}  {}",
+                                "{}  {}{}",
                                 pos + 1,
+                                if deck.offline.is_some() { "⚠ " } else { "" },
                                 super::utils::truncate_chars(&deck.name, 18)
                             );
                             let text = if deck.mute {
@@ -631,7 +637,17 @@ fn render_layer_row(
                             } else {
                                 egui::RichText::new(name)
                             };
-                            ui.label(text).on_hover_text(&deck.name);
+                            let text = if deck.offline.is_some() {
+                                text.color(ui.visuals().warn_fg_color)
+                            } else {
+                                text
+                            };
+                            match &deck.offline {
+                                Some(why) => ui
+                                    .label(text)
+                                    .on_hover_text(format!("{} — offline: {why}", deck.name)),
+                                None => ui.label(text).on_hover_text(&deck.name),
+                            };
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 2.0;
                                 let mut shown = !deck.mute;
@@ -645,21 +661,10 @@ fn render_layer_row(
                                         mute: !shown,
                                     });
                                 }
-                                if ui
-                                    .add_enabled(pos > 0, egui::Button::new("⏶").small())
-                                    .on_hover_text("Back — swap with the layer before it")
-                                    .clicked()
-                                {
-                                    actions.commands.push(EngineCommand::MoveDeck {
-                                        deck_uuid: deck.uuid.clone(),
-                                        dst_channel_uuid: ch.uuid.clone(),
-                                        before_deck_uuid: Some(ch.decks[pos - 1].uuid.clone()),
-                                    });
-                                }
                                 let front = pos + 1 >= ch.decks.len();
                                 if ui
-                                    .add_enabled(!front, egui::Button::new("⏷").small())
-                                    .on_hover_text("Forward — swap with the layer after it")
+                                    .add_enabled(!front, egui::Button::new("⏶").small())
+                                    .on_hover_text("Forward — up, in front of the layer above it")
                                     .clicked()
                                 {
                                     actions.commands.push(EngineCommand::MoveDeck {
@@ -669,6 +674,17 @@ fn render_layer_row(
                                             .decks
                                             .get(pos + 2)
                                             .map(|d| d.uuid.clone()),
+                                    });
+                                }
+                                if ui
+                                    .add_enabled(pos > 0, egui::Button::new("⏷").small())
+                                    .on_hover_text("Back — down, behind the layer below it")
+                                    .clicked()
+                                {
+                                    actions.commands.push(EngineCommand::MoveDeck {
+                                        deck_uuid: deck.uuid.clone(),
+                                        dst_channel_uuid: ch.uuid.clone(),
+                                        before_deck_uuid: Some(ch.decks[pos - 1].uuid.clone()),
                                     });
                                 }
                                 if ui
@@ -726,6 +742,7 @@ fn render_layer_row(
                 ui.separator();
             }
             super::deck_detail::framing_menu_items(ui, deck, actions);
+            super::deck_detail::reset_menu_item(ui, deck, actions);
             ui.separator();
             let subject = super::clipboard_menu::Subject::deck(&deck.uuid, &deck.name);
             super::clipboard_menu::items(ui, data, actions, &subject);
@@ -1032,6 +1049,17 @@ fn render_source(ui: &mut egui::Ui, deck: &DeckUIInfo, data: &UIData, actions: &
             .small()
             .weak(),
         );
+    }
+    // A PowerPoint input: its show, steps and screen, and what holds it up.
+    if let Some(p) = &deck.presentation {
+        ui.separator();
+        super::presentation::render_deck_column(ui, data, deck, p, actions);
+    }
+    // A presenter view: the show it follows, its talk clock, and what it
+    // shows where.
+    if let Some(follows) = &deck.presenter_of {
+        ui.separator();
+        super::presentation::render_presenter_column(ui, data, deck, follows, actions);
     }
     super::deck_detail::render_source_settings(ui, deck, data, actions);
     super::deck_detail::render_generator_params(
@@ -1625,6 +1653,97 @@ mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable;
 
+    /// A PowerPoint input's Source shows its show — steps, screen, and what
+    /// holds it up — and says why its capture is black, not "rescan".
+    #[test]
+    fn a_powerpoint_inputs_source_shows_its_show_and_why_it_is_black() {
+        use crate::engine::value::presentation::{
+            PlaysOn, PresentationSnapshot, PresentationStatus, Screen,
+        };
+        let mut data = UIData::test_fixture();
+        let layer = &mut data.channels[0].decks[0];
+        layer.screen_capture = Some(crate::usecases::ui::ScreenCaptureUI {
+            target_label: "com.microsoft.Powerpoint — talk".into(),
+            is_display: false,
+            rate: 1.0,
+            rate_fps: 60.0,
+            crop: [0.0, 0.0, 1.0, 1.0],
+            show_cursor: false,
+            exclude_varda: true,
+            bound: false,
+            connected: false,
+        });
+        layer.presentation = Some(PresentationSnapshot {
+            path: "/Talks/talk.pptx".into(),
+            status: PresentationStatus::Failed,
+            message: Some("Nida may not control PowerPoint".into()),
+            slide: None,
+            slides: None,
+            position: None,
+            shown: None,
+            screen: Screen::Slide,
+            title: None,
+            notes: String::new(),
+            next_slide: None,
+            next_title: None,
+            plays_on: PlaysOn::Auto,
+            playing_on: None,
+            slide_pixels: None,
+            video: None,
+        });
+        let layer = data.channels[0].decks[0].clone();
+        let harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 900.0))
+            .build_ui(|ui| {
+                let mut actions = UIActions::new();
+                render_source(ui, &layer, &data, &mut actions);
+            });
+        harness.get_by_label("PowerPoint");
+        assert_eq!(
+            harness
+                .query_all_by_label("Nida may not control PowerPoint")
+                .count(),
+            2,
+            "in its column and on its capture"
+        );
+        assert!(harness
+            .query_by_label("Target not found — showing black. Reopen the target and rescan.")
+            .is_none());
+    }
+
+    /// A presenter view's Source has its layout: the talk timer switched
+    /// off there is a `SetPresenterLayout` for that layer.
+    #[test]
+    fn a_presenter_views_source_switches_its_clocks() {
+        let mut data = UIData::test_fixture();
+        let follows = data.channels[0].decks[0].uuid.clone();
+        let presenter = &mut data.channels[0].decks[1];
+        presenter.presenter_of = Some(follows);
+        presenter.presenter_layout =
+            Some(crate::engine::value::presentation::PresenterLayout::default());
+        let uuid = presenter.uuid.clone();
+        let mut harness = {
+            let uuid = uuid.clone();
+            harness(data, move |ctx| open_layer(ctx, &uuid))
+        };
+        harness.get_by_label("Source").click();
+        harness.run();
+        for label in ["Time of day", "Next slide", "Top", "Bottom"] {
+            harness.get_by_label(label);
+        }
+        harness.get_by_label("Talk timer").click();
+        harness.run();
+        assert!(
+            harness.state().commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetPresenterLayout { deck_uuid, layout }
+                    if *deck_uuid == uuid && !layout.timer && !layout.clock
+            )),
+            "{:?}",
+            harness.state().commands
+        );
+    }
+
     /// One frame of the window alone, on a bare context.
     fn frame(ctx: &egui::Context, data: &UIData) -> UIActions {
         let mut actions = UIActions::new();
@@ -1637,6 +1756,19 @@ mod tests {
 
     fn open_on(ctx: &egui::Context) -> Option<(String, Item)> {
         current(ctx).map(|o| (o.channel, o.item))
+    }
+
+    /// An open window says its channel is shown big — drawn at the show's
+    /// rate, even when the selection has gone elsewhere; a closed one, none.
+    #[test]
+    fn an_open_window_has_its_channel_drawn_at_the_shows_rate() {
+        let mut data = UIData::test_fixture();
+        let ctx = egui::Context::default();
+        assert!(frame(&ctx, &data).session.shown_full.is_empty(), "closed");
+        open_channel(&ctx, &data.channels[1]);
+        data.selected_channel = Some(0);
+        let shown = frame(&ctx, &data).session.shown_full;
+        assert_eq!(shown, vec![data.channels[1].uuid.clone()]);
     }
 
     #[test]
@@ -1881,9 +2013,9 @@ mod tests {
         );
     }
 
-    /// As vMix numbers them: Layer 1, at the back, first.
+    /// As in Premiere: the layer in front first, Layer 1 at the back last.
     #[test]
-    fn the_layers_are_listed_back_first() {
+    fn the_layers_are_listed_front_first() {
         let data = UIData::test_fixture();
         let names: Vec<String> = data.channels[0]
             .decks
@@ -1895,7 +2027,7 @@ mod tests {
             harness(data, open)
         };
         let y = |name: &str| harness.get_by_label(&format!("{name} layer")).rect().top();
-        assert!(y(&names[0]) < y(&names[1]));
+        assert!(y(&names[1]) < y(&names[0]));
     }
 
     #[test]
@@ -1928,31 +2060,42 @@ mod tests {
             let open = on_channel_a(&data);
             harness(data, open)
         };
-        // Layer 1 (listed first) can only go forward.
+        // Layer 2 (listed first, in front) can only go down, behind Layer 1;
+        // Layer 1 (listed last) only up, over Layer 2.
         harness.get_all_by_label("⏷").next().unwrap().click();
         harness.run();
-        let moved = harness.state().commands.iter().find_map(|c| match c {
-            EngineCommand::MoveDeck {
-                deck_uuid,
-                before_deck_uuid,
-                ..
-            } => Some((deck_uuid.clone(), before_deck_uuid.clone())),
-            _ => None,
-        });
+        harness.get_all_by_label("⏶").last().unwrap().click();
+        harness.run();
+        let moved: Vec<_> = harness
+            .state()
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                EngineCommand::MoveDeck {
+                    deck_uuid,
+                    before_deck_uuid,
+                    ..
+                } => Some((deck_uuid.clone(), before_deck_uuid.clone())),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
             moved,
-            Some((
-                ch.decks[0].uuid.clone(),
-                ch.decks.get(2).map(|d| d.uuid.clone())
-            )),
-            "Layer 1 goes over Layer 2"
+            [
+                (ch.decks[1].uuid.clone(), Some(ch.decks[0].uuid.clone())),
+                (
+                    ch.decks[0].uuid.clone(),
+                    ch.decks.get(2).map(|d| d.uuid.clone())
+                ),
+            ],
+            "Layer 2 goes behind Layer 1, then Layer 1 over Layer 2"
         );
     }
 
     #[test]
     fn a_layer_is_hidden_and_deleted_from_its_row() {
         let data = UIData::test_fixture();
-        let front = data.channels[0].decks[0].uuid.clone();
+        let front = data.channels[0].decks.last().unwrap().uuid.clone();
         let mut harness = {
             let open = on_channel_a(&data);
             harness(data, open)
@@ -2099,6 +2242,7 @@ mod tests {
             value: crate::params::ParamValue::Float(v),
             min: None,
             max: None,
+            choices: None,
         };
         (
             uuid.into(),
@@ -2126,6 +2270,7 @@ mod tests {
             value,
             min: Some(0.0),
             max: Some(1.0),
+            choices: None,
         };
         (
             uuid.into(),
@@ -2355,6 +2500,7 @@ mod tests {
                     value: ParamValue::Float(0.0),
                     min: Some(0.0),
                     max: Some(2.0),
+                    choices: None,
                 }],
             },
         ));
@@ -2390,6 +2536,7 @@ mod tests {
                 value: ParamValue::Float(0.0),
                 min: Some(0.0),
                 max: Some(3.0),
+                choices: None,
             });
         let mut harness = layer_harness(data);
         harness.get_by_label("Source").click();

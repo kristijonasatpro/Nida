@@ -92,6 +92,7 @@ fn fs_main(
 
     // Apply UV transform for scaling modes
     let source_uv = rotated_uv * params.uv_scale + params.uv_offset;
+    let covers = texels_per_pixel(source_uv, vec2<f32>(textureDimensions(source_texture)));
 
     // Outside the source — the bars Fit and Center leave — nothing: fully
     // transparent, so a fitted picture or a logo shows what is under it rather
@@ -102,7 +103,8 @@ fn fs_main(
         return vec4<f32>(0.0);
     }
 
-    var color = textureSample(source_texture, texture_sampler, source_uv);
+    let part = drawn_part(params.uv_scale, params.uv_offset);
+    var color = sample_scaled(source_texture, texture_sampler, source_uv, covers, part);
     if (params.premultiplied == 1u) {
         // Premultiplied source: scale rgb and alpha together so opacity dims the
         // channel uniformly. Paired with PREMULTIPLIED_ALPHA_BLENDING on the target.

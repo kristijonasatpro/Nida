@@ -16,20 +16,12 @@ pub enum MediaKind {
     Audio,
 }
 
-const IMAGES: [&str; 11] = [
-    "png", "jpg", "jpeg", "bmp", "tif", "tiff", "tga", "webp", "svg", "svgz", "heic",
-];
-const VIDEOS: [&str; 12] = [
-    "mov", "mp4", "m4v", "avi", "mkv", "webm", "gif", "mxf", "mpg", "mpeg", "ts", "mts",
-];
-const SOUNDS: [&str; 10] = [
-    "mp3", "wav", "m4a", "aac", "flac", "ogg", "opus", "aif", "aiff", "wma",
-];
+use crate::engine::value::media::{IMAGES, SOUNDS, VIDEOS};
 
 impl MediaKind {
     /// What `path` would make, by its extension; `None` for anything else.
     pub fn of(path: &Path) -> Option<Self> {
-        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        let ext = crate::engine::value::media::extension(path)?;
         if IMAGES.contains(&ext.as_str()) {
             Some(Self::Image)
         } else if VIDEOS.contains(&ext.as_str()) {

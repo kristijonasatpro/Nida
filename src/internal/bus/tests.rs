@@ -759,6 +759,7 @@ fn adding_a_bus_whose_uuid_is_taken_is_refused() {
         auto_duration: DEFAULT_AUTO_DURATION,
         easing: CrossfadeEasing::EaseInOut,
         hidden_layers: Vec::new(),
+        hidden_sources: Vec::new(),
     });
     assert!(
         bank.add(clash).is_err(),

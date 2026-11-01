@@ -6,7 +6,7 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::internal::modulation::{AudioBandPreset, LFOWaveform};
 use crate::usecases::api::{command_response, SharedState};
 
@@ -62,7 +62,7 @@ pub struct ClearModulationBody {
     pub target: String,
 }
 
-#[utoipa::path(post, path = "/api/modulation/lfo", request_body = AddLfoBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(post, path = "/api/modulation/lfo", request_body = AddLfoBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn add_lfo(
     State(state): State<SharedState>,
     Json(body): Json<AddLfoBody>,
@@ -79,7 +79,7 @@ pub async fn add_lfo(
     }
 }
 
-#[utoipa::path(post, path = "/api/modulation/audio-band", request_body = AddAudioBandBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(post, path = "/api/modulation/audio-band", request_body = AddAudioBandBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn add_audio_band(
     State(state): State<SharedState>,
     Json(body): Json<AddAudioBandBody>,
@@ -96,7 +96,7 @@ pub async fn add_audio_band(
     }
 }
 
-#[utoipa::path(post, path = "/api/modulation/adsr", request_body = AddAdsrBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(post, path = "/api/modulation/adsr", request_body = AddAdsrBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn add_adsr(
     State(state): State<SharedState>,
     Json(body): Json<AddAdsrBody>,
@@ -115,7 +115,7 @@ pub async fn add_adsr(
     }
 }
 
-#[utoipa::path(post, path = "/api/modulation/step-sequencer", request_body = AddStepSequencerBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(post, path = "/api/modulation/step-sequencer", request_body = AddStepSequencerBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn add_step_sequencer(
     State(state): State<SharedState>,
     Json(body): Json<AddStepSequencerBody>,
@@ -132,7 +132,7 @@ pub async fn add_step_sequencer(
     }
 }
 
-#[utoipa::path(delete, path = "/api/modulation/{uuid}", params(("uuid" = String, Path, description = "Modulation source UUID")), responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(delete, path = "/api/modulation/{uuid}", params(("uuid" = String, Path, description = "Modulation source UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn remove_source(
     State(state): State<SharedState>,
     Path(uuid): Path<String>,
@@ -146,7 +146,7 @@ pub async fn remove_source(
     }
 }
 
-#[utoipa::path(post, path = "/api/modulation/assign", request_body = AssignModulationBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(post, path = "/api/modulation/assign", request_body = AssignModulationBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn assign(
     State(state): State<SharedState>,
     Json(body): Json<AssignModulationBody>,
@@ -164,7 +164,7 @@ pub async fn assign(
     }
 }
 
-#[utoipa::path(post, path = "/api/modulation/clear", request_body = ClearModulationBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(post, path = "/api/modulation/clear", request_body = ClearModulationBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn clear(
     State(state): State<SharedState>,
     Json(body): Json<ClearModulationBody>,
@@ -230,7 +230,7 @@ pub struct TimebaseBody {
     pub timebase: crate::timebase::Timebase,
 }
 
-#[utoipa::path(put, path = "/api/modulation/{uuid}/timebase", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = TimebaseBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/timebase", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = TimebaseBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_timebase(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -270,7 +270,7 @@ pub struct BreakpointsBody {
     pub breakpoints: Vec<crate::modulation::Breakpoint>,
 }
 
-#[utoipa::path(post, path = "/api/modulation/automation", request_body = AddAutomationLaneBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(post, path = "/api/modulation/automation", request_body = AddAutomationLaneBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn add_automation_lane(
     State(s): State<SharedState>,
     Json(b): Json<AddAutomationLaneBody>,
@@ -287,7 +287,7 @@ pub async fn add_automation_lane(
     }
 }
 
-#[utoipa::path(put, path = "/api/modulation/{uuid}/breakpoints", params(("uuid" = String, Path, description = "Envelope source UUID")), request_body = BreakpointsBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/breakpoints", params(("uuid" = String, Path, description = "Envelope source UUID")), request_body = BreakpointsBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn set_envelope_breakpoints(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -305,7 +305,7 @@ pub async fn set_envelope_breakpoints(
     }
 }
 
-#[utoipa::path(put, path = "/api/modulation/{uuid}/lfo/frequency", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/lfo/frequency", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_lfo_frequency(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -322,7 +322,7 @@ pub async fn update_lfo_frequency(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/lfo/waveform", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = WaveformBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/lfo/waveform", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = WaveformBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_lfo_waveform(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -339,7 +339,7 @@ pub async fn update_lfo_waveform(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/lfo/phase", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/lfo/phase", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_lfo_phase(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -356,7 +356,7 @@ pub async fn update_lfo_phase(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/lfo/amplitude", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/lfo/amplitude", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_lfo_amplitude(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -373,7 +373,7 @@ pub async fn update_lfo_amplitude(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/lfo/bipolar", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = BoolBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/lfo/bipolar", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = BoolBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_lfo_bipolar(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -390,7 +390,7 @@ pub async fn update_lfo_bipolar(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/audio/smoothing", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/audio/smoothing", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_audio_smoothing(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -407,7 +407,7 @@ pub async fn update_audio_smoothing(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/audio/freq-range", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FreqRangeBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/audio/freq-range", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FreqRangeBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_audio_freq_range(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -425,7 +425,7 @@ pub async fn update_audio_freq_range(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/audio/gain", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/audio/gain", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_audio_gain(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -442,7 +442,7 @@ pub async fn update_audio_gain(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/audio/preset", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = PresetBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/audio/preset", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = PresetBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_audio_preset(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -459,7 +459,7 @@ pub async fn update_audio_preset(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/audio/mode", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = AudioModeBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/audio/mode", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = AudioModeBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_audio_mode(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -473,7 +473,7 @@ pub async fn update_audio_mode(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/adsr/attack", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/adsr/attack", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_adsr_attack(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -490,7 +490,7 @@ pub async fn update_adsr_attack(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/adsr/decay", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/adsr/decay", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_adsr_decay(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -507,7 +507,7 @@ pub async fn update_adsr_decay(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/adsr/sustain", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/adsr/sustain", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_adsr_sustain(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -524,7 +524,7 @@ pub async fn update_adsr_sustain(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/adsr/release", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/adsr/release", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_adsr_release(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -541,7 +541,7 @@ pub async fn update_adsr_release(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/modulation/{uuid}/adsr/trigger", params(("uuid" = String, Path, description = "Modulation source UUID")), responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(post, path = "/api/modulation/{uuid}/adsr/trigger", params(("uuid" = String, Path, description = "Modulation source UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn trigger_adsr(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -551,7 +551,7 @@ pub async fn trigger_adsr(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/modulation/{uuid}/adsr/release-gate", params(("uuid" = String, Path, description = "Modulation source UUID")), responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(post, path = "/api/modulation/{uuid}/adsr/release-gate", params(("uuid" = String, Path, description = "Modulation source UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn release_adsr(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -561,7 +561,7 @@ pub async fn release_adsr(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/step-seq/steps", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = StepsBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/step-seq/steps", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = StepsBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_step_seq_steps(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -578,7 +578,7 @@ pub async fn update_step_seq_steps(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/step-seq/rate", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/step-seq/rate", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_step_seq_rate(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -595,7 +595,7 @@ pub async fn update_step_seq_rate(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/step-seq/interpolation", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = InterpolationBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/step-seq/interpolation", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = InterpolationBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_step_seq_interpolation(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -651,7 +651,7 @@ pub struct RemoveModOnModBody {
     pub param_name: String,
 }
 
-#[utoipa::path(put, path = "/api/modulation/{uuid}/audio/source", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = ModAudioSourceBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/audio/source", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = ModAudioSourceBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_audio_source(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -668,7 +668,7 @@ pub async fn update_audio_source(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/audio/noise-gate", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/audio/noise-gate", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = FloatBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_audio_noise_gate(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -685,7 +685,7 @@ pub async fn update_audio_noise_gate(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/step-seq/bipolar", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = BoolBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/step-seq/bipolar", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = BoolBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_step_seq_bipolar(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -702,7 +702,7 @@ pub async fn update_step_seq_bipolar(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/step-seq/count", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = StepSeqCountBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/step-seq/count", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = StepSeqCountBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn set_step_seq_count(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -719,7 +719,7 @@ pub async fn set_step_seq_count(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/modulation/{uuid}/step-seq/value", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = StepSeqValueBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(put, path = "/api/modulation/{uuid}/step-seq/value", params(("uuid" = String, Path, description = "Modulation source UUID")), request_body = StepSeqValueBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn update_step_seq_value(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -737,7 +737,7 @@ pub async fn update_step_seq_value(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/modulation/mod-on-mod", request_body = AssignModOnModBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(post, path = "/api/modulation/mod-on-mod", request_body = AssignModOnModBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn assign_mod_on_mod(
     State(s): State<SharedState>,
     Json(b): Json<AssignModOnModBody>,
@@ -755,7 +755,7 @@ pub async fn assign_mod_on_mod(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/modulation/mod-on-mod/remove", request_body = RemoveModOnModBody, responses((status = 200, body = CommandResult)), tag = "Modulation")]
+#[utoipa::path(post, path = "/api/modulation/mod-on-mod/remove", request_body = RemoveModOnModBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Modulation")]
 pub async fn remove_mod_on_mod(
     State(s): State<SharedState>,
     Json(b): Json<RemoveModOnModBody>,
@@ -784,7 +784,7 @@ pub struct AddAnalyzerModSourceBody {
 
 #[utoipa::path(post, path = "/api/modulation/analyzer",
     request_body = AddAnalyzerModSourceBody,
-    responses((status = 200, body = CommandResult)),
+    responses((status = 200, body = crate::usecases::api::ApiReply)),
     tag = "Modulation")]
 pub async fn add_analyzer_mod_source(
     State(state): State<SharedState>,
@@ -806,7 +806,7 @@ pub async fn add_analyzer_mod_source(
 #[utoipa::path(put, path = "/api/modulation/{uuid}/analyzer/smoothing",
     params(("uuid" = String, Path, description = "Modulation source UUID")),
     request_body = FloatBody,
-    responses((status = 200, body = CommandResult)),
+    responses((status = 200, body = crate::usecases::api::ApiReply)),
     tag = "Modulation")]
 pub async fn update_analyzer_smoothing(
     State(s): State<SharedState>,

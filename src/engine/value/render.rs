@@ -469,6 +469,15 @@ pub enum OutputTarget {
         /// levels, black at 16 and white at 235, as video gear takes them.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         full_range: bool,
+        /// `mode` follows the show's rate — 1080p at it, or the nearest the
+        /// device has — chosen again as it starts and as the rate changes;
+        /// off, the format picked by hand stays. On unless said: one saved
+        /// before had its format chosen from the show's rate as it was made.
+        #[serde(
+            default = "crate::engine::value::render::follows_show",
+            skip_serializing_if = "crate::engine::value::render::is_true"
+        )]
+        follow_show: bool,
     },
     /// The stream: one encode sent to up to four RTMP destinations. Its
     /// settings live with the stream (`crate::streaming`), and it never
@@ -521,6 +530,20 @@ impl OutputTarget {
     }
 }
 
+/// A Blackmagic output's format follows the show's rate unless told
+/// otherwise (see [`OutputTarget::DeckLink`]).
+#[must_use]
+pub fn follows_show() -> bool {
+    true
+}
+
+/// Whether `value` is true: a field written only when it is not.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+#[must_use]
+pub fn is_true(value: &bool) -> bool {
+    *value
+}
+
 impl std::fmt::Display for OutputTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -548,6 +571,7 @@ impl std::fmt::Display for OutputTarget {
                 device,
                 mode,
                 full_range,
+                ..
             } => {
                 let levels = if *full_range { ", full levels" } else { "" };
                 write!(f, "Blackmagic: {device} ({mode}{levels})")
@@ -976,12 +1000,14 @@ mod tests {
             device: "UltraStudio Monitor 3G".into(),
             mode: "1080p60".into(),
             full_range: false,
+            follow_show: true,
         };
         assert_eq!(blackmagic.to_string(), "Blackmagic: UltraStudio Monitor 3G (1080p60)");
         let full = OutputTarget::DeckLink {
             device: "UltraStudio Monitor 3G".into(),
             mode: "1080p60".into(),
             full_range: true,
+            follow_show: true,
         };
         assert_eq!(
             full.to_string(),

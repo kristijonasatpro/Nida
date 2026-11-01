@@ -125,17 +125,23 @@ pub(super) fn render_monitoring_section(
         let gpu_response = ui
             .add(
                 egui::Label::new(
-                    egui::RichText::new(format!("🖥 {gpu:.0}%"))
+                    // Nida's own share, as Activity Monitor shows it; coloured
+                    // by how busy the whole GPU is, which is what holds frames
+                    // up.
+                    egui::RichText::new(format!("🖥 {:.0}%", data.nida_gpu.unwrap_or(gpu)))
                         .color(load_color(gpu))
                         .monospace()
                         .small(),
                 )
                 .sense(egui::Sense::click()),
             )
-            .on_hover_text(if data.gpu_utilization_measured {
-                "How busy the GPU is, as macOS reports it — click for details"
-            } else {
-                "GPU load, estimated from the layers' costs — click for details"
+            .on_hover_text(match (data.gpu_utilization_measured, data.nida_gpu) {
+                (true, Some(nida)) => format!(
+                    "Nida uses {nida:.0}% of the GPU, as Activity Monitor shows it; the whole GPU \
+                     is {gpu:.0}% busy — every app and the screens. Click for details"
+                ),
+                (true, None) => "How busy the GPU is, as macOS reports it — click for details".into(),
+                _ => "GPU load, estimated from the layers' costs — click for details".into(),
             });
         status_popover(&gpu_response, |ui| {
             render_gpu_popover(ui, data);
@@ -148,16 +154,33 @@ pub(super) fn render_monitoring_section(
                 .small(),
         );
 
+        // Nida's own memory, as Activity Monitor shows it; coloured by how
+        // full the whole Mac is.
+        let mac = format!(
+            "the Mac uses {:.1} of {:.0} GB",
+            ram_gb(data.ram_used),
+            ram_gb(data.ram_total)
+        );
         ui.label(
-            egui::RichText::new(format!(
-                "RAM {:.1}/{:.0}G",
-                ram_gb(data.ram_used),
-                ram_gb(data.ram_total)
-            ))
+            egui::RichText::new(match data.nida_ram {
+                Some(nida) => format!("RAM {:.1}G", ram_gb(nida)),
+                None => format!(
+                    "RAM {:.1}/{:.0}G",
+                    ram_gb(data.ram_used),
+                    ram_gb(data.ram_total)
+                ),
+            })
             .color(load_color(ram_percent(data)))
             .monospace()
             .small(),
-        );
+        )
+        .on_hover_text(match data.nida_ram {
+            Some(nida) => format!(
+                "Nida uses {:.1} GB, as Activity Monitor's Memory column shows it; {mac}",
+                ram_gb(nida)
+            ),
+            None => format!("Memory: {mac}"),
+        });
 
         let decks = deck_count(data);
         ui.label(

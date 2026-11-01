@@ -84,7 +84,10 @@ impl VardaApp {
                 | EngineCommand::SetRundownMain { .. }
                 | EngineCommand::SetRundownOverlay { .. }
                 | EngineCommand::SetRundownPlay { .. }
+                | EngineCommand::SetRundownUntilNext { .. }
+                | EngineCommand::SetRundownTimer { .. }
                 | EngineCommand::SetRundownThen { .. }
+                | EngineCommand::SetRundownAt { .. }
                 | EngineCommand::CaptureRundownStep { .. }
                 | EngineCommand::SetRundownNext { .. }
                 | EngineCommand::SetRundownFade { .. } => Some("Step not changed"),
@@ -219,6 +222,11 @@ pub(crate) fn command_is_deck_add(cmd: &EngineCommand) -> bool {
             | EngineCommand::AddHtmlDeck { .. }
             | EngineCommand::AddPlaylistDeck { .. }
             | EngineCommand::AddTimerDeck { .. }
+            | EngineCommand::AddLowerThirdDeck { .. }
+            | EngineCommand::AddTextDeck { .. }
+            | EngineCommand::AddPresentationDeck { .. }
+            | EngineCommand::AddPresenterDeck { .. }
+            | EngineCommand::AddSlidesDeck { .. }
     )
 }
 
@@ -256,6 +264,7 @@ mod tests {
                 channel_uuid: ch(),
                 camera_id: 0,
                 mode: None,
+                audio: None,
             },
             EngineCommand::AddDepthSensorDeck {
                 channel_uuid: ch(),
@@ -300,8 +309,29 @@ mod tests {
                 channel_uuid: ch(),
                 settings: None,
             },
+            EngineCommand::AddLowerThirdDeck {
+                channel_uuid: ch(),
+                settings: None,
+            },
+            EngineCommand::AddTextDeck {
+                channel_uuid: ch(),
+                settings: None,
+            },
+            EngineCommand::AddPresentationDeck {
+                channel_uuid: ch(),
+                path: "/talk.pptx".into(),
+            },
+            EngineCommand::AddPresenterDeck {
+                channel_uuid: ch(),
+                deck_uuid: "d1".into(),
+            },
+            EngineCommand::AddSlidesDeck {
+                channel_uuid: ch(),
+                paths: Vec::new(),
+                settings: None,
+            },
         ];
-        assert_eq!(deck_adds.len(), 15, "expected 15 deck-add variants");
+        assert_eq!(deck_adds.len(), 20, "expected 20 deck-add variants");
         for cmd in &deck_adds {
             assert!(command_is_deck_add(cmd), "not recognized: {cmd:?}");
         }

@@ -1823,8 +1823,6 @@ dependencies = [
 [[package]]
 name = "coreaudio-rs"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d15c3c3cee7c087938f7ad1c3098840b3ef1f1bdc7f6e496336c3b1e7a6f3914"
 dependencies = [
  "bitflags 2.13.1",
  "libc",
@@ -6428,6 +6426,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6948501a91121d6399b79abaa33a8aa4ea7857fe019f341b8c23ad6e81b79b08"
 dependencies = [
  "bitflags 2.13.1",
+ "block2 0.6.2",
  "libc",
  "objc2 0.6.4",
  "objc2-core-audio",
@@ -6456,6 +6455,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13a380031deed8e99db00065c45937da434ca987c034e13b87e4441f9e4090be"
 dependencies = [
  "objc2 0.6.4",
+ "objc2-audio-toolbox",
  "objc2-foundation 0.3.2",
 ]
 
@@ -11909,7 +11909,7 @@ dependencies = [
 
 [[package]]
 name = "varda"
-version = "0.9.0"
+version = "0.9.7"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -11955,8 +11955,11 @@ dependencies = [
  "notify",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
+ "objc2-audio-toolbox",
  "objc2-av-foundation",
+ "objc2-avf-audio",
  "objc2-core-audio",
+ "objc2-core-audio-types",
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-core-media",
@@ -11973,6 +11976,7 @@ dependencies = [
  "resvg 0.47.0",
  "rfd",
  "rosc",
+ "roxmltree 0.21.1",
  "rustfft",
  "serde",
  "serde_json",
@@ -11985,6 +11989,7 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http",
+ "ttf-parser",
  "url",
  "usvg 0.47.0",
  "utoipa",
@@ -11997,6 +12002,7 @@ dependencies = [
  "winit",
  "x11rb 0.14.0",
  "yuvutils-rs",
+ "zip",
 ]
 
 [[package]]

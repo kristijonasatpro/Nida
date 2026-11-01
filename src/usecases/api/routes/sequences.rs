@@ -9,17 +9,17 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
-#[utoipa::path(post, path = "/api/sequences", responses((status = 200, body = CommandResult)), tag = "Sequences")]
+#[utoipa::path(post, path = "/api/sequences", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Sequences")]
 pub async fn create(State(s): State<SharedState>) -> impl IntoResponse {
     match s.send_command(EngineCommand::CreateSequence).await {
         Ok(r) => command_response(r),
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(delete, path = "/api/sequences/{sequence_uuid}", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Sequence not found")), tag = "Sequences")]
+#[utoipa::path(delete, path = "/api/sequences/{sequence_uuid}", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence not found")), tag = "Sequences")]
 pub async fn delete(
     State(s): State<SharedState>,
     Path(sequence_uuid): Path<String>,
@@ -32,7 +32,7 @@ pub async fn delete(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/sequences/{sequence_uuid}/play", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Sequence not found")), tag = "Sequences")]
+#[utoipa::path(post, path = "/api/sequences/{sequence_uuid}/play", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence not found")), tag = "Sequences")]
 pub async fn play(
     State(s): State<SharedState>,
     Path(sequence_uuid): Path<String>,
@@ -45,7 +45,7 @@ pub async fn play(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/sequences/{sequence_uuid}/stop", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Sequence not found")), tag = "Sequences")]
+#[utoipa::path(post, path = "/api/sequences/{sequence_uuid}/stop", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence not found")), tag = "Sequences")]
 pub async fn stop(
     State(s): State<SharedState>,
     Path(sequence_uuid): Path<String>,
@@ -58,7 +58,7 @@ pub async fn stop(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/sequences/{sequence_uuid}/toggle", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Sequence not found")), tag = "Sequences")]
+#[utoipa::path(post, path = "/api/sequences/{sequence_uuid}/toggle", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence not found")), tag = "Sequences")]
 pub async fn toggle(
     State(s): State<SharedState>,
     Path(sequence_uuid): Path<String>,
@@ -79,7 +79,7 @@ pub struct AddFadeStepBody {
     /// UUID of the channel to fade to.
     pub to_channel_uuid: String,
 }
-#[utoipa::path(post, path = "/api/sequences/{sequence_uuid}/steps/fade", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), request_body = AddFadeStepBody, responses((status = 200, body = CommandResult), (status = 404, description = "Sequence or channel not found")), tag = "Sequences")]
+#[utoipa::path(post, path = "/api/sequences/{sequence_uuid}/steps/fade", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), request_body = AddFadeStepBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence or channel not found")), tag = "Sequences")]
 pub async fn add_fade_step(
     State(s): State<SharedState>,
     Path(sequence_uuid): Path<String>,
@@ -97,7 +97,7 @@ pub async fn add_fade_step(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/sequences/{sequence_uuid}/steps/wait", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Sequence not found")), tag = "Sequences")]
+#[utoipa::path(post, path = "/api/sequences/{sequence_uuid}/steps/wait", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence not found")), tag = "Sequences")]
 pub async fn add_wait_step(
     State(s): State<SharedState>,
     Path(sequence_uuid): Path<String>,
@@ -116,7 +116,7 @@ pub struct AddGoToStepBody {
     /// Index of the step to jump to.
     pub step_index: usize,
 }
-#[utoipa::path(post, path = "/api/sequences/{sequence_uuid}/steps/goto", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), request_body = AddGoToStepBody, responses((status = 200, body = CommandResult), (status = 404, description = "Sequence not found")), tag = "Sequences")]
+#[utoipa::path(post, path = "/api/sequences/{sequence_uuid}/steps/goto", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), request_body = AddGoToStepBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence not found")), tag = "Sequences")]
 pub async fn add_goto_step(
     State(s): State<SharedState>,
     Path(sequence_uuid): Path<String>,
@@ -133,7 +133,7 @@ pub async fn add_goto_step(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(delete, path = "/api/sequences/{sequence_uuid}/steps/{step_idx}", params(("sequence_uuid" = String, Path, description = "Sequence UUID"), ("step_idx" = usize, Path, description = "Step position within the sequence")), responses((status = 200, body = CommandResult), (status = 404, description = "Sequence or step not found")), tag = "Sequences")]
+#[utoipa::path(delete, path = "/api/sequences/{sequence_uuid}/steps/{step_idx}", params(("sequence_uuid" = String, Path, description = "Sequence UUID"), ("step_idx" = usize, Path, description = "Step position within the sequence")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence or step not found")), tag = "Sequences")]
 pub async fn remove_step(
     State(s): State<SharedState>,
     Path((sequence_uuid, step_idx)): Path<(String, usize)>,
@@ -157,7 +157,7 @@ pub struct StepDurationBody {
     /// Unit of the duration (seconds or beats).
     pub unit: crate::channel::DurationUnit,
 }
-#[utoipa::path(put, path = "/api/sequences/{sequence_uuid}/steps/{step_idx}/duration", params(("sequence_uuid" = String, Path, description = "Sequence UUID"), ("step_idx" = usize, Path, description = "Step position within the sequence")), request_body = StepDurationBody, responses((status = 200, body = CommandResult), (status = 404, description = "Sequence or step not found")), tag = "Sequences")]
+#[utoipa::path(put, path = "/api/sequences/{sequence_uuid}/steps/{step_idx}/duration", params(("sequence_uuid" = String, Path, description = "Sequence UUID"), ("step_idx" = usize, Path, description = "Step position within the sequence")), request_body = StepDurationBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence or step not found")), tag = "Sequences")]
 pub async fn set_step_duration(
     State(s): State<SharedState>,
     Path((sequence_uuid, step_idx)): Path<(String, usize)>,
@@ -182,7 +182,7 @@ pub struct StepEasingBody {
     /// Name of the easing curve.
     pub easing: String,
 }
-#[utoipa::path(put, path = "/api/sequences/{sequence_uuid}/steps/{step_idx}/easing", params(("sequence_uuid" = String, Path, description = "Sequence UUID"), ("step_idx" = usize, Path, description = "Step position within the sequence")), request_body = StepEasingBody, responses((status = 200, body = CommandResult), (status = 404, description = "Sequence or step not found")), tag = "Sequences")]
+#[utoipa::path(put, path = "/api/sequences/{sequence_uuid}/steps/{step_idx}/easing", params(("sequence_uuid" = String, Path, description = "Sequence UUID"), ("step_idx" = usize, Path, description = "Step position within the sequence")), request_body = StepEasingBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence or step not found")), tag = "Sequences")]
 pub async fn set_step_easing(
     State(s): State<SharedState>,
     Path((sequence_uuid, step_idx)): Path<(String, usize)>,
@@ -206,7 +206,7 @@ pub struct StepShaderBody {
     /// Shader name for the transition, or null to clear.
     pub shader_name: Option<String>,
 }
-#[utoipa::path(put, path = "/api/sequences/{sequence_uuid}/steps/{step_idx}/shader", params(("sequence_uuid" = String, Path, description = "Sequence UUID"), ("step_idx" = usize, Path, description = "Step position within the sequence")), request_body = StepShaderBody, responses((status = 200, body = CommandResult), (status = 404, description = "Sequence or step not found")), tag = "Sequences")]
+#[utoipa::path(put, path = "/api/sequences/{sequence_uuid}/steps/{step_idx}/shader", params(("sequence_uuid" = String, Path, description = "Sequence UUID"), ("step_idx" = usize, Path, description = "Step position within the sequence")), request_body = StepShaderBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence or step not found")), tag = "Sequences")]
 pub async fn set_step_shader(
     State(s): State<SharedState>,
     Path((sequence_uuid, step_idx)): Path<(String, usize)>,
@@ -245,7 +245,7 @@ pub struct MoveStepBody {
     pub to: usize,
 }
 
-#[utoipa::path(put, path = "/api/sequences/{sequence_uuid}/steps/{step_idx}/from-ch", params(("sequence_uuid" = String, Path, description = "Sequence UUID"), ("step_idx" = usize, Path, description = "Step position within the sequence")), request_body = StepChBody, responses((status = 200, body = CommandResult), (status = 404, description = "Sequence, step, or channel not found")), tag = "Sequences")]
+#[utoipa::path(put, path = "/api/sequences/{sequence_uuid}/steps/{step_idx}/from-ch", params(("sequence_uuid" = String, Path, description = "Sequence UUID"), ("step_idx" = usize, Path, description = "Step position within the sequence")), request_body = StepChBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence, step, or channel not found")), tag = "Sequences")]
 pub async fn set_step_from_ch(
     State(s): State<SharedState>,
     Path((sequence_uuid, step_idx)): Path<(String, usize)>,
@@ -263,7 +263,7 @@ pub async fn set_step_from_ch(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/sequences/{sequence_uuid}/steps/{step_idx}/to-ch", params(("sequence_uuid" = String, Path, description = "Sequence UUID"), ("step_idx" = usize, Path, description = "Step position within the sequence")), request_body = StepChBody, responses((status = 200, body = CommandResult), (status = 404, description = "Sequence, step, or channel not found")), tag = "Sequences")]
+#[utoipa::path(put, path = "/api/sequences/{sequence_uuid}/steps/{step_idx}/to-ch", params(("sequence_uuid" = String, Path, description = "Sequence UUID"), ("step_idx" = usize, Path, description = "Step position within the sequence")), request_body = StepChBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence, step, or channel not found")), tag = "Sequences")]
 pub async fn set_step_to_ch(
     State(s): State<SharedState>,
     Path((sequence_uuid, step_idx)): Path<(String, usize)>,
@@ -281,7 +281,7 @@ pub async fn set_step_to_ch(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/sequences/{sequence_uuid}/steps/{step_idx}/goto-target", params(("sequence_uuid" = String, Path, description = "Sequence UUID"), ("step_idx" = usize, Path, description = "Step position within the sequence")), request_body = GoToTargetBody, responses((status = 200, body = CommandResult), (status = 404, description = "Sequence or step not found")), tag = "Sequences")]
+#[utoipa::path(put, path = "/api/sequences/{sequence_uuid}/steps/{step_idx}/goto-target", params(("sequence_uuid" = String, Path, description = "Sequence UUID"), ("step_idx" = usize, Path, description = "Step position within the sequence")), request_body = GoToTargetBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence or step not found")), tag = "Sequences")]
 pub async fn set_goto_target(
     State(s): State<SharedState>,
     Path((sequence_uuid, step_idx)): Path<(String, usize)>,
@@ -299,7 +299,7 @@ pub async fn set_goto_target(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/sequences/{sequence_uuid}/steps/move", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), request_body = MoveStepBody, responses((status = 200, body = CommandResult), (status = 404, description = "Sequence not found")), tag = "Sequences")]
+#[utoipa::path(post, path = "/api/sequences/{sequence_uuid}/steps/move", params(("sequence_uuid" = String, Path, description = "Sequence UUID")), request_body = MoveStepBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Sequence not found")), tag = "Sequences")]
 pub async fn move_step(
     State(s): State<SharedState>,
     Path(sequence_uuid): Path<String>,

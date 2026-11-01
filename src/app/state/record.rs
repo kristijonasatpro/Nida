@@ -116,7 +116,7 @@ impl super::super::VardaApp {
             if free_bytes.is_some_and(|b| b < crate::record::LOW_SPACE_BYTES) {
                 Some("The disk is nearly full".into())
             } else if behind {
-                Some("The encoder cannot keep up — frames are being repeated".into())
+                Some("The encoder cannot keep up — frames are left out or repeated".into())
             } else {
                 None
             }
@@ -139,7 +139,12 @@ impl super::super::VardaApp {
             problem,
             dropped: self.recording.dropped_before + self.recording.dropped_seen,
             fps,
+            file_fps: self.recording.settings.options.fps.unwrap_or(fps).max(1),
             last_file,
+            audio_bus: match self.recording.output.first() {
+                Some(UnifiedOutput::Headless(h)) => h.audio_bus.clone(),
+                _ => None,
+            },
         }
     }
 
@@ -148,9 +153,12 @@ impl super::super::VardaApp {
     pub fn cmd_set_record_options(&mut self, options: RecordOptions) -> CommandResult {
         let options = options.normalized();
         if self.record_running() {
+            // What is recorded, and the reminder to record, can change
+            // while recording; the file's own settings cannot.
             let current = &self.recording.settings.options;
             let only_source = RecordOptions {
                 source: current.source.clone(),
+                warn_when_off: current.warn_when_off,
                 ..options.clone()
             } == *current;
             if !only_source {
@@ -374,5 +382,64 @@ impl super::super::VardaApp {
             },
             Some(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::VardaApp as App;
+
+    fn headless_app() -> Option<App> {
+        let gpu = crate::renderer::context::GpuContext::new_headless().ok()?;
+        App::new(gpu, &crate::testing::headless_config()).ok()
+    }
+
+    /// While recording, the reminder to record (and the picture) can be
+    /// changed; the file's own settings cannot.
+    #[test]
+    fn the_reminder_changes_while_recording_the_files_settings_do_not() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        // Recording, as far as the settings go: an output in place, no
+        // encoder started.
+        let output = HeadlessOutput::new(
+            &app.context.device,
+            "Record".into(),
+            crate::engine::value::render::OutputSource::Master,
+            OutputTarget::Record,
+            64,
+            36,
+        );
+        let mut output = output;
+        output.audio_bus = Some("busa0001".into());
+        app.recording.output = vec![UnifiedOutput::Headless(output)];
+        assert!(app.record_running());
+        assert_eq!(
+            app.record_status().audio_bus.as_deref(),
+            Some("busa0001"),
+            "the bus it started with, for its meter"
+        );
+        let current = app.recording.settings.options.clone();
+        let reminded = RecordOptions {
+            warn_when_off: !current.warn_when_off,
+            ..current.clone()
+        };
+        assert!(matches!(
+            app.cmd_set_record_options(reminded.clone()),
+            CommandResult::Ok
+        ));
+        assert_eq!(app.recording.settings.options, reminded);
+        let other_folder = RecordOptions {
+            folder: PathBuf::from("/elsewhere"),
+            ..reminded.clone()
+        };
+        assert!(matches!(
+            app.cmd_set_record_options(other_folder),
+            CommandResult::Err { .. }
+        ));
+        assert_eq!(app.recording.settings.options, reminded, "unchanged");
+        app.recording.output.clear();
     }
 }

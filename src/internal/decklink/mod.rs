@@ -15,6 +15,10 @@
 //! headers are Blackmagic's DeckLink SDK 12.0 (`vendor/decklink-sdk`, under
 //! Blackmagic's licence, as OBS ships them).
 
+pub mod input;
+#[cfg(target_os = "macos")]
+pub mod sync_probe;
+
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 /// One of a device's video formats.

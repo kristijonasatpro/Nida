@@ -150,6 +150,32 @@ fn route_reference_is_up_to_date() {
     );
 }
 
+/// The whole spec, as the running API serves it at `/api/openapi.json`, kept
+/// in the repository as `docs/api/openapi.json`: read on GitHub — by a person,
+/// or an AI agent setting up a show — without Nida running.
+#[test]
+fn published_openapi_json_is_up_to_date() {
+    let path = manifest_path("docs/api/openapi.json");
+    let generated = varda::usecases::api::runner::ApiDoc::openapi()
+        .to_pretty_json()
+        .expect("serialize openapi")
+        + "\n";
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+
+    if existing == generated {
+        return;
+    }
+    if std::env::var_os("UPDATE_API_DOCS").is_some() {
+        std::fs::create_dir_all(manifest_path("docs/api")).expect("make docs/api");
+        std::fs::write(&path, generated).expect("write docs/api/openapi.json");
+        return;
+    }
+    panic!(
+        "docs/api/openapi.json is out of date with the OpenAPI spec.\n\
+         Regenerate with: UPDATE_API_DOCS=1 cargo test --test api_docs"
+    );
+}
+
 /// Every path passed to `Router::route`, whether the call is on one line or
 /// wrapped across several by rustfmt.
 fn registered_routes(src: &str) -> Vec<String> {

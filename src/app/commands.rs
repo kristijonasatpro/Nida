@@ -153,14 +153,37 @@ impl VardaApp {
         }
     }
 
-    /// True if any command in the batch is undoable. Used by the windowed
-    /// runner to make one snapshot decision over the GUI's command stream,
-    /// sharing the single compiler-checked [`command_is_undoable`] predicate
-    /// with the bus consumers.
-    // Method form is the engine-facing API used by `usecases/ui/runner.rs`.
-    #[allow(clippy::unused_self)]
+    /// True if any command in the batch makes an undo step. Used by the
+    /// windowed runner to make one snapshot decision over the GUI's command
+    /// stream, sharing [`Self::makes_undo_step`] with the bus consumers.
     pub(crate) fn batch_has_undoable(&self, cmds: &[EngineCommand]) -> bool {
-        cmds.iter().any(command_is_undoable)
+        cmds.iter().any(|cmd| self.makes_undo_step(cmd))
+    }
+
+    /// Whether `cmd` makes an undo step now: undoable (see
+    /// [`command_is_undoable`]), and not a lower third's first list. Undo
+    /// never takes a followed list away (see `LowerThird::restore_settings`),
+    /// so that step would undo nothing: the next Undo press would seem to do
+    /// nothing, and the change before it stay. A list put in place of
+    /// another is a step — Undo goes back to the other.
+    pub(crate) fn makes_undo_step(&self, cmd: &EngineCommand) -> bool {
+        if let EngineCommand::ImportLowerThirdRows { deck_uuid, .. } = cmd {
+            if self.lower_third_without_list(deck_uuid) {
+                return false;
+            }
+        }
+        command_is_undoable(cmd)
+    }
+
+    /// Whether `deck_uuid` is a lower third following no list.
+    fn lower_third_without_list(&self, deck_uuid: &str) -> bool {
+        self.mixer
+            .channels()
+            .iter()
+            .flat_map(|ch| &ch.decks)
+            .find(|slot| slot.deck.uuid() == deck_uuid)
+            .and_then(|slot| slot.deck.lower_third())
+            .is_some_and(|lower| lower.settings().source.is_none())
     }
 
     /// Execute a single command and return the result.
@@ -221,7 +244,26 @@ impl VardaApp {
                 channel_uuid,
                 camera_id,
                 mode,
-            } => wire_id(self.add_camera_deck(&channel_uuid, camera_id, mode)),
+                audio,
+            } => {
+                let added = wire_id(self.add_camera_deck(&channel_uuid, camera_id, mode));
+                // Its own sound, switched with it, as a camera input's.
+                if let (CommandResult::OkWithId { uuid }, Some(audio)) = (&added, audio) {
+                    let name = self
+                        .camera_manager
+                        .devices()
+                        .iter()
+                        .find(|d| d.id == camera_id)
+                        .map_or_else(|| format!("Camera {camera_id}"), |d| d.name.clone());
+                    self.audio_mix.add_input_of_deck(
+                        &name,
+                        &audio.device,
+                        (audio.left, audio.right),
+                        uuid,
+                    );
+                }
+                added
+            }
             EngineCommand::AddDepthSensorDeck {
                 channel_uuid,
                 depth_sensor_id,
@@ -358,6 +400,10 @@ impl VardaApp {
             EngineCommand::RenameChannel { channel_uuid, name } => {
                 self.cmd_rename_channel(&channel_uuid, &name)
             }
+            EngineCommand::SetChannelColor {
+                channel_uuid,
+                color,
+            } => self.cmd_set_channel_color(&channel_uuid, color),
             EngineCommand::MoveChannel {
                 channel_uuid,
                 before_channel_uuid,
@@ -598,6 +644,11 @@ impl VardaApp {
                 channel_uuid,
                 hidden,
             } => self.cmd_set_bus_layer_hidden(&uuid, &channel_uuid, hidden),
+            EngineCommand::SetBusSourceHidden {
+                uuid,
+                input,
+                hidden,
+            } => self.cmd_set_bus_source_hidden(&uuid, &input, hidden),
 
             EngineCommand::AddAudioBus { name } => self.cmd_add_audio_bus(&name),
             EngineCommand::RemoveAudioBus { uuid } => self.cmd_remove_audio_bus(&uuid),
@@ -607,11 +658,88 @@ impl VardaApp {
             EngineCommand::SetAudioBusGain { uuid, gain_db } => {
                 self.cmd_edit_audio_bus(&uuid, |b| b.gain_db = gain_db)
             }
+            EngineCommand::SetAudioBusCompressor { uuid, config } => {
+                self.cmd_set_audio_compressor(&uuid, true, config)
+            }
+            EngineCommand::ResetAudioMeter { uuid, bus } => {
+                self.audio_mix.reset_meter(&uuid, bus);
+                CommandResult::Ok
+            }
+            EngineCommand::ResetAudioLoudness { uuid } => {
+                self.audio_mix.reset_loudness(&uuid);
+                CommandResult::Ok
+            }
+            EngineCommand::SetAudioSourceCompressor { uuid, config } => {
+                self.cmd_set_audio_compressor(&uuid, false, config)
+            }
+            EngineCommand::SetAudioSourceDeEsser { uuid, config } => self.cmd_set_audio_processing(
+                &uuid,
+                super::state::audio_mix::AudioProcessing::DeEsser(config),
+            ),
+            EngineCommand::SetAudioSourceEq { uuid, config } => self.cmd_set_audio_processing(
+                &uuid,
+                super::state::audio_mix::AudioProcessing::Eq(config),
+            ),
+            EngineCommand::SetAudioSourceGate { uuid, config } => self.cmd_set_audio_processing(
+                &uuid,
+                super::state::audio_mix::AudioProcessing::Gate(config),
+            ),
+            EngineCommand::SetAudioSourceLowCut { uuid, config } => self.cmd_set_audio_processing(
+                &uuid,
+                super::state::audio_mix::AudioProcessing::LowCut(config),
+            ),
+            EngineCommand::SetAudioSourceLeveler { uuid, config } => self.cmd_set_audio_processing(
+                &uuid,
+                super::state::audio_mix::AudioProcessing::Leveler(config),
+            ),
+            EngineCommand::SetAudioBusLimiter { uuid, config } => self.cmd_set_audio_processing(
+                &uuid,
+                super::state::audio_mix::AudioProcessing::Limiter(config),
+            ),
             EngineCommand::SetAudioBusMute { uuid, muted } => {
                 self.cmd_edit_audio_bus(&uuid, |b| b.muted = muted)
             }
             EngineCommand::SetAudioBusDelay { uuid, delay_ms } => {
                 self.cmd_edit_audio_bus(&uuid, |b| b.delay_ms = delay_ms)
+            }
+            EngineCommand::SetAudioBusInsert { uuid, component } => {
+                self.cmd_set_audio_insert(&uuid, component)
+            }
+            EngineCommand::OpenAudioBusInsert { uuid } => self.cmd_open_audio_insert(&uuid),
+            EngineCommand::CloseAudioBusInsert { uuid } => {
+                self.audio_mix().close_insert_window(&uuid);
+                CommandResult::Ok
+            }
+            EngineCommand::SetAudioBusInsertBypass { uuid, bypass } => {
+                self.cmd_edit_audio_bus(&uuid, |b| {
+                    if let Some(insert) = &mut b.insert {
+                        insert.bypass = bypass;
+                    }
+                })
+            }
+            EngineCommand::SetAudioBusPreFader { uuid, pre_fader } => {
+                self.cmd_edit_audio_bus(&uuid, |b| b.pre_fader = pre_fader)
+            }
+            EngineCommand::SetAudioSendSettings {
+                uuid,
+                bus_uuid,
+                on,
+                gain_db,
+                mode,
+            } => self.cmd_set_audio_send_settings(&uuid, &bus_uuid, on, gain_db, mode),
+            EngineCommand::SetAudioBusLive { uuid, live, frames } => {
+                if frames.is_some_and(|f| !crate::audio_mix::LIVE_FRAMES.contains(&f)) {
+                    return CommandResult::Err {
+                        code: crate::engine::ErrorCode::InvalidInput,
+                        message: "A live buffer is 32, 64, 128 or 256 frames".to_string(),
+                    };
+                }
+                self.cmd_edit_audio_bus(&uuid, |b| {
+                    b.live = live;
+                    if frames.is_some() {
+                        b.live_frames = frames;
+                    }
+                })
             }
             EngineCommand::SetAudioBusDevice {
                 uuid,
@@ -627,7 +755,11 @@ impl VardaApp {
                 left,
                 right,
             } => self.cmd_add_audio_input(&name, &device, left, right),
-            EngineCommand::AddAppSound { app, name } => self.cmd_add_app_sound(&app, &name),
+            EngineCommand::AddAppSound {
+                app,
+                name,
+                deck_uuid,
+            } => self.cmd_add_app_sound(&app, &name, deck_uuid.as_deref()),
             EngineCommand::RemoveAudioInput { uuid } => self.cmd_remove_audio_input(&uuid),
             EngineCommand::SetAudioSourceGain { uuid, gain_db } => {
                 self.cmd_edit_audio_source(&uuid, |s| s.gain_db = gain_db)
@@ -716,7 +848,26 @@ impl VardaApp {
                 deck_uuid,
                 action,
             } => self.cmd_set_rundown_play(&uuid, &deck_uuid, action),
-            EngineCommand::SetRundownThen { uuid, secs } => self.cmd_set_rundown_then(&uuid, secs),
+            EngineCommand::SetRundownUntilNext {
+                uuid,
+                deck_uuid,
+                on,
+            } => self.cmd_set_rundown_until_next(&uuid, &deck_uuid, on),
+            EngineCommand::SetRundownTimer {
+                uuid,
+                deck_uuid,
+                timer,
+            } => self.cmd_set_rundown_timer(&uuid, &deck_uuid, timer),
+            EngineCommand::SetRundownThen {
+                uuid,
+                secs,
+                when_ends,
+            } => self.cmd_set_rundown_then(&uuid, secs, when_ends.as_deref()),
+            EngineCommand::SetRundownAt {
+                uuid,
+                at_secs,
+                always,
+            } => self.cmd_set_rundown_at(&uuid, at_secs, always),
             EngineCommand::CaptureRundownStep { uuid } => self.cmd_capture_rundown_step(&uuid),
             EngineCommand::TakeRundownStep { uuid, fade } => {
                 self.cmd_take_rundown_step(&uuid, fade)
@@ -1022,8 +1173,69 @@ impl VardaApp {
             EngineCommand::SetPlaylistPlaying { deck_uuid, playing } => {
                 wire(self.edit_playlist(&deck_uuid, |list| list.set_playing(playing)))
             }
+            EngineCommand::StopWithFade { deck_uuid, secs } => {
+                self.cmd_stop_with_fade(&deck_uuid, secs)
+            }
+            EngineCommand::SetStopFade { secs } => {
+                if self.audio_mix.set_stop_fade_secs(secs) {
+                    CommandResult::Ok
+                } else {
+                    CommandResult::Err {
+                        code: ErrorCode::InvalidInput,
+                        message: format!(
+                            "A stop fades for 0 to {} seconds",
+                            crate::audio_mix::MAX_STOP_FADE_SECS
+                        ),
+                    }
+                }
+            }
             EngineCommand::ShowPlaylistItem { deck_uuid, index } => {
                 wire(self.edit_playlist(&deck_uuid, |list| list.show_item(index)))
+            }
+
+            // ── Slides ────────────────────────────────────────
+            EngineCommand::AddSlidesDeck {
+                channel_uuid,
+                paths,
+                settings,
+            } => wire_id(self.add_slides_deck(&channel_uuid, &paths, settings)),
+            EngineCommand::SetSlidesTalks { deck_uuid, talks } => {
+                wire(self.set_slides_talks(&deck_uuid, talks))
+            }
+            EngineCommand::AddTalks {
+                deck_uuid,
+                paths,
+                at,
+            } => self.add_talks(deck_uuid.as_deref(), &paths, at),
+            EngineCommand::EditTalk {
+                deck_uuid,
+                talk_id,
+                name,
+                path,
+            } => wire(self.edit_talk(&deck_uuid, &talk_id, name, path.as_deref())),
+            EngineCommand::MoveTalk {
+                deck_uuid,
+                talk_id,
+                to,
+            } => wire(self.move_talk(&deck_uuid, &talk_id, to)),
+            EngineCommand::RemoveTalk { deck_uuid, talk_id } => {
+                wire(self.remove_talk(&deck_uuid, &talk_id))
+            }
+            EngineCommand::SetSlidesSettings {
+                deck_uuid,
+                settings,
+            } => wire(self.edit_slides(&deck_uuid, |s| s.set_settings(settings))),
+            EngineCommand::StartTalk { deck_uuid, to } => {
+                wire(self.start_talk(deck_uuid.as_deref(), &to))
+            }
+            EngineCommand::SetNextTalk { deck_uuid, talk_id } => {
+                wire(self.set_next_talk(&deck_uuid, talk_id))
+            }
+            EngineCommand::CheckTalks { deck_uuid } => {
+                wire(self.check_talks(deck_uuid.as_deref()))
+            }
+            EngineCommand::MakeSlidePictures { deck_uuid } => {
+                wire(self.make_slide_pictures(deck_uuid.as_deref()))
             }
 
             // ── Timers ────────────────────────────────────────
@@ -1035,8 +1247,78 @@ impl VardaApp {
                 deck_uuid,
                 settings,
             } => wire(self.edit_timer(&deck_uuid, |timer| timer.set_settings(settings))),
+            EngineCommand::AddTextDeck {
+                channel_uuid,
+                settings,
+            } => wire_id(self.add_text_deck(&channel_uuid, settings)),
+            EngineCommand::SetTextSettings {
+                deck_uuid,
+                settings,
+            } => wire(self.edit_text(&deck_uuid, |t| t.set_settings(settings))),
+            EngineCommand::AddLowerThirdDeck {
+                channel_uuid,
+                settings,
+            } => wire_id(self.add_lower_third_deck(&channel_uuid, settings)),
+            EngineCommand::SetLowerThirdSettings {
+                deck_uuid,
+                settings,
+            } => wire(self.edit_lower_third(&deck_uuid, |l| l.edit_settings(settings))),
+            EngineCommand::LowerThirdShow { deck_uuid, row } => {
+                wire(self.edit_lower_third(&deck_uuid, |l| l.show(row)))
+            }
+            EngineCommand::LowerThirdHide { deck_uuid } => {
+                wire(self.edit_lower_third(&deck_uuid, crate::deck::lower_third::LowerThird::hide))
+            }
+            EngineCommand::LowerThirdStep { deck_uuid, by } => {
+                wire(self.edit_lower_third(&deck_uuid, |l| l.step(by)))
+            }
+            EngineCommand::ImportLowerThirdRows { deck_uuid, path } => {
+                let first = self.lower_third_without_list(&deck_uuid);
+                let result = self.import_lower_third_rows(&deck_uuid, &path);
+                // A first list makes no step (see `makes_undo_step`), so it
+                // clears Redo as a step would: what Redo holds is from before
+                // the list, and would take it away.
+                if first && !self.lower_third_without_list(&deck_uuid) {
+                    self.session.history.clear_redo();
+                }
+                wire(result)
+            }
             EngineCommand::ControlTimer { deck_uuid, action } => {
                 wire(self.edit_timer(&deck_uuid, |timer| timer.control(action)))
+            }
+
+            // ── PowerPoint ────────────────────────────────────
+            EngineCommand::AddPresentationDeck { channel_uuid, path } => {
+                wire_id(self.add_presentation_deck(&channel_uuid, &path))
+            }
+            EngineCommand::PresentationGo { deck_uuid, to } => {
+                wire(self.presentation_go(deck_uuid.as_deref(), to))
+            }
+            EngineCommand::PresentationVideo { deck_uuid, control } => {
+                wire(self.presentation_video(deck_uuid.as_deref(), control))
+            }
+            EngineCommand::SetPresentationScreen { deck_uuid, screen } => {
+                wire(self.presentation_screen(deck_uuid.as_deref(), screen, false))
+            }
+            EngineCommand::TogglePresentationScreen { deck_uuid, screen } => {
+                wire(self.presentation_screen(deck_uuid.as_deref(), screen, true))
+            }
+            EngineCommand::RestartPresentation { deck_uuid } => {
+                wire(self.restart_presentation(&deck_uuid))
+            }
+            EngineCommand::SetPresenterLayout { deck_uuid, layout } => {
+                wire(self.set_presenter_layout(&deck_uuid, layout))
+            }
+            EngineCommand::SetPresentationPlaysOn {
+                deck_uuid,
+                plays_on,
+            } => wire(self.set_presentation_plays_on(&deck_uuid, plays_on)),
+            EngineCommand::AddPresenterDeck {
+                channel_uuid,
+                deck_uuid,
+            } => wire_id(self.add_presenter_deck(&channel_uuid, &deck_uuid)),
+            EngineCommand::RestartPresenterClock { deck_uuid } => {
+                wire(self.restart_presenter_clock(&deck_uuid))
             }
 
             // ── Deck Auto-Transitions ─────────────────────────
@@ -1873,11 +2155,15 @@ impl VardaApp {
             EngineCommand::SetCameraColour { deck_uuid, colour } => {
                 self.cmd_set_camera_colour(&deck_uuid, colour)
             }
+            EngineCommand::ResetInput { deck_uuid } => self.cmd_reset_input(&deck_uuid),
             EngineCommand::SetCameraProfile { deck_uuid, profile } => {
                 self.cmd_set_camera_profile(&deck_uuid, &profile)
             }
             EngineCommand::SetCameraLowestLatency { deck_uuid, on } => {
                 self.cmd_set_camera_lowest_latency(&deck_uuid, on)
+            }
+            EngineCommand::SetCameraMode { deck_uuid, mode } => {
+                self.cmd_set_camera_mode(&deck_uuid, mode)
             }
             EngineCommand::RescanDepthSensors => {
                 self.depth_manager.scan_devices();
@@ -2076,6 +2362,7 @@ impl VardaApp {
 
             EngineCommand::SetTargetFps { fps } => {
                 self.set_target_fps(fps);
+                self.blackmagic_follow_show_rate();
                 CommandResult::Ok
             }
             EngineCommand::SetFramesInFlight { frames } => {
@@ -2096,6 +2383,10 @@ impl VardaApp {
             }
             EngineCommand::SetControlScreenRate { on } => {
                 self.set_control_screen_rate(on);
+                CommandResult::Ok
+            }
+            EngineCommand::SetNightShiftOff { on } => {
+                self.set_night_shift_off(on);
                 CommandResult::Ok
             }
             EngineCommand::SetControlVsync { on } => {
@@ -2208,7 +2499,8 @@ impl VardaApp {
 
             // ── System ────────────────────────────────────────────
             EngineCommand::Shutdown => {
-                self.shutdown_requested = true;
+                self.shutdown_requested
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 CommandResult::Ok
             }
         }
@@ -2249,8 +2541,25 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::RemoveAudioBus { .. }
             | C::RenameAudioBus { .. }
             | C::SetAudioBusGain { .. }
+            | C::SetAudioBusCompressor { .. }
+            | C::ResetAudioMeter { .. }
+            | C::ResetAudioLoudness { .. }
+            | C::SetAudioSourceCompressor { .. }
+            | C::SetAudioSourceLowCut { .. }
+            | C::SetAudioSourceGate { .. }
+            | C::SetAudioSourceEq { .. }
+            | C::SetAudioSourceDeEsser { .. }
+            | C::SetAudioSourceLeveler { .. }
+            | C::SetAudioBusLimiter { .. }
             | C::SetAudioBusMute { .. }
             | C::SetAudioBusDelay { .. }
+            | C::SetAudioBusLive { .. }
+            | C::SetAudioBusPreFader { .. }
+            | C::SetAudioSendSettings { .. }
+            | C::SetAudioBusInsert { .. }
+            | C::SetAudioBusInsertBypass { .. }
+            | C::OpenAudioBusInsert { .. }
+            | C::CloseAudioBusInsert { .. }
             | C::SetAudioBusDevice { .. }
             | C::AddAudioInput { .. }
             | C::AddAppSound { .. }
@@ -2314,9 +2623,31 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::VideoSetAutoPlayback { .. }
             // Playlist transport: what plays is live, like a clip's.
             | C::SetPlaylistPlaying { .. }
+            // A Stop is transport too, and how long it fades is the
+            // console's, like the rundown's fade time.
+            | C::StopWithFade { .. }
+            | C::SetStopFade { .. }
             | C::ShowPlaylistItem { .. }
             // Starting and stopping a timer is live, like a clip's transport.
             | C::ControlTimer { .. }
+            | C::LowerThirdShow { .. }
+            | C::LowerThirdHide { .. }
+            | C::LowerThirdStep { .. }
+            // Starting a talk, and which comes next, are live, like a
+            // playlist's transport; the list itself is undoable.
+            | C::StartTalk { .. }
+            | C::SetNextTalk { .. }
+            // Looking files over changes nothing in the show, nor does
+            // having PowerPoint save them as pictures.
+            | C::CheckTalks { .. }
+            | C::MakeSlidePictures { .. }
+            // A PowerPoint show's steps are live, like a playlist's.
+            | C::PresentationGo { .. }
+            | C::PresentationVideo { .. }
+            | C::SetPresentationScreen { .. }
+            | C::TogglePresentationScreen { .. }
+            | C::RestartPresentation { .. }
+            | C::RestartPresenterClock { .. }
             // ADSR live triggers.
             | C::TriggerAdsr { .. }
             | C::ReleaseAdsr { .. }
@@ -2383,6 +2714,8 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::RescanNdi
             | C::RescanSyphon
             | C::RescanCameras
+            | C::ResetInput { .. }
+            | C::SetCameraMode { .. }
             | C::RescanCaptureTargets
             | C::RequestScreenCapturePermission
             | C::ShowCameraVideoEffects
@@ -2422,6 +2755,7 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::SetFrameHold { .. }
             | C::SetControlVsync { .. }
             | C::SetControlScreenRate { .. }
+            | C::SetNightShiftOff { .. }
             | C::StartPerfProfile { .. }
             | C::TracePresents { .. }
             // Param toggle is a live keyboard/shortcut affordance (SetParam edits
@@ -2521,9 +2855,25 @@ mod tests {
                 deck_uuid: "d".into(),
                 action: None,
             },
+            C::SetRundownUntilNext {
+                uuid: step(),
+                deck_uuid: "d".into(),
+                on: true,
+            },
+            C::SetRundownTimer {
+                uuid: step(),
+                deck_uuid: "d".into(),
+                timer: None,
+            },
             C::SetRundownThen {
                 uuid: step(),
                 secs: None,
+                when_ends: None,
+            },
+            C::SetRundownAt {
+                uuid: step(),
+                at_secs: None,
+                always: None,
             },
             C::CaptureRundownStep { uuid: step() },
         ] {

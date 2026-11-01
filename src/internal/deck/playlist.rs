@@ -261,6 +261,11 @@ impl Playlist {
         self.open(index);
     }
 
+    /// Whether it has played to the end of its last item, not looping.
+    pub fn is_finished(&self) -> bool {
+        self.finished()
+    }
+
     /// At the last item of a list that does not loop, done with it.
     fn finished(&self) -> bool {
         self.shown.as_ref().is_some_and(|open| {

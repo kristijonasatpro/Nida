@@ -59,7 +59,7 @@ New to Nida? Start with [Main mode](18-main.md), [Screen Layouts](20-layouts.md)
   - [Broadcast: Preview / Program and Inputs](20-layouts.md#broadcast-preview--program-and-inputs)
   - [VJ: Layers](20-layouts.md#vj-layers)
 - **21. [Input Settings](21-input-settings.md)** — like vMix's double-click window: a channel's layers (hide, reorder, delete, add), each layer's position, crop, colour, keys and effects, and the channel's own — with layout templates
-  - [Layers](21-input-settings.md#layers) — numbered as vMix numbers them, 1 at the back
+  - [Layers](21-input-settings.md#layers) — listed as Premiere lists tracks: the one in front at the top, 1 at the back
   - [A layer](21-input-settings.md#a-layer) — Position, Playback, Colour, Key, Effects
   - [The whole channel](21-input-settings.md#the-whole-channel) — General, Layout templates, Colour, Key, Effects
 - **22. [LED Screens](22-led-screens.md)** — like Resolume's Advanced Output: several LED screens on one HDMI feed to the processor, each at its own pixels, showing Main or a bus of its own
@@ -69,6 +69,9 @@ New to Nida? Start with [Main mode](18-main.md), [Screen Layouts](20-layouts.md)
   - [Over the API](22-led-screens.md#over-the-api)
 - **23. [Adding Inputs](23-adding-inputs.md)** — like vMix's Add Input: clips, pictures, cameras and capture cards, NDI, desktop capture, streams, web pages, colours and sound devices, each a new input
   - [Cameras and capture cards](23-adding-inputs.md#cameras-and-capture-cards) — format (size and frame rate), the camera's own sound
+  - [Broadcast backgrounds](23-adding-inputs.md#broadcast-backgrounds) — calm moving backgrounds for events by mood (tech, cyber, warm, calm, colours): Speed, Density, Calm centre, palettes
+  - [Text](23-adding-inputs.md#text) — lines of text in any font, edited live on air, with a box, outline, shadow and a fade
+  - [Lower thirds](23-adding-inputs.md#lower-thirds) — names and titles on a plate from a typed list or an organiser's CSV (Lithuanian Excel too, read again when saved): Show/Hide/Next, palettes, Cut/Fade/Slide/Wipe
   - [NDI](23-adding-inputs.md#ndi) — the runtime, sources on the network, their sound; sending NDI with an audio bus
   - [Desktop capture](23-adding-inputs.md#desktop-capture) — displays and windows, Screen Recording access
   - [Over the API](23-adding-inputs.md#over-the-api) — `POST /api/inputs`
@@ -81,6 +84,16 @@ New to Nida? Start with [Main mode](18-main.md), [Screen Layouts](20-layouts.md)
   - [Running the show](25-rundown.md#running-the-show) — GO, Cut and Fade; all of it or none; going on by itself
   - [Clips, playlists and timers](25-rundown.md#clips-playlists-and-timers) — a sting on no screen, a talk's countdown
   - [Over the API](25-rundown.md#over-the-api) — `/api/rundown/…`
+- **26. [Presentations](26-presentations.md)** — a conference's talks in one Slides input — PowerPoint decks, PDFs, web presentations, clips, pictures — in running order, each started with one press in the Presentations panel; a PiP or presenter view showing it follows the talk on
+  - [The Presentations panel](26-presentations.md#the-presentations-panel) — ON AIR, NEXT, the running order
+  - [Starting a talk](26-presentations.md#starting-a-talk) — what is on stays on until the new talk's picture is there
+  - [PDF talks](26-presentations.md#pdf-talks) and [web talks](26-presentations.md#web-talks) — drawn by Nida; played by the Mac's WebKit off screen
+  - [Checked before the show](26-presentations.md#checked-before-the-show) — linked videos not copied, fonts this Mac lacks, 4:3 decks, pages that need the internet
+  - [PowerPoint](26-presentations.md#powerpoint) — a deck played by PowerPoint on this Mac, its transitions, animations and videos as PowerPoint plays them; as a talk or an input of its own
+  - [Moving it on](26-presentations.md#moving-it-on) — ◀ ▶, PageDown / PageUp and B, black and white
+  - [It stays up](26-presentations.md#it-stays-up) — a show ended in PowerPoint comes back; kept with the show
+  - [Over the API](26-presentations.md#over-the-api) — `StartTalk`, `AddTalks`, `PresentationGo`, `slides` and `presentation` in the state
+- **27. [The dot on output screens](27-privacy-dot.md)** — macOS's green, orange and purple capture dot, and Apple's switch that keeps it off LED walls and stage monitors
 
 Parts III–VI are the engine underneath, from Varda, with Nida's additions.
 
@@ -163,6 +176,9 @@ Parts III–VI are the engine underneath, from Varda, with Nida's additions.
   - [File Location](12-isf-authoring.md#file-location) — shader directory precedence hierarchy, `--shader-dir`
 - **13. [HTTP API & Headless Mode](13-api.md)**
   - [Swagger UI](13-api.md#swagger-ui)
+  - [Running a show remotely](13-api.md#running-a-show-remotely)
+  - [Setting up a show with an AI agent](13-api.md#setting-up-a-show-with-an-ai-agent)
+  - [An agent beside a live show](13-api.md#an-agent-beside-a-live-show) — looking before touching, read-only measuring, the shared Undo, names and text
   - [Headless Mode](13-api.md#headless-mode)
   - [WebSocket](13-api.md#websocket)
   - [Common Patterns](13-api.md#common-patterns)

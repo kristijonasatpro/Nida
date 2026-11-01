@@ -403,3 +403,575 @@ fn a_screen_gets_a_bus_of_its_own_named_after_it() {
     );
     assert!(matches!(r, CommandResult::Err { .. }), "{r:?}");
 }
+
+/// A lower third sent to a bus comes on over what the bus shows, inside the
+/// part of it its LED screen shows — laid out for that band, not the 16:9
+/// picture's foot — and goes off with Hide.
+#[test]
+fn a_lower_third_sent_to_a_bus_comes_on_in_its_screens_part() {
+    use varda::engine::value::lower_third::{
+        LowerThirdBar, LowerThirdMotion, LowerThirdRow, LowerThirdSettings,
+    };
+    use varda::engine::InputSource;
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    let (_picture, cube, _dir) = show(&mut app);
+    let out = feed_output(&mut app);
+    // The CUBE bus's middle band, rows 40–139 of its 320×180, fills a
+    // 320×100 screen at the top of the feed.
+    let band = LedScreen {
+        fit: LedFit::Part {
+            x: 0,
+            y: 40,
+            width: W,
+            height: 100,
+        },
+        ..LedScreen::new(
+            "Band",
+            [W, 100],
+            [0, 0],
+            OutputSource::BusProgram(cube.clone()),
+        )
+    };
+    let r = send(
+        &mut app,
+        EngineCommand::SetOutputLed {
+            output_uuid: out.clone(),
+            layout: Some(LedLayout {
+                feed: [W, H],
+                screens: vec![band],
+                test_card: false,
+            }),
+        },
+    );
+    assert!(matches!(r, CommandResult::Ok), "{r:?}");
+    let mut settings = LowerThirdSettings {
+        rows: vec![LowerThirdRow {
+            name: "Jonas Jonaitis".into(),
+            title: "Moderatorius".into(),
+            ..LowerThirdRow::default()
+        }],
+        targets: vec![cube.clone()],
+        ..LowerThirdSettings::default()
+    };
+    settings.look.palette = 0;
+    settings.look.plate = [1.0, 0.0, 0.0];
+    settings.look.plate_opacity = 1.0;
+    settings.look.bar = LowerThirdBar::None;
+    settings.look.motion = LowerThirdMotion::Cut;
+    settings.look.size = 0.18;
+    let r = send(
+        &mut app,
+        EngineCommand::AddInput {
+            source: InputSource::LowerThird {
+                settings: Some(settings),
+            },
+            name: None,
+            audio: None,
+        },
+    );
+    let CommandResult::OkWithId {
+        uuid: lower_channel,
+    } = r
+    else {
+        panic!("{r:?}");
+    };
+    // Its input in no picture of its own: names on the wall only.
+    send(
+        &mut app,
+        EngineCommand::SetChannelOpacity {
+            channel_uuid: lower_channel,
+            opacity: 0.0,
+        },
+    );
+    let lower = app
+        .build_engine_state()
+        .mixer
+        .channels
+        .iter()
+        .flat_map(|c| c.decks.clone())
+        .find(|d| d.lower_third.is_some())
+        .expect("the lower third")
+        .uuid;
+    let red_in_band = |app: &VardaApp| {
+        let px = output_pixels(app, &out);
+        let mut red = Vec::new();
+        for y in 0..100 {
+            for x in 0..W {
+                let p = px[(y * W + x) as usize];
+                if p[0] > 200 && p[1] < 60 && p[2] < 60 {
+                    red.push((x, y));
+                }
+            }
+        }
+        red
+    };
+    render(&mut app);
+    assert!(red_in_band(&app).is_empty(), "nothing before Show");
+    send(
+        &mut app,
+        EngineCommand::LowerThirdShow {
+            deck_uuid: lower.clone(),
+            row: None,
+        },
+    );
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut red = Vec::new();
+    while red.len() < 200 && std::time::Instant::now() < until {
+        render(&mut app);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        red = red_in_band(&app);
+    }
+    assert!(
+        red.len() >= 200,
+        "its plate on the band: {} red pixels",
+        red.len()
+    );
+    // In the band's lower left, inside it.
+    let (xs, ys): (Vec<u32>, Vec<u32>) = red.iter().copied().unzip();
+    let left = *xs.iter().max().unwrap() < W * 3 / 4;
+    let low = ys.iter().sum::<u32>() / ys.len() as u32 > 50;
+    assert!(left && low, "in the band's lower left");
+    // Whole inside it — laid out for the band, not cut off at its foot as a
+    // 16:9 picture's lower third would be.
+    assert!(
+        ys.iter().all(|y| *y < 97),
+        "inside the band, not cut at its foot: lowest {}",
+        ys.iter().max().unwrap()
+    );
+    // The rest of the band still the bus's own green.
+    let px = output_pixels(&app, &out);
+    assert!(
+        near(px[(10 * W + W - 10) as usize], [0, 255, 0]),
+        "the bus's picture under it"
+    );
+    send(&mut app, EngineCommand::LowerThirdHide { deck_uuid: lower });
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !red_in_band(&app).is_empty() && std::time::Instant::now() < until {
+        render(&mut app);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(red_in_band(&app).is_empty(), "off with Hide");
+}
+
+/// A lower third on a bus, its own input off air with the window's tiles on
+/// (its channel drawn only a few times a second): its wipe still moves on
+/// every frame there, not in steps of three.
+#[test]
+fn a_lower_third_on_a_bus_moves_every_frame_with_its_input_off_air() {
+    use varda::engine::value::lower_third::{
+        LowerThirdBar, LowerThirdMotion, LowerThirdRow, LowerThirdSettings,
+    };
+    use varda::engine::InputSource;
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    app.set_ui_tiles(true);
+    let (_picture, cube, _dir) = show(&mut app);
+    let out = feed_output(&mut app);
+    let band = LedScreen {
+        fit: LedFit::Part {
+            x: 0,
+            y: 40,
+            width: W,
+            height: 100,
+        },
+        ..LedScreen::new(
+            "Band",
+            [W, 100],
+            [0, 0],
+            OutputSource::BusProgram(cube.clone()),
+        )
+    };
+    let r = send(
+        &mut app,
+        EngineCommand::SetOutputLed {
+            output_uuid: out.clone(),
+            layout: Some(LedLayout {
+                feed: [W, H],
+                screens: vec![band],
+                test_card: false,
+            }),
+        },
+    );
+    assert!(matches!(r, CommandResult::Ok), "{r:?}");
+    let mut settings = LowerThirdSettings {
+        rows: vec![LowerThirdRow {
+            name: "Jonas Jonaitis".into(),
+            title: "Moderatorius".into(),
+            ..LowerThirdRow::default()
+        }],
+        targets: vec![cube.clone()],
+        ..LowerThirdSettings::default()
+    };
+    settings.look.palette = 0;
+    settings.look.plate = [1.0, 0.0, 0.0];
+    settings.look.plate_opacity = 1.0;
+    settings.look.bar = LowerThirdBar::None;
+    settings.look.motion = LowerThirdMotion::Wipe;
+    settings.look.motion_secs = 1.5;
+    settings.look.size = 0.18;
+    let lower_channel = id(send(
+        &mut app,
+        EngineCommand::AddInput {
+            source: InputSource::LowerThird {
+                settings: Some(settings),
+            },
+            name: None,
+            audio: None,
+        },
+    ));
+    send(
+        &mut app,
+        EngineCommand::SetChannelOpacity {
+            channel_uuid: lower_channel,
+            opacity: 0.0,
+        },
+    );
+    let lower = app
+        .build_engine_state()
+        .mixer
+        .channels
+        .iter()
+        .flat_map(|c| c.decks.clone())
+        .find(|d| d.lower_third.is_some())
+        .expect("the lower third")
+        .uuid;
+    let red_in_band = |app: &VardaApp| {
+        let px = output_pixels(app, &out);
+        (0..100 * W)
+            .filter(|i| {
+                let p = px[*i as usize];
+                p[0] > 200 && p[1] < 60 && p[2] < 60
+            })
+            .count()
+    };
+    render(&mut app);
+    send(
+        &mut app,
+        EngineCommand::LowerThirdShow {
+            deck_uuid: lower,
+            row: None,
+        },
+    );
+    // One frame at a time, about 60 a second, through the wipe.
+    let mut counts = Vec::new();
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+    while std::time::Instant::now() < until {
+        app.render_mixer_frame();
+        app.render_outputs();
+        counts.push(red_in_band(&app));
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    }
+    let full = *counts.iter().max().unwrap();
+    assert!(full > 200, "its plate on the band: {full}");
+    // The frames part way through the plate's wipe, up to its being whole
+    // (the text, coming after, covers some of it), and how many repeat the
+    // one before.
+    let whole = counts.iter().position(|c| *c == full).unwrap();
+    let moving: Vec<usize> = counts[..whole]
+        .iter()
+        .copied()
+        .filter(|c| *c > full / 10)
+        .collect();
+    let repeats = moving.windows(2).filter(|w| w[0] == w[1]).count();
+    println!("wipe frames {}, repeats {repeats}: {moving:?}", moving.len());
+    assert!(moving.len() >= 8, "a wipe over many frames: {}", moving.len());
+    assert!(
+        repeats * 5 < moving.len(),
+        "the wipe stood still on {repeats} of {} frames",
+        moving.len()
+    );
+}
+
+/// A text input sent to a bus — its input in no picture of its own — comes
+/// on over what the bus shows, inside the part its screen shows, laid out
+/// for that part; hidden, it fades away; the bus's picture stays under it.
+#[test]
+fn a_text_sent_to_a_bus_comes_on_over_it_in_its_screens_part() {
+    use varda::engine::value::text::TextSettings;
+    use varda::engine::value::timer::Anchor;
+    use varda::engine::InputSource;
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    let (_picture, cube, _dir) = show(&mut app);
+    let out = feed_output(&mut app);
+    let band = LedScreen {
+        fit: LedFit::Part {
+            x: 0,
+            y: 40,
+            width: W,
+            height: 100,
+        },
+        ..LedScreen::new(
+            "Band",
+            [W, 100],
+            [0, 0],
+            OutputSource::BusProgram(cube.clone()),
+        )
+    };
+    let r = send(
+        &mut app,
+        EngineCommand::SetOutputLed {
+            output_uuid: out.clone(),
+            layout: Some(LedLayout {
+                feed: [W, H],
+                screens: vec![band],
+                test_card: false,
+            }),
+        },
+    );
+    assert!(matches!(r, CommandResult::Ok), "{r:?}");
+    let mut settings = TextSettings {
+        text: "PERTRAUKA".into(),
+        targets: vec![cube.clone()],
+        fade_secs: 0.2,
+        ..TextSettings::default()
+    };
+    settings.look.colour = [255, 0, 0];
+    settings.look.box_opacity = 1.0;
+    settings.look.box_colour = [255, 0, 0];
+    settings.look.shadow_opacity = 0.0;
+    settings.look.size = 0.2;
+    settings.look.anchor = Anchor::BottomLeft;
+    let channel = id(send(
+        &mut app,
+        EngineCommand::AddInput {
+            source: InputSource::Text {
+                settings: Some(settings.clone()),
+            },
+            name: None,
+            audio: None,
+        },
+    ));
+    send(
+        &mut app,
+        EngineCommand::SetChannelOpacity {
+            channel_uuid: channel,
+            opacity: 0.0,
+        },
+    );
+    let deck = app
+        .build_engine_state()
+        .mixer
+        .channels
+        .iter()
+        .flat_map(|c| c.decks.clone())
+        .find(|d| d.text.is_some())
+        .expect("the text")
+        .uuid;
+    let red_in_band = |app: &VardaApp| {
+        let px = output_pixels(app, &out);
+        let mut red = Vec::new();
+        for y in 0..100 {
+            for x in 0..W {
+                let p = px[(y * W + x) as usize];
+                if p[0] > 200 && p[1] < 60 && p[2] < 60 {
+                    red.push((x, y));
+                }
+            }
+        }
+        red
+    };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut red = Vec::new();
+    while red.len() < 200 && std::time::Instant::now() < until {
+        render(&mut app);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        red = red_in_band(&app);
+    }
+    assert!(red.len() >= 200, "its box on the band: {} red pixels", red.len());
+    // In the band's lower left, whole inside it.
+    let (xs, ys): (Vec<u32>, Vec<u32>) = red.iter().copied().unzip();
+    assert!(*xs.iter().max().unwrap() < W * 3 / 4, "in the band's left");
+    assert!(ys.iter().sum::<u32>() / ys.len() as u32 > 50, "in the band's lower half");
+    assert!(ys.iter().all(|y| *y < 99), "inside the band, not cut at its foot");
+    let px = output_pixels(&app, &out);
+    assert!(
+        near(px[(10 * W + W - 10) as usize], [0, 255, 0]),
+        "the bus's picture under it"
+    );
+    // Hidden: gone, faded.
+    settings.visible = false;
+    let r = send(
+        &mut app,
+        EngineCommand::SetTextSettings {
+            deck_uuid: deck,
+            settings,
+        },
+    );
+    assert!(matches!(r, CommandResult::Ok), "{r:?}");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !red_in_band(&app).is_empty() && std::time::Instant::now() < until {
+        render(&mut app);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(red_in_band(&app).is_empty(), "off when hidden");
+}
+
+/// A channel off air that a surface shows by itself is drawn every frame
+/// — the surface is not a tile.
+#[test]
+fn a_channel_a_surface_shows_is_drawn_every_frame_off_air() {
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    app.set_ui_tiles(true);
+    let (_picture, _cube, _dir) = show(&mut app);
+    // A new input, on no bus.
+    let uuid = id(send(
+        &mut app,
+        EngineCommand::AddInput {
+            source: varda::engine::InputSource::Colour {
+                color: [0.2, 0.4, 0.8, 1.0],
+            },
+            name: None,
+            audio: None,
+        },
+    ));
+    let channel = app
+        .mixer_ref()
+        .channels()
+        .iter()
+        .position(|c| c.uuid() == uuid)
+        .expect("the new input");
+    send(
+        &mut app,
+        EngineCommand::SetChannelOpacity {
+            channel_uuid: uuid,
+            opacity: 0.0,
+        },
+    );
+    let r = send(
+        &mut app,
+        EngineCommand::AddSurface {
+            name: "Side".into(),
+            source: OutputSource::Channel(channel),
+        },
+    );
+    assert!(!matches!(r, CommandResult::Err { .. }), "{r:?}");
+    let before = app.mixer_ref().channels()[channel].frames_drawn();
+    for _ in 0..12 {
+        app.render_mixer_frame();
+        app.render_outputs();
+    }
+    assert_eq!(
+        app.mixer_ref().channels()[channel].frames_drawn() - before,
+        12,
+        "drawn every frame"
+    );
+}
+
+/// A bus made with the master larger, the master then made smaller: a lower
+/// third sent to it is laid out on the bus's picture as it is now, not below
+/// it.
+#[test]
+fn a_lower_third_on_a_bus_after_the_master_shrinks_stays_on_it() {
+    use varda::engine::value::lower_third::{
+        LowerThirdBar, LowerThirdMotion, LowerThirdRow, LowerThirdSettings,
+    };
+    use varda::engine::InputSource;
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    let _ = show(&mut app);
+    // Made with the master twice the size, which then goes back down.
+    send(
+        &mut app,
+        EngineCommand::SetRenderResolution {
+            width: W * 2,
+            height: H * 2,
+        },
+    );
+    let big = id(send(
+        &mut app,
+        EngineCommand::AddBus {
+            name: "BIG".into(),
+            width: W * 2,
+            height: H * 2,
+        },
+    ));
+    send(
+        &mut app,
+        EngineCommand::SetRenderResolution {
+            width: W,
+            height: H,
+        },
+    );
+    let out = feed_output(&mut app);
+    let screen = LedScreen {
+        fit: LedFit::Stretch,
+        ..LedScreen::new("All", [W, H], [0, 0], OutputSource::BusProgram(big.clone()))
+    };
+    let r = send(
+        &mut app,
+        EngineCommand::SetOutputLed {
+            output_uuid: out.clone(),
+            layout: Some(LedLayout {
+                feed: [W, H],
+                screens: vec![screen],
+                test_card: false,
+            }),
+        },
+    );
+    assert!(matches!(r, CommandResult::Ok), "{r:?}");
+    let mut settings = LowerThirdSettings {
+        rows: vec![LowerThirdRow {
+            name: "Ona Onaitė".into(),
+            ..LowerThirdRow::default()
+        }],
+        targets: vec![big],
+        ..LowerThirdSettings::default()
+    };
+    settings.look.palette = 0;
+    settings.look.plate = [1.0, 0.0, 0.0];
+    settings.look.plate_opacity = 1.0;
+    settings.look.bar = LowerThirdBar::None;
+    settings.look.motion = LowerThirdMotion::Cut;
+    settings.look.size = 0.12;
+    let r = send(
+        &mut app,
+        EngineCommand::AddInput {
+            source: InputSource::LowerThird {
+                settings: Some(settings),
+            },
+            name: None,
+            audio: None,
+        },
+    );
+    assert!(matches!(r, CommandResult::OkWithId { .. }), "{r:?}");
+    let lower = app
+        .build_engine_state()
+        .mixer
+        .channels
+        .iter()
+        .flat_map(|c| c.decks.clone())
+        .find(|d| d.lower_third.is_some())
+        .expect("the lower third")
+        .uuid;
+    send(
+        &mut app,
+        EngineCommand::LowerThirdShow {
+            deck_uuid: lower,
+            row: None,
+        },
+    );
+    let red = |app: &VardaApp| {
+        output_pixels(app, &out)
+            .iter()
+            .filter(|p| p[0] > 200 && p[1] < 60 && p[2] < 60)
+            .count()
+    };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while red(&app) < 200 && std::time::Instant::now() < until {
+        render(&mut app);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        red(&app) >= 200,
+        "its plate on the bus's picture: {}",
+        red(&app)
+    );
+}

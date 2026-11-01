@@ -800,7 +800,7 @@ fn font_filter_id() -> egui::Id {
 }
 
 /// The installed fonts, by family, looked through by name.
-fn font_picker(ui: &mut egui::Ui, font: &mut String) {
+pub(super) fn font_picker(ui: &mut egui::Ui, font: &mut String) {
     let Some(families) = crate::deck::svg::font_families() else {
         // Still being read: typed by name meanwhile.
         typed(ui, "font", font, "a font's name").on_hover_text("A font installed on this computer, by name");
@@ -836,7 +836,7 @@ fn font_picker(ui: &mut egui::Ui, font: &mut String) {
 
 /// A little frame with its nine places: the one clicked is where the
 /// timer goes.
-fn anchor_picker(ui: &mut egui::Ui, anchor: &mut Anchor) {
+pub(super) fn anchor_picker(ui: &mut egui::Ui, anchor: &mut Anchor) {
     let size = egui::vec2(72.0, 42.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);

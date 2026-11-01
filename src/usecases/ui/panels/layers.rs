@@ -8,7 +8,6 @@
 
 use super::super::{ChannelUIInfo, DeckDrag, LibraryDrag, UIActions, UIData};
 use super::main_desk::{self, NEXT_GREEN, ON_MAIN_RED};
-use super::utils::channel_color;
 use crate::engine::EngineCommand;
 use crate::mixer::MixMode;
 use crate::BlendMode;
@@ -76,7 +75,7 @@ fn cell_width(data: &UIData) -> f32 {
 }
 
 fn render_row(ui: &mut egui::Ui, ch: &ChannelUIInfo, data: &UIData, actions: &mut UIActions) {
-    let accent = channel_color(ch.ch_idx);
+    let accent = ch.accent();
     let main_mode = main_desk::in_main_mode(data);
     let on_main = main_mode && main_desk::channel_on_main(data, ch);
     let selected = data.selected_channel == Some(ch.ch_idx);
@@ -86,6 +85,9 @@ fn render_row(ui: &mut egui::Ui, ch: &ChannelUIInfo, data: &UIData, actions: &mu
 
     ui.push_id(("layer_row", ch.ch_idx), |ui| {
         let hover = source_drag && ui.rect_contains_pointer(ui.max_rect());
+        // Where each card is drawn, front first: a drop between two goes
+        // there, as in a Classic column.
+        let mut cards: super::insertion::Cards = Vec::with_capacity(ch.decks.len());
         let stroke = if hover {
             egui::Stroke::new(2.0, accent)
         } else if on_main {
@@ -125,8 +127,9 @@ fn render_row(ui: &mut egui::Ui, ch: &ChannelUIInfo, data: &UIData, actions: &mu
                             // tall as the panel.
                             ui.add_space(4.0);
                             let cell = cell_width(data);
-                            for deck in &ch.decks {
-                                ui.allocate_ui_with_layout(
+                            // Front first, as the other lists of layers.
+                            for deck in ch.decks.iter().rev() {
+                                let card = ui.allocate_ui_with_layout(
                                     egui::vec2(cell, 0.0),
                                     egui::Layout::top_down(egui::Align::Min),
                                     |ui| {
@@ -135,6 +138,7 @@ fn render_row(ui: &mut egui::Ui, ch: &ChannelUIInfo, data: &UIData, actions: &mu
                                         );
                                     },
                                 );
+                                cards.push((deck.uuid.clone(), card.response.rect));
                             }
                             render_empty_cell(ui, ch, hover, accent, data, actions);
                         });
@@ -146,10 +150,15 @@ fn render_row(ui: &mut egui::Ui, ch: &ChannelUIInfo, data: &UIData, actions: &mu
             actions.session.select_channel = Some(ch.ch_idx);
         }
         row.context_menu(|ui| super::mixer::channel_context_menu(ui, data, actions, ch));
-        ui.ctx().memory_mut(|m| {
-            m.data
-                .insert_temp(egui::Id::new("ch_drop_rect").with(ch.ch_idx), rect);
-        });
+        super::publish_drop_rect(ui, ch.ch_idx, rect);
+        // The cards' part of the row, from the first card to the row's end.
+        if let Some((_, first)) = cards.first() {
+            let area = egui::Rect::from_min_max(
+                egui::pos2(first.left() - 4.0, rect.top()),
+                rect.max,
+            );
+            super::insertion::publish_cards_across(ui, ch.ch_idx, cards, area);
+        }
         super::dnd::publish_channel_surface_fx(ui.ctx(), &ch.uuid, ch.ch_idx, rect);
         super::mixer::handle_deck_drop(ui, ch, rect, accent, actions);
     });
@@ -163,7 +172,7 @@ fn render_header(
     data: &UIData,
     actions: &mut UIActions,
 ) {
-    let accent = channel_color(ch.ch_idx);
+    let accent = ch.accent();
     let main_mode = main_desk::in_main_mode(data);
     let name = ui.add(
         egui::Label::new(
@@ -184,7 +193,7 @@ fn render_header(
     if let Some((deck, list)) = super::playlist::of_channel(ch) {
         ui.horizontal(|ui| {
             let size = egui::vec2(28.0, 22.0);
-            super::playlist::play_button(ui, &deck.uuid, list, size, actions);
+            super::playlist::play_button(ui, &deck.uuid, list, size, data, actions);
             super::playlist::list_button(ui, &deck.uuid, size);
         });
     }
@@ -193,6 +202,18 @@ fn render_header(
             let size = egui::vec2(28.0, 22.0);
             super::timer::start_button(ui, &deck.uuid, timer, size, actions);
             super::timer::settings_button(ui, &deck.uuid, size);
+        });
+    }
+    if let Some((deck, lower)) = super::lower_third::of_channel(ch) {
+        ui.horizontal(|ui| {
+            let size = egui::vec2(28.0, 22.0);
+            super::lower_third::show_button(ui, &deck.uuid, lower, size, actions);
+            super::lower_third::next_button(ui, &deck.uuid, lower, size, actions);
+        });
+    }
+    if let Some((deck, _)) = super::presentation::of_channel(ch) {
+        ui.horizontal(|ui| {
+            super::presentation::step_buttons(ui, &deck.uuid, egui::vec2(28.0, 22.0), actions);
         });
     }
 
@@ -423,6 +444,41 @@ mod tests {
         harness
     }
 
+    /// A layer's cards run across its row, front first: a drop between two
+    /// goes there — and a card dragged between two moves there — as in a
+    /// Classic column; past the last, behind them all.
+    #[test]
+    fn a_drop_between_a_layers_cards_goes_between_them() {
+        let data = UIData::test_fixture();
+        assert!(data.channels[0].decks.len() >= 2, "precondition: two decks");
+        let front = data.channels[0].decks.last().unwrap().uuid.clone();
+        let back = data.channels[0].decks[0].uuid.clone();
+        let harness = harness(data);
+        let stacks = harness
+            .ctx
+            .memory(|m| {
+                m.data
+                    .get_temp::<Vec<super::super::insertion::Stack>>(super::super::insertion::stacks_id(0))
+            })
+            .expect("the row publishes its cards");
+        let stack = stacks.first().expect("one view");
+        assert!(stack.across, "across the row");
+        let ids: Vec<&str> = stack.cards.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids.first().copied(), Some(front.as_str()), "front first");
+        let (first, second) = (stack.cards[0].1, stack.cards[1].1);
+        let between = egui::pos2(second.left() + 4.0, second.center().y);
+        assert_eq!(
+            super::super::insertion::insertion_at(&harness.ctx, 0, between).before,
+            Some(front.clone())
+        );
+        let past = egui::pos2(stack.cards.last().unwrap().1.right() + 20.0, first.center().y);
+        assert_eq!(
+            super::super::insertion::insertion_at(&harness.ctx, 0, past).before,
+            Some(back),
+            "behind them all"
+        );
+    }
+
     fn main_mode_fixture() -> UIData {
         let mut data = UIData::test_fixture();
         data.main.mode = MixMode::Program;
@@ -463,6 +519,22 @@ mod tests {
         };
         let pitch = (y(&first) - y(&last)) / (UIData::test_fixture().channels.len() - 1) as f32;
         assert!(pitch < 250.0, "rows {pitch} px apart");
+    }
+
+    /// In a row, as in a channel's other lists: the layer in front first.
+    #[test]
+    fn a_rows_cards_put_the_layer_in_front_first() {
+        let data = UIData::test_fixture();
+        let back = data.channels[0].decks[0].name.clone();
+        let front = data.channels[0].decks[1].name.clone();
+        let harness = harness(data);
+        let x = |name: &str| {
+            harness
+                .get_by_label(&format!("{name} deck card"))
+                .rect()
+                .left()
+        };
+        assert!(x(&front) < x(&back), "{front} before {back}");
     }
 
     #[test]

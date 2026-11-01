@@ -42,6 +42,25 @@ impl SharedState {
     }
 }
 
+/// What a route that sends the engine a command answers over HTTP.
+///
+/// Done: `200` with `{"status": "ok"}`, and `uuid` when the command made
+/// something, `data` when it reports something. Refused by the engine: `400`,
+/// `404`, `500` or `503` with `{"error": "invalid_input" | "not_found" |
+/// "internal" | "unavailable", "message": "…"}`. A request that cannot be read
+/// (bad JSON, a missing field, no JSON content type) gets a plain-text `400`,
+/// `415` or `422` instead, and a few routes answer some failures in plain text.
+#[derive(utoipa::ToSchema)]
+pub struct ApiReply {
+    /// `"ok"`.
+    #[schema(example = "ok")]
+    pub status: String,
+    /// The UUID of what the command made, when it made something.
+    pub uuid: Option<String>,
+    /// What the command reports, when it reports something.
+    pub data: Option<serde_json::Value>,
+}
+
 /// Map a `CommandResult` to an axum HTTP response.
 pub fn command_response(result: CommandResult) -> axum::response::Response {
     use axum::http::StatusCode;

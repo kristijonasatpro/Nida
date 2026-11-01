@@ -318,7 +318,14 @@ impl VardaApp {
         });
 
         let format = self.context.compositing_format;
-        let effect = match crate::persistence::restore_effect(&config, &self.context, format) {
+        // An offline effect comes as it was, offline (see
+        // `persistence::restore_effect_kept`).
+        let effect = match crate::persistence::restore_effect_kept(
+            &config,
+            &self.context,
+            &self.registry,
+            format,
+        ) {
             Ok(effect) => effect,
             Err(e) => {
                 return CommandResult::Err {
@@ -404,7 +411,13 @@ impl VardaApp {
 
         let format = self.context.compositing_format;
         for effect_config in &config.effects {
-            match crate::persistence::restore_effect(effect_config, &self.context, format) {
+            // An offline effect comes along offline, not left out.
+            match crate::persistence::restore_effect_kept(
+                effect_config,
+                &self.context,
+                &self.registry,
+                format,
+            ) {
                 Ok(effect) => {
                     if let Some(channel) = self.mixer.channel_mut(channel_idx) {
                         channel.add_effect(effect);

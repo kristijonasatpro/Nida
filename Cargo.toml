@@ -1,6 +1,6 @@
 [package]
 name = "varda"
-version = "0.9.0"
+version = "0.9.7"
 edition = "2021"
 authors = ["Varda Contributors"]
 description = "Linux, MacOS, and Windows VJ software"
@@ -108,7 +108,13 @@ imageproc = "0.26.2"
 # master resolution calls for. Pinned to one minor so both share a tree type.
 # Default features on: real artwork carries text and embedded rasters.
 usvg = "0.47.0"
+# Which letters a font has: a lower third checks its font has the Lithuanian ones.
+ttf-parser = "0.25.1"
 resvg = "0.47.0"
+# PowerPoint files (.pptx) are zipped XML: each slide's notes, whether it is
+# hidden, the slide size. Both already come in with the API docs and usvg.
+zip = { version = "3", default-features = false, features = ["deflate"] }
+roxmltree = "0.21"
 dxf = "0.6.1"
 base64 = "0.22.1"
 dirs = "6.0.0"
@@ -200,12 +206,37 @@ objc2-core-audio         = { version = "0.3", default-features = false, features
     "objc2-foundation",
     "AudioHardware",
 ] }
+# Audio Unit effects installed on this Mac, listed for a bus's insert
+# (src/internal/audio_mix/plugins.rs).
+objc2-avf-audio          = { version = "0.3", default-features = false, features = [
+    "std",
+    "AVAudioFormat",
+    "AVAudioTypes",
+    "AVAudioUnitComponent",
+    "objc2-audio-toolbox",
+] }
+# ...and one hosted, out of process, as a bus's insert (au_host.rs).
+objc2-audio-toolbox      = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-core-audio-types",
+    "AUAudioUnit",
+    "AUComponent",
+    "AUParameters",
+    "AudioComponent",
+] }
+objc2-core-audio-types   = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "CoreAudioBaseTypes",
+] }
 # What macOS calls each screen, and the Identify overlay that puts each
 # screen's name on it (src/app/screens.rs).
 objc2-app-kit            = { version = "0.3", default-features = false, features = [
     "std",
     # CGFloat sizes and colours: a release build has no other crate asking.
     "objc2-core-foundation",
+    "NSApplication",
     "NSColor",
     "NSControl",
     "NSFont",
@@ -216,6 +247,7 @@ objc2-app-kit            = { version = "0.3", default-features = false, features
     "NSText",
     "NSTextField",
     "NSView",
+    "NSViewController",
     "NSWindow",
 ] }
 
@@ -371,3 +403,7 @@ strip = "none"
 # ProMotion screens, which wgpu does not expose. See vendor/wgpu-hal/NIDA-PATCH.md.
 [patch.crates-io]
 wgpu-hal = { path = "vendor/wgpu-hal" }
+# cpal's CoreAudio layer, patched: its input callback asked the unit for its
+# format when the device's buffer size changed, and could deadlock with a
+# stream starting on the same device (vendor/coreaudio-rs/NIDA-PATCH.md).
+coreaudio-rs = { path = "vendor/coreaudio-rs" }

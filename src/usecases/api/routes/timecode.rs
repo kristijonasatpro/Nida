@@ -10,7 +10,7 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
 #[derive(Deserialize, ToSchema)]
@@ -28,7 +28,7 @@ pub struct LtcInputBody {
 }
 
 /// Choose which incoming timecode signal the transport follows.
-#[utoipa::path(put, path = "/api/timecode/preference", request_body = PreferenceBody, responses((status = 200, body = CommandResult)), tag = "Timecode")]
+#[utoipa::path(put, path = "/api/timecode/preference", request_body = PreferenceBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Timecode")]
 pub async fn set_preference(
     State(s): State<SharedState>,
     Json(b): Json<PreferenceBody>,
@@ -50,7 +50,7 @@ pub async fn set_preference(
 /// the signal's cadence. Naming it matters only for 29.97 non-drop, which is
 /// indistinguishable from 30 in the signal and 3.6 seconds an hour away from it
 /// in position.
-#[utoipa::path(put, path = "/api/timecode/ltc-input", request_body = LtcInputBody, responses((status = 200, body = CommandResult)), tag = "Timecode")]
+#[utoipa::path(put, path = "/api/timecode/ltc-input", request_body = LtcInputBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Timecode")]
 pub async fn set_ltc_input(
     State(s): State<SharedState>,
     Json(b): Json<LtcInputBody>,

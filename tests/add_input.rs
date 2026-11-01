@@ -375,3 +375,43 @@ fn a_colour_can_be_changed_after_it_is_added() {
         CommandResult::Err { .. }
     ));
 }
+
+/// Without the browser (a build without it, or turned off as here), a web
+/// page is refused — and why said — not added as an empty layer.
+#[test]
+fn a_web_page_is_refused_without_the_browser() {
+    use clap::Parser as _;
+    let dir = tempfile::tempdir().unwrap();
+    let Some(gpu) = common::headless_gpu() else {
+        return;
+    };
+    let config = varda::app::AppConfig::try_parse_from([
+        "varda",
+        "--headless",
+        "--no-osc",
+        "--no-ndi",
+        "--no-syphon",
+        "--no-camera",
+        "--no-html",
+        "--workspace",
+        dir.path().to_str().unwrap(),
+    ])
+    .unwrap();
+    let mut app = VardaApp::new(gpu, &config).unwrap();
+    let before = channels(&app).len();
+    let reply = send_cmd(
+        &mut app,
+        EngineCommand::AddInput {
+            source: InputSource::Html {
+                url: "data:text/html,<body style=background:red>TEST</body>".into(),
+            },
+            name: None,
+            audio: None,
+        },
+    );
+    match reply {
+        CommandResult::Err { message, .. } => assert!(message.contains("no browser"), "{message}"),
+        other => panic!("expected it refused, got {other:?}"),
+    }
+    assert_eq!(channels(&app).len(), before, "no channel left behind");
+}
