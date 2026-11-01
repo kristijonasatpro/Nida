@@ -52,7 +52,9 @@ fn bench_capture(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(u64::from(width) * u64::from(height) * 4));
         group.bench_function(BenchmarkId::new("full_rgba8", width), |b| {
             b.iter(|| {
-                let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                let mut encoder = gpu
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
                 baseline.begin_readback(&mut encoder, &source, std::time::Instant::now());
                 gpu.submit([encoder.finish()]);
                 completed(&gpu, || baseline.try_read(&gpu.device));
@@ -64,7 +66,9 @@ fn bench_capture(c: &mut Criterion) {
             group.throughput(Throughput::Bytes(u64::from(size.0) * u64::from(size.1) * 4));
             group.bench_function(BenchmarkId::new(format!("edge_{long_edge}"), width), |b| {
                 b.iter(|| {
-                    let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                    let mut encoder = gpu
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
                     reduced.encode(&gpu.device, &mut encoder, &source);
                     gpu.submit([encoder.finish()]);
                     completed(&gpu, || reduced.try_read(&gpu.device));
