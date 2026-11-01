@@ -39,6 +39,13 @@ import sys
 import tarfile
 import tempfile
 import urllib.parse
+
+# Who signs: NIDA_SIGN_IDENTITY, a code-signing certificate in the keychain,
+# or ad hoc. macOS keeps what an app may use — camera, microphone, screen —
+# by its signature: ad hoc, each build is a new app and asks again; signed
+# by the same certificate every time, it asks once (the kits built on the
+# mini use "Nida Local Signing").
+SIGN = os.environ.get("NIDA_SIGN_IDENTITY") or "-"
 import urllib.request
 from pathlib import Path
 
@@ -192,12 +199,12 @@ def bundle(app, min_macos, identifier, origins):
 
     # Signed again, inside out: libraries, the other programs, the app.
     for file in sorted(frameworks.iterdir()):
-        run("codesign", "--force", "--sign", "-", str(file))
+        run("codesign", "--force", "--sign", SIGN, str(file))
     main = macos / "nida"
     for program in programs:
         if program != main:
-            run("codesign", "--force", "--sign", "-", str(program))
-    run("codesign", "--force", "--sign", "-", "--identifier", identifier, str(app))
+            run("codesign", "--force", "--sign", SIGN, str(program))
+    run("codesign", "--force", "--sign", SIGN, "--identifier", identifier, str(app))
 
     check(app, min_macos)
     return named
@@ -767,7 +774,7 @@ def main():
     crates = rust_licences(app, args.cargo_args) if args.cargo_args is not None else 0
     shader_credits(app)
     # The licence files went in after signing: sign the app again over them.
-    run("codesign", "--force", "--sign", "-", "--identifier", args.identifier, str(app))
+    run("codesign", "--force", "--sign", SIGN, "--identifier", args.identifier, str(app))
     run("codesign", "--verify", "--deep", "--strict", str(app))
     if args.sources:
         sources(with_build_interfaces(packages), set(packages), head, installs, args.sources, args.version)

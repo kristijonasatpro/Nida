@@ -459,3 +459,28 @@ fn a_recording_keeps_its_colours_through_the_gpu_conversion() {
         );
     }
 }
+
+/// The status gives the rate the file is written at — its own when one is
+/// set — beside the rate frames reach the encoder at.
+#[test]
+fn the_status_gives_the_files_own_rate() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let Some(mut app) = app() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let options = RecordOptions {
+        folder: dir.path().join("takes"),
+        size: Some((640, 360)),
+        fps: Some(30),
+        ..RecordOptions::default()
+    };
+    ok(send_cmd(&mut app, EngineCommand::SetRecordOptions { options }));
+    ok(send_cmd(&mut app, EngineCommand::StartRecording));
+    run(&mut app, 1.0);
+    let status = app.record_status();
+    ok(send_cmd(&mut app, EngineCommand::StopRecording));
+    assert_eq!(status.file_fps, 30, "{status:?}");
+}

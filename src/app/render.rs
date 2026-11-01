@@ -507,6 +507,7 @@ impl VardaApp {
         // How each camera's pictures are read into colours, as its decks say
         // (see `CameraManager::set_colours`).
         let mut camera_colours = std::collections::HashMap::new();
+        let mut camera_names = std::collections::HashMap::new();
         let mut camera_latencies = std::collections::HashMap::new();
         // What each camera's picture is coded as, a LUT file named in full
         // (see `CameraManager::set_profiles`).
@@ -539,6 +540,7 @@ impl VardaApp {
                 needed_capture_ids.extend(talk_captures.iter().copied());
                 if let Some(cam_id) = slot.deck.camera_id() {
                     camera_colours.insert(cam_id, slot.deck.camera_colour);
+                    camera_names.insert(cam_id, slot.deck.source_name().to_string());
                     camera_latencies.insert(cam_id, slot.deck.camera_lowest_latency);
                     camera_profiles.insert(cam_id, lut_in_full(&slot.deck.camera_profile, &luts));
                 }
@@ -578,6 +580,7 @@ impl VardaApp {
 
         // A camera missing when the show opened is picked up once it is here.
         self.reconcile_cameras();
+        self.follow_lower_third_lists();
         // PowerPoint inputs: shows opened, closed, their windows captured;
         // presenter views told where their shows are.
         self.reconcile_presentations();
@@ -585,6 +588,29 @@ impl VardaApp {
         self.reconcile_web_talks();
         self.feed_presenters();
         // macOS camera effects change a camera's picture on air: say so.
+        // A camera whose frames come far slower than it was opened at (a
+        // USB 2 link): said, every couple of seconds looked at.
+        if self
+            .camera_rates_at
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(2))
+        {
+            self.camera_rates_at = Some(std::time::Instant::now());
+            self.camera_rates.retain(|id, _| camera_names.contains_key(id));
+            for (id, name) in &camera_names {
+                let Some(signal) = self.camera_manager.signal(*id) else {
+                    continue;
+                };
+                if self.camera_rates.entry(*id).or_default().look(signal.fps, signal.opened_fps) {
+                    let text = crate::camera::slow_camera_warning(
+                        name.trim_start_matches(|c: char| !c.is_alphanumeric()).trim(),
+                        signal.fps,
+                        signal.opened_fps.unwrap_or_default(),
+                    );
+                    log::warn!("{text}");
+                    self.session.notifications.warn(text);
+                }
+            }
+        }
         if let Some(effects) = self.camera_manager.poll_video_effects() {
             let text = crate::camera::video_effects_warning(&effects);
             log::warn!("{text}");
@@ -602,6 +628,7 @@ impl VardaApp {
         // Update only needed camera frames
         self.camera_manager
             .update_selective(&self.context, &needed_camera_ids, show_at);
+        self.check_atem_setup();
 
         // Upload screen-capture frames for visible/cued decks only. An
         // invisible capture deck costs nothing, which is what makes a
@@ -853,15 +880,27 @@ impl VardaApp {
         };
 
         let target_fps = self.target_fps;
+        // The show's rate as frames really come, for the recordings' and
+        // streams' timelines: a take at a whole share of it is placed by the
+        // show's own frames.
+        let cadence = self.frame_cadence.unwrap_or(target_fps);
+        crate::renderer::subprocess::set_show_fps(cadence);
+        // Lower thirds sent to buses drawn for each bus's names area.
+        self.prepare_lower_third_targets();
         let watched = self.watched_channels();
         self.mixer.decks_shown_alone = self.decks_shown_alone();
         self.mixer.tile_previews = self.ui_tiles;
+        self.mixer.tile_channels.clone_from(&self.tile_channels);
         // The refresh is taken by the mixer: when the frame was drawn is kept
         // for the outputs first, or the recording timed every frame by when
         // its readback was started — a few milliseconds later each time, by
         // however long the mixer took — and repeated one and left out the
         // next, a pair a second (a laptop, 2026-10-03).
-        self.frame_stats.drawn_at = Some(self.frame_drawn());
+        let drawn = self.frame_drawn();
+        self.frame_stats.drawn_at = Some(drawn);
+        // Numbered for the takes at a share of the show's rate, which count
+        // its frames rather than time them (see `subprocess::Grid`).
+        crate::renderer::subprocess::note_frame_drawn(drawn, cadence);
         self.mixer.frame_timing = crate::mixer::FrameTiming {
             refresh_at: self.frame_stats.refresh_at.take(),
             held: self.frames_follow_a_screen(),
@@ -966,6 +1005,7 @@ impl VardaApp {
         // Resolved once per frame, before any destination renders, so every
         // output following a bus sees the same on-air content this frame.
         let mut bus_feeds = self.bus_feeds();
+        let names_areas = self.bus_names_areas();
 
         // Prepare sub-mixes for any Channels(...) sources: a surface's own, or
         // the master with layers hidden that a bus puts on air.
@@ -1044,6 +1084,22 @@ impl VardaApp {
             &mut bus_feeds,
             |source| Self::resolve_direct(mixer, source, None),
             mixer.black_view(),
+        );
+        // Lower thirds sent to buses, drawn over what each shows — its
+        // dissolve too.
+        let overlays = super::state::lower_thirds::live_bus_overlays(
+            mixer,
+            &self.production_buses,
+            &names_areas,
+            (self.render_width, self.render_height),
+        );
+        self.output.bus_overlays.render(
+            context,
+            (self.render_width, self.render_height),
+            &mut bus_feeds,
+            |source| Self::resolve_direct(mixer, source, None),
+            mixer.black_view(),
+            &overlays,
         );
 
         // Run domemaster renderer if enabled (content rotation is updated each frame via set_content_rotation)
@@ -1544,6 +1600,9 @@ impl VardaApp {
             .screen_facts_at
             .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1));
         if due || screens != self.output.screen_facts_for {
+            if screens != self.output.screen_facts_for {
+                super::screens::forget_panels();
+            }
             self.output.screen_facts = super::screens::facts(&handles, &names);
             self.output.screen_facts_for = screens;
             self.output.screen_facts_at = Some(std::time::Instant::now());

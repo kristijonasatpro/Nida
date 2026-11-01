@@ -281,6 +281,7 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
                         channel_uuid: channel_uuid.clone(),
                         camera_id: cam_id,
                         mode: None,
+                        audio: None,
                     });
                 }
 

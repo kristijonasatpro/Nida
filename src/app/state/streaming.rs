@@ -709,10 +709,14 @@ fn follow_upload(rate: &mut RateControl, sub: &crate::renderer::FfmpegSubprocess
         );
         sub.set_video_kbps(target);
     }
+    // Said to be lowering only while it is: kept at the rate asked, it
+    // said so all the same.
     fanout.set_remedy(if applied <= rate.floor() {
         Remedy::AtFloor
-    } else {
+    } else if applied < rate.asked() {
         Remedy::Adapting
+    } else {
+        Remedy::WillAdapt
     });
 }
 

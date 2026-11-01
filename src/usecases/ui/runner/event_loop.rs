@@ -176,6 +176,11 @@ impl ApplicationHandler for UIRunner {
                 self.main_focused = *focused;
                 crate::clicker::set_focused(*focused || self.panel_windows.any_focused());
             }
+            // Minimised or covered — while starting too: its tiles are not
+            // seen, so off-air inputs are not drawn for them.
+            if let WindowEvent::Occluded(hidden) = &event {
+                self.ui_occluded = *hidden;
+            }
         }
         if self.varda.is_none() && self.engine.is_none() {
             return;
@@ -217,13 +222,15 @@ impl ApplicationHandler for UIRunner {
                 }
                 WindowEvent::Resized(new_size) => {
                     self.cached_screen_size = new_size;
-                    if let (Some(ws), Some(gpu)) = (&mut self.window_surface, &self.gpu) {
-                        ws.resize(gpu, new_size);
-                    }
+                    self.apply_ui_render_scale();
+                    self.resize_ui_surface(new_size);
                 }
                 WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                     self.cached_scale_factor = scale_factor as f32;
+                    self.apply_ui_render_scale();
                 }
+                // Moved to another screen: drawn at that one's share.
+                WindowEvent::Moved(_) => self.apply_ui_render_scale(),
                 WindowEvent::RedrawRequested => {
                     self.render(event_loop);
                     // Frame pacing: don't request_redraw() here.
@@ -244,7 +251,7 @@ impl ApplicationHandler for UIRunner {
                     | WindowEvent::KeyboardInput { .. }
             ) || cfg!(feature = "html");
             if wanted {
-                let handled = self.with_engine(|this| {
+                let handled = self.with_engine("an output window's event", |this| {
                     if let Some(varda) = this.varda.as_mut() {
                         output_window_event(varda, window_id, event);
                     }
@@ -356,6 +363,9 @@ impl ApplicationHandler for UIRunner {
             log::info!("Quit: saving workspace and exiting...");
             self.shut_down();
         }
+        // Blackmagic captures stopped before the process ends — headless
+        // too, whose Quit comes here without its shutdown flag.
+        crate::decklink::input::shutdown();
         // Night Shift, if Nida holds it off, given back however it ends:
         // headless too, whose Quit (⌘Q, the Dock) comes here without its
         // shutdown flag (see `night_shift`).
@@ -436,6 +446,9 @@ impl UIRunner {
             }
             varda.refuse_commands();
         }
+        // Blackmagic captures stopped before the process ends: quit from
+        // macOS ends it straight after this, the captures never closed.
+        crate::decklink::input::shutdown();
         // A Save As that landed as Nida quit moved the show: it is the one
         // to open next time, the Recent list written before Nida goes.
         if !self.config.headless {

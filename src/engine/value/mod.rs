@@ -13,6 +13,8 @@ pub mod camera;
 pub mod detect;
 pub mod dome;
 pub mod led;
+pub mod lower_third;
+pub mod text;
 pub mod mask;
 pub mod media;
 pub mod playlist;

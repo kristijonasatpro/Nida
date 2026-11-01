@@ -72,6 +72,12 @@ impl HistoryManager {
         !self.redo_stack.is_empty()
     }
 
+    /// Forget what Redo holds: a change made with no step of its own, after
+    /// which those states would undo it.
+    pub fn clear_redo(&mut self) {
+        self.redo_stack.clear();
+    }
+
     /// Clear all history (e.g. on workspace load).
     pub fn clear(&mut self) {
         self.undo_stack.clear();

@@ -685,6 +685,16 @@ pub enum SourceConfig {
         #[serde(default)]
         elapsed: f64,
     },
+    /// Lines of text and how they look.
+    Text {
+        #[serde(default)]
+        settings: crate::engine::value::text::TextSettings,
+    },
+    /// A lower third: its rows, cue and look; it comes back off air.
+    LowerThird {
+        #[serde(default)]
+        settings: crate::engine::value::lower_third::LowerThirdSettings,
+    },
     /// A presenter view of the PowerPoint input whose layer (deck UUID) it
     /// follows, laid out as `layout` has it (left out when as a new one).
     Presenter {
@@ -1284,7 +1294,10 @@ impl SourceConfig {
             }
             // A missing file is skipped as the list plays, not refused here;
             // a timer's settings out of range are brought into it.
-            SourceConfig::Playlist { .. } | SourceConfig::Timer { .. } => {}
+            SourceConfig::Playlist { .. }
+            | SourceConfig::Timer { .. }
+            | SourceConfig::LowerThird { .. }
+            | SourceConfig::Text { .. } => {}
             // A missing file is said in the panel; two talks may not share
             // one id, or one would be lost.
             SourceConfig::Slides { talks, .. } => {

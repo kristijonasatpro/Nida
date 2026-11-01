@@ -143,14 +143,61 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
             mouse_wheel: true,
         })
         .show(ui, |ui| {
-            // === GENERATORS ===
+            // === BROADCAST: backgrounds for events, by mood ===
+            let bc_header =
+                egui::RichText::new(format!("📺 Broadcast ({})", data.broadcast.len())).strong();
+            egui::CollapsingHeader::new(bc_header)
+                .id_salt("lib_broadcast")
+                .default_open(false)
+                .show(ui, |ui| {
+                    for mood in crate::engine::BROADCAST_MOODS {
+                        let looks: Vec<&crate::engine::BroadcastLook> =
+                            data.broadcast.iter().filter(|l| l.mood == mood).collect();
+                        if looks.is_empty() {
+                            continue;
+                        }
+                        ui.label(egui::RichText::new(mood).small().strong());
+                        for look in looks {
+                            let item_id = egui::Id::new(("lib_bc", look.index));
+                            let resp = ui
+                                .dnd_drag_source(item_id, LibraryDrag::Generator(look.index), |ui| {
+                                    ui.label(egui::RichText::new(format!("  ◆ {}", look.title)).size(12.0));
+                                })
+                                .response;
+                            if ui.ctx().is_being_dragged(item_id) {
+                                ui.ctx().memory_mut(|mem| {
+                                    mem.data
+                                        .insert_temp(egui::Id::new("__lib_dnd_gen_idx"), look.index);
+                                });
+                            }
+                            if resp.double_clicked() {
+                                if let Some(ch) = data.channels.first() {
+                                    actions.session.shader_to_add = Some((
+                                        crate::usecases::ui::DeckPlace::back_of(ch.uuid.clone()),
+                                        look.index,
+                                    ));
+                                }
+                            }
+                            resp.on_hover_text(
+                                "Drag to a channel to create a deck, or double-click to add to Ch 0",
+                            );
+                        }
+                    }
+                });
+
+            // === GENERATORS (the Broadcast backgrounds in their own section) ===
+            let generators: Vec<&(String, usize)> = data
+                .generators
+                .iter()
+                .filter(|(name, _)| !data.broadcast.iter().any(|look| look.name == *name))
+                .collect();
             let gen_header =
-                egui::RichText::new(format!("🎨 Generators ({})", data.generators.len())).strong();
+                egui::RichText::new(format!("🎨 Generators ({})", generators.len())).strong();
             egui::CollapsingHeader::new(gen_header)
                 .id_salt("lib_generators")
                 .default_open(false)
                 .show(ui, |ui| {
-                    for (name, gen_idx) in &data.generators {
+                    for (name, gen_idx) in generators {
                         let item_id = egui::Id::new(("lib_gen", *gen_idx));
                         let resp = ui
                             .dnd_drag_source(item_id, LibraryDrag::Generator(*gen_idx), |ui| {
@@ -253,10 +300,12 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                     if ui.small_button("🔄 Rescan").clicked() {
                         actions.commands.push(EngineCommand::RescanCameras);
                     }
-                    if data.cameras.is_empty() {
+                    // Each Blackmagic box once, read its own way.
+                    let cameras = data.cameras_listed();
+                    if cameras.is_empty() {
                         ui.label(egui::RichText::new("No cameras detected").small().weak());
                     }
-                    for (name, cam_id) in &data.cameras {
+                    for (name, cam_id) in &cameras {
                         let item_id = egui::Id::new(("lib_cam", *cam_id));
                         ui.dnd_drag_source(item_id, LibraryDrag::Camera(*cam_id), |ui| {
                             ui.label(egui::RichText::new(format!("  📹 {name}")).size(12.0));

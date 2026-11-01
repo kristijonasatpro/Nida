@@ -165,7 +165,15 @@ fn render_preview(
         },
     );
     monitor_label(ui, "PREVIEW", &what, NEXT_GREEN, size.x);
-    let texture = next.and_then(|ch| data.channel_preview_textures.get(&ch.ch_idx).copied());
+    // Its own frames, stepped one a window frame, when there are some —
+    // asked for by saying it is drawn.
+    actions.session.preview_monitor_shown |= next.is_some();
+    let texture = next.and_then(|ch| {
+        data.preview_monitor_texture
+            .filter(|(of, _)| *of == ch.ch_idx)
+            .map(|(_, texture)| texture)
+            .or_else(|| data.channel_preview_textures.get(&ch.ch_idx).copied())
+    });
     let empty = if next.is_some() {
         "No picture yet"
     } else {
@@ -742,6 +750,9 @@ mod tests {
                 dynamics: crate::audio_mix::DynamicsSnapshot::default(),
                 config: crate::audio_mix::AudioBusConfig::new("Master"),
                 device_ok: None,
+                device_note: None,
+                live: None,
+                insert_status: None,
                 meter_db: [-12.0; 2],
             },
             crate::audio_mix::AudioBusSnapshot {
@@ -749,6 +760,9 @@ mod tests {
                 dynamics: crate::audio_mix::DynamicsSnapshot::default(),
                 config: speakers,
                 device_ok: Some(true),
+                device_note: None,
+                live: None,
+                insert_status: None,
                 meter_db: [-6.0; 2],
             },
         ];

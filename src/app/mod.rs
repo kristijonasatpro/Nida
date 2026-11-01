@@ -8,6 +8,7 @@
 mod actions;
 pub(crate) mod app_id;
 mod bus_dissolve;
+mod bus_overlay;
 mod commands;
 mod engine_impl;
 pub(crate) mod frame_parts;
@@ -58,6 +59,19 @@ pub struct AppConfig {
     /// Run without main UI window (API-only control)
     #[arg(long)]
     pub headless: bool,
+
+    /// Measure the Mac's media engine — one and two 4K encoders at once —
+    /// print what it found and quit. Keeps the engine busy for about a
+    /// minute and a half: run it with nothing on air.
+    #[arg(long = "bench-encoders", hide = true)]
+    pub bench_encoders: bool,
+
+    /// Measure how late a Blackmagic box's sound comes through macOS (its
+    /// sound device) against its sound through Blackmagic's own API — the
+    /// box named like this — print it and quit. Twelve seconds, sound going
+    /// into the box, no input on it open.
+    #[arg(long = "blackmagic-sound-lag", hide = true, value_name = "BOX")]
+    pub blackmagic_sound_lag: Option<String>,
 
     /// HTTP API port (or `VARDA_PORT`, which an app bundle can set)
     #[arg(long = "port", env = "VARDA_PORT", default_value_t = 8080)]
@@ -262,6 +276,8 @@ pub(crate) struct OutputSubsystem {
     pub screen_names: screens::ScreenNames,
     /// Render targets for buses fading between two pictures.
     pub bus_dissolves: bus_dissolve::BusDissolves,
+    /// Lower thirds drawn over the buses they are sent to.
+    pub bus_overlays: bus_overlay::BusOverlays,
     /// Keeps the computer and displays awake while Varda runs.
     keep_awake: keep_awake::KeepAwake,
     /// The screen the control window is on, by monitor name.
@@ -353,6 +369,8 @@ pub(crate) struct FrameStats {
     /// Where the control window's frames' time goes, and its slow frames.
     pub control_parts: Vec<crate::engine::PartStats>,
     pub control_slow_frames: Vec<crate::engine::SlowFrame>,
+    /// How the control window's monitors stepped through the show's frames.
+    pub control_monitors: crate::engine::ControlMonitorsStats,
     /// How often the control window is drawn, and why.
     pub control_rate: crate::engine::ControlRateStats,
     /// Where the GPU's time goes, by part of the app, a second at a time.
@@ -651,11 +669,22 @@ pub struct VardaApp {
     /// The sound inputs' listing, when it had not finished as the app
     /// started (see `AudioManager::new_waiting_at_most`).
     audio_inputs_pending: Option<crate::audio::InputListing>,
+    /// When the sound inputs are to be listed again, the devices having
+    /// changed (see `audio::device_watch`).
+    audio_rescan_due: Option<std::time::Instant>,
+    /// The sound inputs being listed again.
+    audio_inputs_rescan: Option<crate::audio::InputListing>,
+    /// When ATEM Setup was last looked for (see `state::atem`).
+    atem_checked: Option<std::time::Instant>,
     /// The stream: settings, and its encoder and destinations while on.
     streaming: state::streaming::Streaming,
     /// Recording: settings, and its encoder while recording.
     recording: state::record::Recording,
     camera_manager: CameraManager,
+    /// Each camera's frame rate watched (see `camera::RateWatch`), and when
+    /// it was last looked at.
+    camera_rates: std::collections::HashMap<crate::camera::CameraId, crate::camera::RateWatch>,
+    camera_rates_at: Option<std::time::Instant>,
     /// Depth-sensor capture manager (Kinect/LIDAR point-cloud sources).
     depth_manager: DepthSensorManager,
     /// Screen / window capture manager. See spec/screen-capture.md.
@@ -722,11 +751,21 @@ pub struct VardaApp {
     // Channels force-rendered for off-air preview. Never persisted; affects the
     // render gate only, never the compositor. See /spec/channel-preview.md.
     preview_channels: Vec<usize>,
+    /// The channels whose tiles the control window shows (see
+    /// `set_tile_channels`).
+    tile_channels: Vec<usize>,
+    /// The rate frames really come at (see `set_frame_cadence`).
+    frame_cadence: Option<u32>,
+    /// A screen's mode changed: the show's thread looks at its clock again
+    /// now (see `take_clock_recheck`).
+    clock_recheck: bool,
     /// The deck selected in the UI (channel, deck), whose own picture the
     /// settings show while it is edited. Set by the runner each frame.
     ui_selected_deck: Option<(usize, usize)>,
     /// When decks waiting for their camera are next looked for.
     camera_retry_at: Option<std::time::Instant>,
+    /// The lower thirds' list files, looked at for changes off the frame.
+    lower_third_lists: state::lower_thirds::ListWatch,
     /// The control window is up, showing every channel's picture as a tile:
     /// off-air channels are drawn now and then for it (see
     /// `Mixer::tile_previews`), their cameras kept live.
@@ -764,6 +803,7 @@ impl VardaApp {
     /// fails to start.
     pub fn new(gpu: GpuContext, config: &AppConfig) -> anyhow::Result<Self> {
         log::info!("[STARTUP]   Audio init...");
+        crate::audio::device_watch::start();
         let (audio_manager, audio_inputs_pending) =
             AudioManager::new_waiting_at_most(std::time::Duration::from_secs(3));
 
@@ -912,8 +952,13 @@ impl VardaApp {
             clips_on_air: std::collections::HashMap::new(),
             audio_devices_listed: false,
             audio_inputs_pending,
+            audio_rescan_due: None,
+            audio_inputs_rescan: None,
+            atem_checked: None,
             streaming: state::streaming::Streaming::default(),
             recording: state::record::Recording::default(),
+            camera_rates: std::collections::HashMap::new(),
+            camera_rates_at: None,
             camera_manager: if config.camera_disabled {
                 CameraManager::disabled()
             } else {
@@ -970,6 +1015,7 @@ impl VardaApp {
                     screens::ScreenNames::load()
                 },
                 bus_dissolves: bus_dissolve::BusDissolves::default(),
+                bus_overlays: bus_overlay::BusOverlays::default(),
                 keep_awake: keep_awake::KeepAwake::default(),
                 control_screen: None,
                 rate_check_at: None,
@@ -1028,6 +1074,7 @@ impl VardaApp {
                 control_on_screen: crate::engine::OnScreenStats::default(),
                 control_parts: Vec::new(),
                 control_slow_frames: Vec::new(),
+                control_monitors: crate::engine::ControlMonitorsStats::default(),
                 control_rate: crate::engine::ControlRateStats::default(),
                 control_queue: crate::engine::ControlQueueStats::default(),
                 gpu_time: crate::renderer::gpu_time::GpuTime::default(),
@@ -1080,8 +1127,12 @@ impl VardaApp {
             control_screen_rate: true,
             night_shift_off: true,
             preview_channels: Vec::new(),
+            tile_channels: Vec::new(),
+            frame_cadence: None,
+            clock_recheck: false,
             ui_selected_deck: None,
             camera_retry_at: None,
+            lower_third_lists: state::lower_thirds::ListWatch::default(),
             ui_tiles: false,
             midi_pending_undo: false,
             midi_pending_redo: false,
@@ -1117,11 +1168,11 @@ impl VardaApp {
             // CLI / MIDI-issued) edits are undoable on the same timeline the
             // windowed UI uses. In-process UI mutations do NOT flow through the
             // bus — the windowed runner records those itself — so there is no
-            // double-record here. See commands::command_is_undoable.
+            // double-record here. See `makes_undo_step`.
             // A pass under way has already pushed the one entry it gets, and a
             // performer playing a fader through the API would otherwise fill
             // the stack a frame at a time.
-            if commands::command_is_undoable(&cmd) && !self.is_recording() {
+            if self.makes_undo_step(&cmd) && !self.is_recording() {
                 let snapshot = self.history_snapshot_default();
                 self.push_history(snapshot);
             }
@@ -1515,6 +1566,25 @@ impl VardaApp {
         self.preview_channels = channels;
     }
 
+    /// The channels whose pictures the control window (and its panels'
+    /// windows) shows as tiles this frame: an off-air one is drawn for its
+    /// tile only while it is seen (see `Mixer::tile_channels`).
+    pub fn set_tile_channels(&mut self, channels: Vec<usize>) {
+        self.tile_channels = channels;
+    }
+
+    /// The rate frames really come at, as the show's thread knows it — a
+    /// screen's refreshes, which follow a new target rate only after a
+    /// moment — for the recordings and streams that count frames by it.
+    pub fn set_frame_cadence(&mut self, fps: Option<u32>) {
+        self.frame_cadence = fps;
+    }
+
+    /// The channels whose tiles are seen now (see `set_tile_channels`).
+    pub fn tile_channels(&self) -> &[usize] {
+        &self.tile_channels
+    }
+
     /// The control window is up and shows every channel's picture as a tile
     /// (see `Mixer::tile_previews`). Set once by the windowed app.
     pub fn set_ui_tiles(&mut self, on: bool) {
@@ -1859,9 +1929,17 @@ impl VardaApp {
         }
     }
 
+    /// Whether a screen's mode changed since asked: the show's thread then
+    /// looks at its clock again at once — a screen now refreshing at another
+    /// rate may be the one frames follow.
+    pub fn take_clock_recheck(&mut self) -> bool {
+        std::mem::take(&mut self.clock_recheck)
+    }
+
     /// Tell the log, and the operator once, what was done to the control
     /// window's screen (see `crate::screen_rate`).
     pub fn note_screen_rate(&mut self, kept: &crate::screen_rate::Kept) {
+        self.clock_recheck = true;
         match kept {
             crate::screen_rate::Kept::Set { display, from, to } => {
                 let text = format!(
@@ -1928,6 +2006,11 @@ impl VardaApp {
 
     /// Where the control window's frames' time goes, and its slow frames
     /// (it draws on the main thread, apart from the engine).
+    /// How the control window's monitors stepped through the show's frames.
+    pub fn set_control_monitors(&mut self, monitors: crate::engine::ControlMonitorsStats) {
+        self.frame_stats.control_monitors = monitors;
+    }
+
     pub fn set_control_parts(
         &mut self,
         parts: Vec<crate::engine::PartStats>,

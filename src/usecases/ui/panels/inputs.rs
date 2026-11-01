@@ -341,6 +341,10 @@ fn render_tile(
     let overlay_on = main_desk::overlay_on(data, ch);
     let size = egui::vec2(width, tile_height(width, data));
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    // The tile under the pointer drawn at the show's rate, not a tile's.
+    if response.hovered() {
+        actions.session.shown_full.push(ch.uuid.clone());
+    }
 
     let source_drag = egui::DragAndDrop::payload::<LibraryDrag>(ui.ctx())
         .is_some_and(|p| !matches!(&*p, LibraryDrag::Effect(_)))
@@ -481,21 +485,29 @@ fn render_tile(
     if !confirming {
         super::playlist::overlay_on_picture(ui, picture_rect, ch, data, actions);
         // Rows at the foot of the picture, from the bottom: a timer's, a
-        // presentation's, a clip's.
+        // presentation's, a lower third's, a clip's.
         let timer = usize::from(super::timer::of_channel(ch).is_some());
         let powerpoint = usize::from(super::presentation::of_channel(ch).is_some());
         let talks = usize::from(super::slides::of_channel(ch).is_some());
+        let lower = usize::from(super::lower_third::of_channel(ch).is_some());
         super::transport::overlay_on_picture(
             ui,
             picture_rect,
             ch,
-            timer + powerpoint + talks,
+            timer + powerpoint + talks + lower,
             data,
             actions,
         );
         super::timer::overlay_on_picture(ui, picture_rect, ch, actions);
         super::presentation::overlay_on_picture(ui, picture_rect, ch, timer, actions);
         super::slides::overlay_on_picture(ui, picture_rect, ch, timer + powerpoint, actions);
+        super::lower_third::overlay_on_picture(
+            ui,
+            picture_rect,
+            ch,
+            timer + powerpoint + talks,
+            actions,
+        );
     }
 
     render_title_bar(ui, ch, title, data, actions);
@@ -893,6 +905,7 @@ fn render_chip(
             ui.close();
         }
         super::deck_detail::framing_menu_items(ui, deck, actions);
+        super::deck_detail::reset_menu_item(ui, deck, actions);
         if ui.button("Remove deck").clicked() {
             actions.commands.push(EngineCommand::RemoveDeck {
                 deck_uuid: deck.uuid.clone(),

@@ -204,6 +204,13 @@ fn render_header(
             super::timer::settings_button(ui, &deck.uuid, size);
         });
     }
+    if let Some((deck, lower)) = super::lower_third::of_channel(ch) {
+        ui.horizontal(|ui| {
+            let size = egui::vec2(28.0, 22.0);
+            super::lower_third::show_button(ui, &deck.uuid, lower, size, actions);
+            super::lower_third::next_button(ui, &deck.uuid, lower, size, actions);
+        });
+    }
     if let Some((deck, _)) = super::presentation::of_channel(ch) {
         ui.horizontal(|ui| {
             super::presentation::step_buttons(ui, &deck.uuid, egui::vec2(28.0, 22.0), actions);

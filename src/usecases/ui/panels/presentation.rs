@@ -870,6 +870,8 @@ mod tests {
             meter_db: [-96.0, -96.0],
             signal_db: [-96.0, -96.0],
             refused: None,
+            send_settings: std::collections::BTreeMap::default(),
+            sent_before: Vec::new(),
         });
         let after = harness(&data);
         after.get_by_label("PowerPoint's sound: in the audio mixer");

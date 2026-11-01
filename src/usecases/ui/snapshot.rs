@@ -125,6 +125,8 @@ pub(crate) fn build_ui_data(
                         playlist: d.playlist.clone(),
                         slides: d.slides.clone(),
                         timer: d.timer.clone(),
+                        lower_third: d.lower_third.clone(),
+                        text: d.text.clone(),
                         presentation: d.presentation.clone(),
                         presenter_of: d.presenter_of.clone(),
                         presenter_layout: d.presenter_layout,
@@ -132,6 +134,9 @@ pub(crate) fn build_ui_data(
                         camera_colour: d.camera_colour,
                         camera_profile: d.camera_profile.clone(),
                         camera_lowest_latency: d.camera_lowest_latency,
+                        camera_signal: d.camera_signal.clone(),
+                        camera_id: d.camera_id,
+                        camera_mode: d.camera_mode,
                         is_html_interactive: d.is_html_interactive,
                         opacity: d.opacity,
                         effective_opacity: d.effective_opacity,
@@ -589,6 +594,7 @@ pub(crate) fn build_ui_data(
         .collect();
     UIData {
         generators: engine.registry.generators,
+        broadcast: engine.registry.broadcast,
         filters: engine.registry.filters,
         effect_masks,
         shader_count: engine.registry.shader_count,
@@ -603,6 +609,7 @@ pub(crate) fn build_ui_data(
         channel_preview_textures: channel_preview_textures.clone(),
         output_preview_textures: output_preview_textures.clone(),
         main_output_texture,
+        preview_monitor_texture: None,
         notifications,
         crossfader: engine.mixer.crossfader,
         auto_crossfade_active: engine.mixer.auto_crossfade_active,
@@ -691,6 +698,8 @@ pub(crate) fn build_ui_data(
         cameras: engine.cameras.devices,
         camera_modes: engine.cameras.modes,
         camera_access_denied: engine.cameras.access_denied,
+        cameras_with_own_sound: engine.cameras.with_own_sound.clone(),
+        cameras_following_signal: engine.cameras.following_signal.clone(),
         camera_video_effects: engine.cameras.video_effects.clone(),
         depth_sensors: engine.depth_sensors.devices,
         capture_targets: engine.screen_capture.targets,
@@ -804,6 +813,8 @@ pub(crate) fn build_ui_data(
             .gpu_busy()
             .unwrap_or_else(|| app.mixer_ref().gpu_utilization()),
         gpu_utilization_measured: app.frame_stats.system_monitor.gpu_busy().is_some(),
+        nida_gpu: app.frame_stats.system_monitor.nida_gpu(),
+        nida_ram: app.frame_stats.system_monitor.nida_ram(),
         cpu_usage: app.frame_stats.system_monitor.cpu_usage(),
         ram_used: app.frame_stats.system_monitor.ram_used(),
         ram_total: app.frame_stats.system_monitor.ram_total(),
@@ -879,6 +890,7 @@ fn params_snapshot_to_ui(snap: &ShaderParamsSnapshot) -> ShaderParamsUI {
                 value: p.value,
                 min: p.min,
                 max: p.max,
+                choices: p.choices.clone(),
             })
             .collect(),
     }

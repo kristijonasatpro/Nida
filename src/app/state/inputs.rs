@@ -143,8 +143,9 @@ impl VardaApp {
         }
     }
 
-    /// Show a camera layer's newest picture every frame, or each in turn at
-    /// the delay that keeps them even — and so every other layer on that
+    /// Show a camera layer at the lowest latency (see
+    /// `FramePicker::set_newest`), or each picture in turn at the delay that
+    /// keeps them even — and so every other layer on that
     /// camera, which share its capture. Told to the capture at once as well
     /// as each frame (see `CameraManager::set_lowest_latencies`).
     pub fn cmd_set_camera_lowest_latency(&mut self, deck_uuid: &str, on: bool) -> CommandResult {
@@ -156,6 +157,46 @@ impl VardaApp {
                 log::info!(
                     "Camera layer {deck_uuid}: {}",
                     if on { "lowest latency" } else { "even motion" }
+                );
+                CommandResult::Ok
+            }
+            Err(not_found) => not_found,
+        }
+    }
+
+    /// Open a camera layer's camera at `mode` — `None`, its best — and so
+    /// every other layer on that camera, which share its capture; kept with
+    /// the show.
+    pub fn cmd_set_camera_mode(
+        &mut self,
+        deck_uuid: &str,
+        mode: Option<crate::engine::value::camera::CameraMode>,
+    ) -> CommandResult {
+        // A layer still waiting for its camera — starting, or not plugged
+        // in — finds it by its device.
+        let waiting = self
+            .mixer
+            .find_deck_by_uuid(deck_uuid)
+            .and_then(|(ch, dk)| {
+                let deck = &self.mixer.channels()[ch].decks[dk].deck;
+                Some((
+                    deck.camera_device.clone(),
+                    deck.camera_waiting_for()?.to_string(),
+                ))
+            });
+        match self.each_layer_on_camera(deck_uuid, |deck| deck.camera_mode = mode) {
+            Ok(camera) => {
+                let camera = camera.or_else(|| {
+                    let (device, name) = waiting?;
+                    self.camera_manager.find(device.as_deref(), &name)
+                });
+                // Not open nor starting, it opens at this format when found.
+                if let Some(id) = camera {
+                    self.camera_manager.set_mode(id, mode);
+                }
+                log::info!(
+                    "Camera layer {deck_uuid}: format {}",
+                    mode.map_or_else(|| "best".to_string(), |m| m.label())
                 );
                 CommandResult::Ok
             }
@@ -179,6 +220,31 @@ impl VardaApp {
             }
             Err(not_found) => not_found,
         }
+    }
+
+    /// Reset camera layer `deck_uuid`'s input (see
+    /// [`EngineCommand::ResetInput`]): its capture closes and opens again
+    /// as it is — the device found afresh, its formats read again — whoever
+    /// else holds it; one not open yet is looked for at once; the sound
+    /// taken with its layers is opened again; the devices are listed again.
+    pub(crate) fn cmd_reset_input(&mut self, deck_uuid: &str) -> CommandResult {
+        let mut layers: Vec<String> = Vec::new();
+        let camera = match self.each_layer_on_camera(deck_uuid, |deck| {
+            layers.push(deck.uuid().to_string());
+        }) {
+            Ok(camera) => camera,
+            Err(not_found) => return not_found,
+        };
+        if let Some(id) = camera {
+            self.camera_manager.restart(id);
+        }
+        self.camera_retry_at = None;
+        for uuid in &layers {
+            self.audio_mix
+                .reopen_inputs_of_deck(uuid, &mut self.audio_manager);
+        }
+        self.audio_rescan_due = Some(std::time::Instant::now());
+        CommandResult::Ok
     }
 
     /// Do `set` to camera layer `deck_uuid` and every other layer on its
@@ -251,6 +317,8 @@ impl VardaApp {
             deck.camera_colour = other.camera_colour;
             deck.camera_profile.clone_from(&other.camera_profile);
             deck.camera_lowest_latency = other.camera_lowest_latency;
+            // They share its capture, at one format.
+            deck.camera_mode = other.camera_mode;
         }
     }
 
@@ -264,6 +332,13 @@ impl VardaApp {
             Option<String>,
             Option<crate::camera::CameraMode>,
         );
+        // A Blackmagic box plugged in or out, or told of by its discovery
+        // after the first look: the cameras looked for again.
+        if self.camera_manager.blackmagic_changed() {
+            self.camera_manager.refresh_blackmagic();
+        }
+        let moves = self.camera_manager.take_moves();
+        self.follow_moved_cameras(&moves);
         // Cameras started for waiting decks that run now: shown.
         for opened in self.camera_manager.poll_opening(&self.context.device) {
             match opened.result {
@@ -302,6 +377,7 @@ impl VardaApp {
         }
         self.camera_retry_at = Some(now + std::time::Duration::from_secs(2));
         self.camera_manager.scan_devices();
+        self.warn_camera_access(self.camera_manager.access_denied());
         // Each camera found: open already (another input shows it), its decks
         // shown at once; else started in the background — starting takes the
         // OS a moment the render loop does not wait for.
@@ -336,6 +412,41 @@ impl VardaApp {
                 log::warn!("{e:#}");
             }
         }
+    }
+
+    /// Cameras plugged back into another port, found there by their
+    /// captures: their inputs keep the device's new unique ID, so the show
+    /// saved finds it there next time — not another of the same model.
+    fn follow_moved_cameras(&mut self, moves: &[(crate::camera::CameraId, String)]) {
+        for (id, unique_id) in moves {
+            for channel in self.mixer.channels_mut() {
+                for slot in &mut channel.decks {
+                    if slot.deck.camera_id() == Some(*id) {
+                        slot.deck.camera_device = Some(unique_id.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Inputs wait for their cameras: say so, once, while macOS does not let
+    /// Nida use them — refused, or still asking. macOS asks again after
+    /// each update of an app not signed by a developer, and a show's camera
+    /// inputs stayed black with only the log saying why (an M5 Max, 0.9.6,
+    /// 2026-10-28). Forgotten once access is given.
+    fn warn_camera_access(&mut self, denied: bool) {
+        const KEY: &str = "camera-access";
+        if !denied {
+            self.session.notifications.clear_once_key_prefix(KEY);
+            return;
+        }
+        self.session.notifications.notify_once(
+            KEY,
+            crate::notifications::NotificationLevel::Warning,
+            "Cameras are black: macOS is not letting Nida use them. Click Allow on its \
+             prompt (it can hide behind full-screen windows), or turn Nida on in System \
+             Settings → Privacy & Security → Camera. After an update macOS asks again.",
+        );
     }
 
     /// A camera started in the background runs: the decks that waited for
@@ -428,6 +539,31 @@ mod tests {
         assert_eq!(without_icon("Ärger Cam"), "Ärger Cam");
     }
 
+    /// Camera inputs waiting while macOS refuses the cameras are said once,
+    /// not every look; given access and refused again, said again.
+    #[test]
+    fn refused_cameras_are_said_once() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let said = |app: &VardaApp| {
+            app.session
+                .notifications
+                .visible()
+                .iter()
+                .filter(|n| n.message.contains("macOS is not letting Nida use them"))
+                .count()
+        };
+        app.warn_camera_access(false);
+        assert_eq!(said(&app), 0, "allowed");
+        app.warn_camera_access(true);
+        app.warn_camera_access(true);
+        assert_eq!(said(&app), 1, "once");
+        app.warn_camera_access(false);
+        app.warn_camera_access(true);
+        assert_eq!(said(&app), 2, "refused again");
+    }
+
     fn headless_app() -> Option<VardaApp> {
         let gpu = crate::renderer::context::GpuContext::new_headless().ok()?;
         VardaApp::new(gpu, &crate::testing::headless_config()).ok()
@@ -450,6 +586,55 @@ mod tests {
         let uuid = deck.uuid().to_string();
         app.mixer.channels_mut()[0].add_deck(deck);
         uuid
+    }
+
+    /// Reset input: a camera not open yet is looked for at once, and the
+    /// sound devices are listed again; its layers stay on it; a layer not
+    /// there is not found.
+    #[test]
+    fn a_reset_input_looks_for_its_camera_and_sound_again() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let first = camera_layer(&mut app, 3, "usb-atem");
+        app.camera_retry_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        assert!(matches!(app.cmd_reset_input(&first), CommandResult::Ok));
+        assert!(app.camera_retry_at.is_none(), "looked for at once");
+        assert!(app.audio_rescan_due.is_some(), "sound devices listed again");
+        let still = app
+            .mixer
+            .channels()
+            .iter()
+            .flat_map(|c| &c.decks)
+            .find(|slot| slot.deck.uuid() == first)
+            .and_then(|slot| slot.deck.camera_id());
+        assert_eq!(still, Some(3), "kept on its camera");
+        assert!(matches!(
+            app.cmd_reset_input("no-such-layer"),
+            CommandResult::Err { .. }
+        ));
+    }
+
+    /// A camera found on another port: the inputs on it keep its new
+    /// unique ID, others theirs.
+    #[test]
+    fn inputs_follow_their_camera_to_another_port() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let moved = camera_layer(&mut app, 3, "usb-old");
+        let other = camera_layer(&mut app, 4, "usb-other");
+        app.follow_moved_cameras(&[(3, "usb-new".to_string())]);
+        let device = |app: &VardaApp, uuid: &str| {
+            app.mixer
+                .channels()
+                .iter()
+                .flat_map(|c| &c.decks)
+                .find(|slot| slot.deck.uuid() == uuid)
+                .and_then(|slot| slot.deck.camera_device.clone())
+        };
+        assert_eq!(device(&app, &moved).as_deref(), Some("usb-new"));
+        assert_eq!(device(&app, &other).as_deref(), Some("usb-other"));
     }
 
     fn colour_of(app: &VardaApp, uuid: &str) -> CameraColour {
@@ -539,6 +724,71 @@ mod tests {
         assert_eq!(by_device.camera_colour, full, "the same device, opened again");
         let other = new_layer(&app, 4, "0xfacetime");
         assert!(other.camera_colour.is_auto() && other.camera_profile.is_normal());
+    }
+
+    /// A camera's format is set on every layer of that camera and no other
+    /// camera's — kept with the show — and is no step to undo: the camera
+    /// opened again stays as it is.
+    #[test]
+    fn a_cameras_format_is_set_on_every_layer_of_that_camera() {
+        use crate::engine::value::camera::CameraMode;
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let first = camera_layer(&mut app, 3, "0xatem");
+        let second = camera_layer(&mut app, 3, "0xatem");
+        let other = camera_layer(&mut app, 4, "0xfacetime");
+        let mode_of = |app: &VardaApp, uuid: &str| {
+            let (ch, dk) = app.mixer.find_deck_by_uuid(uuid).expect("the layer");
+            app.mixer.channels()[ch].decks[dk].deck.camera_mode
+        };
+        let fifty = CameraMode {
+            width: 1920,
+            height: 1080,
+            fps: 50,
+        };
+        let set = EngineCommand::SetCameraMode {
+            deck_uuid: first.clone(),
+            mode: Some(fifty),
+        };
+        assert!(!crate::app::commands::command_is_undoable(&set));
+        assert!(matches!(app.execute_command(set), CommandResult::Ok));
+        assert_eq!(mode_of(&app, &first), Some(fifty));
+        assert_eq!(mode_of(&app, &second), Some(fifty), "the same camera");
+        assert_eq!(mode_of(&app, &other), None, "another camera");
+        let best = EngineCommand::SetCameraMode {
+            deck_uuid: second.clone(),
+            mode: None,
+        };
+        assert!(matches!(app.execute_command(best), CommandResult::Ok));
+        assert_eq!(mode_of(&app, &first), None, "its best again");
+    }
+
+    /// A new layer on a camera takes the format the camera is opened at:
+    /// they share its capture.
+    #[test]
+    fn a_new_layer_on_a_camera_takes_its_format() {
+        use crate::engine::value::camera::CameraMode;
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let first = camera_layer(&mut app, 3, "0xatem");
+        let fifty = Some(CameraMode {
+            width: 1920,
+            height: 1080,
+            fps: 50,
+        });
+        let set = EngineCommand::SetCameraMode {
+            deck_uuid: first,
+            mode: fifty,
+        };
+        assert!(matches!(app.execute_command(set), CommandResult::Ok));
+        let mut deck =
+            crate::deck::Deck::new_from_camera(&app.context, 3, "Camera", 1920, 1080, 64, 64)
+                .expect("a camera layer");
+        deck.camera_device = Some("0xatem".into());
+        app.read_as_its_camera_is(&mut deck);
+        assert_eq!(deck.camera_mode, fifty);
     }
 
     /// A camera's lowest latency is set on every layer of that camera and no

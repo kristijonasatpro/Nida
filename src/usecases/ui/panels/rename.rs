@@ -459,6 +459,9 @@ mod tests {
             dynamics: crate::audio_mix::DynamicsSnapshot::default(),
             config: bus,
             device_ok: None,
+            device_note: None,
+            live: None,
+            insert_status: None,
             meter_db: [f32::NEG_INFINITY; 2],
             peak_db: [-96.0;2],
         }];

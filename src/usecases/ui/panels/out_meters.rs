@@ -259,6 +259,9 @@ mod tests {
                 ..AudioBusConfig::new(name)
             },
             device_ok: device.map(|_| true),
+            device_note: None,
+            live: None,
+            insert_status: None,
             meter_db: [meter; 2],
         }
     }

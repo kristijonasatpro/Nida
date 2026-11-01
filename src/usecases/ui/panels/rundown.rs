@@ -2077,6 +2077,8 @@ mod tests {
             signal_db: [-96.0, -96.0],
             peak_db: [-96.0;2],
             refused: None,
+            send_settings: std::collections::BTreeMap::default(),
+            sent_before: Vec::new(),
         };
         let mut data = show();
         data.rundown.steps[1].step.plays =
@@ -2395,6 +2397,8 @@ mod tests {
             signal_db: [-96.0, -96.0],
             peak_db: [-96.0; 2],
             refused: None,
+            send_settings: std::collections::BTreeMap::default(),
+            sent_before: Vec::new(),
         }];
         data.rundown.steps[1].step.plays = vec![
             PlaySet::new(clip, PlayAction::Start),

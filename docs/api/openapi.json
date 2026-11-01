@@ -690,6 +690,160 @@
         }
       }
     },
+    "/api/audio-buses/{bus_uuid}/insert": {
+      "put": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "operationId": "set_bus_insert",
+        "parameters": [
+          {
+            "name": "bus_uuid",
+            "in": "path",
+            "description": "Audio bus UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AudioInsertBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such bus"
+          }
+        }
+      }
+    },
+    "/api/audio-buses/{bus_uuid}/insert/bypass": {
+      "put": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "operationId": "set_bus_insert_bypass",
+        "parameters": [
+          {
+            "name": "bus_uuid",
+            "in": "path",
+            "description": "Audio bus UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AudioBypassBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such bus"
+          }
+        }
+      }
+    },
+    "/api/audio-buses/{bus_uuid}/insert/window": {
+      "post": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "operationId": "open_bus_insert",
+        "parameters": [
+          {
+            "name": "bus_uuid",
+            "in": "path",
+            "description": "Audio bus UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such bus"
+          },
+          "503": {
+            "description": "No effect on it, or not loaded"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "operationId": "close_bus_insert",
+        "parameters": [
+          {
+            "name": "bus_uuid",
+            "in": "path",
+            "description": "Audio bus UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/audio-buses/{bus_uuid}/limiter": {
       "put": {
         "tags": [
@@ -731,6 +885,50 @@
           },
           "400": {
             "description": "Ceiling out of −12–0 dBFS or release out of 10–1000 ms"
+          },
+          "404": {
+            "description": "No such bus"
+          }
+        }
+      }
+    },
+    "/api/audio-buses/{bus_uuid}/live": {
+      "put": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "operationId": "set_bus_live",
+        "parameters": [
+          {
+            "name": "bus_uuid",
+            "in": "path",
+            "description": "Audio bus UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AudioLiveBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
           },
           "404": {
             "description": "No such bus"
@@ -868,6 +1066,50 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/AudioNameBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such bus"
+          }
+        }
+      }
+    },
+    "/api/audio-buses/{bus_uuid}/pre-fader": {
+      "put": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "operationId": "set_bus_pre_fader",
+        "parameters": [
+          {
+            "name": "bus_uuid",
+            "in": "path",
+            "description": "Audio bus UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AudioPreFaderBody"
               }
             }
           },
@@ -1235,6 +1477,54 @@
         }
       }
     },
+    "/api/audio-sources/{source_uuid}/de-esser": {
+      "put": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "summary": "A source's de-esser: an \"s\" over its threshold turns the top down.",
+        "operationId": "set_source_de_esser",
+        "parameters": [
+          {
+            "name": "source_uuid",
+            "in": "path",
+            "description": "Source UUID (the deck's, for a clip)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeEsserConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Out of 3000–10 000 Hz, threshold −60–0 dBFS or range 0–20 dB"
+          },
+          "404": {
+            "description": "No such source"
+          }
+        }
+      }
+    },
     "/api/audio-sources/{source_uuid}/delay": {
       "put": {
         "tags": [
@@ -1272,6 +1562,54 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "No such source"
+          }
+        }
+      }
+    },
+    "/api/audio-sources/{source_uuid}/eq": {
+      "put": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "summary": "A source's EQ: a low shelf, two bells and a high shelf.",
+        "operationId": "set_source_eq",
+        "parameters": [
+          {
+            "name": "source_uuid",
+            "in": "path",
+            "description": "Source UUID (the deck's, for a clip)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EqConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A band out of 20–20 000 Hz, −18–18 dB or Q 0.3–10"
           },
           "404": {
             "description": "No such source"
@@ -1360,6 +1698,54 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "No such source"
+          }
+        }
+      }
+    },
+    "/api/audio-sources/{source_uuid}/gate": {
+      "put": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "summary": "A source's gate: the room turned down in a pause.",
+        "operationId": "set_source_gate",
+        "parameters": [
+          {
+            "name": "source_uuid",
+            "in": "path",
+            "description": "Source UUID (the deck's, for a clip)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GateConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Threshold out of −80–−10 dBFS, range 0–30 dB, attack 0.1–50 ms, hold 0–500 ms or release 10–2000 ms"
           },
           "404": {
             "description": "No such source"
@@ -14416,6 +14802,18 @@
           "Full"
         ]
       },
+      "AudioBypassBody": {
+        "type": "object",
+        "description": "A bus's insert bypassed, or not.",
+        "required": [
+          "bypass"
+        ],
+        "properties": {
+          "bypass": {
+            "type": "boolean"
+          }
+        }
+      },
       "AudioDelayBody": {
         "type": "object",
         "description": "A bus's or a source's delay.",
@@ -14444,7 +14842,7 @@
           "first_channel": {
             "type": "integer",
             "format": "int32",
-            "description": "First output of the pair (0 = outputs 1-2).",
+            "description": "First output of the pair (0 = outputs 1-2). A pair past the\ndevice's outputs (`audio_mix.output_channels`) plays on its last pair,\nsaid in the bus's `device_note`.",
             "minimum": 0
           }
         }
@@ -14507,6 +14905,19 @@
           }
         }
       },
+      "AudioInsertBody": {
+        "type": "object",
+        "description": "A bus's Audio Unit insert.",
+        "properties": {
+          "component": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The effect's codes as listed in `audio_mix.effects`\n(\"aufx:lpas:appl\"), or null to take it out. First in the bus's\nprocessing; the bus plays 20 ms later with one; not on a live bus."
+          }
+        }
+      },
       "AudioListenBody": {
         "type": "object",
         "description": "What the monitor listens to.",
@@ -14517,6 +14928,28 @@
               "null"
             ],
             "description": "Audio bus UUID; `null` for the first bus."
+          }
+        }
+      },
+      "AudioLiveBody": {
+        "type": "object",
+        "description": "A bus played live or not.",
+        "required": [
+          "live"
+        ],
+        "properties": {
+          "frames": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The device's buffer, frames a call: 32, 64, 128 or 256 (48 kHz: 0.7,\n1.3, 2.7, 5.3 ms). Left as it was when not given; 64 at first.",
+            "minimum": 0
+          },
+          "live": {
+            "type": "boolean",
+            "description": "Live: the mics on the bus's own sound device mixed inside that\ndevice, about 7 ms from mic to speakers; the rest of the bus at the\nusual delay. Its state shows as the bus's `live` (true while it plays\nlive) and `device_note` (why not)."
           }
         }
       },
@@ -14556,6 +14989,18 @@
           }
         }
       },
+      "AudioPreFaderBody": {
+        "type": "object",
+        "description": "A bus as a monitor mix, or not.",
+        "required": [
+          "pre_fader"
+        ],
+        "properties": {
+          "pre_fader": {
+            "type": "boolean"
+          }
+        }
+      },
       "AudioReactMode": {
         "type": "string",
         "description": "How audio energy drives the modulation value.",
@@ -14568,12 +15013,32 @@
       "AudioSendBody": {
         "type": "object",
         "description": "A send switch.",
-        "required": [
-          "on"
-        ],
         "properties": {
+          "gain_db": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Its level, −96 (silent) to +10 dB; left out, as it was. Setting it\ndoes not turn the send on."
+          },
+          "mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SendMode",
+                "description": "Where it takes the source: \"inherit\" (as its bus), \"pre\" or \"post\"\nthe fader; left out, as it was."
+              }
+            ]
+          },
           "on": {
-            "type": "boolean"
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "On or off; left out, as it was."
           }
         }
       },
@@ -15351,6 +15816,22 @@
           }
         }
       },
+      "ControlMonitorsStats": {
+        "type": "object",
+        "description": "The Main and Preview monitors' steps.",
+        "required": [
+          "main",
+          "preview"
+        ],
+        "properties": {
+          "main": {
+            "$ref": "#/components/schemas/MonitorSteps"
+          },
+          "preview": {
+            "$ref": "#/components/schemas/MonitorSteps"
+          }
+        }
+      },
       "ControlQueueStats": {
         "type": "object",
         "description": "The control window's queue of frames waiting to be shown. With every\nframe held on screen it settles at 3 (measured on a laptop), and the\nframe loop waits for the oldest to come off the screen — time taken from\nthe loop, not smoothness: skipping frames to drain it made the control\nscreen stutter.",
@@ -15590,6 +16071,34 @@
           "url": {
             "type": "string",
             "description": "DASH stream URL (.mpd)."
+          }
+        }
+      },
+      "DeEsserConfig": {
+        "type": "object",
+        "description": "A source's de-esser: an \"s\" over its threshold turns the top down.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "hz": {
+            "type": "number",
+            "format": "float",
+            "description": "Where it listens, 3000–10 000 Hz. The shelf it turns down is\nhalfway down half an octave under this: an \"s\" here loses about 80%\nof the reduction, everything above all of it, the voice's presence\n(an octave under) under a fifth.",
+            "default": 6500.0
+          },
+          "range_db": {
+            "type": "number",
+            "format": "float",
+            "description": "How far down it turns the top at most, 0–20 dB.",
+            "default": 8.0
+          },
+          "threshold_db": {
+            "type": "number",
+            "format": "float",
+            "description": "It acts once the band around its frequency comes over this, dBFS,\n−60 to 0 (4:1 over it, eased in over 6 dB).",
+            "default": -30.0
           }
         }
       },
@@ -16336,6 +16845,76 @@
         ],
         "description": "Identifies which effect chain to operate on.\n\nUsed for chain-scoped operations (append an effect, reorder within a chain).\nOperations on an *existing* effect address it by its own UUID instead — see\n[`/spec/api-addressing.md`]."
       },
+      "EqBandConfig": {
+        "type": "object",
+        "description": "One band of a source's EQ.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "gain_db": {
+            "type": "number",
+            "format": "float",
+            "description": "How far up or down, −18 to 18 dB.",
+            "default": 0.0
+          },
+          "hz": {
+            "type": "number",
+            "format": "float",
+            "description": "Its frequency, 20–20 000 Hz: a bell's middle, a shelf's turn.",
+            "default": 1000.0
+          },
+          "q": {
+            "type": "number",
+            "format": "float",
+            "description": "A bell's width, 0.3 (wide) to 10 (narrow); a shelf's is fixed.",
+            "default": 1.0
+          }
+        }
+      },
+      "EqConfig": {
+        "type": "object",
+        "description": "A source's EQ: a low shelf, two bells and a high shelf, in that order.",
+        "properties": {
+          "bands": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EqBandConfig"
+            },
+            "default": [
+              {
+                "enabled": true,
+                "hz": 150.0,
+                "gain_db": 0.0,
+                "q": 0.7071067690849304
+              },
+              {
+                "enabled": true,
+                "hz": 350.0,
+                "gain_db": 0.0,
+                "q": 1.0
+              },
+              {
+                "enabled": true,
+                "hz": 3000.0,
+                "gain_db": 0.0,
+                "q": 1.0
+              },
+              {
+                "enabled": true,
+                "hz": 8000.0,
+                "gain_db": 0.0,
+                "q": 0.7071067690849304
+              }
+            ]
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
       "FadeTimeBody": {
         "type": "object",
         "description": "A fade time.",
@@ -16404,6 +16983,46 @@
             "type": "number",
             "format": "float",
             "description": "Lower bound of the frequency range in Hz."
+          }
+        }
+      },
+      "GateConfig": {
+        "type": "object",
+        "description": "A source's gate: in a pause it turns the room down — the hum, the\nshuffle, the other speakers' spill — and opens the moment the voice\ncomes back. A range gate, not a hard one: closed, the sound is only\n`range_db` down, so a voice's soft tail is turned down, not cut off.",
+        "properties": {
+          "attack_ms": {
+            "type": "number",
+            "format": "float",
+            "description": "How quickly it opens, 0.1–50 ms: a time constant, in dB.",
+            "default": 0.5
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "hold_ms": {
+            "type": "number",
+            "format": "float",
+            "description": "How long it stays open after the sound fell under it, 0–500 ms.",
+            "default": 120.0
+          },
+          "range_db": {
+            "type": "number",
+            "format": "float",
+            "description": "How far down it turns the sound while closed, 0–30 dB.",
+            "default": 15.0
+          },
+          "release_ms": {
+            "type": "number",
+            "format": "float",
+            "description": "How slowly it closes, 10–2000 ms: a time constant, in dB — two thirds\nof the way down in it, about 95% in three.",
+            "default": 250.0
+          },
+          "threshold_db": {
+            "type": "number",
+            "format": "float",
+            "description": "It opens when the sound comes over this, dBFS, −80 to −10; it closes\nonce it has stayed 3 dB under it for the hold.",
+            "default": -50.0
           }
         }
       },
@@ -16931,6 +17550,56 @@
           },
           {
             "type": "object",
+            "description": "Lines of text typed in, with a font, a box, an outline, a shadow.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "text"
+                ]
+              },
+              "settings": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/TextSettings"
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A lower third: names and titles on a plate, brought on air one at a\ntime.",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "lower_third"
+                ]
+              },
+              "settings": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/LowerThirdSettings"
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "A PowerPoint deck, played by PowerPoint on this computer in a window\nNida captures — its transitions, animations and videos as PowerPoint\nplays them — and moved on from Nida (macOS).",
             "required": [
               "path",
@@ -17377,6 +18046,322 @@
           }
         }
       },
+      "LowerThirdBar": {
+        "type": "string",
+        "description": "The accent bar on a lower third's plate.",
+        "enum": [
+          "edge",
+          "top",
+          "under",
+          "none"
+        ]
+      },
+      "LowerThirdLook": {
+        "type": "object",
+        "description": "How a lower third looks and moves.",
+        "properties": {
+          "auto_out_secs": {
+            "type": "number",
+            "format": "float",
+            "description": "Taken out by itself after this many seconds on air; 0 stays.",
+            "default": 0.0
+          },
+          "bar": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LowerThirdBar"
+              }
+            ],
+            "default": "edge"
+          },
+          "bar_colour": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
+            "default": [
+              0.11999999731779099,
+              0.4399999976158142,
+              0.8500000238418579
+            ]
+          },
+          "font": {
+            "type": "string",
+            "description": "A font installed on this Mac, by family name; empty for the system's.",
+            "default": ""
+          },
+          "image": {
+            "type": "string",
+            "description": "The picture used as the plate, for the \"Picture as plate\" style (and\nthe full-frame picture): a PNG or\nJPEG file.",
+            "default": ""
+          },
+          "motion": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LowerThirdMotion"
+              }
+            ],
+            "default": "wipe"
+          },
+          "motion_secs": {
+            "type": "number",
+            "format": "float",
+            "description": "How long it takes to come in or go out, in seconds.",
+            "default": 0.5
+          },
+          "name_colour": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
+            "default": [
+              1.0,
+              1.0,
+              1.0
+            ]
+          },
+          "palette": {
+            "type": "integer",
+            "format": "int32",
+            "description": "A Broadcast palette (1–12, as the backgrounds have them), or 0 for\nthe colours below.",
+            "default": 1,
+            "minimum": 0
+          },
+          "picture_delay": {
+            "type": "number",
+            "format": "float",
+            "default": 0.0
+          },
+          "picture_motion": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LowerThirdMotion",
+                "description": "Full-frame picture: how the picture comes in (and goes out, the\nother way), how long it takes and after how long."
+              }
+            ],
+            "default": "wipe"
+          },
+          "picture_offset": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
+            "default": [
+              0.0,
+              0.0
+            ]
+          },
+          "picture_scale": {
+            "type": "number",
+            "format": "float",
+            "description": "Full-frame picture: its size (1 as drawn, the frame's) and how far it\nis moved (shares of the frame's width and height).",
+            "default": 1.0
+          },
+          "picture_secs": {
+            "type": "number",
+            "format": "float",
+            "default": 0.5
+          },
+          "place": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LowerThirdPlace"
+              }
+            ],
+            "default": "lower_left"
+          },
+          "plate": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
+            "description": "sRGB, 0–1: the plate, the accent bar, the name, the lines under it.",
+            "default": [
+              0.07999999821186066,
+              0.14000000059604645,
+              0.2199999988079071
+            ]
+          },
+          "plate_opacity": {
+            "type": "number",
+            "format": "float",
+            "description": "How solid the plate is: 0 shows the text alone.",
+            "default": 0.8500000238418579
+          },
+          "safe_area": {
+            "type": "boolean",
+            "description": "Inside the graphics-safe area (5% in from each edge), as broadcast\nasks; off for an LED wall shown edge to edge.",
+            "default": true
+          },
+          "size": {
+            "type": "number",
+            "format": "float",
+            "description": "The name's height, as a share of the frame's height.",
+            "default": 0.04500000178813934
+          },
+          "style": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LowerThirdStyle",
+                "description": "The plate's shape."
+              }
+            ],
+            "default": "plate"
+          },
+          "text_after": {
+            "type": "boolean",
+            "description": "The text comes in once the plate is in (and goes before it): the\npicture first, then the name.",
+            "default": false
+          },
+          "text_align": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TextAlign"
+              }
+            ],
+            "default": "left"
+          },
+          "text_box": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
+            "description": "Full-frame picture: the box the text goes in — x, y, width, height,\nshares of the frame — and how its lines line up in it.",
+            "default": [
+              0.05999999865889549,
+              0.7799999713897705,
+              0.5,
+              0.14000000059604645
+            ]
+          },
+          "text_delay": {
+            "type": "number",
+            "format": "float",
+            "default": 0.30000001192092896
+          },
+          "text_motion": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LowerThirdMotion",
+                "description": "Full-frame picture: the same for the text."
+              }
+            ],
+            "default": "fade"
+          },
+          "text_secs": {
+            "type": "number",
+            "format": "float",
+            "default": 0.4000000059604645
+          },
+          "title_colour": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
+            "default": [
+              0.4399999976158142,
+              0.8899999856948853,
+              1.0
+            ]
+          }
+        }
+      },
+      "LowerThirdMotion": {
+        "type": "string",
+        "description": "How a lower third comes in and goes out.",
+        "enum": [
+          "cut",
+          "fade",
+          "slide",
+          "wipe"
+        ]
+      },
+      "LowerThirdPlace": {
+        "type": "string",
+        "description": "Where on the frame a lower third sits.",
+        "enum": [
+          "lower_left",
+          "lower_centre",
+          "lower_right",
+          "upper_left"
+        ]
+      },
+      "LowerThirdRow": {
+        "type": "object",
+        "description": "One person, or one caption: a name and up to two lines under it.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "What the organiser's list calls it, if anything."
+          },
+          "name": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "title2": {
+            "type": "string",
+            "description": "A second line: an organisation, or the title in another language."
+          }
+        }
+      },
+      "LowerThirdSettings": {
+        "type": "object",
+        "description": "A lower-third input: its rows, the one cued next, how they look, and the\nlist they were read from.",
+        "properties": {
+          "cued": {
+            "type": "integer",
+            "description": "The row Show puts on air.",
+            "minimum": 0
+          },
+          "look": {
+            "$ref": "#/components/schemas/LowerThirdLook"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LowerThirdRow"
+            }
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The CSV or TSV file the rows were read from, read again as it\nchanges."
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The buses (by UUID) it is shown on too, over whatever each shows, in\nits names area — the LED wall's screens, say. Main as ever: the\ninput on Program."
+          }
+        }
+      },
+      "LowerThirdStyle": {
+        "type": "string",
+        "description": "The shape a lower third's plate takes.",
+        "enum": [
+          "plate",
+          "two_tone",
+          "ribbon",
+          "pill",
+          "text_only",
+          "image",
+          "full_frame"
+        ]
+      },
       "LtcInput": {
         "type": "object",
         "description": "Which audio input carries LTC.\n\nHeld beside the preference rather than inside it: this is a patch decision\nthat should survive switching to `Auto` and back, and burying it in one\nenum variant would lose it on every switch.\nSee /spec/timecode.md § Preference and Priority.",
@@ -17807,6 +18792,35 @@
           "width": {
             "type": "integer",
             "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "MonitorSteps": {
+        "type": "object",
+        "description": "How a monitor of the control window stepped through the show's frames,\nsince Nida started: each window frame it picked one for, the next frame\n— or the same again (no newer one yet: a window faster than the show,\nor the show held up), or one or more skipped (the window drawn less\noften than the show, as while the show stands still). Counted as\npicked: a window frame given up before it was drawn (rare) counts too.",
+        "required": [
+          "shown",
+          "same_as_last",
+          "skipped"
+        ],
+        "properties": {
+          "same_as_last": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Window frames it picked the same frame as the one before.",
+            "minimum": 0
+          },
+          "shown": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Window frames it picked a frame for.",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Window frames it skipped frames to (one count each, however many).",
             "minimum": 0
           }
         }
@@ -18581,6 +19595,10 @@
             "type": "boolean",
             "description": "Frames asked for by the refresh each display-link callback is\nstamped for, not by counting callbacks (see `SetClockTimestamps`)."
           },
+          "control_monitors": {
+            "$ref": "#/components/schemas/ControlMonitorsStats",
+            "description": "How the control window's Main and Preview monitors stepped through\nthe show's frames (see `monitor_frames`)."
+          },
           "control_on_screen": {
             "$ref": "#/components/schemas/OnScreenStats",
             "description": "How evenly the control window's frames reached its screen."
@@ -18622,6 +19640,15 @@
               }
             ]
           },
+          "footprint_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Nida's own memory in bytes, as Activity Monitor's Memory column\n(its physical footprint); absent where unknown.",
+            "minimum": 0
+          },
           "frame_hold": {
             "type": "boolean",
             "description": "Each frame held on screen for a frame's time (see `SetFrameHold`)."
@@ -18635,6 +19662,14 @@
             "format": "int32",
             "description": "Frames the GPU may still be drawing when the next starts (see the\n`SetFramesInFlight` command).",
             "minimum": 0
+          },
+          "gpu_app_pct": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "Nida's own share of the GPU (0–100), as Activity Monitor shows it\n(macOS: its clients' accumulated GPU time); absent where unknown."
           },
           "gpu_busy_pct": {
             "type": [
@@ -18711,6 +19746,14 @@
               "$ref": "#/components/schemas/SlowFrame"
             },
             "description": "The last frames (up to 20) that were busy for most of a frame's time,\nstarted half a frame after their refresh, or came half a frame late,\npart by part."
+          },
+          "tiles_seen": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "description": "The channels whose tiles the control window (and its panels'\nwindows) shows now, by index: an off-air one is drawn for its tile\nonly while it is seen."
           }
         }
       },
@@ -19246,6 +20289,12 @@
               "null"
             ],
             "description": "The file being written now."
+          },
+          "file_fps": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The rate the file is written at: its own when set (Frame rate),\nelse that one.",
+            "minimum": 0
           },
           "files": {
             "type": "array",
@@ -19783,6 +20832,15 @@
             "description": "Its name on this computer (\"Stage LED\"), or `null` to take it away."
           }
         }
+      },
+      "SendMode": {
+        "type": "string",
+        "description": "Where a send takes its source: as its bus does, or before or after the\nsource's fader whatever the bus.",
+        "enum": [
+          "inherit",
+          "pre",
+          "post"
+        ]
       },
       "SetBezierCageBody": {
         "type": "object",
@@ -20880,6 +21938,128 @@
             "format": "int32",
             "description": "Target FPS (0 = uncapped).",
             "minimum": 0
+          }
+        }
+      },
+      "TextAlign": {
+        "type": "string",
+        "description": "How the lines line up with each other.",
+        "enum": [
+          "left",
+          "centre",
+          "right"
+        ]
+      },
+      "TextLook": {
+        "type": "object",
+        "description": "How the text looks. Colours are sRGB.",
+        "properties": {
+          "align": {
+            "$ref": "#/components/schemas/TextAlign"
+          },
+          "anchor": {
+            "$ref": "#/components/schemas/Anchor"
+          },
+          "bold": {
+            "type": "boolean"
+          },
+          "box_colour": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "The box behind the text: none at 0 opacity."
+          },
+          "box_opacity": {
+            "type": "number",
+            "format": "float"
+          },
+          "box_padding": {
+            "type": "number",
+            "format": "float"
+          },
+          "box_radius": {
+            "type": "number",
+            "format": "float",
+            "description": "Its corners' rounding and the room inside it, as shares of the size."
+          },
+          "colour": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "font": {
+            "type": "string",
+            "description": "A font family installed on the computer; empty, or one not found,\nis the system's sans serif."
+          },
+          "italic": {
+            "type": "boolean"
+          },
+          "margin": {
+            "type": "number",
+            "format": "float",
+            "description": "Room kept from the frame's edges, as a share of its height."
+          },
+          "outline": {
+            "type": "number",
+            "format": "float",
+            "description": "An outline round the letters, as a share of the size: none at 0."
+          },
+          "outline_colour": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          "shadow_opacity": {
+            "type": "number",
+            "format": "float",
+            "description": "A soft shadow under the letters: none at 0 opacity."
+          },
+          "size": {
+            "type": "number",
+            "format": "float",
+            "description": "The font's size, as a share of the frame's height."
+          },
+          "spacing": {
+            "type": "number",
+            "format": "float",
+            "description": "Line to line, as a share of the size."
+          }
+        }
+      },
+      "TextSettings": {
+        "type": "object",
+        "description": "A text input: its lines, how they look, and whether they show.",
+        "properties": {
+          "fade_secs": {
+            "type": "number",
+            "format": "float"
+          },
+          "look": {
+            "$ref": "#/components/schemas/TextLook"
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The buses (by UUID) it is shown on too, over whatever each shows, in\nthe part each one's screens show (an LED wall's band), laid out for\nthat part. Main as ever: the input on Program, or an overlay."
+          },
+          "text": {
+            "type": "string",
+            "description": "The text, a line a line."
+          },
+          "visible": {
+            "type": "boolean",
+            "description": "Shown, or hidden (the input clear); a change fades over `fade_secs`."
           }
         }
       },

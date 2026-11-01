@@ -4100,6 +4100,103 @@ mod tests {
 
     // ── Audio processing routes ─────────────────────────────────────
 
+    /// A send's on alone is as it always was; a level or point goes as one
+    /// change, a level never turning the send on; a bus becomes a monitor mix.
+    #[tokio::test]
+    async fn a_sends_level_and_point_and_a_monitor_mix_are_set_from_the_body() {
+        use crate::engine::EngineCommand as C;
+        for (body, check) in [
+            (
+                serde_json::json!({"on": true}),
+                (|c: &C| matches!(c, C::SetAudioSend { on: true, .. })) as fn(&C) -> bool,
+            ),
+            (serde_json::json!({"gain_db": -6.0}), |c: &C| {
+                matches!(c, C::SetAudioSendSettings { on: None, gain_db: Some(g), mode: None, .. } if (*g + 6.0).abs() < 1e-6)
+            }),
+            (serde_json::json!({"on": false, "mode": "pre"}), |c: &C| {
+                matches!(c, C::SetAudioSendSettings { on: Some(false), gain_db: None, mode: Some(crate::audio_mix::SendMode::Pre), .. })
+            }),
+        ] {
+            let (app, sent) = router_recording_commands();
+            let (status, json) = put_json(app, "/api/audio-sources/mic1/sends/bus1", body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            let sent = sent.lock().unwrap();
+            assert!(sent.len() == 1 && check(&sent[0]), "{body}: {sent:?}");
+        }
+        let (app, sent) = router_recording_commands();
+        let (status, _) = put_json(app, "/api/audio-buses/bus1/pre-fader", serde_json::json!({"pre_fader": true})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(matches!(
+            &sent.lock().unwrap()[..],
+            [C::SetAudioBusPreFader { uuid, pre_fader: true }] if uuid == "bus1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_sources_de_esser_is_set_from_the_body() {
+        use crate::engine::EngineCommand as C;
+        let (app, sent) = router_recording_commands();
+        let (status, json) = put_json(
+            app,
+            "/api/audio-sources/mic1/de-esser",
+            serde_json::json!({"enabled": true, "hz": 7000.0, "threshold_db": -28.0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let sent = sent.lock().unwrap();
+        assert!(
+            matches!(&sent[..], [C::SetAudioSourceDeEsser { uuid, config }]
+                if uuid == "mic1" && config.enabled && (config.hz - 7000.0).abs() < 1e-3
+                    && (config.threshold_db + 28.0).abs() < 1e-6 && (config.range_db - 8.0).abs() < 1e-6),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sources_eq_is_set_whole_from_the_body() {
+        use crate::engine::EngineCommand as C;
+        let (app, sent) = router_recording_commands();
+        let (status, json) = put_json(
+            app,
+            "/api/audio-sources/mic1/eq",
+            serde_json::json!({"enabled": true, "bands": [
+                {"hz": 150.0, "gain_db": -3.0},
+                {"hz": 350.0},
+                {"hz": 3000.0, "gain_db": 2.0, "q": 1.5},
+                {"hz": 8000.0}
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let sent = sent.lock().unwrap();
+        assert!(
+            matches!(&sent[..], [C::SetAudioSourceEq { uuid, config }]
+                if uuid == "mic1" && config.enabled && (config.bands[2].gain_db - 2.0).abs() < 1e-6
+                    && (config.bands[2].q - 1.5).abs() < 1e-6 && config.bands[1].enabled),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sources_gate_is_set_whole_from_the_body() {
+        use crate::audio_mix::GateConfig;
+        use crate::engine::EngineCommand as C;
+        let (app, sent) = router_recording_commands();
+        let (status, json) = put_json(
+            app,
+            "/api/audio-sources/mic1/gate",
+            serde_json::json!({"enabled": true, "threshold_db": -45.0, "range_db": 12.0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let sent = sent.lock().unwrap();
+        assert!(
+            matches!(&sent[..], [C::SetAudioSourceGate { uuid, config }]
+                if uuid == "mic1" && *config == GateConfig { enabled: true, threshold_db: -45.0, range_db: 12.0, ..GateConfig::default() }),
+            "{sent:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_sources_low_cut_is_set_whole_from_the_body() {
         use crate::audio_mix::LowCutConfig;

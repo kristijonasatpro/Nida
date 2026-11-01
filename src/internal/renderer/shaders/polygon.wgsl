@@ -130,13 +130,15 @@ fn zone_blend(uv: vec2<f32>, rect: vec4<f32>, cfg: vec4<f32>) -> f32 {
 fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
     // Apply UV transform for content mapping modes
     let source_uv = uv * params.uv_scale + params.uv_offset;
+    let covers = texels_per_pixel(source_uv, vec2<f32>(textureDimensions(source_texture)));
 
     // Clamp — pixels outside the source are black
     if (source_uv.x < 0.0 || source_uv.x > 1.0 || source_uv.y < 0.0 || source_uv.y > 1.0) {
         return vec4<f32>(0.0, 0.0, 0.0, params.opacity);
     }
 
-    var color = textureSample(source_texture, texture_sampler, source_uv);
+    let part = drawn_part(params.uv_scale, params.uv_offset);
+    var color = sample_scaled(source_texture, texture_sampler, source_uv, covers, part);
     color.a *= params.opacity;
 
     // Per-surface overlap zone blending — dim only within overlap rectangles.

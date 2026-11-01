@@ -659,7 +659,44 @@ impl VardaApp {
                 }
             }
         }
+        // A channel, or a deck of one, an output, an LED screen or a surface
+        // shows by itself: drawn every frame, on air or not.
+        for source in self.shown_sources() {
+            let channels = match source {
+                OutputSource::Channel(ch) | OutputSource::Deck(ch, _) => vec![*ch],
+                OutputSource::Channels(shown) => shown.clone(),
+                _ => continue,
+            };
+            for channel in channels {
+                if !watched.contains(&channel) {
+                    watched.push(channel);
+                }
+            }
+        }
         watched
+    }
+
+    /// What every surface, output and LED screen shows.
+    fn shown_sources(&self) -> Vec<&OutputSource> {
+        let mut sources: Vec<&OutputSource> = self
+            .output
+            .surface_manager
+            .surfaces
+            .iter()
+            .map(|surface| &surface.source)
+            .collect();
+        for output in &self.output.outputs {
+            let (source, led) = match output {
+                crate::renderer::UnifiedOutput::Window(w) => (None, w.led.as_ref()),
+                crate::renderer::UnifiedOutput::Headless(h) => (Some(&h.source), h.led.as_ref()),
+            };
+            sources.extend(source);
+            sources.extend(
+                led.into_iter()
+                    .flat_map(|l| l.screens.iter().map(|s| &s.source)),
+            );
+        }
+        sources
     }
 
     /// Decks shown on their own outside Main — alone on a bus's Program or
@@ -686,25 +723,7 @@ impl VardaApp {
             }
         }
         // A deck an output, an LED screen or a surface shows by itself.
-        let mut sources: Vec<&OutputSource> = self
-            .output
-            .surface_manager
-            .surfaces
-            .iter()
-            .map(|surface| &surface.source)
-            .collect();
-        for output in &self.output.outputs {
-            let (source, led) = match output {
-                crate::renderer::UnifiedOutput::Window(w) => (None, w.led.as_ref()),
-                crate::renderer::UnifiedOutput::Headless(h) => (Some(&h.source), h.led.as_ref()),
-            };
-            sources.extend(source);
-            sources.extend(
-                led.into_iter()
-                    .flat_map(|l| l.screens.iter().map(|s| &s.source)),
-            );
-        }
-        for source in sources {
+        for source in self.shown_sources() {
             if let OutputSource::Deck(ch, dk) = source {
                 if let Some(slot) = self
                     .mixer

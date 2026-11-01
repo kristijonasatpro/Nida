@@ -21,6 +21,7 @@
 //! - `io` — external I/O deck creation and stream library mutations
 
 mod arrangement;
+mod atem;
 pub(crate) mod audio_mix;
 mod buses;
 mod channel_order;
@@ -41,6 +42,8 @@ mod sequences;
 pub(crate) mod slides;
 pub(crate) mod streaming;
 mod surfaces;
+pub(crate) mod lower_thirds;
+mod texts;
 mod timers;
 pub(crate) mod ui_motion;
 

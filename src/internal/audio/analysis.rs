@@ -6,16 +6,15 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use cpal::Sample;
 use crossbeam_channel::Sender;
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 
 use super::{
-    compute_onset_threshold, estimate_bpm, fan_out_pcm, AudioData, PcmSubscriber, TempoRange,
-    FFT_HOP, FFT_SIZE, MIN_ONSET_INTERVAL, ONSET_BAND_HZ, ONSET_MEDIAN_WINDOW, SILENCE_LEVEL,
-    SILENCE_RESET_SECS, TEMPO_CONFIRMATIONS, TEMPO_MIN_SECS, TEMPO_SMOOTHING, TEMPO_TOLERANCE,
-    TEMPO_UPDATE_SECS, TEMPO_WINDOW_SECS,
+    compute_onset_threshold, estimate_bpm, AudioData, TempoRange, FFT_HOP, FFT_SIZE,
+    MIN_ONSET_INTERVAL, ONSET_BAND_HZ, ONSET_MEDIAN_WINDOW, SILENCE_LEVEL, SILENCE_RESET_SECS,
+    TEMPO_CONFIRMATIONS, TEMPO_MIN_SECS, TEMPO_SMOOTHING, TEMPO_TOLERANCE, TEMPO_UPDATE_SECS,
+    TEMPO_WINDOW_SECS,
 };
 
 /// Seconds the band's level average takes to follow a change, for onset
@@ -381,9 +380,8 @@ impl HopAnalyzer {
 /// 170 ms at 48 kHz). When full, hops are dropped so the callback never blocks.
 const HOP_QUEUE: usize = 32;
 
-/// Capture callback state: tees raw PCM to passthrough subscribers, mixes to
-/// mono, and sends each full hop to the analysis thread. Never waits, and
-/// allocates only when a passthrough is subscribed.
+/// Analysis callback state: mixes to mono and sends full hops to the worker.
+/// Never waits or allocates. The caller retains Nida's raw PCM/live-bus tee.
 pub(crate) struct CaptureState {
     channels: usize,
     hop: [f32; FFT_HOP],
@@ -391,7 +389,6 @@ pub(crate) struct CaptureState {
     hops: Sender<(u64, [f32; FFT_HOP])>,
     /// Counts every captured hop, including ones skipped under overload.
     next_hop: u64,
-    pcm_subs: Arc<ArcSwap<Vec<PcmSubscriber>>>,
 }
 
 impl CaptureState {
@@ -406,7 +403,6 @@ impl CaptureState {
         channels: usize,
         sample_rate: f32,
         sender: Sender<AudioData>,
-        pcm_subs: Arc<ArcSwap<Vec<PcmSubscriber>>>,
         tempo_range: Arc<AtomicU64>,
     ) -> std::io::Result<Self> {
         if channels == 0 || !sample_rate.is_finite() || sample_rate <= 0.0 {
@@ -439,7 +435,6 @@ impl CaptureState {
             filled: 0,
             hops,
             next_hop: 0,
-            pcm_subs,
         })
     }
 
@@ -449,17 +444,6 @@ impl CaptureState {
         T: cpal::Sample,
         f32: cpal::FromSample<T>,
     {
-        // Forward raw interleaved PCM to every passthrough subscriber. Skipped
-        // when there are none, so the video-only path costs nothing.
-        let subs = self.pcm_subs.load();
-        if !subs.is_empty() {
-            let pcm: Vec<f32> = data
-                .iter()
-                .map(|s| <f32 as Sample>::from_sample(*s))
-                .collect();
-            fan_out_pcm(&subs, &pcm);
-        }
-
         for chunk in data.chunks(self.channels) {
             let sample: f32 = chunk
                 .iter()
@@ -818,7 +802,6 @@ mod tests {
             filled: 0,
             hops,
             next_hop: 0,
-            pcm_subs: Arc::default(),
         };
         capture.process(&[0.0_f32; FFT_HOP * 3]);
         assert_eq!(received.try_recv().unwrap().0, 0);
@@ -855,8 +838,8 @@ mod tests {
 
         let (sender, published) = crossbeam_channel::bounded(HOPS);
         let tempo_range = Arc::new(AtomicU64::new(TempoRange::default().to_bits()));
-        let mut capture = CaptureState::new(2, 48_000.0, sender, Arc::default(), tempo_range)
-            .expect("analysis thread");
+        let mut capture =
+            CaptureState::new(2, 48_000.0, sender, tempo_range).expect("analysis thread");
         for buffer in signal.chunks(2 * 100) {
             capture.process(buffer);
         }
