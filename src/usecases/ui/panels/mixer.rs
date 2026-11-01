@@ -671,6 +671,11 @@ pub(super) fn render_channel_column(
                             super::timer::start_button(ui, &deck.uuid, timer, size, actions);
                             super::timer::settings_button(ui, &deck.uuid, size);
                         }
+                        if let Some((deck, lower)) = super::lower_third::of_channel(ch) {
+                            let size = egui::vec2(26.0, 20.0);
+                            super::lower_third::show_button(ui, &deck.uuid, lower, size, actions);
+                            super::lower_third::next_button(ui, &deck.uuid, lower, size, actions);
+                        }
                         if let Some((deck, _)) = super::presentation::of_channel(ch) {
                             let size = egui::vec2(26.0, 20.0);
                             super::presentation::step_buttons(ui, &deck.uuid, size, actions);
@@ -1286,6 +1291,7 @@ pub(super) fn render_deck_thumbnail(
                 ui.close();
             }
             super::deck_detail::framing_menu_items(ui, deck, actions);
+            super::deck_detail::reset_menu_item(ui, deck, actions);
             ui.separator();
             let subject = clipboard_menu::Subject::deck(&deck.uuid, &deck.name);
             clipboard_menu::items(ui, data, actions, &subject);

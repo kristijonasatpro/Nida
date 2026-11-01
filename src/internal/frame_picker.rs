@@ -93,6 +93,19 @@ const SKIP_UNTIL: f64 = 0.25;
 /// had those repeated and skipped in pairs.
 const HELD_UP: f64 = 1.5;
 
+/// How soon before a show frame is drawn a frame may come and be said to
+/// come as it is drawn, in frames.
+const AT_THE_DRAW: f64 = 0.25;
+
+/// At the lowest latency, how many of the latest frames coming as show
+/// frames are drawn hold each frame back a frame, as it is otherwise: one in
+/// twenty. An input that keeps coming then comes just before some draws and
+/// just after others, and taking the newest to have come showed frames twice
+/// and skipped the next by turns, motion stuttering (an UltraStudio Mini
+/// Recorder, its pictures stamped as they came, 2026-10-28).
+const AT_THE_DRAW_MOST: usize = AGES_KEPT / 20;
+
+
 /// Gaps too long to be the input's rate, in a row, after which they are its
 /// rate: a camera gone from 60 to 30 fps.
 const RELEARN_AFTER: usize = 30;
@@ -149,9 +162,15 @@ pub struct FramePicker<F> {
     lost: usize,
     /// Frames kept waiting at most.
     keep: usize,
-    /// Show the newest frame come at each pick, held to no delay (see
+    /// Show each frame as soon as most come in time (see
     /// [`FramePicker::set_newest`]).
     newest: bool,
+    /// When each frame come since the last pick came, host seconds — those
+    /// told (see [`FramePicker::push_came`]).
+    came: Vec<f64>,
+    /// Whether each of the latest frames told when it came came as its show
+    /// frame was drawn (see [`AT_THE_DRAW`]).
+    at_the_draw: VecDeque<bool>,
 }
 
 impl<F> Default for FramePicker<F> {
@@ -174,6 +193,8 @@ impl<F> Default for FramePicker<F> {
             lost: 0,
             keep: KEEP,
             newest: false,
+            came: Vec::new(),
+            at_the_draw: VecDeque::with_capacity(AGES_KEPT + 1),
         }
     }
 }
@@ -201,6 +222,12 @@ impl<F> FramePicker<F> {
         self.waiting.clear();
     }
 
+    /// Frames let go so far forgotten: the next skip counts only those let
+    /// go from now — an input opened again counts its own.
+    pub fn forget_lost(&mut self) {
+        self.lost = 0;
+    }
+
     /// One keeping at most `keep` frames waiting (at least 2): for frames
     /// that hold something their source needs back, as a captured screen's
     /// do its surfaces.
@@ -211,21 +238,35 @@ impl<F> FramePicker<F> {
         }
     }
 
-    /// Show the newest frame come at each pick, rather than each frame in
-    /// turn at the delay that keeps them even: about a frame sooner on
-    /// screen for an input whose frames come unevenly — a camera over USB,
-    /// some 5% of whose frames come more than 10 ms later than most — but
-    /// each frame that comes late shown late, the one before repeated and
-    /// the next skipped: two or so judders a second with that camera (a
-    /// laptop, 2026-10-04). How late frames come is still followed, so
-    /// turning it off is even at once.
+    /// Show each frame at the delay most frames come in time for, rather
+    /// than the one all do: about a frame sooner on screen for an input a
+    /// few of whose frames come much later than the rest — a camera over
+    /// USB, some 5% of whose frames come more than 10 ms later than most —
+    /// but each of those shown late, the one before repeated and the next
+    /// skipped: two or so judders a second with that camera (a laptop,
+    /// 2026-10-04). An input whose frames keep coming as show frames are
+    /// drawn is held a frame, as it is otherwise (see [`AT_THE_DRAW_MOST`]).
+    /// Changed, the delay is followed afresh: it takes effect at once.
     pub fn set_newest(&mut self, newest: bool) {
+        if self.newest != newest {
+            self.delay = None;
+            self.earlier_since = None;
+            self.lowered_at = None;
+            self.held_since = None;
+            self.raised = None;
+            self.lower_after = LOWER_AFTER;
+        }
         self.newest = newest;
     }
 
     /// The newest frame waiting, if any.
     pub fn newest(&self) -> Option<&F> {
         self.waiting.back().map(|(_, frame)| frame)
+    }
+
+    /// The time between the input's frames, as seen, seconds.
+    pub fn period(&self) -> Option<f64> {
+        self.period
     }
 
     /// How long before its show frame's time the frame shown last was
@@ -247,6 +288,20 @@ impl<F> FramePicker<F> {
     /// How many frames wait.
     pub fn waiting(&self) -> usize {
         self.waiting.len()
+    }
+
+    /// [`Self::push`], told when the frame came, `came`, host seconds: an
+    /// input whose frames keep coming as show frames are drawn is known by
+    /// it (see [`Self::pick_drawn`]).
+    #[must_use = "frames let go are dropped once the picker is let go of"]
+    pub fn push_came(&mut self, at: f64, came: f64, frame: F) -> Vec<F> {
+        // Only the latest count (see `at_the_draw`): an input not shown,
+        // never picked, keeps no more.
+        if self.came.len() >= AGES_KEPT {
+            self.came.remove(0);
+        }
+        self.came.push(came);
+        self.push(at, frame)
     }
 
     /// A frame captured at `at`, host seconds. One captured within half a
@@ -366,9 +421,38 @@ impl<F> FramePicker<F> {
         let_go
     }
 
+    /// How many arrival times wait for a pick — for tests.
+    #[cfg(test)]
+    pub(crate) fn came_waiting(&self) -> usize {
+        self.came.len()
+    }
+
+    /// How many frames told when they came came as their show frame was
+    /// drawn, lately — for tests.
+    #[cfg(test)]
+    pub(crate) fn told_at_the_draw(&self) -> usize {
+        self.at_the_draw.iter().filter(|&&at| at).count()
+    }
+
+    /// [`Self::pick`], drawn at `drawn`, host seconds: how soon before it
+    /// each frame told when it came came is followed (see [`AT_THE_DRAW`]).
+    pub fn pick_drawn(&mut self, show_at: f64, drawn: f64) -> (Option<F>, Picked) {
+        let soon = self.period.unwrap_or(1.0 / 60.0) * AT_THE_DRAW;
+        for came in std::mem::take(&mut self.came) {
+            if self.at_the_draw.len() >= AGES_KEPT {
+                self.at_the_draw.pop_front();
+            }
+            self.at_the_draw.push_back(drawn - came < soon);
+        }
+        self.pick(show_at)
+    }
+
     /// The frame for the show frame due on screen at `show_at`, host
     /// seconds, and what was done; `None` keeps the frame before.
     pub fn pick(&mut self, show_at: f64) -> (Option<F>, Picked) {
+        // When frames came, if told, counts only against when they were
+        // drawn (see `pick_drawn`).
+        self.came.clear();
         // How old the frames come since the last pick are, now they are
         // here to show: the oldest of them, which came latest for its turn.
         // A frame that comes late is counted as late as it came; while none
@@ -392,10 +476,13 @@ impl<F> FramePicker<F> {
         let Some(&(oldest, _)) = self.waiting.front() else {
             return (None, Picked::Repeated);
         };
-        let delay = self.follow_delay(self.lately().min(LONGEST_DELAY), show_at);
-        if self.newest {
-            return self.take(self.waiting.len() - 1, show_at);
-        }
+        let at_the_draw = self.at_the_draw.iter().filter(|&&at| at).count();
+        let worst = if self.newest && at_the_draw < AT_THE_DRAW_MOST {
+            self.mostly()
+        } else {
+            self.lately()
+        };
+        let delay = self.follow_delay(worst.min(LONGEST_DELAY), show_at);
         let wanted = show_at - delay;
         let frame = self.period.unwrap_or(1.0 / 60.0);
 
@@ -444,6 +531,22 @@ impl<F> FramePicker<F> {
         } else {
             latest.max(0.0)
         }
+    }
+
+    /// How old frames have lately been at most when first there to show,
+    /// but for those older than most by half a frame or more — a camera over
+    /// USB's few late ones; none counted yet, nothing.
+    fn mostly(&self) -> f64 {
+        let mut ages: Vec<f64> = self.ages.iter().copied().collect();
+        ages.sort_by(f64::total_cmp);
+        let Some(&middle) = ages.get(ages.len() / 2) else {
+            return 0.0;
+        };
+        let most = middle + self.period.unwrap_or(1.0 / 60.0) * 0.5;
+        ages.iter()
+            .copied()
+            .filter(|&age| age <= most)
+            .fold(0.0, f64::max)
     }
 
     /// The delay, given how old frames have lately been when first there to
@@ -554,7 +657,23 @@ mod tests {
         jitter: impl Fn(usize) -> f64,
         secs: f64,
     ) -> (Run, Vec<usize>) {
+        let (run, shown, _) = run_at(false, input_period, show_period, latency, jitter, secs);
+        (run, shown)
+    }
+
+    /// [`run`], at the lowest latency if `newest`; with how long before its
+    /// show frame each frame shown was captured, on average once settled.
+    fn run_at(
+        newest: bool,
+        input_period: f64,
+        show_period: f64,
+        latency: f64,
+        jitter: impl Fn(usize) -> f64,
+        secs: f64,
+    ) -> (Run, Vec<usize>, f64) {
         let mut picker = FramePicker::new();
+        picker.set_newest(newest);
+        let (mut behind, mut picks) = (0.0_f64, 0.0_f64);
         let mut arrivals: Vec<(f64, usize, f64)> = (0..((secs + 1.0) / input_period) as usize)
             .map(|i| {
                 // Clocks that never line up exactly, and a camera's stamps a
@@ -575,13 +694,17 @@ mod tests {
             // milliseconds before it is due.
             let drawn = show_at - 0.010;
             while next_arrival < arrivals.len() && arrivals[next_arrival].0 <= drawn {
-                let (_, i, captured) = arrivals[next_arrival];
-                let _ = picker.push(captured, i);
+                let (came, i, captured) = arrivals[next_arrival];
+                let _ = picker.push_came(captured, came, i);
                 next_arrival += 1;
             }
-            let (frame, what) = picker.pick(show_at);
+            let (frame, what) = picker.pick_drawn(show_at, drawn);
             // Settled after the first second.
             let counting = show_at > 2.2;
+            if let (true, Some(latency)) = (counting, picker.latency()) {
+                behind += latency;
+                picks += 1.0;
+            }
             match what {
                 Picked::Repeated => {
                     in_a_row += 1;
@@ -603,7 +726,7 @@ mod tests {
                 shown.push(i);
             }
         }
-        (run, shown)
+        (run, shown, behind / picks.max(1.0))
     }
 
     /// An arrival delay that puts frames right around the moment show
@@ -1053,39 +1176,95 @@ mod tests {
         assert!(waited(6) < 15.0, "in time since: waited {:.0} s", waited(6));
     }
 
-    /// Set to the lowest latency, a camera's newest frame is shown at each
-    /// pick, the ones before it skipped, and a pick with none new repeats
-    /// the frame before; turned off again, frames are picked at the delay
-    /// that keeps them even, followed all the while.
+    /// At the lowest latency, an input whose frames keep coming at about
+    /// the moment show frames are drawn — an UltraStudio, its pictures
+    /// stamped right at the pick — is held a frame and moves one frame a
+    /// frame: taken as the newest came, it showed frames twice and skipped
+    /// the next by turns.
     #[test]
-    fn at_the_lowest_latency_the_newest_frame_is_shown_each_pick() {
+    fn at_the_lowest_latency_frames_coming_at_the_draw_move_evenly() {
+        let (run, shown, _) = run_at(
+            true,
+            1.0 / 60.0,
+            1.0 / 60.0015,
+            NEAR_THE_DRAW,
+            jitter(0.008),
+            60.0,
+        );
+        assert_eq!(run, Run::default(), "{run:?}");
+        assert!(shown.windows(2).skip(70).all(|w| w[1] == w[0] + 1));
+    }
+
+    /// At the lowest latency, a camera over USB — one frame in twenty
+    /// coming 12 ms late — is shown a frame sooner than at the even
+    /// delay, which waits for those; only they are shown late, the one
+    /// before each repeated once.
+    #[test]
+    fn at_the_lowest_latency_a_usb_camera_is_shown_sooner_its_late_frames_late() {
+        let usb = |i: usize| jitter(0.002)(i) + if i % 20 == 7 { 0.012 } else { 0.0 };
+        let (even, _, even_behind) = run_at(false, 1.0 / 60.0, 1.0 / 60.0015, 0.028, usb, 30.0);
+        let (low, _, low_behind) = run_at(true, 1.0 / 60.0, 1.0 / 60.0015, 0.028, usb, 30.0);
+        assert_eq!(even, Run::default(), "{even:?}");
+        assert!(
+            low_behind < even_behind - 0.012,
+            "{:.1} ms behind, at the even delay {:.1}",
+            low_behind * 1e3,
+            even_behind * 1e3
+        );
+        // 29 s counted: 87 late frames, three a second.
+        assert!((60..=90).contains(&low.repeated), "{low:?}");
+        assert_eq!(low.repeats_in_a_row, 1, "{low:?}");
+    }
+
+    /// An input not shown — its frames never picked — keeps only the latest
+    /// times they came, not every one.
+    #[test]
+    fn an_input_never_picked_keeps_only_the_latest_arrivals() {
+        let mut picker = FramePicker::keeping(4);
+        for i in 0..10_000_u32 {
+            let at = 1.0 + f64::from(i) / 60.0;
+            let _ = picker.push_came(at, at + 0.01, i);
+        }
+        assert!(picker.came_waiting() <= super::AGES_KEPT);
+    }
+
+    /// Set to the lowest latency, a camera is shown sooner at once — not
+    /// once frames have come in time for a while, as a delay comes down —
+    /// and set back, at the even delay at once.
+    #[test]
+    fn the_lowest_latency_takes_effect_at_once_both_ways() {
         let frame = 1.0 / 60.0;
         let mut picker = FramePicker::new();
-        // Steady frames, 25 ms on their way, picked 10 ms before each show
-        // frame: at the even delay, a frame held behind each newest.
-        for i in 0..240_u32 {
-            let at = 1.0 + f64::from(i) * frame;
-            let _ = picker.push(at, i);
-            let _ = picker.pick(at + 0.045);
-        }
-        let held = picker.latency().expect("a latency");
+        let mut next = 0_u32;
+        // Frames 28 ms on their way, one in twenty 12 ms more; each show
+        // frame drawn 10 ms before it is due. How far behind the last pick
+        // of `picks` was.
+        let mut picks = |picker: &mut FramePicker<u32>, ks: std::ops::Range<u32>| {
+            for k in ks {
+                let show_at = 1.200_113 + f64::from(k) * frame;
+                loop {
+                    let at = 1.000_371 + f64::from(next) * frame;
+                    let came = at + 0.028 + if next % 20 == 7 { 0.012 } else { 0.0 };
+                    if came > show_at - 0.010 {
+                        break;
+                    }
+                    let _ = picker.push_came(at, came, next);
+                    next += 1;
+                }
+                let _ = picker.pick_drawn(show_at, show_at - 0.010);
+            }
+            picker.latency().expect("a latency")
+        };
+        let even = picks(&mut picker, 0..600);
         picker.set_newest(true);
-        // Two come at once: the newer shown, the one before it skipped.
-        let at = 1.0 + 240.0 * frame;
-        let _ = picker.push(at, 240);
-        let _ = picker.push(at + frame, 241);
-        assert_eq!(picker.pick(at + frame + 0.030), (Some(241), Picked::Skipped(1)));
-        assert!(picker.latency().expect("a latency") < held, "sooner");
-        // None new: the frame before again.
-        assert_eq!(picker.pick(at + 2.0 * frame + 0.030), (None, Picked::Repeated));
-        // Off again: each in turn.
+        let low = picks(&mut picker, 600..610);
+        assert!(
+            low < even - 0.012,
+            "at once: {low:.4} s, {even:.4} s before"
+        );
         picker.set_newest(false);
-        for i in 242..300_u32 {
-            let at = 1.0 + f64::from(i) * frame;
-            let _ = picker.push(at, i);
-            let (_, what) = picker.pick(at + 0.045);
-            assert_ne!(what, Picked::Skipped(1), "frame {i}");
-        }
+        let back = picks(&mut picker, 610..620);
+        assert!(back > even - 0.002, "back at once: {back:.4} s");
     }
 
     /// A camera a frame late every 80 s — too seldom for a shortening to be

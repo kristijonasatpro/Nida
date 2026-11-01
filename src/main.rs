@@ -122,6 +122,20 @@ fn main() -> anyhow::Result<()> {
     }));
 
     let config = varda::app::AppConfig::parse();
+    if config.bench_encoders {
+        #[cfg(target_os = "macos")]
+        println!("{}", varda::streaming::vt_bench::run());
+        #[cfg(not(target_os = "macos"))]
+        println!("The media engine bench runs on a Mac.");
+        return Ok(());
+    }
+    if let Some(name) = &config.blackmagic_sound_lag {
+        #[cfg(target_os = "macos")]
+        println!("{}", varda::decklink::sync_probe::run(name));
+        #[cfg(not(target_os = "macos"))]
+        println!("Blackmagic boxes are measured on a Mac ({name}).");
+        return Ok(());
+    }
 
     // First-launch CLI install (non-blocking, non-fatal). An app bundle
     // built for one machine sets VARDA_NO_CLI_INSTALL: no admin prompt.

@@ -35,6 +35,11 @@ sign with theirs.) Until then, the picture goes back one of three ways:
 1. **Over NDI** — NDI's free **NDI Virtual Input** (in NDI Tools for Mac)
    makes Nida's NDI output a camera the call app can choose. The NDI output
    alone adds no camera:
+   - Nida needs the **NDI runtime** itself, and NDI Tools does not add it
+     (its apps carry their own): install the free NDI SDK for Apple from
+     ndi.video, or `brew install --cask libndi`, then reopen Nida. Without
+     it the NDI output says *Not sent: no NDI runtime loaded*,
+     and the Library's NDI list says *SDK not found*.
    - In **Outputs**, an NDI output ([NDI](09-streaming-and-io.md#ndi))
      showing Main or a bus, started (**▶ Start**): a new output is stopped.
    - Install NDI Tools and start **NDI Virtual Input**. The first time, macOS

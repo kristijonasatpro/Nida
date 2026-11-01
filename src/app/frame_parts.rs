@@ -46,6 +46,11 @@ impl FrameParts {
         self.start_delay = start_delay.map(ms);
     }
 
+    /// This frame's parts so far, in milliseconds.
+    pub fn so_far(&self) -> Vec<(String, f32)> {
+        self.frame.clone()
+    }
+
     /// `took` spent on `part` this frame (added to what it had, if twice).
     pub fn add(&mut self, part: &str, took: Duration) {
         if self.started.is_none() {

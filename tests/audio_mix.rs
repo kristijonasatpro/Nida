@@ -513,7 +513,33 @@ fn audio_buses_route_and_save_with_the_stage() {
                 delay_ms: 80.0,
             },
         ));
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::SetAudioBusLive {
+                uuid: stream.clone(),
+                live: true,
+                frames: Some(128),
+            },
+        ));
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::SetAudioBusInsert {
+                uuid: stream.clone(),
+                component: Some("aufx:lpas:appl".into()),
+            },
+        ));
+        assert!(matches!(
+            send_cmd(
+                &mut app,
+                EngineCommand::SetAudioBusInsert {
+                    uuid: stream.clone(),
+                    component: Some("lowpass".into()),
+                },
+            ),
+            CommandResult::Err { .. }
+        ));
         // A microphone that is not connected here still keeps its strip.
+        // (Its gate is set further down, once it is added.)
         let mic = new_uuid(send_cmd(
             &mut app,
             EngineCommand::AddAudioInput {
@@ -529,6 +555,112 @@ fn audio_buses_route_and_save_with_the_stage() {
                 uuid: mic.clone(),
                 bus_uuid: stream.clone(),
                 on: true,
+            },
+        ));
+        // Turned on, its send's settings are kept from then on (a live bus
+        // keeps it among its mics when it is turned off).
+        let kept = app
+            .build_engine_state()
+            .audio_mix
+            .sources
+            .iter()
+            .find(|s| s.uuid == mic)
+            .is_some_and(|s| s.sent_before.contains(&stream));
+        assert!(kept, "marked as sent before");
+        // Its default send (to the first bus, on as it was added, no settings
+        // saved): turned off, its settings are kept too — and on again.
+        let first_bus = app.build_engine_state().audio_mix.buses[0].config.uuid.clone();
+        let strip = |app: &VardaApp| {
+            app.build_engine_state()
+                .audio_mix
+                .sources
+                .iter()
+                .find(|s| s.uuid == mic)
+                .cloned()
+                .expect("mic")
+        };
+        assert!(strip(&app).sends.contains(&first_bus), "sent there by default");
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::SetAudioSend { uuid: mic.clone(), bus_uuid: first_bus.clone(), on: false },
+        ));
+        assert!(strip(&app).sent_before.contains(&first_bus), "marked as it went off");
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::SetAudioSend { uuid: mic.clone(), bus_uuid: first_bus.clone(), on: true },
+        ));
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::SetAudioSourceGate {
+                uuid: mic.clone(),
+                config: varda::audio_mix::GateConfig {
+                    enabled: true,
+                    threshold_db: -45.0,
+                    ..varda::audio_mix::GateConfig::default()
+                },
+            },
+        ));
+        assert!(matches!(
+            send_cmd(
+                &mut app,
+                EngineCommand::SetAudioSourceGate {
+                    uuid: mic.clone(),
+                    config: varda::audio_mix::GateConfig {
+                        range_db: 90.0,
+                        ..varda::audio_mix::GateConfig::default()
+                    },
+                },
+            ),
+            CommandResult::Err { .. }
+        ));
+        let mut eq = varda::audio_mix::EqConfig {
+            enabled: true,
+            ..varda::audio_mix::EqConfig::default()
+        };
+        eq.bands[2].gain_db = 2.5;
+        ok(send_cmd(&mut app, EngineCommand::SetAudioSourceEq { uuid: mic.clone(), config: eq }));
+        // A send's level set while it is off: kept, the send still off.
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::SetAudioSendSettings {
+                uuid: mic.clone(),
+                bus_uuid: stream.clone(),
+                on: None,
+                gain_db: Some(-9.0),
+                mode: Some(varda::audio_mix::SendMode::Pre),
+            },
+        ));
+        assert!(matches!(
+            send_cmd(
+                &mut app,
+                EngineCommand::SetAudioSendSettings {
+                    uuid: mic.clone(),
+                    bus_uuid: stream.clone(),
+                    on: None,
+                    gain_db: Some(40.0),
+                    mode: None,
+                },
+            ),
+            CommandResult::Err { .. }
+        ));
+        ok(send_cmd(&mut app, EngineCommand::SetAudioBusPreFader { uuid: stream.clone(), pre_fader: true }));
+        // A live buffer is one of those offered.
+        assert!(matches!(
+            send_cmd(
+                &mut app,
+                EngineCommand::SetAudioBusLive { uuid: stream.clone(), live: false, frames: Some(1) },
+            ),
+            CommandResult::Err { .. }
+        ));
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::SetAudioSourceDeEsser {
+                uuid: mic.clone(),
+                config: varda::audio_mix::DeEsserConfig {
+                    enabled: true,
+                    hz: 7_500.0,
+                    ..varda::audio_mix::DeEsserConfig::default()
+                },
             },
         ));
         assert!(matches!(
@@ -558,6 +690,12 @@ fn audio_buses_route_and_save_with_the_stage() {
     assert_eq!(bus.config.name, "STREAM");
     assert!((bus.config.gain_db + 3.0).abs() < 1e-6);
     assert!((bus.config.delay_ms - 80.0).abs() < 1e-6);
+    assert!(bus.config.live, "played live, as saved");
+    assert_eq!(bus.config.live_frames, Some(128), "a refused buffer left it as it was");
+    assert!(bus.config.pre_fader, "a monitor mix, as saved");
+    let insert = bus.config.insert.as_ref().expect("its insert, as saved");
+    assert_eq!(insert.component, "aufx:lpas:appl");
+    assert!(!insert.name.is_empty());
     let strip = state
         .audio_mix
         .sources
@@ -565,6 +703,15 @@ fn audio_buses_route_and_save_with_the_stage() {
         .find(|s| s.uuid == mic)
         .expect("the microphone came back");
     assert!(!strip.live, "its device is not here");
+    let de_esser = strip.dynamics.de_esser.expect("its de-esser");
+    assert!(de_esser.enabled && (de_esser.hz - 7_500.0).abs() < 1e-3, "as saved: {de_esser:?}");
+    let send = strip.send_settings.get(&stream).expect("its send to STREAM, kept");
+    assert!((send.gain_db + 9.0).abs() < 1e-6 && send.mode == varda::audio_mix::SendMode::Pre, "{send:?}");
+    assert!(strip.sends.contains(&stream), "a level leaves the send as it was (on)");
+    let eq = strip.dynamics.eq.expect("its EQ");
+    assert!(eq.enabled && (eq.bands[2].gain_db - 2.5).abs() < 1e-6, "its EQ, as saved: {eq:?}");
+    let gate = strip.dynamics.gate.expect("its gate");
+    assert!(gate.enabled && (gate.threshold_db + 45.0).abs() < 1e-6, "its gate, as saved: {gate:?}");
     assert!(strip.sends.contains(&stream));
 }
 
@@ -917,6 +1064,40 @@ fn a_frame_is_recorded_at_the_refresh_it_was_drawn_for() {
     app.set_frame_refresh_at(Some(refresh));
     app.render_mixer_frame();
     assert_eq!(app.frame_drawn_at(), Some(refresh));
+    // Numbered too, for a take at a share of the show's rate, which counts
+    // the show's frames by number: one drawn after it, numbered after it.
+    let first = varda::renderer::subprocess::frame_number(refresh).expect("numbered");
+    let next = refresh + Duration::from_millis(17);
+    app.set_frame_refresh_at(Some(next));
+    app.render_mixer_frame();
+    let second = varda::renderer::subprocess::frame_number(next).expect("numbered");
+    assert!(second > first);
+}
+
+/// A frame is noted at the rate frames really come — the screen's clock,
+/// which follows a new target rate only after a moment — not the target:
+/// a take counting the show's frames by the target ran double speed then
+/// froze at each change (Max5 on the Studio).
+#[test]
+fn a_frame_is_noted_at_the_rate_frames_really_come() {
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    app.set_target_fps(30);
+    app.set_frame_cadence(Some(60));
+    let refresh = Instant::now()
+        .checked_sub(Duration::from_millis(20))
+        .unwrap();
+    app.set_frame_refresh_at(Some(refresh));
+    app.render_mixer_frame();
+    let (_, fps) = varda::renderer::subprocess::frame_drawn(refresh).expect("noted");
+    assert_eq!(fps, 60, "the clock's rate, not the target's");
+    // With no clock told (headless), the target.
+    app.set_frame_cadence(None);
+    let later = refresh + Duration::from_millis(17);
+    app.set_frame_refresh_at(Some(later));
+    app.render_mixer_frame();
+    assert_eq!(varda::renderer::subprocess::frame_drawn(later).map(|d| d.1), Some(30));
 }
 
 #[test]

@@ -189,6 +189,12 @@ pub struct UISession {
     /// collapse a continuous drag into a single undo step (snapshot on gesture
     /// start, suppressed while held).
     pub gesture_active: bool,
+    /// Channels whose pictures this frame shows big or under the pointer —
+    /// an Input Settings window's, the tile hovered: drawn at the show's
+    /// rate, not a tile's. By UUID: commands this frame may move them.
+    pub shown_full: Vec<String>,
+    /// The Preview monitor was drawn this frame.
+    pub preview_monitor_shown: bool,
 }
 
 impl Default for UISession {
@@ -251,6 +257,8 @@ impl UISession {
             undo_requested: false,
             redo_requested: false,
             gesture_active: false,
+            shown_full: Vec::new(),
+            preview_monitor_shown: false,
         }
     }
 }

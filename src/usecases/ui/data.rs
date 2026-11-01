@@ -23,6 +23,8 @@ pub struct ParamUIInfo {
     pub value: ParamValue,
     pub min: Option<f32>,
     pub max: Option<f32>,
+    /// A list setting's choices: each value and its name.
+    pub choices: Option<Vec<(i32, String)>>,
 }
 
 /// Shader parameters info for UI (generator or effect)
@@ -273,6 +275,10 @@ pub struct DeckUIInfo {
     pub slides: Option<crate::engine::value::slides::SlidesSnapshot>,
     /// A timer's settings and what it reads (None = not a timer).
     pub timer: Option<crate::engine::value::timer::TimerSnapshot>,
+    /// A lower third's rows, look and what is on air (None = not one).
+    pub lower_third: Option<crate::engine::value::lower_third::LowerThirdSnapshot>,
+    /// A text input's text and look (None = not one).
+    pub text: Option<crate::engine::value::text::TextSnapshot>,
     /// A PowerPoint input's show (None = not a PowerPoint input).
     pub presentation: Option<crate::engine::value::presentation::PresentationSnapshot>,
     /// A presenter view: the PowerPoint input's layer it shows.
@@ -288,6 +294,13 @@ pub struct DeckUIInfo {
     /// Whether a camera's newest picture is shown every frame (None = not a
     /// camera).
     pub camera_lowest_latency: Option<bool>,
+    /// What a camera sends, as its pictures say (None = not a camera, or no
+    /// picture read yet).
+    pub camera_signal: Option<crate::engine::value::camera::CameraSignal>,
+    /// A camera layer's camera, by id.
+    pub camera_id: Option<crate::camera::CameraId>,
+    /// The format its camera is opened at; none, its best.
+    pub camera_mode: Option<crate::engine::value::camera::CameraMode>,
     /// True when the interactive window is currently open for this deck.
     pub is_html_interactive: bool,
     pub opacity: f32,
@@ -458,6 +471,8 @@ pub struct HtmlLibraryEntry {
 #[allow(clippy::struct_excessive_bools)]
 pub struct UIData {
     pub generators: Vec<(String, usize)>,
+    /// The Broadcast backgrounds, by mood (also among `generators`).
+    pub broadcast: Vec<crate::engine::BroadcastLook>,
     pub filters: Vec<(String, usize)>,
     /// Each masked effect's mask, by effect UUID.
     pub effect_masks: std::collections::HashMap<String, crate::engine::value::mask::EffectMask>,
@@ -481,6 +496,9 @@ pub struct UIData {
     /// Output preview textures keyed by output index
     pub output_preview_textures: std::collections::HashMap<usize, egui::TextureId>,
     pub main_output_texture: Option<egui::TextureId>,
+    /// The Preview monitor's picture, stepped a show frame a window frame
+    /// (see `monitor_frames`), and the input it is of.
+    pub preview_monitor_texture: Option<(usize, egui::TextureId)>,
     pub notifications: Vec<NotificationUI>,
     /// Crossfader position (0.0 = A, 1.0 = B)
     pub crossfader: f32,
@@ -615,6 +633,12 @@ pub struct UIData {
     pub cameras: Vec<(String, crate::camera::CameraId)>,
     /// The OS refuses this app the cameras (Camera access off on a Mac).
     pub camera_access_denied: bool,
+    /// The cameras whose sound comes with their pictures (Blackmagic
+    /// inputs): into the mixer by themselves.
+    pub cameras_with_own_sound: Vec<crate::camera::CameraId>,
+    /// The cameras that take the format coming in, whatever they were
+    /// opened at: no format to choose.
+    pub cameras_following_signal: Vec<crate::camera::CameraId>,
     /// macOS camera effects on for this app, which change every camera's
     /// picture on air (see `CameraSnapshot::video_effects`).
     pub camera_video_effects: Vec<String>,
@@ -677,6 +701,10 @@ pub struct UIData {
     /// Whether `gpu_utilization` is the OS's own figure for how busy the GPU
     /// is (macOS), rather than Nida's estimate from the layers' costs.
     pub gpu_utilization_measured: bool,
+    /// Nida's own share of the GPU (0–100), as Activity Monitor shows it.
+    pub nida_gpu: Option<f32>,
+    /// Nida's own memory in bytes (its footprint, as Activity Monitor).
+    pub nida_ram: Option<u64>,
     /// CPU usage % (0–100)
     pub cpu_usage: f32,
     /// RAM used in bytes
@@ -973,4 +1001,52 @@ pub struct SurfaceUI {
     pub holes: Vec<SurfacePath>,
     /// Flattened hole contours (canvas coords) for overlay rendering.
     pub hole_contours: Vec<Vec<[f32; 2]>>,
+}
+
+impl UIData {
+    /// The camera listed as macOS has it that is the same Blackmagic box as
+    /// camera `id` — one read through Blackmagic's own way, its sound with
+    /// its pictures: only when that is certain, one of each by the box's
+    /// exact name.
+    pub fn macos_twin(
+        &self,
+        id: crate::camera::CameraId,
+    ) -> Option<(String, crate::camera::CameraId)> {
+        use crate::decklink::input::same_box;
+        if !self.cameras_with_own_sound.contains(&id) {
+            return None;
+        }
+        let name = &self.cameras.iter().find(|(_, c)| *c == id)?.0;
+        let own = |c: &crate::camera::CameraId| self.cameras_with_own_sound.contains(c);
+        let ours = self
+            .cameras
+            .iter()
+            .filter(|(n, c)| own(c) && same_box(name, n))
+            .count();
+        let twins: Vec<&(String, crate::camera::CameraId)> = self
+            .cameras
+            .iter()
+            .filter(|(n, c)| !own(c) && same_box(name, n))
+            .collect();
+        match twins.as_slice() {
+            [twin] if ours == 1 => Some((*twin).clone()),
+            _ => None,
+        }
+    }
+
+    /// The cameras to offer: each Blackmagic box once, read through its own
+    /// way — its sound comes with its pictures — its macOS-listed twin only
+    /// chosen on purpose (see [`Self::macos_twin`]).
+    pub fn cameras_listed(&self) -> Vec<(String, crate::camera::CameraId)> {
+        let twins: Vec<crate::camera::CameraId> = self
+            .cameras_with_own_sound
+            .iter()
+            .filter_map(|id| self.macos_twin(*id).map(|(_, twin)| twin))
+            .collect();
+        self.cameras
+            .iter()
+            .filter(|(_, id)| !twins.contains(id))
+            .cloned()
+            .collect()
+    }
 }

@@ -166,6 +166,11 @@ impl DisplayClock {
         self.every
     }
 
+    /// The screen's refresh rate, Hz.
+    pub fn refresh_hz(&self) -> f64 {
+        self.refresh_hz
+    }
+
     /// Whether this clock is the one wanted: the screen `display`, a frame
     /// every `every` refreshes, at `hz` (see [`same_clock`]).
     pub fn is(&self, display: u32, every: u32, hz: f64) -> bool {

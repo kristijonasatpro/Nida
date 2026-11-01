@@ -337,8 +337,13 @@ impl MixerCommands for VardaApp {
         if !open {
             // What fails before the camera starts (not there, no access)
             // fails the add, nothing left behind.
-            self.camera_manager
-                .open_in_background(camera_id, mode, vec![uuid.clone()], true)?;
+            // At the format its other layers have (see `read_as_its_camera_is`).
+            self.camera_manager.open_in_background(
+                camera_id,
+                deck.camera_mode,
+                vec![uuid.clone()],
+                true,
+            )?;
         }
         self.add_default_effects(&mut deck);
         let ch = self
@@ -2015,6 +2020,108 @@ mod tests {
         }
         assert_eq!(deck(&app), Some(id), "shows its camera once it runs");
         assert!(app.camera_manager.is_active(id));
+    }
+
+    /// A camera started for a new layer opens at the format its other
+    /// layers have, which the new layer takes.
+    #[test]
+    fn a_camera_started_for_a_new_layer_opens_at_its_layers_format() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        app.camera_manager =
+            crate::camera::CameraManager::with_devices(&[("a", "ATEM")], slow_to_start);
+        let id = app.camera_manager.devices()[0].id;
+        let fifty = Some(crate::camera::CameraMode {
+            width: 1920,
+            height: 1080,
+            fps: 50,
+        });
+        // A layer of the show, waiting for its camera at 50p.
+        let mut waiting = crate::deck::Deck::new_from_camera(
+            &app.context,
+            crate::camera::UNBOUND_CAMERA,
+            "ATEM",
+            1920,
+            1080,
+            64,
+            64,
+        )
+        .expect("a camera layer");
+        waiting.camera_device = Some("a".into());
+        waiting.camera_mode = fifty;
+        app.mixer.channels_mut()[0].add_deck(waiting);
+        let channel = channel_uuid(&app, 0);
+        let added = app.add_camera_deck(&channel, id, None).expect("added");
+        let (ch, dk) = app.mixer.find_deck_by_uuid(&added).expect("the layer");
+        assert_eq!(app.mixer.channels()[ch].decks[dk].deck.camera_mode, fifty);
+        assert_eq!(app.camera_manager.opening_mode(id), fifty);
+    }
+
+    /// A format chosen for a camera input still starting reaches its
+    /// capture: it opens again at it as soon as it has started.
+    #[test]
+    fn a_format_chosen_while_the_camera_starts_reaches_it() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        app.camera_manager =
+            crate::camera::CameraManager::with_devices(&[("a", "ATEM")], slow_to_start);
+        let id = app.camera_manager.devices()[0].id;
+        let channel = channel_uuid(&app, 0);
+        let uuid = app.add_camera_deck(&channel, id, None).expect("added");
+        assert!(app.camera_manager.is_opening(id), "still starting");
+        let fifty = Some(crate::camera::CameraMode {
+            width: 1920,
+            height: 1080,
+            fps: 50,
+        });
+        let set = crate::engine::EngineCommand::SetCameraMode {
+            deck_uuid: uuid,
+            mode: fifty,
+        };
+        assert!(matches!(
+            app.execute_command(set),
+            crate::engine::CommandResult::Ok
+        ));
+        assert_eq!(app.camera_manager.take_asked_mode(id), Some(fifty));
+    }
+
+    /// A camera layer added with its own sound has that sound in the mixer,
+    /// as the layer's: switched with it (Audio Auto), named after the camera.
+    #[test]
+    fn a_camera_layer_added_with_its_sound_has_it_in_the_mixer() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        app.camera_manager =
+            crate::camera::CameraManager::with_devices(&[("a", "ATEM")], slow_to_start);
+        let id = app.camera_manager.devices()[0].id;
+        let channel = channel_uuid(&app, 0);
+        let added = app.execute_command(crate::engine::EngineCommand::AddCameraDeck {
+            channel_uuid: channel,
+            camera_id: id,
+            mode: None,
+            audio: Some(crate::engine::InputAudio {
+                device: "Blackmagic Design".into(),
+                left: 0,
+                right: 1,
+            }),
+        });
+        let crate::engine::CommandResult::OkWithId { uuid } = added else {
+            panic!("expected the layer, got {added:?}");
+        };
+        let input = app
+            .audio_mix
+            .config()
+            .inputs
+            .iter()
+            .find(|i| i.deck.as_deref() == Some(uuid.as_str()))
+            .expect("its sound, as the layer's");
+        assert_eq!(
+            (input.device.as_str(), input.name.as_str()),
+            ("Blackmagic Design", "ATEM")
+        );
     }
 
     fn channel_uuid(app: &super::super::VardaApp, idx: usize) -> String {

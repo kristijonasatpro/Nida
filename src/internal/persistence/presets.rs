@@ -126,10 +126,10 @@ impl PresetLibrary {
     pub fn keep_deck(&mut self, path: &Path, json: &str) -> Option<KeptPreset> {
         match serde_json::from_str::<DeckConfig>(json) {
             Ok(config) => {
-                let kept = KeptPreset::Deck(DeckPreset {
+                let kept = KeptPreset::Deck(Box::new(DeckPreset {
                     name: preset_name(path),
                     config,
-                });
+                }));
                 self.put(&kept);
                 Some(kept)
             }
@@ -180,7 +180,7 @@ impl PresetLibrary {
         match kept {
             KeptPreset::Deck(preset) => {
                 self.deck_presets.retain(|p| p.name != preset.name);
-                self.deck_presets.push(preset.clone());
+                self.deck_presets.push((**preset).clone());
                 self.deck_presets.sort_by(|a, b| a.name.cmp(&b.name));
             }
             KeptPreset::Channel(preset) => {
@@ -257,7 +257,8 @@ impl PresetLibrary {
 /// A preset taken into the library before its file landed.
 #[derive(Debug, Clone)]
 pub enum KeptPreset {
-    Deck(DeckPreset),
+    /// Boxed: a deck's settings (a lower third's, a text's) are large.
+    Deck(Box<DeckPreset>),
     Channel(ChannelPreset),
 }
 

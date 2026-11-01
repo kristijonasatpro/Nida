@@ -15,6 +15,8 @@ pub(crate) mod flv;
 pub mod network;
 pub(crate) mod ts;
 #[cfg(target_os = "macos")]
+pub mod vt_bench;
+#[cfg(target_os = "macos")]
 pub(crate) mod vt_encoder;
 
 pub use fanout::{Fanout, Remedy};
@@ -614,6 +616,48 @@ pub(crate) struct RelayTarget {
     /// The server and application without key or password, for logs and
     /// the status line.
     pub display: String,
+    /// The stream key and login password, to be kept out of what is said
+    /// (see [`RelayTarget::redact`]).
+    pub secrets: Vec<String>,
+}
+
+impl RelayTarget {
+    /// `line` — what the sender said — with the key and password blanked:
+    /// ffmpeg puts the address it failed on in its errors, and those go to
+    /// the log and the Stream window.
+    pub fn redact(&self, line: &str) -> String {
+        self.secrets
+            .iter()
+            .filter(|secret| !secret.is_empty())
+            .fold(line.to_string(), |line, secret| {
+                if secret.chars().count() >= 3 {
+                    line.replace(secret.as_str(), "•••")
+                } else {
+                    blank_short(&line, secret)
+                }
+            })
+    }
+}
+
+/// `secret` blanked in `line` where an address carries it — a password
+/// between the login's ':' and its '@', a key as the address's last part:
+/// too short to blank wherever it shows, which would blank bits of words.
+fn blank_short(line: &str, secret: &str) -> String {
+    let line = line.replace(&format!(":{secret}@"), ":•••@");
+    let part = format!("/{secret}");
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line.as_str();
+    while let Some(at) = rest.find(&part) {
+        let after = &rest[at + part.len()..];
+        let last = after.chars().next().is_none_or(|c| {
+            c.is_whitespace() || matches!(c, '\'' | '"' | ':' | ',' | ';' | ')' | ']' | '>')
+        });
+        out.push_str(&rest[..=at]);
+        out.push_str(if last { "•••" } else { secret });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 impl StreamDestination {
@@ -693,27 +737,44 @@ impl StreamDestination {
             Some(login) => format!("{scheme}://{login}@{host}"),
             None => format!("{scheme}://{host}"),
         };
-        let display = if path.is_empty() {
+        // Shown without the stream name a URL ends with when the key box is
+        // empty: that is the key.
+        let shown_path = if key.is_empty() {
+            path.rsplit_once('/').map_or("", |(app, _)| app)
+        } else {
+            path
+        };
+        let display = if shown_path.is_empty() {
             format!("{scheme}://{host}")
         } else {
-            format!("{scheme}://{host}/{path}")
+            format!("{scheme}://{host}/{shown_path}")
         };
+        // The password, whether typed in its box or in the URL's login.
+        let password = login
+            .as_deref()
+            .and_then(|login| login.split_once(':'))
+            .map(|(_, password)| password.to_string())
+            .filter(|password| !password.is_empty());
         if key.is_empty() {
             // The URL carries the stream name itself: application, then key.
             if !path.contains('/') {
                 return Err("Enter the stream key".into());
             }
+            let stream_name = path.rsplit('/').next().unwrap_or_default().to_string();
             return Ok(RelayTarget {
                 url: format!("{base}/{path}"),
                 args: Vec::new(),
                 display,
+                secrets: std::iter::once(stream_name).chain(password).collect(),
             });
         }
         if path.is_empty() {
             return Err("The URL needs the application after the server, e.g. /live".into());
         }
+        // The key once, as the stream name: not in the URL as well, where it
+        // showed twice in the sender's command line, and in its errors.
         Ok(RelayTarget {
-            url: format!("{base}/{path}/{key}"),
+            url: format!("{base}/{path}"),
             args: vec![
                 "-rtmp_app".into(),
                 path.to_string(),
@@ -721,6 +782,7 @@ impl StreamDestination {
                 key.to_string(),
             ],
             display,
+            secrets: std::iter::once(key.to_string()).chain(password).collect(),
         })
     }
 }
@@ -1064,7 +1126,10 @@ mod tests {
         let t = dest("rtmps://live.example.com:443/live/", "example-key?x=1")
             .relay_target()
             .unwrap();
-        assert_eq!(t.url, "rtmps://live.example.com:443/live/example-key?x=1");
+        assert_eq!(
+            t.url, "rtmps://live.example.com:443/live",
+            "the key not in it too"
+        );
         assert_eq!(
             t.args,
             ["-rtmp_app", "live", "-rtmp_playpath", "example-key?x=1"],
@@ -1104,9 +1169,30 @@ mod tests {
         let t = d.relay_target().unwrap();
         assert_eq!(
             t.url,
-            "rtmp://vj@example.com:not@real:pw@stream.example.com/live/event1"
+            "rtmp://vj@example.com:not@real:pw@stream.example.com/live"
         );
         assert!(!t.display.contains("real:pw") && !t.display.contains("event1"));
+        let said = "rtmp://vj@example.com:not@real:pw@stream.example.com/live: event1 refused";
+        let shown = t.redact(said);
+        assert!(
+            !shown.contains("not@real:pw") && !shown.contains("event1"),
+            "{shown}"
+        );
+    }
+
+    /// A key typed into the URL is never shown; short keys and passwords
+    /// are blanked where an address carries them, not in every word.
+    #[test]
+    fn a_key_in_the_url_and_short_secrets_are_never_shown() {
+        let t = dest("rtmp://h/live/secret-key", "").relay_target().unwrap();
+        assert_eq!(t.display, "rtmp://h/live");
+        let short = dest("rtmp://u:pw@h/live", "k1").relay_target().unwrap();
+        let said = "rtmp://u:pw@h/live/k1: refused (k1) as k1x";
+        assert_eq!(
+            short.redact(said),
+            "rtmp://u:•••@h/live/•••: refused (k1) as k1x"
+        );
+        assert_eq!(short.redact("upwards"), "upwards");
     }
 
     #[test]
@@ -1128,8 +1214,14 @@ mod tests {
     #[test]
     fn a_login_already_in_the_url_is_kept() {
         let t = dest("rtmp://u:p@h:1935/live", "k").relay_target().unwrap();
-        assert_eq!(t.url, "rtmp://u:p@h:1935/live/k");
+        assert_eq!(t.url, "rtmp://u:p@h:1935/live");
         assert_eq!(t.display, "rtmp://h:1935/live");
+        let typed = dest("rtmp://u:secret-pw@h:1935/live", "k")
+            .relay_target()
+            .unwrap();
+        assert!(!typed
+            .redact("refused rtmp://u:secret-pw@h")
+            .contains("secret-pw"));
     }
 
     #[test]

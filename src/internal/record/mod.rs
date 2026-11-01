@@ -206,6 +206,45 @@ impl RecordOptions {
         kbps.clamp(2_000, 150_000)
     }
 
+    /// The codec to encode in Nida on the media engine, when it can be:
+    /// H.264 or HEVC, on the hardware encoder where it opens.
+    pub(crate) fn engine_codec(&self) -> Option<VideoCodec> {
+        let codec = self.codec.video_codec()?;
+        (self.encoder.resolved(codec).0 == StreamEncoder::Hardware).then_some(codec)
+    }
+
+    /// ffmpeg's video and container arguments for a picture encoded in Nida
+    /// (see `FfmpegSubprocess::spawn_record_with`): copied as it comes, each
+    /// frame at its own time, written out as it is made.
+    pub(crate) fn copied_video_args(&self) -> Vec<String> {
+        let mut args: Vec<String> = ["-c:v", "copy", "-flush_packets", "1"]
+            .map(str::to_string)
+            .to_vec();
+        // HEVC as Apple's players take it, as ffmpeg's encoders tag it.
+        if self.codec == RecordCodec::Hevc && self.format != RecordFormat::Mkv {
+            args.extend(["-tag:v", "hvc1"].map(str::to_string));
+        }
+        args.extend(self.container_args());
+        args
+    }
+
+    /// The container's arguments: MP4 in one-second pieces, so a crash loses
+    /// at most the last; MOV; Matroska.
+    fn container_args(&self) -> Vec<String> {
+        match self.format {
+            RecordFormat::Mp4 => [
+                "-movflags",
+                "+frag_keyframe+empty_moov+default_base_moof",
+                "-f",
+                "mp4",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            RecordFormat::Mov => ["-f", "mov"].map(str::to_string).to_vec(),
+            RecordFormat::Mkv => ["-f", "matroska"].map(str::to_string).to_vec(),
+        }
+    }
+
     /// Whether the recording can take NV12 frames made on the GPU: H.264 and
     /// HEVC can; `ProRes` takes RGBA.
     pub(crate) fn takes_nv12(&self) -> bool {
@@ -285,19 +324,7 @@ impl RecordOptions {
         // crash can lose is what the OS has not written yet, not seconds of
         // picture sitting in ffmpeg.
         args.extend(["-flush_packets", "1"].map(str::to_string));
-        match self.format {
-            RecordFormat::Mp4 => args.extend(
-                [
-                    "-movflags",
-                    "+frag_keyframe+empty_moov+default_base_moof",
-                    "-f",
-                    "mp4",
-                ]
-                .map(str::to_string),
-            ),
-            RecordFormat::Mov => args.extend(["-f", "mov"].map(str::to_string)),
-            RecordFormat::Mkv => args.extend(["-f", "matroska"].map(str::to_string)),
-        }
+        args.extend(self.container_args());
         args
     }
 
@@ -374,6 +401,10 @@ pub struct RecordStatus {
     /// The rate frames reach the encoder at, as it was started.
     #[serde(default)]
     pub fps: u32,
+    /// The rate the file is written at: its own when set (Frame rate),
+    /// else that one.
+    #[serde(default)]
+    pub file_fps: u32,
     /// The last finished recording, for "Show in Finder".
     pub last_file: Option<String>,
     /// The audio-mixer bus the running recording carries, as chosen when it
@@ -394,6 +425,7 @@ impl RecordStatus {
             problem: None,
             dropped: 0,
             fps: 0,
+            file_fps: 0,
             last_file,
             audio_bus: None,
         }
@@ -660,6 +692,30 @@ fn available_on(path: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    /// A picture encoded in Nida is copied into the file as it comes, HEVC
+    /// tagged as Apple's players take it, MP4 in one-second pieces.
+    #[test]
+    fn a_picture_encoded_in_nida_is_copied_hevc_tagged_for_apple() {
+        let hevc = super::RecordOptions {
+            codec: super::RecordCodec::Hevc,
+            ..super::RecordOptions::default()
+        };
+        let args = hevc.copied_video_args().join(" ");
+        assert!(
+            args.contains("-c:v copy") && args.contains("-tag:v hvc1"),
+            "{args}"
+        );
+        assert!(args.contains("+frag_keyframe+empty_moov"), "{args}");
+        let mkv = super::RecordOptions {
+            format: super::RecordFormat::Mkv,
+            ..hevc
+        };
+        assert!(
+            !mkv.copied_video_args().join(" ").contains("hvc1"),
+            "Matroska has no tag"
+        );
+    }
+
     use super::*;
 
     /// The free space where a recording goes is found at once — the frame

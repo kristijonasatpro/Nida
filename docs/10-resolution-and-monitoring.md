@@ -45,6 +45,17 @@ one shows the 4K picture scaled down — mixing sizes costs the smaller screen
 its pixel-for-pixel match. Rendering in 4K is also about four times the GPU
 work of Full HD.
 
+Scaling keeps the picture as sharp as it can. A picture drawn bigger — a Full
+HD camera in a 4K show — is scaled up bicubic, not blurred; one drawn smaller
+— a 4K show on a Full HD screen — takes the average of the pixels each
+screen pixel covers, so fine detail does not shimmer, and a bus's part
+of the show never picks up the bus beside it. A Full HD source in a 4K show
+seen on a Full HD screen keeps most of its finest detail (before, a one-pixel
+line came back at half strength); a show that only ever goes to Full HD
+screens is sharpest at Full HD all the same, and a quarter of the GPU work.
+The control window's previews keep one sample a pixel: averaged, they cost
+eight times the GPU time.
+
 ### Presets
 
 **Landscape**
@@ -177,11 +188,15 @@ Real-time frame-rate counter, color-coded: green (>55), yellow (30–55), red (<
 
 ### GPU Load
 
-Render load as a percentage of the frame budget: `(total_render_ms / 16.67ms) × 100%`, color-coded green (<50%), yellow (50–80%), red (>80%). The **🖥 GPU Details** popover shows device name, backend (Metal/Vulkan), driver info, device type (discrete/integrated), and render-load ms.
+On a Mac, **Nida's own share of the GPU**, as Activity Monitor's GPU column shows it (its GPU time over the last second), coloured by how busy the **whole** GPU is — every app and the screens' compositing too, which is what holds frames up: green (<50%), yellow (50–80%), red (>80%). Hover it for both figures. Elsewhere it is the render load as a percentage of the frame budget. The **🖥 GPU Details** popover shows device name, backend (Metal/Vulkan), driver info, device type (discrete/integrated), and render-load ms.
 
 ### CPU / RAM
 
-CPU percentage and RAM usage (used/total), both color-coded. These are sampled once per second (not per frame) to avoid measurement overhead.
+CPU percentage, and **Nida's own memory** (its footprint, as Activity Monitor's Memory column shows it) coloured by how full the whole Mac's memory is; hover it for the Mac's used and total. Both are sampled once per second (not per frame) to avoid measurement overhead.
+
+### The Main and Preview monitors
+
+The show is drawn on the refresh of the screen it goes to (the LED wall's, say); the control window on its own screen's. Both at 60 Hz, they still drift apart, and a window showing "the newest frame" would, as the two refreshes cross, show one frame twice and skip the next — the Main monitor stuttering while the outputs are smooth. So each frame of the master and of the cued input is kept, small, in a short queue, and the monitors step through it one frame each refresh of the window, a frame behind the show. Tiles of inputs off air are drawn ten times a second while seen (none while scrolled away or covered); an input open in **Input Settings**, cued in Preview, or under the pointer is drawn every frame. `GET /api/state/performance` lists the inputs whose tiles are seen (`pacing.tiles_seen`, by position). When the control window holds the show more than 10 ms — while it reads the show, or applies what was done — the log says so, part by part, with the commands it ran ("The control window held the show 31.5 ms (applying what was done): commands 28.0, …"), at most once a second.
 
 ### Decks & VRAM
 

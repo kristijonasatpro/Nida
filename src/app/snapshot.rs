@@ -247,6 +247,11 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                             .playlist()
                             .map(crate::deck::playlist::Playlist::snapshot),
                         slides: app.slides_snapshot(&slot.deck),
+                        text: slot.deck.text().map(crate::deck::text::Text::snapshot),
+                        lower_third: slot
+                            .deck
+                            .lower_third()
+                            .map(crate::deck::lower_third::LowerThird::snapshot),
                         timer: slot.deck.timer().map(|timer| {
                             timer.snapshot(crate::engine::value::timer::panel_of(slot.deck.uuid()))
                         }),
@@ -263,6 +268,15 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                             .then(|| slot.deck.camera_profile.clone()),
                         camera_lowest_latency: (slot.deck.source_type() == "camera")
                             .then_some(slot.deck.camera_lowest_latency),
+                        camera_signal: (slot.deck.source_type() == "camera")
+                            .then(|| slot.deck.camera_id())
+                            .flatten()
+                            .and_then(|id| app.camera_manager.signal(id)),
+                        camera_id: (slot.deck.source_type() == "camera")
+                            .then(|| slot.deck.camera_id())
+                            .flatten()
+                            .filter(|id| *id != crate::camera::UNBOUND_CAMERA),
+                        camera_mode: slot.deck.camera_mode,
                         is_html_interactive: {
                             #[cfg(feature = "html")]
                             {
@@ -411,6 +425,7 @@ fn build_shader_params(
                 value: *value,
                 min: def.and_then(|d| d.min),
                 max: def.and_then(|d| d.max),
+                choices: def.and_then(crate::isf::ISFInput::choices),
             })
         })
         .collect();
@@ -522,6 +537,7 @@ pub(crate) fn build_registry_snapshot(app: &VardaApp) -> RegistrySnapshot {
         .map(|(i, s)| (s.name(), i))
         .collect();
     generators.sort_by_key(|a| a.0.to_lowercase());
+    let broadcast = broadcast_looks(&app.registry.generators());
     // A layer's own mask is made from Input Settings, not dropped from the
     // Library: alone, it would just make the layer vanish.
     let mut filters: Vec<(String, usize)> = app
@@ -535,9 +551,61 @@ pub(crate) fn build_registry_snapshot(app: &VardaApp) -> RegistrySnapshot {
     filters.sort_by_key(|a| a.0.to_lowercase());
     RegistrySnapshot {
         generators,
+        broadcast,
         filters,
         shader_count: app.registry.count(),
     }
+}
+
+/// The Broadcast backgrounds among `generators` (by their index there): the
+/// shaders in the "Broadcast" category, each with its mood and a title from
+/// its description ("Hex field — a slow wave…" → "Hex field"), by mood then
+/// title.
+pub(crate) fn broadcast_looks(
+    generators: &[&crate::isf::ISFShader],
+) -> Vec<crate::engine::BroadcastLook> {
+    let mut looks: Vec<crate::engine::BroadcastLook> = generators
+        .iter()
+        .enumerate()
+        .filter_map(|(index, shader)| {
+            let categories = shader.metadata.categories.as_ref()?;
+            if !categories.iter().any(|c| c == "Broadcast") {
+                return None;
+            }
+            let mood = categories
+                .iter()
+                .find(|c| crate::engine::BROADCAST_MOODS.contains(&c.as_str()))
+                .cloned()
+                .unwrap_or_else(|| "Colours".to_string());
+            let name = shader.name();
+            let title = shader
+                .metadata
+                .description
+                .as_deref()
+                .and_then(|d| d.split(" — ").next())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map_or_else(|| name.clone(), str::to_string);
+            Some(crate::engine::BroadcastLook {
+                name,
+                title,
+                mood,
+                index,
+            })
+        })
+        .collect();
+    let rank = |mood: &str| {
+        crate::engine::BROADCAST_MOODS
+            .iter()
+            .position(|m| *m == mood)
+            .unwrap_or(99)
+    };
+    looks.sort_by(|a, b| {
+        rank(&a.mood)
+            .cmp(&rank(&b.mood))
+            .then_with(|| a.title.cmp(&b.title))
+    });
+    looks
 }
 
 /// Build a `MidiSnapshot` from the current `VardaApp` state.
@@ -605,6 +673,8 @@ pub(crate) fn build_camera_snapshot(app: &VardaApp) -> CameraSnapshot {
             .map(|d| (d.id, d.modes()))
             .collect(),
         access_denied: app.camera_manager.access_denied(),
+        with_own_sound: app.camera_manager.with_own_sound(),
+        following_signal: app.camera_manager.following_signal(),
         video_effects: app
             .camera_manager
             .video_effects()
@@ -850,6 +920,7 @@ fn build_pacing_snapshot(app: &VardaApp) -> crate::engine::PacingSnapshot {
         .collect();
     crate::engine::PacingSnapshot {
         clock: stats.clock.clone(),
+        tiles_seen: app.tile_channels().to_vec(),
         frames_in_flight: app.frames_in_flight(),
         frame_pacing: app.frame_pacing(),
         interval_mean_ms: mean,
@@ -877,6 +948,9 @@ fn build_pacing_snapshot(app: &VardaApp) -> crate::engine::PacingSnapshot {
         control_slow_frames: stats.control_slow_frames.clone(),
         control_rate: stats.control_rate.clone(),
         gpu_busy_pct: stats.system_monitor.gpu_busy(),
+        gpu_app_pct: stats.system_monitor.nida_gpu(),
+        footprint_bytes: stats.system_monitor.nida_ram(),
+        control_monitors: stats.control_monitors,
         gpu_time: stats.gpu_time.snapshot(),
     }
 }
@@ -981,6 +1055,65 @@ mod tests {
         let gpu = crate::renderer::context::GpuContext::new_headless().ok()?;
         let config = crate::testing::headless_config();
         super::super::VardaApp::new(gpu, &config).ok()
+    }
+
+    /// The Broadcast backgrounds are the generators in the Broadcast
+    /// category, each by its mood, titled from its description, in mood
+    /// order; the rest are not among them.
+    #[test]
+    fn the_broadcast_looks_are_its_category_by_mood() {
+        let shader = |categories: &str, description: &str, file: &str| {
+            let mut s = crate::isf::ISFShader::from_string(&format!(
+                "/*{{\"DESCRIPTION\": \"{description}\", \"CATEGORIES\": [{categories}], \"INPUTS\": []}}*/\nvoid main() {{}}"
+            ))
+            .expect("a shader");
+            s.file_path = Some(format!("/x/{file}.fs"));
+            s
+        };
+        let calm = shader(
+            "\"Generator\", \"Broadcast\", \"Calm\"",
+            "Aurora — slow curtains",
+            "broadcast_aurora",
+        );
+        let plain = shader("\"Generator\"", "Plasma", "plasma");
+        let tech = shader(
+            "\"Generator\", \"Broadcast\", \"Tech\"",
+            "Hex field — a wave",
+            "broadcast_hex_glow",
+        );
+        let looks = broadcast_looks(&[&calm, &plain, &tech]);
+        let seen: Vec<(&str, &str, &str, usize)> = looks
+            .iter()
+            .map(|l| (l.title.as_str(), l.mood.as_str(), l.name.as_str(), l.index))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("Hex field", "Tech", "broadcast_hex_glow", 2),
+                ("Aurora", "Calm", "broadcast_aurora", 0)
+            ]
+        );
+    }
+
+    /// The shipped library holds the Broadcast backgrounds, every mood among
+    /// them, each found by its index among the generators.
+    #[test]
+    fn the_library_holds_the_broadcast_looks() {
+        let Some(app) = headless_app() else {
+            return;
+        };
+        let registry = build_registry_snapshot(&app);
+        assert!(registry.broadcast.len() >= 10, "{:?}", registry.broadcast);
+        for mood in crate::engine::BROADCAST_MOODS {
+            assert!(
+                registry.broadcast.iter().any(|l| l.mood == mood),
+                "no {mood} look"
+            );
+        }
+        let generators = app.registry.generators();
+        for look in &registry.broadcast {
+            assert_eq!(generators[look.index].name(), look.name);
+        }
     }
 
     /// An overlay counts as showing only while its channel is drawn: on (or

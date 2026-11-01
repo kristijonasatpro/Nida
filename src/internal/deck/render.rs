@@ -147,6 +147,9 @@ fn accumulate_phase_times(
                     .unwrap_or(1.0);
             }
             accumulators[pi.index] += dt * rate * pi.scale;
+            if let Some(wrap) = pi.wrap.filter(|w| *w > 0.0) {
+                accumulators[pi.index] = accumulators[pi.index].rem_euclid(wrap);
+            }
         }
     }
 }
@@ -217,6 +220,8 @@ impl Deck {
             DeckSource::Playlist(list) => list.tick(encoder),
             DeckSource::Slides(slides) => slides.tick(encoder),
             DeckSource::Timer(timer) => timer.tick(),
+            DeckSource::LowerThird(lower) => lower.tick(),
+            DeckSource::Text(text) => text.tick(),
             DeckSource::Presenter(presenter) => presenter.tick(),
             _ => {}
         }
@@ -979,6 +984,8 @@ impl Deck {
                 );
             }
             DeckSource::Timer(timer) => timer.render(cmd_buffers, generator_target),
+            DeckSource::LowerThird(lower) => lower.render(cmd_buffers, generator_target),
+            DeckSource::Text(text) => text.render(cmd_buffers, generator_target),
             DeckSource::Presenter(presenter) => presenter.render(
                 cmd_buffers,
                 generator_target,
@@ -1114,6 +1121,8 @@ impl Deck {
             | DeckSource::Playlist(_)
             | DeckSource::Slides(_)
             | DeckSource::Timer(_)
+            | DeckSource::LowerThird(_)
+            | DeckSource::Text(_)
             | DeckSource::Presenter(_)
             | DeckSource::Offline(_) => false,
         };
@@ -1821,6 +1830,8 @@ impl Deck {
             DeckSource::Playlist(list) => list.resize(width, height),
             // Its numbers are sized and placed against the master.
             DeckSource::Timer(timer) => timer.resize(width, height),
+            DeckSource::LowerThird(lower) => lower.resize(width, height),
+            DeckSource::Text(text) => text.resize(width, height),
             // So is a presenter view's panel.
             DeckSource::Presenter(presenter) => presenter.resize(width, height),
             // So are a Slides layer's talks.
@@ -2020,6 +2031,7 @@ mod tests {
             index,
             scale,
             multiply_by: Vec::new(),
+            wrap: None,
         }
     }
 
@@ -2083,6 +2095,29 @@ mod tests {
             "deck0",
         );
         assert!((accum[0] - 0.4).abs() < 1e-5);
+    }
+
+    /// A phase with a wrap is kept below it, starting again from 0 — where a
+    /// growing float would lose its precision hours into a show.
+    #[test]
+    fn a_wrapped_phase_starts_again_from_zero() {
+        let isf_inputs = vec![float_input("speed", 1.0, 0.0, 5.0)];
+        let mut params = ShaderParams::from_inputs(&isf_inputs);
+        let modulation = no_modulation();
+        let mut acc = [9.95_f32, 0.0, 0.0, 0.0];
+        let inputs = [PhaseInput {
+            wrap: Some(10.0),
+            ..phase("speed", 0, 1.0)
+        }];
+        accumulate_phase_times(
+            &mut acc,
+            0.1,
+            Some(&inputs),
+            &mut params,
+            &modulation,
+            "deck0",
+        );
+        assert!((acc[0] - 0.05).abs() < 1e-4, "{}", acc[0]);
     }
 
     #[test]

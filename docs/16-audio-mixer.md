@@ -52,18 +52,50 @@ the square beside **×** expands them, and **Processing** on the left holds:
    hum. 100 Hz suits speech; 12 or 24 dB an octave below it. A new frequency
    or slope glides in over about 10 ms, so it can be moved on air without a
    click.
-2. **Leveler**: rides each speaker slowly to the same average level (the
+2. **Gate**: in a pause it turns the room down — the hum, the shuffle, the
+   other microphones' spill — by **Down by** (15 dB; up to 30), never cut
+   off, so a voice's soft tail is turned down, not chopped. It opens as soon
+   as the sound comes over **Opens above** (−50 dBFS to start with: set it
+   just over the room with no one talking), and closes once the sound has
+   stayed 3 dB under that for its **Hold** (120 ms), over its **Release**
+   (250 ms: a time constant in dB — about 95% of the way down in three times
+   that) — so a voice hovering at the threshold does not flutter it. Its
+   attack is a 0.5 ms time constant and no delay is added, so the first
+   millisecond or two of a sharp sound (a click, a plosive) comes through a
+   little turned down. It
+   listens to what the low cut leaves, so rumble does not hold it open.
+   Off unless switched on; the panel shows how far down it turns the sound
+   now.
+3. **EQ**: the voice's tone — a **Low** shelf (150 Hz), two **Bells** (350
+   Hz and 3 kHz, each with its width, **Q**) and a **High** shelf (8 kHz),
+   each up or down by up to 18 dB. Before the leveler, so tone is set before
+   level; after the gate, so a lift does not open it. A band moved on air
+   glides there in about 20 ms (no click); off or flat, the sound passes
+   untouched.
+   Mind the low cut under a low shelf cut: together they can thin a voice.
+4. **Leveler**: rides each speaker slowly to the same average level (the
    **Target**, −20 dB by default), up to **Most boost** and **Most cut**, as a
    radio station's processor does, so a soft speaker after a loud one needs no
    hand on the fader. It turns down three times as fast as it turns up
    (**Speed**). Below **Hold below** it takes the sound for a pause or the room
    and holds still, so it never pumps the room's noise up between sentences.
    The panel shows the gain it applies now.
-3. **Compressor**: above its threshold the voice rises only 1/ratio as much,
+5. **Compressor**: above its threshold the voice rises only 1/ratio as much,
    evening out what the leveler leaves. Stereo linked, from the louder
    channel's peak.
+6. **De-esser**: an "s" over its threshold turns the top down by up to its
+   range (8 dB), the voice under it untouched. It listens around its
+   frequency (**Listens at**, 6.5 kHz; 3–10 kHz) and turns down a shelf
+   halfway down half an octave under it, so the "s" there loses about 80%
+   of the reduction and everything above all of it. Over its threshold
+   (**Acts above**, −30 dBFS) the band rises a quarter as much, eased in
+   over 6 dB; it catches an "s" in about 1 ms and lets go over 60 ms. Last,
+   after the compressor, which brings sibilance up. "band −N dBFS" shows
+   how loud the band is: set the threshold a few dB under it on an "s".
 
-**Speech preset** sets all three for a talk's microphone: low cut at 100 Hz,
+**Speech preset** sets the low cut, leveler and compressor for a talk's
+microphone (the gate, EQ and de-esser stay as they are: they depend on the
+room and the voice): low cut at 100 Hz,
 the leveler to −20 dB, gentle compression (3:1 from −18 dB, 3 dB made up).
 Pre-fader listen hears the processed sound, as on a console.
 
@@ -123,12 +155,16 @@ streams.
   Audio Input**. An input whose device is unplugged shows **not connected**
   and comes back by itself when it is plugged in again — unplugged mid-show
   too: Nida says the sound stopped, and takes it again within a couple of
-  seconds of the device coming back. An output that takes a device's sound
+  seconds of the device coming back. A device plugged in for the first time
+  after Nida started is listed as macOS sees it, in about a second. When the
+  devices change, an input that then sends nothing but exact silence for ten
+  seconds (its device made anew by its driver) is opened again, once. An output that takes a device's sound
   straight, not through a bus, stays without it until it is started again.
-  Plugging a device in
-  never moves an input onto it, unless the two have the same name; one
-  plugged in while Nida runs is listed after **Rescan** and gives sound once
-  Nida is reopened. Right-click an input's name to remove it.
+  Plugging a device in never moves an input onto it, unless the two have the
+  same name. Devices are opened and closed beside the show, never in its
+  frames: plugging one in, adding an input or a Reset input does not make
+  the picture stutter (each used to hold the outputs for about a tenth of a
+  second). Right-click an input's name to remove it.
 - **A camera's sound** — chosen under **Audio** when adding a camera or
   capture card ([Adding Inputs](23-adding-inputs.md)): an input like the one
   above, named after the camera's input, with Audio Auto on so it switches
@@ -183,12 +219,131 @@ rename is not undone by Undo — rename it back. Each bus strip has its fader, m
 
 - **Plays on** — the sound device: the Mac's speakers, HDMI into the ATEM or a
   TV, a USB interface into the desk. On a multi-channel interface, pick the
-  output pair (**outputs 3-4** and so on). A device that is unplugged shows
-  **⚠** and is reconnected automatically. After plugging a device in, click
-  **Rescan** to see it in the list.
+  output pair (**outputs 3-4** and so on); the list offers only the pairs the
+  device has. A pair set that the device does not have (a show made on a
+  bigger interface) is marked **⚠** and plays on the device's last pair —
+  outputs 1-2 on a two-output interface — rather than on one side; hover
+  the **⚠** to see where it plays. A device that is unplugged shows **⚠** and
+  is reconnected automatically (hover: why it would not open). After
+  plugging a device in, click **Rescan** to see it in the list.
+- **Live** — for the room's speakers and stage monitors (see
+  [Live: the room's speakers](#live-the-rooms-speakers) below). Offered once
+  the bus plays on a device.
+- **Monitor mix (before the faders)** — for a wedge, in-ears or a booth:
+  each source reaches this bus at its send's level, before its fader, so
+  riding a fader for the room leaves this mix as it is (see
+  [Sends and monitor mixes](#sends-and-monitor-mixes) below).
+- **Effect** — an Audio Unit plug-in first in the bus's processing (see
+  [Plug-ins](#plug-ins-audio-units) below).
 - **Delay** 0–300 ms, to hold the sound back until the picture catches up —
   useful when an LED processor or projector adds a few frames. See below for
   how to measure it.
+
+### Live: the room's speakers
+
+A bus feeding the PA or the stage monitors needs the speaker's voice back in
+the room at once: heard much later than they speak, the room sounds like an
+echo. The usual way a bus reaches its device takes about 50 ms (the mix's
+10 ms blocks, then each device's own buffer). Switch the bus to **Live** in
+its ⚙ and the microphones on its own sound device — a Scarlett, a USB mixer,
+whose inputs and outputs are one device — are mixed inside that device as
+their sound arrives: about **7 ms** from mic to speakers (5.1 ms measured
+on a Scarlett Solo at 64 frames, plus the limiter's 1.5 ms look-ahead).
+
+- Each mic keeps its strip's low cut, leveler, compressor, fader, **On** and
+  balance; the bus keeps its compressor, fader, limiter and **Delay** (delay
+  towers). The limiter looks 1.5 ms ahead, on or off. A mic's own **Delay**
+  is left out on a live bus: that one meets a late camera's picture, and the
+  room wants the voice as the speaker talks.
+- The rest of the bus — clips, NDI, a remote guest, mics on other devices —
+  is still heard on it, at the usual delay.
+- The buffer beside **Live**: 64 frames (1.3 ms) at first; 32 is sooner, 128
+  or 256 ask less of the Mac. The buffer is the whole device's, so its
+  inputs get it too, and two live buses on one device both play at the
+  smaller of theirs. A device that will not go as low plays at its smallest.
+- **● live** shows it is playing live. **not live** and the **⚠** on the
+  strip say why not (hover): no mic on the bus's own device sent to it yet,
+  the device's inputs not at 48 kHz, more than eight of its mics sent to the
+  bus, or the device refusing the stream (one whose smallest buffer is over
+  1024 frames, say) — then the bus plays the usual way. Mics on other
+  devices never stop it: they are the rest of the bus.
+- The bus's meter and its recordings are the bus as mixed the usual way.
+
+### Plug-ins (Audio Units)
+
+A bus can run one Audio Unit effect — Apple's own (AUNBandEQ,
+AUPeakLimiter, AUDelay…) or one installed on the Mac (a de-esser, an EQ, a
+FabFilter) — chosen in its ⚙ ▸ **Effect**, first in its processing, before
+its compressor and limiter (the limiter stays last, whatever the plug-in
+does).
+
+- The plug-in runs **outside Nida**, in macOS's own plug-in host: one that
+  crashes takes its host down, not the show. Nida hands it each 10 ms of
+  sound on a thread of its own and never waits for it, so the bus plays
+  **20 ms later** with an effect, plus the plug-in's own delay (a
+  look-ahead, a voice isolator's: shown beside it, **+N ms**). The sound
+  without it — bypassed, a block late, or the plug-in failed — is held back
+  just as much, so the bus's timing does not move; only once, as the
+  plug-in loads and says its own delay. Lining it up with the picture:
+  count that in the bus's **Delay** (less delay needed by that much).
+- A block the plug-in has not finished in time is heard without it, and
+  counted (**late ×N** beside it). One that will not load — not installed
+  on this Mac, say — shows **⚠** (hover: why) and the bus is heard
+  without it; the show keeps it, for the Mac that has it.
+- **Bypass**: it keeps running, the bus is heard without it, faded over
+  10 ms either way.
+- Not on a **Live** bus: a plug-in that hangs would stop the device; a live
+  bus with one plays the usual way (its ⚠ says so).
+- **Open** shows the plug-in's own window (or Apple's plain list of its
+  controls, for one without a window) in the middle of the screen Nida's
+  own window is on, above it — never over a full-screen output, so the
+  audience never sees it. What is set there
+  is the plug-in's own: read from it every 2 seconds, saved with the show,
+  and given back to it when the show is opened again — kept as it is on a
+  Mac without the plug-in.
+
+### Sends and monitor mixes
+
+The bus buttons under each input strip turn its send to a bus on or off — at
+the send's level and point as set, at first full level and as the bus takes
+it (after the fader, unless the bus is a monitor mix). Each input's ⚙ ▸
+General ▸ **Sends** sets them, per bus:
+
+- the tick — sent there or not;
+- its **level**, down to **off** or up to +10 dB — kept while the send is
+  off, so it comes back where it was;
+- where it takes the input: **as bus** (after the fader, or before it on a
+  monitor-mix bus), **before fader** or **after fader**, whatever the bus.
+
+Before the fader leaves out the fader only: the input's **On**, Audio Auto
+and Stop/rundown fades still count. A stage microphone feeding a wedge wants
+Audio Auto off, so switching cameras does not take it out of the speaker's
+ear. Every change — a level, on or off, before or after — glides over 10 ms,
+so a mix can be built while the show runs. A monitor mix on a **Live** bus is
+mixed in the device's callback, as its speakers need it: its own input's
+send levels, the fader left out; a level there glides too (about 10 ms). The
+first time a microphone is sent to a Live bus its device opens again (a short
+gap for the whole bus), so do that before the show; after that, turning its
+send off and on only glides its level (up to eight microphones a bus).
+
+A Live bus opening plays nothing for its first moment and then fades in: a
+device that changes its buffer may replay old sound or swallow the start, so
+it is given about 0.3 s of silence before a smaller buffer and 0.12 s more
+after it starts. An open takes about half a second; once open, nothing of
+this happens again.
+
+To build a monitor mix fast, put its sends **on the faders**: right-click a
+bus's name ▸ **Sends on the faders**, or pick it under **Faders:** at the end
+of the inputs. The inputs' spine turns orange — **SENDS → WEDGE 1** — and each
+input's fader shows and moves its level to that bus (double-click: 0 dB); a
+send that is off is dimmed, and moving it keeps the level for when it is on.
+The On buttons and meters are still the inputs' own — On turns an input off
+on every bus, and the meter (marked "in") shows its own level (after its
+fader, or before it when it is not heard), not its send. Click the orange spine to go back to the main mix. Only
+the mixer's faders flip: the API, OSC and MIDI keep their meaning.
+
+On the usual path a bus takes each input after its **Delay** (the picture
+sync), before the fader or after; a Live bus takes its mics straight away.
 
 ## Headphones
 
@@ -270,8 +425,14 @@ Every control has an HTTP route (tag *Audio Mixer* in [API](13-api.md)), and
 ```
 POST /api/audio-buses                                {"name": "ROOM"}
 PUT  /api/audio-buses/{bus}/device                   {"device": "USB Audio", "first_channel": 0}
+PUT  /api/audio-buses/{bus}/live                     {"live": true, "frames": 64}   (frames optional: 32, 64, 128, 256)
+PUT  /api/audio-buses/{bus}/insert                   {"component": "aufx:lpas:appl"}   (null takes it out)
+PUT  /api/audio-buses/{bus}/insert/bypass            {"bypass": true}
+POST /api/audio-buses/{bus}/insert/window            (its window, on the screen of Nida's own)
+DELETE /api/audio-buses/{bus}/insert/window          (closes it)
 PUT  /api/audio-sources/{deck-or-input}/gain         {"gain_db": -6}
-PUT  /api/audio-sources/{deck-or-input}/sends/{bus}  {"on": true}
+PUT  /api/audio-sources/{deck-or-input}/sends/{bus}  {"on": true}   or any of {"on", "gain_db": -6, "mode": "inherit" | "pre" | "post"} (a level never turns a send on)
+PUT  /api/audio-buses/{bus}/pre-fader                {"pre_fader": true}
 PUT  /api/audio-sources/{deck}/auto                  {"auto": true}
 PUT  /api/audio-sources/{deck}/follow                {"bus_uuid": "main"}   (a bus, "main", or null for anywhere)
 PUT  /api/audio-sources/{deck-or-input}/balance      {"balance": -0.5}
@@ -282,6 +443,9 @@ PUT  /api/audio-monitor/device                       {"device": "Scarlett Solo 4
 PUT  /api/audio-monitor/listen                       {"bus_uuid": "<bus>"}
 POST /api/audio-sources/{deck-or-input}/speech-preset
 PUT  /api/audio-sources/{deck-or-input}/low-cut      {"enabled": true, "hz": 100, "slope_db": 24}
+PUT  /api/audio-sources/{deck-or-input}/gate         {"enabled": true, "threshold_db": -50, "range_db": 15, "attack_ms": 0.5, "hold_ms": 120, "release_ms": 250}
+PUT  /api/audio-sources/{deck-or-input}/de-esser     {"enabled": true, "hz": 6500, "threshold_db": -30, "range_db": 8}
+PUT  /api/audio-sources/{deck-or-input}/eq           {"enabled": true, "bands": [{"hz": 150, "gain_db": -3}, {"hz": 350}, {"hz": 3000, "gain_db": 2, "q": 1}, {"hz": 8000}]}
 PUT  /api/audio-sources/{deck-or-input}/leveler      {"enabled": true, "target_db": -20, "max_boost_db": 12, "max_cut_db": 12, "speed_secs": 3, "hold_below_db": -50}
 PUT  /api/audio-sources/{deck-or-input}/compressor   {"enabled": true, "threshold_db": -18, "ratio": 3, "attack_ms": 5, "release_ms": 150, "knee_db": 6, "makeup_db": 3}
 PUT  /api/audio-buses/{bus}/limiter                  {"enabled": true, "ceiling_db": -1, "release_ms": 100}
@@ -291,3 +455,14 @@ POST /api/audio-buses/{bus}/meters/reset             (its held peak)
 
 A processing route takes the whole setting: fields left out take their
 defaults — `enabled` false, except the limiter's, which is on.
+
+`audio_mix.output_channels` lists each output device's outputs by name (the
+pairs a bus can be set to; 0 when the device would not say). A bus or the
+headphones playing other than as set carries `device_note`: the pair it
+plays on instead, why it is not playing live, or why its device would not
+open. A bus set **Live** carries `live`: `true` while it plays live.
+`audio_mix.effects` lists the Audio Unit effects installed (name, maker,
+version, `component` codes); a bus with an effect carries `insert`
+(as set: `component`, `name`, `bypass`, and `settings`, the plug-in's own
+as a base64 property list) and `insert_status` (`state`: loading, playing, bypassed or
+failed, with `why`; `late_blocks`).

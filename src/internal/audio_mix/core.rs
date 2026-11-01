@@ -136,13 +136,47 @@ impl InputFeed {
             }
         }
         let nominal = f64::from(self.rate) / f64::from(SAMPLE_RATE);
-        let Some(step) = self.drift.step(&mut self.fifo, nominal) else {
+        let Some(step) = self.drift.step_for(&mut self.fifo, nominal, out.len()) else {
             return;
         };
         if self.reader.read(&mut self.fifo, step, out) < out.len() {
             self.drift.ran_dry();
         }
     }
+}
+
+/// One of a source's sends, as the mix plays it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Send {
+    /// The bus, by UUID.
+    pub bus: String,
+    /// Its level, linear.
+    pub gain: f32,
+    /// Taken before the source's fader — a monitor mix, the fader moving
+    /// the room and not the stage — or after it.
+    pub pre: bool,
+}
+
+impl From<&str> for Send {
+    /// A send to `bus` at unity, after the fader: as every send was before
+    /// sends had levels.
+    fn from(bus: &str) -> Self {
+        Self {
+            bus: bus.to_string(),
+            gain: 1.0,
+            pre: false,
+        }
+    }
+}
+
+/// A send's gains as last played, before and after the fader: each glides
+/// to where it is wanted over a block, a send switched between them
+/// crossfading, one turned off fading out in its last block.
+#[derive(Debug, Clone)]
+struct SendEnv {
+    bus: String,
+    pre: Frame,
+    post: Frame,
 }
 
 /// One source strip: a feed with its fader, mute and bus sends.
@@ -155,8 +189,10 @@ pub struct Source {
     /// Fader, in dB.
     pub gain_db: f32,
     pub muted: bool,
-    /// Buses this source is sent to, by UUID.
-    pub sends: Vec<String>,
+    /// Buses this source is sent to, with each send's level and point.
+    pub sends: Vec<Send>,
+    /// Each send's gains as last played (see [`SendEnv`]).
+    send_env: Vec<SendEnv>,
     /// How far this source is on air, 0 to 1, for a source that follows a
     /// video bus; 1 for one that does not. Set every frame by the renderer.
     pub gate: f32,
@@ -191,6 +227,7 @@ impl Source {
             gain_db: 0.0,
             muted: false,
             sends: Vec::new(),
+            send_env: Vec::new(),
             gate: 1.0,
             solo: false,
             balance: 0.0,
@@ -220,10 +257,20 @@ impl Source {
     }
 
     fn target_gain(&self) -> Frame {
+        self.gain_with(db_to_gain(self.gain_db))
+    }
+
+    /// Its gain for a send before its fader: all but the fader — its mute,
+    /// On and fades, its balance.
+    fn pre_fader_gain(&self) -> Frame {
+        self.gain_with(1.0)
+    }
+
+    fn gain_with(&self, fader: f32) -> Frame {
         if self.muted {
             return [0.0; 2];
         }
-        let g = db_to_gain(self.gain_db) * self.gate.clamp(0.0, 1.0);
+        let g = fader * self.gate.clamp(0.0, 1.0);
         let b = self.balance.clamp(-1.0, 1.0);
         [g * (1.0 - b).min(1.0), g * (1.0 + b).min(1.0)]
     }
@@ -275,6 +322,16 @@ impl OutputRing {
     }
 }
 
+/// A live bus's sources other than its mics (see `live`): what the mix
+/// sends its device's callback, summed after each source's own processing
+/// and fader and before the bus's — the callback runs the bus's processing
+/// over the mics and this together.
+pub struct LiveSend {
+    /// Sources mixed in the device's callback, by UUID: left out of this.
+    pub mics: Vec<String>,
+    pub tx: crossbeam_channel::Sender<Frame>,
+}
+
 /// One bus: the sum of what is sent to it, with its own fader, mute and delay,
 /// going to sound devices and to recordings and streams.
 pub struct Bus {
@@ -288,6 +345,11 @@ pub struct Bus {
     pub delay_ms: f32,
     /// Sound devices this bus plays on.
     pub outputs: Vec<Arc<OutputRing>>,
+    /// Played live: its device's callback mixes its mics, and gets the rest
+    /// from here.
+    pub live: Option<LiveSend>,
+    /// Its Audio Unit insert, first in its processing (see `insert`).
+    pub insert: Option<super::insert::Insert>,
     taps: Vec<Tap>,
     current: f32,
     meter: Frame,
@@ -305,6 +367,8 @@ impl Bus {
             muted: false,
             delay_ms: 0.0,
             outputs: Vec::new(),
+            live: None,
+            insert: None,
             taps: Vec::new(),
             current: 0.0,
             meter: [0.0; 2],
@@ -375,7 +439,13 @@ pub struct MixCore {
     pub monitor_listen: Option<String>,
     next_token: u64,
     scratch: Vec<Frame>,
+    /// A source's block before its fader, for its sends taken there.
+    pre_block: Vec<Frame>,
+    /// A send's share of a source's block.
+    send_block: Vec<Frame>,
     sums: Vec<Vec<Frame>>,
+    /// Each live bus's sum without its mics (see [`LiveSend`]).
+    live_sums: Vec<Vec<Frame>>,
     solo_sum: Vec<Frame>,
 }
 
@@ -388,7 +458,10 @@ impl Default for MixCore {
             monitor_listen: None,
             next_token: 0,
             scratch: Vec::new(),
+            pre_block: Vec::new(),
+            send_block: Vec::new(),
             sums: Vec::new(),
+            live_sums: Vec::new(),
             solo_sum: Vec::new(),
         }
     }
@@ -466,6 +539,9 @@ impl MixCore {
         {
             bus.delay.advance(frames);
             bus.dynamics.skip(blocks as usize);
+            if let Some(insert) = &mut bus.insert {
+                insert.skipped(blocks);
+            }
             for tap in &mut bus.taps {
                 // Blocks due before the tap was opened are not its to owe.
                 let before = tap
@@ -483,6 +559,8 @@ impl MixCore {
     }
 
     /// Mix one block of [`BLOCK_FRAMES`] and send every bus on its way.
+    // A send's gains are compared as set: exactly silent, exactly unity.
+    #[allow(clippy::float_cmp)]
     pub fn process_block(&mut self) {
         let n = BLOCK_FRAMES;
         self.scratch.resize(n, [0.0; 2]);
@@ -490,6 +568,13 @@ impl MixCore {
         for sum in &mut self.sums {
             sum.clear();
             sum.resize(n, [0.0; 2]);
+        }
+        self.live_sums.resize_with(self.buses.len(), Vec::new);
+        for (sum, bus) in self.live_sums.iter_mut().zip(&self.buses) {
+            sum.clear();
+            if bus.live.is_some() {
+                sum.resize(n, [0.0; 2]);
+            }
         }
         self.solo_sum.clear();
         self.solo_sum.resize(n, [0.0; 2]);
@@ -506,20 +591,72 @@ impl MixCore {
             }
             source.delay.run(&mut self.scratch, source.delay_ms);
             source.signal = fall(source.signal, peak_of(&self.scratch));
+            // Before its fader, for the sends that take it there.
+            let pre_heard = source.sends.iter().any(|s| s.pre)
+                || source.send_env.iter().any(|e| e.pre != [0.0; 2]);
+            if pre_heard {
+                self.pre_block.clear();
+                self.pre_block.extend_from_slice(&self.scratch);
+            }
+            let pre_gain = source.pre_fader_gain();
             let target = source.target_gain();
             let peak = ramp_sides(&mut self.scratch, source.current, target);
             source.current = target;
             source.meter = fall(source.meter, peak);
             source.held_peak =
                 std::array::from_fn(|channel| source.held_peak[channel].max(peak[channel]));
+            // Each send: its level on the block before or after the fader,
+            // gliding there over the block.
             for send in &source.sends {
-                if let Some(i) = self.buses.iter().position(|b| &b.uuid == send) {
-                    for (acc, frame) in self.sums[i].iter_mut().zip(&self.scratch) {
-                        acc[0] += frame[0];
-                        acc[1] += frame[1];
-                    }
+                if !source.send_env.iter().any(|e| e.bus == send.bus) {
+                    source.send_env.push(SendEnv {
+                        bus: send.bus.clone(),
+                        pre: [0.0; 2],
+                        post: [0.0; 2],
+                    });
                 }
             }
+            for env in &mut source.send_env {
+                let want = source.sends.iter().find(|s| s.bus == env.bus);
+                let pre_to = want
+                    .filter(|s| s.pre)
+                    .map_or([0.0; 2], |s| [pre_gain[0] * s.gain, pre_gain[1] * s.gain]);
+                let post_to = want.filter(|s| !s.pre).map_or([0.0; 2], |s| [s.gain; 2]);
+                if let Some(i) = self.buses.iter().position(|b| b.uuid == env.bus) {
+                    let to_live = self.buses[i]
+                        .live
+                        .as_ref()
+                        .is_some_and(|live| !live.mics.contains(&source.uuid));
+                    for (from, to, block) in [
+                        (env.pre, pre_to, &self.pre_block),
+                        (env.post, post_to, &self.scratch),
+                    ] {
+                        if from == [0.0; 2] && to == [0.0; 2] {
+                            continue;
+                        }
+                        // At unity, as it is: the sum as before sends had levels.
+                        let share = if from == [1.0; 2] && to == [1.0; 2] {
+                            block
+                        } else {
+                            self.send_block.clear();
+                            self.send_block.extend_from_slice(block);
+                            ramp_sides(&mut self.send_block, from, to);
+                            &self.send_block
+                        };
+                        add_into(&mut self.sums[i], share);
+                        if to_live {
+                            add_into(&mut self.live_sums[i], share);
+                        }
+                    }
+                }
+                env.pre = pre_to;
+                env.post = post_to;
+            }
+            // A send turned off has faded out over this block: gone.
+            let sends = &source.sends;
+            source
+                .send_env
+                .retain(|e| sends.iter().any(|s| s.bus == e.bus));
         }
 
         // What the monitor hears when nothing is soloed: its bus as mixed,
@@ -537,7 +674,24 @@ impl MixCore {
             vec![[0.0; 2]; n]
         };
 
+        // A live bus's device, the rest of the bus: a frame at a time, no
+        // allocation; full (the device not reading), what does not fit goes.
+        for (bus, sum) in self.buses.iter().zip(&self.live_sums) {
+            if let Some(live) = &bus.live {
+                for frame in sum {
+                    if live.tx.try_send(*frame).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+
         for (bus, sum) in self.buses.iter_mut().zip(&mut self.sums) {
+            // Its insert first, then its own processing: the limiter stays
+            // last, whatever a plug-in does.
+            if let Some(insert) = &mut bus.insert {
+                insert.process(sum);
+            }
             bus.dynamics.process_pre(sum);
             let target = if bus.muted {
                 0.0
@@ -726,6 +880,90 @@ mod tests {
         [s[s.len() - 2], s[s.len() - 1]]
     }
 
+    fn send(bus: &str, gain: f32, pre: bool) -> Send {
+        Send {
+            bus: bus.into(),
+            gain,
+            pre,
+        }
+    }
+
+    /// Every left sample a tap has had.
+    fn left_samples(tap: &BusTap) -> Vec<f32> {
+        let mut out = Vec::new();
+        while let Ok(chunk) = tap.receiver.try_recv() {
+            out.extend(chunk.samples.iter().step_by(2));
+        }
+        out
+    }
+
+    /// A send carries its level; one before the fader ignores the fader
+    /// (riding it for the room leaves the stage's mix as it is) but not the
+    /// source's On.
+    #[test]
+    fn a_send_carries_its_level_before_or_after_the_fader() {
+        let (mut mic, _) = fifo_source("mic", 0.5, 20);
+        mic.gain_db = -20.0;
+        mic.sends = vec![send("room", 0.5, false), send("wedge", 0.5, true)];
+        let mut core = core_with(vec![mic], &["room", "wedge"]);
+        let room = core.tap("room").unwrap();
+        let wedge = core.tap("wedge").unwrap();
+        for _ in 0..4 {
+            core.process_block();
+        }
+        let fader = db_to_gain(-20.0);
+        assert!(
+            (last_frame(&room)[0] - 0.25 * fader).abs() < 1e-5,
+            "after: level × fader"
+        );
+        assert!(
+            (last_frame(&wedge)[0] - 0.25).abs() < 1e-5,
+            "before: level alone"
+        );
+        core.sources[0].muted = true;
+        core.process_block();
+        core.process_block();
+        assert_eq!(
+            last_frame(&wedge),
+            [0.0, 0.0],
+            "off is off, before the fader too"
+        );
+    }
+
+    /// A send switched between before and after the fader, its level
+    /// changed, or turned off, while sound plays: each glides over a block —
+    /// no step — and a send turned off is forgotten once silent.
+    #[test]
+    fn send_changes_glide_and_an_off_send_is_forgotten() {
+        let (mut mic, _) = fifo_source("mic", 0.5, 40);
+        mic.gain_db = -20.0;
+        mic.sends = vec![send("wedge", 1.0, false)];
+        let mut core = core_with(vec![mic], &["wedge"]);
+        let wedge = core.tap("wedge").unwrap();
+        for block in 0..20 {
+            match block {
+                4 => core.sources[0].sends = vec![send("wedge", 1.0, true)],
+                8 => core.sources[0].sends = vec![send("wedge", 0.2, true)],
+                12 => core.sources[0].sends.clear(),
+                _ => {}
+            }
+            core.process_block();
+        }
+        let samples = left_samples(&wedge);
+        let step = samples
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
+        // Over a block, 0.45 moves 0.001 a sample; at once, all of it.
+        assert!(step < 0.002, "a step of {step}");
+        assert!(
+            (samples[8 * BLOCK_FRAMES - 1] - 0.5).abs() < 1e-5,
+            "before the fader: all of it"
+        );
+        assert_eq!(*samples.last().unwrap(), 0.0, "off");
+        assert!(core.sources[0].send_env.is_empty(), "forgotten once silent");
+    }
+
     #[test]
     fn source_processing_is_once_before_sends_and_fader_and_heard_on_pfl() {
         let (mut source, _) = fifo_source("mic", 0.5, 20);
@@ -740,11 +978,12 @@ mod tests {
             knee_db: 0.0,
             ..super::super::CompressorConfig::default()
         };
-        source.dynamics.configure(
-            super::super::LowCutConfig::default(),
-            super::super::LevelerConfig::default(),
-            config,
-        );
+        source
+            .dynamics
+            .configure(&super::super::dynamics::SourceSettings {
+                compressor: config,
+                ..Default::default()
+            });
         let mut core = core_with(vec![source], &["main", "aux"]);
         let main = core.tap("main").unwrap();
         let aux = core.tap("aux").unwrap();
@@ -958,6 +1197,85 @@ mod tests {
         assert!((s[0] - 0.5).abs() < 1e-6 && s[1].abs() < 1e-6, "{s:?}");
     }
 
+    /// A live bus's device gets from the mix every source sent to the bus
+    /// but the mics its own callback mixes, before the bus's fader (the
+    /// callback's); the bus as mixed — its recordings — keeps them all.
+    #[test]
+    fn a_live_bus_sends_its_device_all_but_its_live_mics() {
+        let (mut mic, _) = fifo_source("mic", 0.25, 4);
+        let (mut clip, _) = fifo_source("clip", 0.5, 4);
+        mic.sends = vec!["pa".into()];
+        clip.sends = vec!["pa".into()];
+        let mut core = core_with(vec![mic, clip], &["pa", "stream"]);
+        let (tx, rx) = crossbeam_channel::bounded(4 * BLOCK_FRAMES);
+        core.buses[0].live = Some(LiveSend {
+            mics: vec!["mic".into()],
+            tx,
+        });
+        core.buses[0].gain_db = -6.0;
+        let tap = core.tap("pa").unwrap();
+        core.process_block();
+        core.process_block();
+        let sent: Vec<Frame> = rx.try_iter().collect();
+        assert_eq!(sent.len(), 2 * BLOCK_FRAMES, "every frame");
+        let last = sent[sent.len() - 1];
+        assert!(
+            (last[0] - 0.5).abs() < 1e-6 && (last[1] + 0.5).abs() < 1e-6,
+            "the clip alone: {last:?}"
+        );
+        let mixed = last_frame(&tap);
+        let fader = db_to_gain(-6.0);
+        assert!(
+            (mixed[0] - 0.75 * fader).abs() < 1e-5,
+            "both, faded: {mixed:?}"
+        );
+    }
+
+    /// A bus's insert runs first in its processing, before its fader, and
+    /// the bus plays two blocks (20 ms) later.
+    #[test]
+    fn a_bus_insert_runs_first_two_blocks_late() {
+        struct Double;
+        impl super::super::insert::Effect for Double {
+            fn process(&mut self, block: &mut [Frame]) -> Result<(), i32> {
+                for f in block.iter_mut() {
+                    *f = [f[0] * 2.0, f[1] * 2.0];
+                }
+                Ok(())
+            }
+        }
+        let (mut src, _) = fifo_source("mic", 0.25, 12);
+        src.sends = vec!["pa".into()];
+        let mut core = core_with(vec![src], &["pa"]);
+        let insert = super::super::insert::Insert::new("pa", Box::new(|| Ok(Box::new(Double))));
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while insert.status.state() != super::super::insert::InsertState::Playing
+            && std::time::Instant::now() < end
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        core.buses[0].insert = Some(insert);
+        core.buses[0].gain_db = -6.0;
+        let tap = core.tap("pa").unwrap();
+        let mut lasts = Vec::new();
+        for _ in 0..6 {
+            core.process_block();
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            lasts.push(last_frame(&tap));
+        }
+        assert_eq!(
+            &lasts[..2],
+            &[[0.0, 0.0], [0.0, 0.0]],
+            "two blocks of silence first"
+        );
+        let want = 0.25 * 2.0 * db_to_gain(-6.0);
+        assert!(
+            (lasts[5][0] - want).abs() < 1e-4,
+            "doubled, then faded: {:?}",
+            lasts[5]
+        );
+    }
+
     #[test]
     fn two_sources_on_one_bus_add_up() {
         let (mut a, _) = fifo_source("a", 0.25, 4);
@@ -1067,7 +1385,11 @@ mod tests {
         core.process_block();
         let mic = core.source("mic").unwrap();
         assert!(mic.meter()[0] < 1e-3, "nothing heard");
-        assert!((mic.signal()[0] - 0.8).abs() < 1e-3, "what it plays: {:?}", mic.signal());
+        assert!(
+            (mic.signal()[0] - 0.8).abs() < 1e-3,
+            "what it plays: {:?}",
+            mic.signal()
+        );
     }
 
     #[test]
@@ -1176,6 +1498,14 @@ mod tests {
             .unwrap();
         }
         let mut out = [[0.0; 2]; BLOCK_FRAMES];
+        // The first look learns nothing of its blocks from a backlog: one
+        // more chunk, and it plays.
+        feed.pull(&mut out);
+        tx.send(PcmChunk {
+            samples: chunk.clone(),
+            lost_before: 0,
+        })
+        .unwrap();
         feed.pull(&mut out);
         assert!(
             out.iter()

@@ -187,6 +187,49 @@ Crop, Border and Transform each have a **Reset**, and so has every colour,
 key and other effect. **Reset all** on the Position tab puts crop, border,
 transform, opacity and blend back to how a new layer starts.
 
+### Reset input
+
+A camera or capture layer's right-click menu (a layer row, a deck card or an
+input's deck) has **Reset input**, as vMix's Reset: the device is closed and
+opened again — found afresh, in another USB port too, its formats read
+again — at the format chosen, and the sound taken with it is opened again.
+Its inputs keep its last picture for the moment it takes. The other layers
+on that camera take it too: they share its capture. Use it
+when a capture box's picture or sound has stuck after its source changed.
+
+### What a camera sends
+
+Under **📹 Camera picture**, a camera layer shows its **Signal** as its
+pictures say: size, the rate they come at, pixel format, colour matrix and
+the range they are read in — `1920×1200 · 60.00 fps · yuvs · BT.709 · video
+range` for a Magewell. Two things are pointed out when they do not match:
+
+- **Darks well below video black** in a picture read as video range: the
+  source may send full range (an ATEM's USB picture does), its shadows
+  crushed and whites clipped — **Read as Full** sets Colour range to Full.
+  Check against a black and a white in its picture: some cameras put a
+  little of their dark detail below video black.
+- **Frames at another rate** than the camera was opened for, by more than
+  2% — a source sending 50 fps to a camera opened for 60: **Use 1920×1080
+  50p** (the format of its size nearest the rate its frames come at, when
+  the camera offers one) opens it again at that; or set the source to the
+  camera's rate.
+
+`GET /api/state` has it for each camera layer as `camera_signal`.
+
+### Format
+
+**Format**, under the camera's picture, is the size and rate the camera is
+opened at: **Best**, or any it offers, as when adding it. Changed, the
+camera is closed and opened again at it — its inputs keep its last picture
+for the moment that takes — and every layer on that camera takes it: they
+share its capture. A layer added later on that camera takes it too. It is
+kept with the show; it is not a step **Undo** takes back.
+
+Over the API: `SetCameraMode` with the layer's `deck_uuid` and a `mode` from
+`GET /api/state/cameras` (`{"width":1920,"height":1080,"fps":50}`), or no
+`mode` for its best.
+
 ## The whole channel
 
 | Tab | |

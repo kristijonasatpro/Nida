@@ -166,10 +166,27 @@ pub struct PacingSnapshot {
     /// How often the control window is drawn, and why.
     #[serde(default)]
     pub control_rate: ControlRateStats,
+    /// The channels whose tiles the control window (and its panels'
+    /// windows) shows now, by index: an off-air one is drawn for its tile
+    /// only while it is seen.
+    #[serde(default)]
+    pub tiles_seen: Vec<usize>,
     /// How busy the GPU is (0–100), as the OS reports it (macOS: the
     /// accelerator's "Device Utilization %"); absent where it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_busy_pct: Option<f32>,
+    /// Nida's own share of the GPU (0–100), as Activity Monitor shows it
+    /// (macOS: its clients' accumulated GPU time); absent where unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_app_pct: Option<f32>,
+    /// Nida's own memory in bytes, as Activity Monitor's Memory column
+    /// (its physical footprint); absent where unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint_bytes: Option<u64>,
+    /// How the control window's Main and Preview monitors stepped through
+    /// the show's frames (see `monitor_frames`).
+    #[serde(default)]
+    pub control_monitors: ControlMonitorsStats,
     /// Where Nida's GPU time went over the last second, by part of the app
     /// (macOS: when each command buffer ran on the GPU); absent elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,6 +314,29 @@ pub struct ControlQueueStats {
     /// Frames presented and not yet reported shown, most over the last ten
     /// frames.
     pub waiting: u64,
+}
+
+/// How a monitor of the control window stepped through the show's frames,
+/// since Nida started: each window frame it picked one for, the next frame
+/// — or the same again (no newer one yet: a window faster than the show,
+/// or the show held up), or one or more skipped (the window drawn less
+/// often than the show, as while the show stands still). Counted as
+/// picked: a window frame given up before it was drawn (rare) counts too.
+#[derive(Clone, Copy, Debug, Default, Serialize, utoipa::ToSchema)]
+pub struct MonitorSteps {
+    /// Window frames it picked a frame for.
+    pub shown: u64,
+    /// Window frames it picked the same frame as the one before.
+    pub same_as_last: u64,
+    /// Window frames it skipped frames to (one count each, however many).
+    pub skipped: u64,
+}
+
+/// The Main and Preview monitors' steps.
+#[derive(Clone, Copy, Debug, Default, Serialize, utoipa::ToSchema)]
+pub struct ControlMonitorsStats {
+    pub main: MonitorSteps,
+    pub preview: MonitorSteps,
 }
 
 /// How often the control window is drawn, and why (see
@@ -706,10 +746,29 @@ pub struct TimecodeSnapshot {
 
 // ── Registry Snapshot ──────────────────────────────────────────────
 
+/// The moods the Broadcast backgrounds go by, in the order they are shown.
+pub const BROADCAST_MOODS: [&str; 5] = ["Tech", "Cyber", "Warm", "Calm", "Colours"];
+
+/// A Broadcast background: a generator for events, kept apart from the
+/// rest (see `shaders/broadcast_*.fs`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BroadcastLook {
+    /// Its shader, as `InputSource::Generator` names it.
+    pub name: String,
+    /// As the operator reads it: "Hex field".
+    pub title: String,
+    /// Tech, Cyber, Warm, Calm or Colours.
+    pub mood: String,
+    /// Its index among the generators.
+    pub index: usize,
+}
+
 #[derive(Clone, Serialize)]
 pub struct RegistrySnapshot {
-    /// Generator shaders: (name, index)
+    /// Generator shaders: (name, index) — the Broadcast backgrounds too.
     pub generators: Vec<(String, usize)>,
+    /// The Broadcast backgrounds, by mood: also among `generators`.
+    pub broadcast: Vec<BroadcastLook>,
     /// Filter shaders: (name, index)
     pub filters: Vec<(String, usize)>,
     /// Total shader count
@@ -790,6 +849,12 @@ pub struct DeckSnapshot {
     /// input).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slides: Option<crate::engine::value::slides::SlidesSnapshot>,
+    /// A lower third's rows, look and what is on air (None = not one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lower_third: Option<crate::engine::value::lower_third::LowerThirdSnapshot>,
+    /// A text input's text and look (None = not one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<crate::engine::value::text::TextSnapshot>,
     /// A timer's settings and what it reads (None = not a timer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timer: Option<crate::engine::value::timer::TimerSnapshot>,
@@ -817,6 +882,16 @@ pub struct DeckSnapshot {
     /// camera).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camera_lowest_latency: Option<bool>,
+    /// What a camera sends, as its pictures say: size, rate, format,
+    /// matrix, range (None = not a camera, or no picture read yet).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camera_signal: Option<crate::engine::value::camera::CameraSignal>,
+    /// A camera layer's camera, by id (`GET /api/state/cameras`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camera_id: Option<crate::camera::CameraId>,
+    /// The format a camera layer's camera is opened at; none, its best.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camera_mode: Option<crate::engine::value::camera::CameraMode>,
     pub opacity: f32,
     pub effective_opacity: f32,
     pub blend_mode: BlendMode,
@@ -923,6 +998,9 @@ pub struct ParamSnapshot {
     pub value: ParamValue,
     pub min: Option<f32>,
     pub max: Option<f32>,
+    /// A list setting's choices: each value and its name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choices: Option<Vec<(i32, String)>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1241,6 +1319,14 @@ pub struct CameraSnapshot {
     pub modes: Vec<(CameraId, Vec<crate::engine::value::camera::CameraMode>)>,
     /// The OS refuses this app the cameras (Camera access off on a Mac).
     pub access_denied: bool,
+    /// The cameras whose sound comes with their pictures (Blackmagic
+    /// inputs): into the mixer by themselves.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub with_own_sound: Vec<CameraId>,
+    /// The cameras that take the format coming in, whatever they were
+    /// opened at (a Blackmagic input that tells it): no format to choose.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub following_signal: Vec<CameraId>,
     /// macOS camera effects on for this app (Portrait, Studio Light, Edge
     /// Light, Background, Reactions gestures): each changes every camera's
     /// picture, on air too.
@@ -1473,6 +1559,7 @@ mod tests {
             },
             registry: RegistrySnapshot {
                 generators: vec![],
+                broadcast: vec![],
                 filters: vec![],
                 shader_count: 0,
             },
@@ -1486,6 +1573,8 @@ mod tests {
                 devices: vec![],
                 modes: vec![],
                 access_denied: false,
+                with_own_sound: Vec::new(),
+                following_signal: Vec::new(),
                 video_effects: Vec::new(),
             },
             depth_sensors: DepthSensorSnapshot { devices: vec![] },
@@ -1572,6 +1661,7 @@ mod tests {
             },
             registry: RegistrySnapshot {
                 generators: vec![("Sine".into(), 0)],
+                broadcast: vec![],
                 filters: vec![],
                 shader_count: 1,
             },
@@ -1585,6 +1675,8 @@ mod tests {
                 devices: vec![],
                 modes: vec![],
                 access_denied: false,
+                with_own_sound: Vec::new(),
+                following_signal: Vec::new(),
                 video_effects: Vec::new(),
             },
             depth_sensors: DepthSensorSnapshot { devices: vec![] },
@@ -1735,6 +1827,8 @@ mod tests {
             playlist: None,
             slides: None,
             timer: None,
+            lower_third: None,
+            text: None,
             presentation: None,
             presenter_of: None,
             presenter_layout: None,
@@ -1742,6 +1836,9 @@ mod tests {
             camera_colour: None,
             camera_profile: None,
             camera_lowest_latency: None,
+            camera_signal: None,
+            camera_id: None,
+            camera_mode: None,
             opacity: 1.0,
             effective_opacity: 0.5,
             blend_mode: BlendMode::Normal,

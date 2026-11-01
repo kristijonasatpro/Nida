@@ -347,7 +347,14 @@ fn same_value(a: &crate::params::ParamValue, b: &crate::params::ParamValue) -> b
 
 /// Transform's settings that only say where the picture goes and how big:
 /// two copies may differ in these and still be one picture.
-const PLACEMENT: &[&str] = &["pos_x", "pos_y", "scale", "scale_mode", "scale_x", "scale_y"];
+const PLACEMENT: &[&str] = &[
+    "pos_x",
+    "pos_y",
+    "scale",
+    "scale_mode",
+    "scale_x",
+    "scale_y",
+];
 
 /// A deck's effects that are on, in order (an offline one is not run).
 fn enabled_effects(deck: &Deck) -> Vec<&crate::deck::Effect> {
@@ -422,15 +429,19 @@ fn drawn_alike(a: &Deck, b: &Deck, modulation: &crate::modulation::ModulationEng
     if !still(a) || !still(b) || !crisp_crops(a, modulation) || !crisp_crops(b, modulation) {
         return false;
     }
-    let settings_alike = |x: &crate::params::ShaderParams,
-                          y: &crate::params::ShaderParams,
-                          skip: &[&str]| {
-        let keys = x.values.keys().chain(y.values.keys()).filter(|k| !skip.contains(&k.as_str()));
-        keys.into_iter().all(|k| match (x.values.get(k), y.values.get(k)) {
-            (Some(p), Some(q)) => same_value(p, q),
-            _ => false,
-        })
-    };
+    let settings_alike =
+        |x: &crate::params::ShaderParams, y: &crate::params::ShaderParams, skip: &[&str]| {
+            let keys = x
+                .values
+                .keys()
+                .chain(y.values.keys())
+                .filter(|k| !skip.contains(&k.as_str()));
+            keys.into_iter()
+                .all(|k| match (x.values.get(k), y.values.get(k)) {
+                    (Some(p), Some(q)) => same_value(p, q),
+                    _ => false,
+                })
+        };
     let (ea, eb) = (enabled_effects(a), enabled_effects(b));
     a.scaling_mode() == b.scaling_mode()
         && settings_alike(&a.generator_params, &b.generator_params, &[])
@@ -494,7 +505,8 @@ fn gaps(rect: [f32; 4], at: [f32; 4], width: u32, height: u32) -> Option<Vec<Pix
     if size[0] <= 0.0 || size[1] <= 0.0 {
         return None;
     }
-    let place = |v: f32, axis: usize| at[axis] + (v - rect[axis]) / size[axis] * (at[axis + 2] - at[axis]);
+    let place =
+        |v: f32, axis: usize| at[axis] + (v - rect[axis]) / size[axis] * (at[axis + 2] - at[axis]);
     let edge = |v: f32, axis: usize, inside: bool| Edge(place(v, axis), inside);
     let [x0, y0, x1, y1] = rect;
     // A band ends at the frame's edge — 0 or 1, which the own picture draws
@@ -561,7 +573,9 @@ fn plain_tap(deck: &Deck, modulation: &crate::modulation::ModulationEngine) -> b
             .filter(|e| e.enabled && e.offline().is_none())
             .all(|e| match e.shader.name().as_str() {
                 "crop" => e.is_neutral_framing(modulation),
-                "transform" => e.plain_placement(modulation).is_some() && e.flips() == [false, false],
+                "transform" => {
+                    e.plain_placement(modulation).is_some() && e.flips() == [false, false]
+                }
                 _ => false,
             })
 }
@@ -607,7 +621,10 @@ pub(super) fn merge_key(deck: &Deck) -> Option<String> {
 /// transform, in the order its effects come — or the whole frame where they
 /// do more than crop, move and scale (inverted, turned, modulated…), which
 /// no rectangle here can say.
-pub(super) fn layer_rect(deck: &Deck, modulation: &crate::modulation::ModulationEngine) -> [f32; 4] {
+pub(super) fn layer_rect(
+    deck: &Deck,
+    modulation: &crate::modulation::ModulationEngine,
+) -> [f32; 4] {
     let mut rect = FRAME;
     // An offline effect is kept, not run: it moves nothing.
     for effect in deck
@@ -687,7 +704,10 @@ fn mapping(own: [f32; 4], shown: [f32; 4]) -> Option<([f32; 2], [f32; 2])> {
         (own[2] - own[0]) / shown_size[0],
         (own[3] - own[1]) / shown_size[1],
     ];
-    Some((scale, [own[0] - shown[0] * scale[0], own[1] - shown[1] * scale[1]]))
+    Some((
+        scale,
+        [own[0] - shown[0] * scale[0], own[1] - shown[1] * scale[1]],
+    ))
 }
 
 /// A pass clearing `view` to nothing.
@@ -775,7 +795,10 @@ impl Mixer {
         if fade.transition == MainTransition::Fade {
             return None;
         }
-        let size = (self.composite_texture.width(), self.composite_texture.height());
+        let size = (
+            self.composite_texture.width(),
+            self.composite_texture.height(),
+        );
         if self.main_transitions.targets.as_ref().map(|t| t.size) != Some(size) {
             self.main_transitions.targets = Some(TransitionTargets::new(context, size));
         }
@@ -822,9 +845,11 @@ impl Mixer {
         // the old: the edge from just before the frame to just past it.
         let softness = effect.params.get_float("softness").unwrap_or(0.0).max(0.0);
         #[allow(clippy::cast_precision_loss)]
-        let aspect = self.main_transitions.targets.as_ref().map_or(16.0 / 9.0, |t| {
-            t.size.0 as f32 / t.size.1.max(1) as f32
-        });
+        let aspect = self
+            .main_transitions
+            .targets
+            .as_ref()
+            .map_or(16.0 / 9.0, |t| t.size.0 as f32 / t.size.1.max(1) as f32);
         let progress = match transition {
             MainTransition::Wipe => -softness + shown * (1.0 + 2.0 * softness),
             MainTransition::Iris => {
@@ -847,7 +872,9 @@ impl Mixer {
         }
         effect.params.build_buffer_data();
         if let Some(buffer) = effect.params.buffer() {
-            context.queue.write_buffer(buffer, 0, effect.params.scratch());
+            context
+                .queue
+                .write_buffer(buffer, 0, effect.params.scratch());
         }
         #[allow(clippy::cast_precision_loss)]
         let uniforms = ISFUniforms {
@@ -1012,7 +1039,9 @@ impl Mixer {
                     place(new[*j].rect)
                 )),
                 Some(j) => {
-                    let why = travels(layer, &new[*j]).err().unwrap_or("drawn differently");
+                    let why = travels(layer, &new[*j])
+                        .err()
+                        .unwrap_or("drawn differently");
                     crossfaded.push((layer.name.clone(), why.to_string()));
                 }
                 None => fades.push(format!("'{}' out", layer.name)),
@@ -1060,11 +1089,7 @@ impl Mixer {
     /// picture and a plain tap of it: each side's own picture then moves,
     /// and fills the other's gaps (see `fill`).
     fn alike(&self, a: &Layer<'_>, b: &Layer<'_>) -> bool {
-        let deck_of = |layer: &Layer<'_>| {
-            layer
-                .deck
-                .map(|(c, d)| &self.channels[c].decks[d].deck)
-        };
+        let deck_of = |layer: &Layer<'_>| layer.deck.map(|(c, d)| &self.channels[c].decks[d].deck);
         match (deck_of(a), deck_of(b)) {
             (Some(x), Some(y)) => drawn_alike(x, y, &self.modulation),
             (Some(tap), None) | (None, Some(tap)) => plain_tap(tap, &self.modulation),
@@ -1088,11 +1113,7 @@ impl Mixer {
         (width, height): (u32, u32),
     ) -> Option<Fill<'a>> {
         let within = gaps(own.rect, at, width, height)?;
-        let deck_of = |layer: &Layer<'_>| {
-            layer
-                .deck
-                .map(|(c, d)| &self.channels[c].decks[d].deck)
-        };
+        let deck_of = |layer: &Layer<'_>| layer.deck.map(|(c, d)| &self.channels[c].decks[d].deck);
         let own_deck = deck_of(own);
         let plain = |d: &&Deck| plain_tap(d, &self.modulation) && d.maps_source_one_to_one();
         if let Some(tap) = own_deck.filter(plain) {
@@ -1251,24 +1272,32 @@ impl Mixer {
             (&old, &old_fill, &old_travel, &old_shown, &targets.from_view),
             (&new, &new_fill, &new_travel, &new_shown, &targets.to_view),
         ] {
-            for (((layer, fill), travel), at) in layers.iter().zip(fills).zip(travel_of).zip(shown_at) {
+            for (((layer, fill), travel), at) in
+                layers.iter().zip(fills).zip(travel_of).zip(shown_at)
+            {
                 // A travelling pair's picture, on both sides at the strength
                 // between theirs, so it shows once whatever the mix.
                 // Else its own picture everywhere — a layer's own picture is
                 // straight alpha, a channel's premultiplied, both drawn
                 // premultiplied over the rest — then the other side's in its
                 // gaps, as it would show it.
-                let draws: Vec<Draw<'_>> =
-                    if let Some(k) = *travel {
-                        vec![(&frames[k].view, FRAME, FRAME, None, 2, pictures[k].3)]
-                    } else {
-                        let own_mode = if layer.premultiplied { 1 } else { 2 };
-                        std::iter::once((layer.view, layer.rect, *at, None, own_mode, layer.opacity))
-                            .chain(fill.as_ref().map(|(view, rect, within, mode)| {
-                                (*view, *rect, *at, Some(within.as_slice()), *mode, layer.opacity)
-                            }))
-                            .collect()
-                    };
+                let draws: Vec<Draw<'_>> = if let Some(k) = *travel {
+                    vec![(&frames[k].view, FRAME, FRAME, None, 2, pictures[k].3)]
+                } else {
+                    let own_mode = if layer.premultiplied { 1 } else { 2 };
+                    std::iter::once((layer.view, layer.rect, *at, None, own_mode, layer.opacity))
+                        .chain(fill.as_ref().map(|(view, rect, within, mode)| {
+                            (
+                                *view,
+                                *rect,
+                                *at,
+                                Some(within.as_slice()),
+                                *mode,
+                                layer.opacity,
+                            )
+                        }))
+                        .collect()
+                };
                 for (view, rect, at, within, mode, opacity) in draws {
                     let Some((scale, offset)) = mapping(rect, at) else {
                         continue;
@@ -1364,16 +1393,27 @@ mod tests {
         assert_eq!(between_framing(&WHOLE, &WHOLE, 0.5).crop, None);
 
         let (from, to) = (with(None), with(Some(crop(Some(border)))));
-        let start = between_framing(&from, &to, 0.0).crop.expect("cropped on its way");
+        let start = between_framing(&from, &to, 0.0)
+            .crop
+            .expect("cropped on its way");
         assert_eq!((start.left, start.strength), (0.0, 0.0));
-        assert_eq!(start.border.map(|b| (b.width, b.circle, b.strength)), Some((0.0, 0.0, 0.0)));
+        assert_eq!(
+            start.border.map(|b| (b.width, b.circle, b.strength)),
+            Some((0.0, 0.0, 0.0))
+        );
         let end = between_framing(&from, &to, 1.0).crop.expect("cropped");
         assert_eq!(end, crop(Some(border)));
 
         let (from, to) = (with(Some(crop(None))), with(Some(crop(Some(border)))));
         let start = between_framing(&from, &to, 0.0).crop.expect("cropped");
-        assert_eq!((start.left, start.feather, start.strength), (0.25, 0.1, 1.0));
-        assert_eq!(start.border.map(|b| (b.width, b.color, b.strength)), Some((0.0, border.color, 0.0)));
+        assert_eq!(
+            (start.left, start.feather, start.strength),
+            (0.25, 0.1, 1.0)
+        );
+        assert_eq!(
+            start.border.map(|b| (b.width, b.color, b.strength)),
+            Some((0.0, border.color, 0.0))
+        );
     }
 
     #[test]
@@ -1390,7 +1430,8 @@ mod tests {
     /// picture from there, not from where it was before the flip.
     #[test]
     fn a_flipped_crop_merges_from_its_mirrored_place() {
-        let ctx = crate::renderer::GpuContext::new_headless().expect("headless GPU required for tests");
+        let ctx =
+            crate::renderer::GpuContext::new_headless().expect("headless GPU required for tests");
         let shaders = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
         let mut deck = Deck::new_solid_color(&ctx, [1.0; 4], 64, 36).expect("deck");
         for name in ["crop", "transform"] {
@@ -1409,6 +1450,9 @@ mod tests {
 
     #[test]
     fn halfway_between_two_rectangles() {
-        assert_eq!(between([0.0, 0.0, 0.5, 0.5], [0.5, 0.5, 1.0, 1.0], 0.5), [0.25, 0.25, 0.75, 0.75]);
+        assert_eq!(
+            between([0.0, 0.0, 0.5, 0.5], [0.5, 0.5, 1.0, 1.0], 0.5),
+            [0.25, 0.25, 0.75, 0.75]
+        );
     }
 }

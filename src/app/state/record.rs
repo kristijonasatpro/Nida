@@ -116,7 +116,7 @@ impl super::super::VardaApp {
             if free_bytes.is_some_and(|b| b < crate::record::LOW_SPACE_BYTES) {
                 Some("The disk is nearly full".into())
             } else if behind {
-                Some("The encoder cannot keep up — frames are being repeated".into())
+                Some("The encoder cannot keep up — frames are left out or repeated".into())
             } else {
                 None
             }
@@ -139,6 +139,7 @@ impl super::super::VardaApp {
             problem,
             dropped: self.recording.dropped_before + self.recording.dropped_seen,
             fps,
+            file_fps: self.recording.settings.options.fps.unwrap_or(fps).max(1),
             last_file,
             audio_bus: match self.recording.output.first() {
                 Some(UnifiedOutput::Headless(h)) => h.audio_bus.clone(),

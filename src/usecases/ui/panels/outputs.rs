@@ -194,7 +194,7 @@ pub(super) fn render_output_section(ui: &mut egui::Ui, data: &UIData, actions: &
                     // A Blackmagic output is 8-bit YUV whatever is asked:
                     // its card has its own Levels instead.
                     if !matches!(output.target, OutputTarget::DeckLink { .. }) {
-                        render_presentation_controls(ui, &output.uuid, output, actions);
+                        render_presentation_controls(ui, &output.uuid, output, data, actions);
                     }
                 });
             ui.add_space(4.0);
@@ -206,6 +206,7 @@ fn render_presentation_controls(
     ui: &mut egui::Ui,
     output_uuid: &str,
     output: &super::super::OutputUI,
+    data: &UIData,
     actions: &mut UIActions,
 ) {
     use crate::engine::value::render::{PresentationDepth, PresentationRequest};
@@ -283,6 +284,25 @@ fn render_presentation_controls(
         });
     }
 
+    // An NDI output with no NDI runtime sends nothing, whatever its format.
+    if matches!(output.target, OutputTarget::NdiSend { .. }) && !data.ndi_available {
+        ui.label(
+            egui::RichText::new(NO_NDI_RUNTIME)
+                .small()
+                .color(egui::Color32::from_rgb(255, 110, 100)),
+        )
+        .on_hover_text(if cfg!(target_os = "macos") {
+            "No NDI runtime was loaded when Nida started: it is not installed, or NDI is \
+             turned off (--no-ndi). Nida uses libndi.dylib in /usr/local/lib or the NDI SDK \
+             for Apple's folder; NDI Tools' apps carry their own and do not add it. Install \
+             the NDI SDK for Apple from ndi.video, or with Homebrew: brew install --cask \
+             libndi — then reopen Nida."
+        } else {
+            "No NDI runtime was loaded when Nida started: it is not installed, or NDI is \
+             turned off (--no-ndi). Install the NDI runtime from ndi.video, then reopen Nida."
+        });
+        return;
+    }
     let resolved = &output.resolved_presentation;
     let status = format!(
         "Delivering {} · {}",
@@ -303,6 +323,9 @@ fn render_presentation_controls(
         );
     }
 }
+
+/// What an NDI output says with no NDI runtime to send with.
+const NO_NDI_RUNTIME: &str = "Not sent: no NDI runtime loaded (not installed, or NDI turned off)";
 
 /// Controls specific to windowed outputs (display selector, calibration, surfaces).
 fn render_windowed_controls(
@@ -1698,6 +1721,39 @@ mod tests {
         harness.run();
         harness.get_by_label("Delivering 8-bit SDR · BGRA8");
         harness.get_by_label("10-bit fallback: Syphon interoperability is limited to BGRA8");
+    }
+
+    /// An NDI output with no NDI runtime says it sends nothing, not that
+    /// it is delivering.
+    #[test]
+    fn an_ndi_output_without_the_runtime_says_so() {
+        use crate::engine::value::render::ResolvedPresentation;
+        let mut data = UIData::test_fixture();
+        let mut output = sample_output(ResolvedPresentation::default());
+        output.target = OutputTarget::NdiSend {
+            sender_name: "Nida NDI".into(),
+        };
+        data.outputs.push(output);
+        for available in [false, true] {
+            data.ndi_available = available;
+            let mut actions = UIActions::new();
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(420.0, 900.0))
+                .build_ui(|ui| render_output_section(ui, &data, &mut actions));
+            harness.run();
+            assert_eq!(
+                harness.query_by_label(NO_NDI_RUNTIME).is_some(),
+                !available,
+                "runtime {available}"
+            );
+            assert_eq!(
+                harness
+                    .query_by_label_contains("Delivering")
+                    .is_some(),
+                available,
+                "runtime {available}"
+            );
+        }
     }
 
     #[test]

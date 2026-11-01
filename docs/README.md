@@ -69,6 +69,9 @@ New to Nida? Start with [Main mode](18-main.md), [Screen Layouts](20-layouts.md)
   - [Over the API](22-led-screens.md#over-the-api)
 - **23. [Adding Inputs](23-adding-inputs.md)** — like vMix's Add Input: clips, pictures, cameras and capture cards, NDI, desktop capture, streams, web pages, colours and sound devices, each a new input
   - [Cameras and capture cards](23-adding-inputs.md#cameras-and-capture-cards) — format (size and frame rate), the camera's own sound
+  - [Broadcast backgrounds](23-adding-inputs.md#broadcast-backgrounds) — calm moving backgrounds for events by mood (tech, cyber, warm, calm, colours): Speed, Density, Calm centre, palettes
+  - [Text](23-adding-inputs.md#text) — lines of text in any font, edited live on air, with a box, outline, shadow and a fade
+  - [Lower thirds](23-adding-inputs.md#lower-thirds) — names and titles on a plate from a typed list or an organiser's CSV (Lithuanian Excel too, read again when saved): Show/Hide/Next, palettes, Cut/Fade/Slide/Wipe
   - [NDI](23-adding-inputs.md#ndi) — the runtime, sources on the network, their sound; sending NDI with an audio bus
   - [Desktop capture](23-adding-inputs.md#desktop-capture) — displays and windows, Screen Recording access
   - [Over the API](23-adding-inputs.md#over-the-api) — `POST /api/inputs`
@@ -175,6 +178,7 @@ Parts III–VI are the engine underneath, from Varda, with Nida's additions.
   - [Swagger UI](13-api.md#swagger-ui)
   - [Running a show remotely](13-api.md#running-a-show-remotely)
   - [Setting up a show with an AI agent](13-api.md#setting-up-a-show-with-an-ai-agent)
+  - [An agent beside a live show](13-api.md#an-agent-beside-a-live-show) — looking before touching, read-only measuring, the shared Undo, names and text
   - [Headless Mode](13-api.md#headless-mode)
   - [WebSocket](13-api.md#websocket)
   - [Common Patterns](13-api.md#common-patterns)
