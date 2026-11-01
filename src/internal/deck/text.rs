@@ -111,6 +111,7 @@ impl Painter {
 /// own deck's picture, and for drawing over a bus's with placement
 /// settings of its own.
 struct Face {
+    texture: wgpu::Texture,
     size: (u32, u32),
     frame: (u32, u32),
     bind_group: wgpu::BindGroup,
@@ -136,6 +137,8 @@ pub struct Text {
     drawn: Option<Spec>,
     asked: Option<Vec<Spec>>,
     painter: Painter,
+    /// Latest completed drawing per frame, including failures and empty text.
+    completed: Vec<(Spec, Option<String>)>,
     /// How far shown (0 hidden, 1 shown) when `since`, and toward which.
     fade_from: f32,
     since: Instant,
@@ -166,6 +169,7 @@ impl Text {
             drawn: None,
             asked: None,
             painter: Painter::start(),
+            completed: Vec::new(),
             fade_from: shown,
             since: Instant::now(),
         })
@@ -191,8 +195,22 @@ impl Text {
     }
 
     pub fn snapshot(&self) -> TextSnapshot {
+        let frames = self.frames();
+        let current = |frame| {
+            self.completed.iter().find(|(done, _)| {
+                done.frame == frame
+                    && done.text == self.settings.text
+                    && done.look == self.settings.look
+            })
+        };
+        let pending = frames.iter().any(|frame| current(*frame).is_none());
+        let error = frames
+            .iter()
+            .find_map(|frame| current(*frame).and_then(|(_, error)| error.clone()));
         TextSnapshot {
             settings: self.settings.clone(),
+            pending,
+            error,
         }
     }
 
@@ -256,6 +274,8 @@ impl Text {
     /// back.
     pub fn tick(&mut self) {
         let wanted = self.wanted();
+        self.completed
+            .retain(|(done, _)| wanted.iter().any(|spec| spec.frame == done.frame));
         if self.asked.as_ref() != Some(&wanted) {
             self.painter.ask(wanted.clone());
             self.asked = Some(wanted);
@@ -279,6 +299,8 @@ impl Text {
         if !frames.contains(&frame) {
             return;
         }
+        self.completed.retain(|(done, _)| done.frame != frame);
+        self.completed.push((spec.clone(), drawing.as_ref().err().map(|()| format!("Text could not be drawn at {}×{}. Any previous picture is retained. Try a smaller size or check the log.", frame.0, frame.1))));
         let Ok(image) = drawing else {
             // Not drawn: the picture before stays on air — after a resize
             // too, scaled, until one is drawn.
@@ -287,11 +309,45 @@ impl Text {
             }
             return;
         };
-        self.faces.retain(|f| f.frame != frame);
         if let Some(image) = image {
-            let (_, view) = super::source::upload_image_texture(&self.context, &image);
+            if let Some(face) = self
+                .faces
+                .iter()
+                .find(|face| face.frame == frame && face.size == image.dimensions())
+            {
+                self.context.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &face.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &image,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * face.size.0),
+                        rows_per_image: Some(face.size.1),
+                    },
+                    wgpu::Extent3d {
+                        width: face.size.0,
+                        height: face.size.1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                if frame == self.frame {
+                    self.main_frame = Some(frame);
+                    self.drawn = Some(spec);
+                }
+                let main = self.main_frame;
+                self.faces
+                    .retain(|f| frames.contains(&f.frame) || Some(f.frame) == main);
+                return;
+            }
+            self.faces.retain(|f| f.frame != frame);
+            let (texture, view) = super::source::upload_image_texture(&self.context, &image);
             let over_params = Placer::params(&self.context.device);
             self.faces.push(Face {
+                texture,
                 size: image.dimensions(),
                 frame,
                 bind_group: self.blit.create_bind_group(&self.context.device, &view),
@@ -300,6 +356,8 @@ impl Text {
                     .bind(&self.context.device, &view, &view, &over_params),
                 over_params,
             });
+        } else {
+            self.faces.retain(|face| face.frame != frame);
         }
         if frame == self.frame {
             self.main_frame = Some(frame);
@@ -848,6 +906,87 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_texture_reuse_and_error_recovery() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            assert!(
+                std::env::var_os("VARDA_REQUIRE_GPU").is_none(),
+                "required GPU unavailable"
+            );
+            return;
+        };
+        let mut text = Text::new(&gpu, TextSettings::default(), (640, 360)).unwrap();
+        assert!(text.snapshot().pending);
+        let initial = text.wanted().remove(0);
+        let image = image::RgbaImage::from_pixel(4, 3, image::Rgba([255, 0, 0, 128]));
+        text.put(initial.clone(), Ok(Some(image.clone())));
+        let texture = text.main_face().unwrap().texture.clone();
+        assert!(!text.snapshot().pending);
+        text.set_settings(TextSettings {
+            text: "Edited".into(),
+            ..TextSettings::default()
+        });
+        assert!(text.snapshot().pending);
+        let edited = text.wanted().remove(0);
+        text.put(edited.clone(), Err(()));
+        assert!(!text.snapshot().pending);
+        assert!(text.snapshot().error.as_ref().unwrap().contains("640×360"));
+        assert_eq!(text.main_face().unwrap().texture, texture);
+        text.put(edited.clone(), Ok(Some(image)));
+        assert!(text.snapshot().error.is_none());
+        assert_eq!(
+            text.main_face().unwrap().texture,
+            texture,
+            "same size reuses GPU texture and bindings"
+        );
+        text.put(edited.clone(), Ok(Some(image::RgbaImage::new(5, 3))));
+        assert_ne!(
+            text.main_face().unwrap().texture,
+            texture,
+            "size changes replace texture"
+        );
+        text.put(edited, Ok(None));
+        assert!(
+            text.main_face().is_none(),
+            "empty text clears the previous picture"
+        );
+    }
+
+    #[test]
+    fn text_error_status_tracks_target_frames_and_current_edits() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            assert!(
+                std::env::var_os("VARDA_REQUIRE_GPU").is_none(),
+                "required GPU unavailable"
+            );
+            return;
+        };
+        let mut text = Text::new(&gpu, TextSettings::default(), (640, 360)).unwrap();
+        text.set_target_frames(&[(320, 180)]);
+        let wanted = text.wanted();
+        text.put(wanted[0].clone(), Ok(None));
+        assert!(text.snapshot().pending, "target still pending");
+        text.put(wanted[1].clone(), Err(()));
+        assert!(!text.snapshot().pending);
+        assert!(text.snapshot().error.unwrap().contains("320×180"));
+        text.set_settings(TextSettings {
+            text: "New edit".into(),
+            ..TextSettings::default()
+        });
+        assert!(text.snapshot().pending);
+        assert!(
+            text.snapshot().error.is_none(),
+            "old edit failures are not reported for new text"
+        );
+        text.set_target_frames(&[]);
+        text.put(text.wanted().remove(0), Ok(None));
+        assert!(!text.snapshot().pending);
+        assert!(
+            text.snapshot().error.is_none(),
+            "removed target failures do not persist"
+        );
+    }
 
     fn spec(text: &str) -> Spec {
         Spec {

@@ -209,6 +209,11 @@ impl TextSettings {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
 pub struct TextSnapshot {
     pub settings: TextSettings,
+    /// A current drawing is still being prepared for this input or a target bus.
+    pub pending: bool,
+    /// The latest drawing failed; any previous picture is retained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[cfg(test)]

@@ -41,6 +41,11 @@ pub(super) fn render_controls(
 ) {
     ui.separator();
     ui.strong("Text");
+    if let Some(error) = &text.error {
+        ui.colored_label(WARN, error);
+    } else if text.pending {
+        ui.weak("Updating text…");
+    }
     lines(ui, deck, text, actions);
     shown(ui, deck, text, actions);
     // Where it comes on: Main, and buses — over what each shows.
@@ -337,6 +342,33 @@ mod tests {
     use crate::usecases::ui::UIData;
     use egui_kittest::kittest::Queryable;
 
+    #[test]
+    fn text_render_failure_is_visible_without_changing_settings() {
+        let data = UIData::test_fixture();
+        let (ch, dk) = data.selected_deck.unwrap();
+        let deck = data.channels[ch].decks[dk].clone();
+        let text = TextSnapshot {
+            settings: TextSettings::default(),
+            pending: false,
+            error: Some("Text could not be drawn; previous picture retained".into()),
+        };
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 900.0))
+            .build_ui_state(
+                move |ui, sent: &mut Vec<EngineCommand>| {
+                    let mut actions = UIActions::new();
+                    render_controls(ui, &data, &deck, &text, &mut actions);
+                    sent.extend(actions.commands);
+                },
+                Vec::new(),
+            );
+        h.run_steps(3);
+        assert!(h
+            .query_by_label("Text could not be drawn; previous picture retained")
+            .is_some());
+        assert!(h.state().is_empty());
+    }
+
     /// Typing, then an undo (the engine's text changed elsewhere): the
     /// field gives way, and the next letter goes on the undone text — the
     /// undone typing is not sent back.
@@ -365,6 +397,8 @@ mod tests {
                 },
                 State {
                     text: TextSnapshot {
+                        pending: false,
+                        error: None,
                         settings: TextSettings {
                             text: "Salė A".into(),
                             ..TextSettings::default()
@@ -407,6 +441,8 @@ mod tests {
         let (ch, dk) = data.selected_deck.expect("fixture selects a deck");
         let deck = data.channels[ch].decks[dk].clone();
         let text = TextSnapshot {
+            pending: false,
+            error: None,
             settings: TextSettings::default(),
         };
         let ui_data = UIData::test_fixture();
