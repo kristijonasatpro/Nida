@@ -305,7 +305,10 @@ fn snapshot_rundown_panel_and_step_window() {
     data.screen = ScreenLayout::builtin(Builtin::Broadcast);
     // The Rundown is a tab behind the Audio Mixer: brought to the front.
     let tab = data.screen.dock.find_tab(&Pane::Rundown).expect("the tab");
-    data.screen.dock.set_active_tab(tab).expect("brought to the front");
+    data.screen
+        .dock
+        .set_active_tab(tab)
+        .expect("brought to the front");
     data.main.mode = varda::mixer::MixMode::Program;
     data.channels[0].name = "Camera".into();
     data.channels[1].name = "Slides".into();
@@ -378,10 +381,7 @@ fn snapshot_rundown_panel_and_step_window() {
                         channel: "cc000001".into(),
                         on: true,
                     }],
-                    plays: vec![PlaySet {
-                        deck: sting,
-                        action: PlayAction::Start,
-                    }],
+                    plays: vec![PlaySet::new(sting, PlayAction::Start)],
                     then_secs: Some(4.0),
                     ..Step::new("")
                 },
@@ -404,7 +404,10 @@ fn snapshot_rundown_panel_and_step_window() {
             to: "s3".into(),
             secs_left: 2.6,
             fade: true,
+            until: None,
         }),
+        at_held: None,
+        held_always: vec![],
     };
     // The wait repaints the panel, so it never settles: stepped instead.
     let Some(mut harness) = unsettled_snapshot_harness(data) else {
@@ -426,7 +429,10 @@ fn broadcast_audio_mix(data: &UIData) -> varda::audio_mix::AudioMixSnapshot {
         AudioBusConfig, AudioBusSnapshot, AudioMixSnapshot, AudioSourceKind, AudioSourceSnapshot,
     };
     let bus = |uuid: &str, name: &str, gain_db: f32, meter: f32| AudioBusSnapshot {
+        dynamics: varda::audio_mix::DynamicsSnapshot::default(),
         config: AudioBusConfig {
+            compressor: varda::audio_mix::CompressorConfig::default(),
+            limiter: varda::audio_mix::LimiterConfig::default(),
             uuid: uuid.into(),
             name: name.into(),
             gain_db,
@@ -434,12 +440,21 @@ fn broadcast_audio_mix(data: &UIData) -> varda::audio_mix::AudioMixSnapshot {
             delay_ms: 0.0,
             device: Some("BMD HDMI".into()),
             first_channel: 0,
+            live: false,
+            live_frames: None,
+            insert: None,
+            pre_fader: false,
         },
         device_ok: Some(true),
+        device_note: None,
+        live: None,
+        insert_status: None,
         meter_db: [meter, meter - 2.0],
+        peak_db: [meter, meter - 2.0],
     };
     let clip =
         |deck: &str, name: &str, on_air: f32, gain_db: f32, meter: f32| AudioSourceSnapshot {
+            dynamics: varda::audio_mix::DynamicsSnapshot::default(),
             uuid: deck.into(),
             name: name.into(),
             kind: AudioSourceKind::Clip {
@@ -457,7 +472,11 @@ fn broadcast_audio_mix(data: &UIData) -> varda::audio_mix::AudioMixSnapshot {
             solo: false,
             live: true,
             meter_db: [meter, meter - 1.5],
+            signal_db: [meter, meter - 1.5],
+            peak_db: [meter, meter - 1.5],
             refused: None,
+            send_settings: std::collections::BTreeMap::default(),
+            sent_before: Vec::new(),
         };
     let deck = |ch: usize| data.channels[ch].decks[0].uuid.clone();
     let mut mic = clip("mic00001", "Lectern", 0.0, -4.0, -14.0);
@@ -488,8 +507,12 @@ fn broadcast_audio_mix(data: &UIData) -> varda::audio_mix::AudioMixSnapshot {
             ..Default::default()
         },
         output_devices: vec!["BMD HDMI".into()],
+        output_channels: std::collections::BTreeMap::new(),
+        effects: std::sync::Arc::default(),
         input_devices: vec![],
         apps: vec![],
+        stop_fade_secs: varda::audio_mix::DEFAULT_STOP_FADE_SECS,
+        stopping: vec![],
     }
 }
 
@@ -777,7 +800,13 @@ fn snapshot_stream_window_live() {
         return;
     };
     harness.run_steps(2);
-    harness.get_by_label_contains("STREAM").click();
+    // The top bar's button, not the STREAM meter beside the output.
+    harness
+        .get_by(|node| {
+            node.role() == egui::accesskit::Role::Button
+                && node.label().is_some_and(|label| label.contains("STREAM"))
+        })
+        .click();
     // Live, the button keeps repainting (clock, blink): step, don't settle.
     harness.run_steps(3);
     harness.snapshot("stream_window_live");
@@ -896,4 +925,170 @@ fn snapshot_led_screens_window() {
     harness.hover_at(egui::pos2(5.0, 5.0));
     harness.run();
     harness.snapshot("led_screens_window");
+}
+
+/// An input's Processing page: the Speech preset on, the leveler turning a
+/// soft speaker up and the compressor at work.
+#[test]
+fn snapshot_audio_processing_input() {
+    use varda::audio_mix::{CompressorConfig, LevelerConfig, LowCutConfig};
+    let mut data = UIData::test_fixture();
+    data.screen = varda::usecases::ui::screen_layout::ScreenLayout::builtin(
+        varda::usecases::ui::screen_layout::Builtin::Broadcast,
+    );
+    data.audio_mix = broadcast_audio_mix(&data);
+    let source = &mut data.audio_mix.sources[0];
+    source.dynamics.config = CompressorConfig::speech();
+    source.dynamics.low_cut = Some(LowCutConfig::speech());
+    source.dynamics.leveler = Some(LevelerConfig::speech());
+    source.dynamics.leveler_gain_db = 6.5;
+    source.dynamics.reduction_db = 4.2;
+    source.dynamics.pre_db = [-27.0, -27.5];
+    source.dynamics.post_db = [-14.0, -14.5];
+    let name = source.name.clone();
+    let Some(mut harness) = snapshot_harness(data) else {
+        return;
+    };
+    for label in [
+        format!("Settings {name}"),
+        "Expand audio settings".to_string(),
+        "Processing".to_string(),
+    ] {
+        harness.get_by_label(&label).click();
+        harness.run();
+    }
+    harness.snapshot("audio_processing_input");
+}
+
+/// A bus's Processing page: its limiter catching a peak and its loudness.
+#[test]
+fn snapshot_audio_processing_bus() {
+    let mut data = UIData::test_fixture();
+    data.screen = varda::usecases::ui::screen_layout::ScreenLayout::builtin(
+        varda::usecases::ui::screen_layout::Builtin::Broadcast,
+    );
+    data.audio_mix = broadcast_audio_mix(&data);
+    let bus = &mut data.audio_mix.buses[0];
+    bus.dynamics.limiter = Some(bus.config.limiter);
+    bus.dynamics.limiter_reduction_db = 2.3;
+    bus.dynamics.pre_db = [-8.0, -8.5];
+    bus.dynamics.post_db = [-1.0, -1.2];
+    bus.dynamics.loudness = Some(varda::audio_mix::LoudnessSnapshot {
+        momentary_lufs: -15.2,
+        short_term_lufs: -16.4,
+        integrated_lufs: Some(-16.9),
+    });
+    let name = bus.config.name.clone();
+    let Some(mut harness) = snapshot_harness(data) else {
+        return;
+    };
+    for label in [
+        format!("Settings {name}"),
+        "Expand audio settings".to_string(),
+        "Processing".to_string(),
+    ] {
+        harness.get_by_label(&label).click();
+        harness.run();
+    }
+    harness.snapshot("audio_processing_bus");
+}
+
+/// The Presentations panel: a day's talks in running order — a PowerPoint
+/// deck on air at slide 3 with its notes, a PDF next and ready, a web
+/// presentation, a speaker's clip, a break picture, and one whose file has
+/// gone.
+#[test]
+fn snapshot_presentations_panel() {
+    use varda::engine::value::presentation::{
+        PlaysOn, PresentationSnapshot, PresentationStatus, Screen,
+    };
+    use varda::engine::value::slides::{
+        SlidesSettings, SlidesSnapshot, TalkKind, TalkSnapshot, TalkState,
+    };
+    use varda::usecases::ui::screen_layout::{Builtin, Pane, ScreenLayout};
+    let mut data = UIData::test_fixture();
+    data.screen = ScreenLayout::builtin(Builtin::Broadcast);
+    let tab = data
+        .screen
+        .dock
+        .find_tab(&Pane::Presentations)
+        .expect("the tab");
+    data.screen
+        .dock
+        .set_active_tab(tab)
+        .expect("brought to the front");
+    data.channels[1].name = "Slides".into();
+    data.channels[1].on_air = Some("Main".into());
+    let talk = |id: &str, name: &str, kind: TalkKind, state: TalkState| TalkSnapshot {
+        id: id.into(),
+        name: name.into(),
+        given_name: name.into(),
+        path: format!("/Talks/{id}"),
+        kind: Some(kind),
+        state,
+        message: None,
+        missing: false,
+        position: None,
+        shown: None,
+        presentation: None,
+        clip: None,
+        warnings: Vec::new(),
+        pictures: false,
+    };
+    let mut keynote = talk("t1", "Opening — keynote", TalkKind::PowerPoint, TalkState::Live);
+    keynote.position = Some(3);
+    keynote.shown = Some(22);
+    keynote.presentation = Some(PresentationSnapshot {
+        path: "/Talks/keynote.pptx".into(),
+        status: PresentationStatus::Showing,
+        message: None,
+        slide: Some(3),
+        slides: Some(24),
+        position: Some(3),
+        shown: Some(22),
+        screen: Screen::Slide,
+        title: Some("Where we are".into()),
+        notes: "Thank the organisers. Ask who came by train.".into(),
+        next_slide: Some(4),
+        next_title: Some("Results".into()),
+        plays_on: PlaysOn::Auto,
+        playing_on: None,
+        slide_pixels: None,
+        video: None,
+    });
+    let mut results = talk("t2", "Ona J. — results", TalkKind::Pdf, TalkState::Ready);
+    results.shown = Some(31);
+    let mut gone = talk("t6", "Late slides", TalkKind::PowerPoint, TalkState::Failed);
+    gone.missing = true;
+    gone.message = Some("Its file is not there".into());
+    data.channels[1].decks[0].slides = Some(SlidesSnapshot {
+        on: Some(keynote.clone()),
+        screen: Screen::Slide,
+        talks: vec![
+            keynote,
+            results,
+            TalkSnapshot {
+                warnings: vec![
+                    "needs the internet when shown — it loads from cdn.jsdelivr.net".into(),
+                ],
+                ..talk("t3", "Panel — AI demo", TalkKind::Web, TalkState::Waiting)
+            },
+            talk("t4", "Demo video", TalkKind::Clip, TalkState::Waiting),
+            talk("t5", "Coffee break", TalkKind::Picture, TalkState::Waiting),
+            gone,
+        ],
+        settings: SlidesSettings::default(),
+        live: Some(0),
+        starting: None,
+        next: Some(1),
+        next_picked: false,
+        previous: None,
+        talk_secs: Some(754.0),
+        making_pictures: 0,
+    });
+    let Some(mut harness) = unsettled_snapshot_harness(data) else {
+        return;
+    };
+    harness.run_steps(4);
+    harness.snapshot("presentations_panel");
 }

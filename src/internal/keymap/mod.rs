@@ -132,6 +132,50 @@ pub enum ActionId {
     /// Take the rundown's next step with a fade: GO. No key by default —
     /// one is learned on the Rundown panel's GO button.
     RundownGo,
+    /// A PowerPoint input's show on air (else the one moved last): the next
+    /// step, `PageDown` by default — what a presentation clicker sends.
+    PresentationNext,
+    /// Back a step: `PageUp` by default.
+    PresentationPrevious,
+    /// Black the screen out, and back: B by default, a clicker's
+    /// black-screen button.
+    PresentationBlack,
+}
+
+impl ActionId {
+    /// Whether every public Nida (0.9 on) reads it: a show keeps a binding to
+    /// any other apart (see [`KeymapConfig::split`]), for an older Nida on
+    /// another Mac — the same show in iCloud — or kept to go back to. An
+    /// action added later answers `false` here.
+    #[must_use]
+    pub fn read_by_older(self) -> bool {
+        match self {
+            Self::Undo
+            | Self::Redo
+            | Self::Save
+            | Self::ToggleLibrary
+            | Self::ToggleStageEditor
+            | Self::ToolSelect
+            | Self::ToolRectangle
+            | Self::ToolPolygon
+            | Self::ToolCircle
+            | Self::DuplicateSurface
+            | Self::FlipHorizontal
+            | Self::FlipVertical
+            | Self::DeleteSurface
+            | Self::ClearDrawing
+            | Self::CombineSurfaces
+            | Self::ToggleMidiLearn
+            | Self::ToggleKeyboardLearn
+            | Self::Copy
+            | Self::Paste
+            | Self::Duplicate
+            | Self::CutToMain
+            | Self::FadeToMain
+            | Self::RundownGo => true,
+            Self::PresentationNext | Self::PresentationPrevious | Self::PresentationBlack => false,
+        }
+    }
 }
 
 /// Persistent keymap store. Mirrors `MidiMappingStore` pattern.
@@ -170,10 +214,14 @@ impl KeymapStore {
         let mut m = HashMap::new();
         let action = |id: ActionId| KeyTarget::Action(id);
 
-        // Main mode takes, as a vMix operator binds them.
+        // Main mode takes, as a vMix operator binds them; a presentation
+        // clicker's buttons.
         for (key, id) in [
             ("Space", ActionId::CutToMain),
             ("Enter", ActionId::FadeToMain),
+            ("PageDown", ActionId::PresentationNext),
+            ("PageUp", ActionId::PresentationPrevious),
+            ("B", ActionId::PresentationBlack),
         ] {
             m.insert(
                 KeyCombo {
@@ -441,13 +489,51 @@ impl KeymapStore {
     }
 }
 
-/// Serializable keymap config for `.varda/keymap.json`.
+/// Serializable keymap config, read leniently (see [`KeymapFile`]). A show
+/// keeps it as two files (see [`KeymapConfig::split`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "KeymapFile")]
 pub struct KeymapConfig {
-    #[serde(default = "default_keymap_version")]
     pub version: u32,
-    #[serde(default)]
     pub bindings: Vec<KeyBinding>,
+}
+
+/// A keymap file as read: a binding this Nida does not know — a later
+/// Nida's action — is left out with a warning, not the whole keymap refused.
+#[derive(Deserialize)]
+struct KeymapFile {
+    #[serde(default = "default_keymap_version")]
+    version: u32,
+    #[serde(default, deserialize_with = "known_bindings")]
+    bindings: Vec<KeyBinding>,
+}
+
+impl From<KeymapFile> for KeymapConfig {
+    fn from(file: KeymapFile) -> Self {
+        Self {
+            version: file.version,
+            bindings: file.bindings,
+        }
+    }
+}
+
+/// The bindings in a list that this Nida knows; another — a later Nida's
+/// action — is left out with a warning, not the keymap refused.
+fn known_bindings<'de, D>(deserializer: D) -> Result<Vec<KeyBinding>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let listed = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(listed
+        .into_iter()
+        .filter_map(|entry| match serde_json::from_value(entry) {
+            Ok(binding) => Some(binding),
+            Err(e) => {
+                log::warn!("Keymap: skipping a binding this Nida does not know: {e}");
+                None
+            }
+        })
+        .collect())
 }
 
 fn default_keymap_version() -> u32 {
@@ -479,6 +565,40 @@ impl KeyBinding {
 }
 
 impl KeymapConfig {
+    /// The keymap as a show keeps it: `keymap.json`, the bindings every
+    /// public Nida reads, and `keymap-newer.json`, those to later actions
+    /// (see [`ActionId::read_by_older`]). An older Nida refuses a whole
+    /// keymap naming an action it does not know — the show opens with
+    /// "Failed to load workspace" — and, never opening the second file,
+    /// leaves it be when it saves the show over: the later keys are there
+    /// again when this Nida opens it.
+    #[must_use]
+    pub fn split(self) -> (Self, Self) {
+        let read_by_older = |binding: &KeyBinding| match binding.target {
+            KeyTarget::Action(id) => id.read_by_older(),
+            KeyTarget::ParamPath(_) => true,
+        };
+        let (bindings, newer) = self.bindings.into_iter().partition(read_by_older);
+        (
+            Self {
+                version: self.version,
+                bindings,
+            },
+            Self {
+                version: self.version,
+                bindings: newer,
+            },
+        )
+    }
+
+    /// The keymap `newer`'s file adds to this one's: its bindings last, so
+    /// they win a key both bind.
+    #[must_use]
+    pub fn with(mut self, newer: Self) -> Self {
+        self.bindings.extend(newer.bindings);
+        self
+    }
+
     /// Validate the keymap config for semantic correctness. Returns a list of errors.
     /// An empty list means the config is valid.
     pub fn validate(&self) -> Vec<String> {
@@ -747,5 +867,122 @@ mod tests {
         };
         let errors = config.validate();
         assert!(errors.iter().any(|e| e.contains("key is empty")));
+    }
+
+    /// The keymap as public Nida 0.9 reads it: the whole file refused at an
+    /// action it does not know.
+    #[allow(dead_code)]
+    mod older {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        pub enum ActionId {
+            Undo,
+            Redo,
+            Save,
+            ToggleLibrary,
+            ToggleStageEditor,
+            ToolSelect,
+            ToolRectangle,
+            ToolPolygon,
+            ToolCircle,
+            DuplicateSurface,
+            FlipHorizontal,
+            FlipVertical,
+            DeleteSurface,
+            ClearDrawing,
+            CombineSurfaces,
+            ToggleMidiLearn,
+            ToggleKeyboardLearn,
+            Copy,
+            Paste,
+            Duplicate,
+            CutToMain,
+            FadeToMain,
+            RundownGo,
+        }
+
+        #[derive(Deserialize)]
+        pub enum KeyTarget {
+            Action(ActionId),
+            ParamPath(String),
+        }
+
+        #[derive(Deserialize)]
+        pub struct KeyBinding {
+            pub key: String,
+            #[serde(default)]
+            pub command: bool,
+            #[serde(default)]
+            pub shift: bool,
+            #[serde(default)]
+            pub alt: bool,
+            pub target: KeyTarget,
+        }
+
+        #[derive(Deserialize)]
+        pub struct KeymapConfig {
+            #[serde(default)]
+            pub version: u32,
+            #[serde(default)]
+            pub bindings: Vec<KeyBinding>,
+        }
+    }
+
+    /// A show saved here opens in an older Nida — on the other Mac, the same
+    /// show in iCloud — its keymap whole but for the later actions, which wait
+    /// in their own file: this Nida reads them all back, an older Nida's save
+    /// of keymap.json between included.
+    #[test]
+    fn an_older_nida_reads_the_keymap_this_one_saves() {
+        let mut store = KeymapStore::with_defaults();
+        // A GO key learned, which 0.9 knows, and a clicker's own key.
+        store.bindings.insert(
+            combo("G", false, false, false),
+            KeyTarget::Action(ActionId::RundownGo),
+        );
+        store.bindings.insert(
+            combo("N", false, false, false),
+            KeyTarget::Action(ActionId::PresentationNext),
+        );
+        let (keymap, newer) = store.to_config().split();
+        let keymap = keymap.to_json().unwrap();
+        let newer = newer.to_json().unwrap();
+
+        let older: older::KeymapConfig =
+            serde_json::from_str(&keymap).expect("an older Nida reads it");
+        // The clicker's keys, its three and N, are this Nida's alone.
+        assert_eq!(older.bindings.len(), store.bindings.len() - 4);
+
+        let mut back = KeymapStore::new();
+        back.load_config(
+            &serde_json::from_str::<KeymapConfig>(&keymap)
+                .unwrap()
+                .with(serde_json::from_str(&newer).unwrap()),
+        );
+        assert_eq!(back.bindings, store.bindings);
+    }
+
+    /// A later Nida's binding is left out, not the whole keymap refused; a
+    /// later action in keymap.json, as a try-out build wrote it, still reads.
+    #[test]
+    fn a_later_nidas_binding_is_left_out_and_the_rest_kept() {
+        let json = r#"{
+            "version": 1,
+            "bindings": [
+                { "key": "S", "command": true, "target": { "Action": "Save" } },
+                { "key": "L", "target": { "Action": "SomethingLater" } },
+                { "key": "PageUp", "target": { "Action": "PresentationPrevious" } }
+            ]
+        }"#;
+        let config: KeymapConfig = serde_json::from_str(json).expect("not refused");
+        let targets: Vec<_> = config.bindings.iter().map(|b| b.target.clone()).collect();
+        assert_eq!(
+            targets,
+            [
+                KeyTarget::Action(ActionId::Save),
+                KeyTarget::Action(ActionId::PresentationPrevious),
+            ]
+        );
     }
 }

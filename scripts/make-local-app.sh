@@ -109,6 +109,7 @@ cat > "$STAGE/Nida.app/Contents/Info.plist" <<PLIST
   <key>NSCameraReactionEffectGesturesEnabledDefault</key><false/>
   <key>NSMicrophoneUsageDescription</key><string>Nida mixes microphones and other sound inputs.</string>
   <key>NSAudioCaptureUsageDescription</key><string>Nida takes an app's sound, such as a Zoom or Teams call's, as an input to mix.</string>
+  <key>NSAppleEventsUsageDescription</key><string>Nida plays PowerPoint decks as inputs: it opens them in PowerPoint and moves the show on when you click.</string>
   <key>NSLocalNetworkUsageDescription</key><string>Nida finds and sends NDI video on the local network.</string>
   <key>NSBonjourServices</key>
   <array>

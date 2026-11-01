@@ -27,6 +27,49 @@ fn stop_armed_id() -> egui::Id {
 const STOP_CONFIRM_SECS: f64 = 3.0;
 
 /// Video bit rates offered, with what they suit.
+/// What is said of recording or streaming at `file` frames a second from a
+/// show at `show`: a rate that does not divide it leaves frames out
+/// unevenly, and motion stutters (Max5: 50 from 60 left one in six out); a
+/// whole multiple of it repeats each frame, for nothing. Nothing for an
+/// even share (60 → 30: every second frame), or an unknown show rate.
+pub(super) fn uneven_rate_warning(show: u32, file: u32) -> Option<String> {
+    if show == 0 || file == 0 || show.is_multiple_of(file) {
+        return None;
+    }
+    if file.is_multiple_of(show) {
+        return Some(format!(
+            "Each of Nida's {show} frames a second goes out {} times: no smoother, and the bits \
+             go on repeats. Use \"Same as Nida\"",
+            file / show
+        ));
+    }
+    if file > show {
+        return Some(format!(
+            "Faster than Nida's {show} fps: frames are shown twice now and then — motion stutters. \
+             Use \"Same as Nida\""
+        ));
+    }
+    let half = if show.is_multiple_of(2) { format!(" or {}", show / 2) } else { String::new() };
+    Some(format!(
+        "Leaves {} of Nida's {show} frames a second out unevenly — motion stutters. Use {show}{half}",
+        show - file
+    ))
+}
+
+/// What is said of a set bit rate far under what the picture needs: under
+/// half of Auto's for its size and rate (8000 kbps at 3840×2160 blurs in
+/// motion).
+fn low_bitrate_warning(options: &RecordOptions, size: (u32, u32), fps: u32) -> Option<String> {
+    let set = options.video_kbps?;
+    let auto = RecordOptions { video_kbps: None, ..options.clone() }.effective_kbps(size, fps);
+    (u64::from(set) * 2 < u64::from(auto)).then(|| {
+        format!(
+            "Low for {}×{} at {fps} fps — it blurs in motion. Auto gives {auto} kbps",
+            size.0, size.1
+        )
+    })
+}
+
 const BITRATE_PRESETS: [(u32, &str); 6] = [
     (8_000, "1080p, talks"),
     (16_000, "1080p, high"),
@@ -57,6 +100,63 @@ fn look(status: &crate::record::RecordStatus, bright: bool) -> (Option<egui::Col
     } else {
         (Some(if bright { WARN_YELLOW } else { WARN_DIM }), true)
     }
+}
+
+/// Whether NOT RECORDING blinks behind the take buttons: asked for, and
+/// not recording.
+pub(super) fn warns_not_recording(data: &UIData) -> bool {
+    data.record.options.warn_when_off && !data.record.status.recording
+}
+
+/// How long one blink of NOT RECORDING takes, on and off.
+const WARN_BLINK_SECS: f64 = 1.2;
+
+/// Take buttons drawn by `add`, with NOT RECORDING blinking behind them while
+/// [`warns_not_recording`]: its words over them — in a slot `label_height`
+/// tall, in a column — and the space they stand in pulsing red. Without the
+/// reminder, just `add`.
+pub(super) fn with_record_warning<R>(
+    ui: &mut egui::Ui,
+    data: &UIData,
+    label_height: Option<f32>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    if !warns_not_recording(data) {
+        return add(ui);
+    }
+    let behind = ui.painter().add(egui::Shape::Noop);
+    let time = ui.input(|i| i.time);
+    #[allow(clippy::cast_possible_truncation)]
+    let pulse = ((time * std::f64::consts::TAU / WARN_BLINK_SECS).sin() * 0.5 + 0.5) as f32;
+    let inner = ui.scope(|ui| {
+        let words = egui::RichText::new("NOT RECORDING")
+            .strong()
+            .color(egui::Color32::WHITE);
+        let hover = "Recording is off — press REC at the top. \
+                     (This reminder: REC ▸ Reminder.)";
+        match label_height {
+            Some(height) => {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), height),
+                    egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                    |ui| ui.label(words).on_hover_text(hover),
+                );
+            }
+            None => {
+                ui.label(words).on_hover_text(hover);
+            }
+        }
+        add(ui)
+    });
+    let rect = inner.response.rect.expand(4.0);
+    let alpha = 0.18 + 0.62 * pulse * pulse;
+    ui.painter().set(
+        behind,
+        egui::epaint::RectShape::filled(rect, 6.0, LIVE_RED.gamma_multiply(alpha)),
+    );
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(40));
+    inner.inner
 }
 
 /// The top-bar button.
@@ -427,7 +527,7 @@ fn render_options(
                             .on_hover_text("A bit rate for the picture's size and frame rate")
                             .changed()
                         {
-                            let fps = options.fps.unwrap_or(data.target_fps.max(1));
+                            let fps = options.fps.unwrap_or(crate::app::state::encoder_fps(data.target_fps));
                             let size = options
                                 .size
                                 .unwrap_or((data.render_width, data.render_height));
@@ -457,7 +557,7 @@ fn render_options(
                                 );
                             }
                         } else {
-                            let fps = options.fps.unwrap_or(data.target_fps.max(1));
+                            let fps = options.fps.unwrap_or(crate::app::state::encoder_fps(data.target_fps));
                             let size = options
                                 .size
                                 .unwrap_or((data.render_width, data.render_height));
@@ -486,6 +586,15 @@ fn render_options(
                     });
                 });
                 ui.end_row();
+                let size = options
+                    .size
+                    .unwrap_or((data.render_width, data.render_height));
+                let fps = options.fps.unwrap_or(crate::app::state::encoder_fps(data.target_fps));
+                if let Some(warning) = low_bitrate_warning(options, size, fps) {
+                    ui.label("");
+                    ui.label(egui::RichText::new(format!("⚠ {warning}")).color(WARN).small());
+                    ui.end_row();
+                }
             }
 
             ui.label("Encoder");
@@ -577,6 +686,14 @@ fn render_options(
                     });
             });
             ui.end_row();
+            if let Some(warning) = options
+                .fps
+                .and_then(|file| uneven_rate_warning(data.target_fps, file))
+            {
+                ui.label("");
+                ui.label(egui::RichText::new(format!("⚠ {warning}")).color(WARN).small());
+                ui.end_row();
+            }
 
             ui.label("Audio");
             ui.add_enabled_ui(!recording && options.codec.has_bit_rate(), |ui| {
@@ -607,11 +724,32 @@ fn render_options(
                 }
             });
             ui.end_row();
+
+            ui.label("Reminder");
+            let mut warn = options.warn_when_off;
+            if ui
+                .checkbox(&mut warn, "Blink NOT RECORDING behind the take buttons")
+                .on_hover_text(
+                    "While not recording, NOT RECORDING blinks behind Cut and Fade — \
+                     in the middle of a show, Record is easily forgotten",
+                )
+                .changed()
+            {
+                set(
+                    actions,
+                    RecordOptions {
+                        warn_when_off: warn,
+                        ..options.clone()
+                    },
+                );
+            }
+            ui.end_row();
         });
     if recording {
         ui.label(
             egui::RichText::new(
-                "Stop recording to change the settings — the picture can change now",
+                "Stop recording to change the settings — the picture and the reminder can \
+                 change now",
             )
             .small()
             .weak(),
@@ -668,6 +806,37 @@ fn render_start_stop(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) 
 
 #[cfg(test)]
 mod tests {
+    /// A recording rate that does not divide the show's leaves frames out
+    /// unevenly, and says so; an even share, or the show's own, does not.
+    #[test]
+    fn an_uneven_recording_rate_is_said() {
+        let said = super::uneven_rate_warning(60, 50).expect("60 → 50");
+        assert!(said.contains("10 of Nida's 60") && said.contains("Use 60 or 30"), "{said}");
+        assert!(super::uneven_rate_warning(50, 30).is_some());
+        let twice = super::uneven_rate_warning(30, 60).expect("a whole multiple");
+        assert!(twice.contains("2 times"), "{twice}");
+        let faster = super::uneven_rate_warning(25, 30).expect("faster, unevenly");
+        assert!(faster.contains("stutters"), "{faster}");
+        for (show, file) in [(60, 60), (60, 30), (50, 25), (0, 50)] {
+            assert_eq!(super::uneven_rate_warning(show, file), None, "{show} → {file}");
+        }
+    }
+
+    /// A set bit rate under half of Auto's for the picture is said; Auto,
+    /// or one near it, is not.
+    #[test]
+    fn a_bit_rate_far_too_low_for_the_picture_is_said() {
+        let low = crate::record::RecordOptions {
+            video_kbps: Some(8_000),
+            ..Default::default()
+        };
+        let said = super::low_bitrate_warning(&low, (3840, 2160), 50).expect("8 Mbit/s at 4K");
+        assert!(said.contains("3840×2160"), "{said}");
+        assert_eq!(super::low_bitrate_warning(&low, (1280, 720), 30), None, "fine at 720p");
+        let auto = crate::record::RecordOptions::default();
+        assert_eq!(super::low_bitrate_warning(&auto, (3840, 2160), 60), None);
+    }
+
     use super::*;
 
     /// Beside REC: the take's size and the room left — yellow below the
@@ -785,7 +954,9 @@ mod tests {
             problem: problem.map(str::to_string),
             dropped: 0,
             fps: 0,
+            file_fps: 0,
             last_file: None,
+            audio_bus: None,
         }
     }
 

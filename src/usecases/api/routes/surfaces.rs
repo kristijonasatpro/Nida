@@ -6,7 +6,7 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::internal::renderer::context::OutputSource;
 use crate::internal::surface::{
     ContentMapping, CubicHandle, SurfaceOutputType, SurfacePath, SurfaceReorderOp,
@@ -76,7 +76,7 @@ pub struct RenameBody {
     pub name: String,
 }
 
-#[utoipa::path(post, path = "/api/surfaces/rect", request_body = AddRectSurfaceBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/rect", request_body = AddRectSurfaceBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn add_rect(
     State(s): State<SharedState>,
     Json(b): Json<AddRectSurfaceBody>,
@@ -93,7 +93,7 @@ pub async fn add_rect(
     }
 }
 
-#[utoipa::path(post, path = "/api/surfaces/polygon", request_body = AddPolygonSurfaceBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/polygon", request_body = AddPolygonSurfaceBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn add_polygon(
     State(s): State<SharedState>,
     Json(b): Json<AddPolygonSurfaceBody>,
@@ -122,7 +122,7 @@ pub async fn add_polygon(
     }
 }
 
-#[utoipa::path(post, path = "/api/surfaces/circle", request_body = AddCircleSurfaceBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/circle", request_body = AddCircleSurfaceBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn add_circle(
     State(s): State<SharedState>,
     Json(b): Json<AddCircleSurfaceBody>,
@@ -143,7 +143,7 @@ pub async fn add_circle(
     }
 }
 
-#[utoipa::path(delete, path = "/api/surfaces/{uuid}", params(("uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(delete, path = "/api/surfaces/{uuid}", params(("uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn remove(State(s): State<SharedState>, Path(uuid): Path<String>) -> impl IntoResponse {
     match s.send_command(EngineCommand::RemoveSurface { uuid }).await {
         Ok(r) => command_response(r),
@@ -151,7 +151,7 @@ pub async fn remove(State(s): State<SharedState>, Path(uuid): Path<String>) -> i
     }
 }
 
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/source", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetSourceBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/source", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetSourceBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn set_source(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -169,7 +169,7 @@ pub async fn set_source(
     }
 }
 
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/output-type", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetOutputTypeBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/output-type", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetOutputTypeBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn set_output_type(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -187,7 +187,7 @@ pub async fn set_output_type(
     }
 }
 
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/content-mapping", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetContentMappingBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/content-mapping", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetContentMappingBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn set_content_mapping(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -205,7 +205,7 @@ pub async fn set_content_mapping(
     }
 }
 
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/name", params(("uuid" = String, Path, description = "Surface UUID")), request_body = RenameBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/name", params(("uuid" = String, Path, description = "Surface UUID")), request_body = RenameBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn rename(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -226,7 +226,7 @@ pub struct VerticesBody {
     pub vertices: Vec<[f32; 2]>,
 }
 
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/vertices", params(("uuid" = String, Path, description = "Surface UUID")), request_body = VerticesBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/vertices", params(("uuid" = String, Path, description = "Surface UUID")), request_body = VerticesBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn set_vertices(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -243,7 +243,7 @@ pub async fn set_vertices(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/surfaces/{uuid}/duplicate", params(("uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/{uuid}/duplicate", params(("uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn duplicate(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -256,7 +256,7 @@ pub async fn duplicate(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/surfaces/{uuid}/flip-horizontal", params(("uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/{uuid}/flip-horizontal", params(("uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn flip_horizontal(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -269,7 +269,7 @@ pub async fn flip_horizontal(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/surfaces/{uuid}/flip-vertical", params(("uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/{uuid}/flip-vertical", params(("uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn flip_vertical(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -361,7 +361,7 @@ pub struct MovePathHandleBody {
     pub pos: [f32; 2],
 }
 
-#[utoipa::path(post, path = "/api/surfaces/{uuid}/vertices/insert", params(("uuid" = String, Path, description = "Surface UUID")), request_body = InsertVertexBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/{uuid}/vertices/insert", params(("uuid" = String, Path, description = "Surface UUID")), request_body = InsertVertexBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn insert_vertex(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -379,7 +379,7 @@ pub async fn insert_vertex(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/circle/radius", params(("uuid" = String, Path, description = "Surface UUID")), request_body = RadiusBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/circle/radius", params(("uuid" = String, Path, description = "Surface UUID")), request_body = RadiusBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn set_circle_radius(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -396,7 +396,7 @@ pub async fn set_circle_radius(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/circle/sides", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SidesBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/circle/sides", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SidesBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn set_circle_sides(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -413,7 +413,7 @@ pub async fn set_circle_sides(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/rotate", params(("uuid" = String, Path, description = "Surface UUID")), request_body = RotateBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/rotate", params(("uuid" = String, Path, description = "Surface UUID")), request_body = RotateBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn rotate_surface(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -431,7 +431,7 @@ pub async fn rotate_surface(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/scale", params(("uuid" = String, Path, description = "Surface UUID")), request_body = ScaleBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/scale", params(("uuid" = String, Path, description = "Surface UUID")), request_body = ScaleBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn scale_surface(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -450,7 +450,7 @@ pub async fn scale_surface(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/surfaces/{uuid}/convert-to-polygon", params(("uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/{uuid}/convert-to-polygon", params(("uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn convert_to_polygon(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -463,7 +463,7 @@ pub async fn convert_to_polygon(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/surfaces/combine", request_body = CombineBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/combine", request_body = CombineBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn combine(
     State(s): State<SharedState>,
     Json(b): Json<CombineBody>,
@@ -484,7 +484,7 @@ pub async fn combine(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/move", params(("uuid" = String, Path, description = "Surface UUID")), request_body = MoveBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/move", params(("uuid" = String, Path, description = "Surface UUID")), request_body = MoveBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn move_surface(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -502,7 +502,7 @@ pub async fn move_surface(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/contour-vertices", params(("uuid" = String, Path, description = "Surface UUID")), request_body = ContourVerticesBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/contour-vertices", params(("uuid" = String, Path, description = "Surface UUID")), request_body = ContourVerticesBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn update_contour_vertices(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -532,7 +532,7 @@ pub async fn update_contour_vertices(
     }
 }
 
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/edge/convert", params(("uuid" = String, Path, description = "Surface UUID")), request_body = ConvertEdgeBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/edge/convert", params(("uuid" = String, Path, description = "Surface UUID")), request_body = ConvertEdgeBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn convert_edge(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -551,7 +551,7 @@ pub async fn convert_edge(
     }
 }
 
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/path/anchor", params(("uuid" = String, Path, description = "Surface UUID")), request_body = MovePathAnchorBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/path/anchor", params(("uuid" = String, Path, description = "Surface UUID")), request_body = MovePathAnchorBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn move_path_anchor(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -570,7 +570,7 @@ pub async fn move_path_anchor(
     }
 }
 
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/path/handle", params(("uuid" = String, Path, description = "Surface UUID")), request_body = MovePathHandleBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/path/handle", params(("uuid" = String, Path, description = "Surface UUID")), request_body = MovePathHandleBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn move_path_handle(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -600,7 +600,7 @@ pub struct SetWarpCornerBody {
     pub position: [f32; 2],
 }
 
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/warp/corner", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetWarpCornerBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/warp/corner", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetWarpCornerBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn set_warp_corner(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -619,7 +619,7 @@ pub async fn set_warp_corner(
     }
 }
 
-#[utoipa::path(post, path = "/api/surfaces/{uuid}/warp/reset", params(("uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/{uuid}/warp/reset", params(("uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn reset_warp(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -641,7 +641,7 @@ pub struct SetWarpSubdivisionsBody {
     pub rows: u32,
 }
 
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/warp/subdivisions", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetWarpSubdivisionsBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/warp/subdivisions", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetWarpSubdivisionsBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn set_warp_subdivisions(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -670,7 +670,7 @@ pub struct SetWarpMeshPointBody {
     pub position: [f32; 2],
 }
 
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/warp/mesh-point", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetWarpMeshPointBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/warp/mesh-point", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetWarpMeshPointBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn set_warp_mesh_point(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -697,7 +697,7 @@ pub struct SetWarpBoundBody {
     pub bound: bool,
 }
 
-#[utoipa::path(post, path = "/api/surfaces/{uuid}/warp/bind", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetWarpBoundBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/{uuid}/warp/bind", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetWarpBoundBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn set_warp_bound(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -715,7 +715,7 @@ pub async fn set_warp_bound(
     }
 }
 
-#[utoipa::path(post, path = "/api/surfaces/{uuid}/warp/bezier", params(("uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/{uuid}/warp/bezier", params(("uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn convert_warp_to_bezier(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -739,7 +739,7 @@ pub struct MoveWarpAnchorBody {
     pub position: [f32; 2],
 }
 
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/warp/anchor", params(("uuid" = String, Path, description = "Surface UUID")), request_body = MoveWarpAnchorBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/warp/anchor", params(("uuid" = String, Path, description = "Surface UUID")), request_body = MoveWarpAnchorBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn move_warp_anchor(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -774,7 +774,7 @@ pub struct MoveWarpHandleBody {
     pub position: [f32; 2],
 }
 
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/warp/handle", params(("uuid" = String, Path, description = "Surface UUID")), request_body = MoveWarpHandleBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/warp/handle", params(("uuid" = String, Path, description = "Surface UUID")), request_body = MoveWarpHandleBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn move_warp_handle(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -804,7 +804,7 @@ pub struct SetBezierCageBody {
     pub rows: u32,
 }
 
-#[utoipa::path(put, path = "/api/surfaces/{uuid}/warp/cage", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetBezierCageBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(put, path = "/api/surfaces/{uuid}/warp/cage", params(("uuid" = String, Path, description = "Surface UUID")), request_body = SetBezierCageBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn set_bezier_cage_subdivisions(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -831,7 +831,7 @@ pub struct AddHoleBody {
     pub hole: SurfacePath,
 }
 
-#[utoipa::path(post, path = "/api/surfaces/{uuid}/holes", params(("uuid" = String, Path, description = "Surface UUID")), request_body = AddHoleBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/{uuid}/holes", params(("uuid" = String, Path, description = "Surface UUID")), request_body = AddHoleBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn add_hole(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -846,7 +846,7 @@ pub async fn add_hole(
     }
 }
 
-#[utoipa::path(delete, path = "/api/surfaces/{uuid}/holes/{index}", params(("uuid" = String, Path, description = "Surface UUID"), ("index" = usize, Path, description = "Hole index")), responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(delete, path = "/api/surfaces/{uuid}/holes/{index}", params(("uuid" = String, Path, description = "Surface UUID"), ("index" = usize, Path, description = "Hole index")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn remove_hole(
     State(s): State<SharedState>,
     Path((uuid, index)): Path<(String, usize)>,
@@ -865,7 +865,7 @@ pub async fn remove_hole(
 
 /// "Make Hole" (8i.7): convert the surface identified by `uuid` into a cut-out
 /// hole in the topmost other surface under its centroid, consuming the source.
-#[utoipa::path(post, path = "/api/surfaces/{uuid}/punch", params(("uuid" = String, Path, description = "Source surface UUID")), responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/{uuid}/punch", params(("uuid" = String, Path, description = "Source surface UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn punch_hole(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -887,7 +887,7 @@ pub struct ReorderBody {
 
 /// Change a surface's global stacking order (8i.12): move it front/back/up/down
 /// within the authoritative surface order (index 0 = bottom, last = top).
-#[utoipa::path(post, path = "/api/surfaces/{uuid}/reorder", params(("uuid" = String, Path, description = "Surface UUID")), request_body = ReorderBody, responses((status = 200, body = CommandResult)), tag = "Surfaces")]
+#[utoipa::path(post, path = "/api/surfaces/{uuid}/reorder", params(("uuid" = String, Path, description = "Surface UUID")), request_body = ReorderBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Surfaces")]
 pub async fn reorder(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,

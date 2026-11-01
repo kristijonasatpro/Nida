@@ -18,7 +18,10 @@ const DEVICE_MISSING_AFTER: std::time::Duration = std::time::Duration::from_secs
 
 impl VardaApp {
     /// Set the output target for a windowed or headless output.
-    pub fn cmd_set_output_target(&mut self, idx: usize, target: OutputTarget) -> CommandResult {
+    pub fn cmd_set_output_target(&mut self, idx: usize, mut target: OutputTarget) -> CommandResult {
+        // A Blackmagic output set to follow the show: in the format for its
+        // rate from now, not the one it is given.
+        follow_show_rate(&mut target, &self.decklink_devices_now(), self.target_fps);
         let ndi_resolution = matches!(&target, OutputTarget::NdiSend { .. }).then(|| {
             let request = self
                 .output
@@ -228,6 +231,12 @@ impl VardaApp {
         // that assign `render_width`/`render_height` directly, such as the
         // workspace loader applying a scene's resolution.
         let (render_width, render_height) = (self.render_width, self.render_height);
+        // A Blackmagic output following the show: in the format for its rate.
+        let fps = self.target_fps;
+        let devices = self.decklink_devices_now();
+        if let Some(UnifiedOutput::Headless(h)) = self.output.outputs.get_mut(idx) {
+            follow_show_rate(&mut h.target, &devices, fps);
+        }
         let device = &self.context.device;
         let (
             target,
@@ -405,6 +414,7 @@ impl VardaApp {
                 device,
                 mode,
                 full_range,
+                ..
             } => {
                 // No ffmpeg subprocess and, for now, no sound: the device's
                 // own thread puts each picture up (see `crate::decklink`), at
@@ -1260,8 +1270,101 @@ pub(crate) fn resolve_output_audio(
     }
 }
 
+/// A Blackmagic output's target, if it follows the show's rate: its format
+/// made the device's for `fps` — 1080p at it, or the nearest — when the
+/// device is among `devices`. Whether the format changed.
+pub(crate) fn follow_show_rate(
+    target: &mut OutputTarget,
+    devices: &[crate::decklink::DeckLinkDevice],
+    fps: u32,
+) -> bool {
+    let OutputTarget::DeckLink {
+        device,
+        mode,
+        follow_show: true,
+        ..
+    } = target
+    else {
+        return false;
+    };
+    // Uncapped has no rate to follow: the format stays.
+    if fps == 0 {
+        return false;
+    }
+    let Some(want) = devices
+        .iter()
+        .find(|d| &d.name == device)
+        .and_then(|d| d.mode_for(fps))
+    else {
+        return false;
+    };
+    if &want.name == mode {
+        return false;
+    }
+    mode.clone_from(&want.name);
+    true
+}
+
+impl VardaApp {
+    /// The show's rate changed: each Blackmagic output following it put in
+    /// the format for the new rate — one running started again in it.
+    pub(crate) fn blackmagic_follow_show_rate(&mut self) {
+        let devices = self.decklink_devices_now();
+        self.blackmagic_follow_show_rate_with(&devices);
+    }
+
+    /// The Blackmagic devices there now, as discovery has them (cheap; see
+    /// [`crate::decklink::devices`]) — a test's own, when it sets them.
+    #[allow(clippy::unused_self)] // a test's devices stand in for the app's
+    pub(crate) fn decklink_devices_now(&self) -> Vec<crate::decklink::DeckLinkDevice> {
+        #[cfg(test)]
+        if let Some(devices) = tests::DEVICES.with(|d| d.borrow().clone()) {
+            return devices;
+        }
+        crate::decklink::devices()
+    }
+
+    pub(crate) fn blackmagic_follow_show_rate_with(
+        &mut self,
+        devices: &[crate::decklink::DeckLinkDevice],
+    ) {
+        let fps = self.target_fps;
+        let mut again = Vec::new();
+        for output in &mut self.output.outputs {
+            if let UnifiedOutput::Headless(h) = output {
+                if follow_show_rate(&mut h.target, devices, fps) {
+                    log::info!("Output '{}' follows the show's rate: now {}", h.name, h.target);
+                    if h.active {
+                        again.push(h.uuid.clone());
+                    }
+                }
+            }
+        }
+        for uuid in again {
+            let _ = self.cmd_stop_output(&uuid);
+            if let CommandResult::Err { message, .. } = self.cmd_start_output(&uuid) {
+                // Still meant to run: started by itself once its device can
+                // be had, as one unplugged is — and saved so.
+                if let Some(UnifiedOutput::Headless(h)) =
+                    self.output.outputs.iter_mut().find(|o| o.uuid() == uuid)
+                {
+                    h.keep_running = true;
+                }
+                self.notify_error(format!(
+                    "A Blackmagic output could not start again at the show's rate: {message}"
+                ));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        /// The Blackmagic devices a test says are there.
+        pub(super) static DEVICES: std::cell::RefCell<Option<Vec<crate::decklink::DeckLinkDevice>>> =
+            const { std::cell::RefCell::new(None) };
+    }
     use super::encoder_fps;
 
     /// An ffmpeg output must be opened at the rate frames are actually made.
@@ -1317,6 +1420,7 @@ mod tests {
                 device: "Test Box".into(),
                 mode: "1080p60".into(),
                 full_range: false,
+                follow_show: true,
             },
             64,
             36,
@@ -1351,6 +1455,7 @@ mod tests {
                     device: "Test Box".into(),
                     mode: mode.into(),
                     full_range,
+                    follow_show: false,
                 },
             })
         };
@@ -1390,4 +1495,184 @@ mod tests {
         assert!(matches!(set(&mut app, CalibrationMode::Surfaces), CommandResult::Err { .. }));
         assert!(matches!(set(&mut app, CalibrationMode::Off), CommandResult::Ok));
     }
+    fn box_with(modes: &[(&str, f64)]) -> crate::decklink::DeckLinkDevice {
+        crate::decklink::DeckLinkDevice {
+            name: "Box".into(),
+            arrival: 0,
+            modes: modes
+                .iter()
+                .map(|(name, fps)| crate::decklink::DeckLinkMode {
+                    name: (*name).into(),
+                    width: 1920,
+                    height: 1080,
+                    fps: *fps,
+                    code: 0,
+                })
+                .collect(),
+        }
+    }
+
+    fn on_box(mode: &str, follow_show: bool) -> crate::renderer::context::OutputTarget {
+        crate::renderer::context::OutputTarget::DeckLink {
+            device: "Box".into(),
+            mode: mode.into(),
+            full_range: false,
+            follow_show,
+        }
+    }
+
+    /// A Blackmagic output following the show takes the format for its rate
+    /// — 1080p at it — and again as it changes; one picked by hand keeps its
+    /// format, and one whose device is not there is left as it is.
+    #[test]
+    fn a_blackmagic_output_follows_the_shows_rate() {
+        use super::follow_show_rate;
+        let device = [box_with(&[("1080p50", 50.0), ("1080p60", 60.0)])];
+        let mut target = on_box("1080p50", true);
+        assert!(follow_show_rate(&mut target, &device, 60));
+        assert_eq!(target, on_box("1080p60", true));
+        assert!(!follow_show_rate(&mut target, &device, 60), "there already");
+        let mut picked = on_box("1080p50", false);
+        assert!(!follow_show_rate(&mut picked, &device, 60));
+        assert_eq!(picked, on_box("1080p50", false), "picked by hand");
+        assert!(!follow_show_rate(&mut target, &[], 50), "no device: left");
+        assert_eq!(target, on_box("1080p60", true));
+    }
+
+    /// The show's rate changed: a stopped Blackmagic output following it is
+    /// in the new rate's format, ready for Start.
+    #[test]
+    fn the_shows_rate_changed_puts_a_following_output_in_its_format() {
+        use crate::renderer::context::{HeadlessOutput, OutputSource, UnifiedOutput};
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let output = HeadlessOutput::new(
+            &app.context.device,
+            "Box".into(),
+            OutputSource::Master,
+            on_box("1080p60", true),
+            64,
+            36,
+        );
+        app.output.outputs.push(UnifiedOutput::Headless(output));
+        app.set_target_fps(50);
+        app.blackmagic_follow_show_rate_with(&[box_with(&[("1080p50", 50.0), ("1080p60", 60.0)])]);
+        let UnifiedOutput::Headless(h) = app.output.outputs.last().unwrap() else {
+            panic!("headless");
+        };
+        assert_eq!(h.target, on_box("1080p50", true));
+        assert!(!h.active, "stopped: it stays so");
+    }
+
+    /// A Blackmagic output saved before follows the show — its format was
+    /// chosen from the show's rate as it was made; one picked by hand is
+    /// written so, and read back so, in the show's outputs too.
+    #[test]
+    fn a_blackmagic_output_saved_before_follows_the_show() {
+        use crate::renderer::context::OutputTarget;
+        let old: OutputTarget =
+            serde_json::from_str(r#"{"DeckLink":{"device":"Box","mode":"1080p50"}}"#).unwrap();
+        assert_eq!(old, on_box("1080p50", true));
+        let picked = on_box("1080p50", false);
+        let text = serde_json::to_string(&picked).unwrap();
+        assert!(text.contains(r#""follow_show":false"#), "{text}");
+        assert_eq!(serde_json::from_str::<OutputTarget>(&text).unwrap(), picked);
+        assert!(!serde_json::to_string(&old).unwrap().contains("follow_show"));
+        let config: crate::scene::OutputTargetConfig =
+            serde_json::from_str(r#"{"type":"deck_link","device":"Box","mode":"1080p50"}"#)
+                .unwrap();
+        assert!(matches!(
+            config,
+            crate::scene::OutputTargetConfig::DeckLink { follow_show: true, .. }
+        ));
+    }
+    /// Run `f` with `devices` as the Blackmagic devices there.
+    fn with_devices<R>(devices: Vec<crate::decklink::DeckLinkDevice>, f: impl FnOnce() -> R) -> R {
+        DEVICES.with(|d| *d.borrow_mut() = Some(devices));
+        let result = f();
+        DEVICES.with(|d| *d.borrow_mut() = None);
+        result
+    }
+
+    fn stopped_on(app: &mut super::VardaApp, target: crate::renderer::context::OutputTarget) -> String {
+        use crate::renderer::context::{HeadlessOutput, OutputSource, UnifiedOutput};
+        let output = HeadlessOutput::new(&app.context.device, "Box".into(), OutputSource::Master, target, 64, 36);
+        let uuid = output.uuid.clone();
+        app.output.outputs.push(UnifiedOutput::Headless(output));
+        uuid
+    }
+
+    fn target_of(app: &super::VardaApp, uuid: &str) -> crate::renderer::context::OutputTarget {
+        match app.output.outputs.iter().find(|o| o.uuid() == uuid) {
+            Some(crate::renderer::context::UnifiedOutput::Headless(h)) => h.target.clone(),
+            _ => panic!("no such output"),
+        }
+    }
+
+    /// Auto turned on — by the API too — takes the show's rate at once; a
+    /// start takes the format for it whatever was saved; uncapped follows
+    /// nothing.
+    #[test]
+    fn auto_takes_the_shows_rate_when_set_and_at_start_but_not_uncapped() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let devices = vec![box_with(&[("1080p24", 24.0), ("1080p50", 50.0), ("1080p60", 60.0)])];
+        with_devices(devices.clone(), || {
+            app.set_target_fps(60);
+            let set = stopped_on(&mut app, on_box("1080p50", false));
+            let _ = app.cmd_set_output_target(
+                app.resolve_output(&set).ok().unwrap(),
+                on_box("1080p50", true),
+            );
+            assert_eq!(target_of(&app, &set), on_box("1080p60", true), "Auto set");
+
+            let saved = stopped_on(&mut app, on_box("1080p50", true));
+            let _ = app.cmd_start_output(&saved);
+            assert_eq!(target_of(&app, &saved), on_box("1080p60", true), "at start");
+        });
+        let mut target = on_box("1080p60", true);
+        assert!(!super::follow_show_rate(&mut target, &devices, 0), "uncapped");
+        assert_eq!(target, on_box("1080p60", true));
+    }
+
+    /// A running output that cannot start again at the show's new rate is
+    /// still meant to run: it starts by itself once its device can be had.
+    #[test]
+    fn an_output_that_cannot_start_again_at_the_new_rate_is_still_meant_to_run() {
+        use crate::renderer::context::UnifiedOutput;
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let uuid = running_blackmagic(&mut app);
+        let mut test_box = box_with(&[("1080p50", 50.0), ("1080p60", 60.0)]);
+        test_box.name = "Test Box".into();
+        with_devices(vec![test_box.clone()], || {
+            app.set_target_fps(50);
+            app.blackmagic_follow_show_rate_with(&[test_box]);
+        });
+        let Some(UnifiedOutput::Headless(h)) = app.output.outputs.iter().find(|o| o.uuid() == uuid) else {
+            panic!("the output");
+        };
+        assert!(matches!(&h.target, crate::renderer::context::OutputTarget::DeckLink { mode, .. } if mode == "1080p50"));
+        assert!(!h.active, "no such device to start on");
+        assert!(h.keep_running, "still meant to run");
+    }
+    /// The frame rate menu's command puts a following output in the format
+    /// for the new rate.
+    #[test]
+    fn the_frame_rate_command_puts_a_following_output_in_its_format() {
+        use crate::engine::EngineCommand;
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        with_devices(vec![box_with(&[("1080p50", 50.0), ("1080p60", 60.0)])], || {
+            app.set_target_fps(60);
+            let uuid = stopped_on(&mut app, on_box("1080p60", true));
+            let _ = app.execute_command(EngineCommand::SetTargetFps { fps: 50 });
+            assert_eq!(target_of(&app, &uuid), on_box("1080p50", true));
+        });
+    }
 }
+

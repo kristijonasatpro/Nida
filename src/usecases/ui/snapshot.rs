@@ -123,10 +123,20 @@ pub(crate) fn build_ui_data(
                         screen_capture,
                         tap,
                         playlist: d.playlist.clone(),
+                        slides: d.slides.clone(),
                         timer: d.timer.clone(),
+                        lower_third: d.lower_third.clone(),
+                        text: d.text.clone(),
+                        presentation: d.presentation.clone(),
+                        presenter_of: d.presenter_of.clone(),
+                        presenter_layout: d.presenter_layout,
+                        offline: d.offline.clone(),
                         camera_colour: d.camera_colour,
                         camera_profile: d.camera_profile.clone(),
                         camera_lowest_latency: d.camera_lowest_latency,
+                        camera_signal: d.camera_signal.clone(),
+                        camera_id: d.camera_id,
+                        camera_mode: d.camera_mode,
                         is_html_interactive: d.is_html_interactive,
                         opacity: d.opacity,
                         effective_opacity: d.effective_opacity,
@@ -153,12 +163,25 @@ pub(crate) fn build_ui_data(
             ChannelUIInfo {
                 ch_idx: ch.idx,
                 uuid: ch.uuid.clone(),
-                name: ch.name.clone(),
+                name: shown_channel_name(&ch.name, ch.idx),
+                unnamed: crate::mixer::is_default_channel_name(&ch.name),
                 opacity: ch.opacity,
                 blend_mode: ch.blend_mode,
                 decks,
                 effects,
                 overlay: ch.overlay,
+                color: ch.color.map(|[r, g, b]| egui::Color32::from_rgb(r, g, b)),
+                on_air: ch.on_air.as_deref().map(|at| {
+                    if at == "main" {
+                        "Main".to_string()
+                    } else {
+                        engine
+                            .buses
+                            .iter()
+                            .find(|bus| bus.uuid == at)
+                            .map_or_else(|| at.to_string(), |bus| bus.name.clone())
+                    }
+                }),
             }
         })
         .collect();
@@ -460,6 +483,8 @@ pub(crate) fn build_ui_data(
             label: m.label.clone(),
             model: m.model.clone(),
             given_name: m.given_name.clone(),
+            identity: m.identity.clone(),
+            main: m.main,
         })
         .collect();
 
@@ -569,6 +594,7 @@ pub(crate) fn build_ui_data(
         .collect();
     UIData {
         generators: engine.registry.generators,
+        broadcast: engine.registry.broadcast,
         filters: engine.registry.filters,
         effect_masks,
         shader_count: engine.registry.shader_count,
@@ -583,6 +609,7 @@ pub(crate) fn build_ui_data(
         channel_preview_textures: channel_preview_textures.clone(),
         output_preview_textures: output_preview_textures.clone(),
         main_output_texture,
+        preview_monitor_texture: None,
         notifications,
         crossfader: engine.mixer.crossfader,
         auto_crossfade_active: engine.mixer.auto_crossfade_active,
@@ -600,6 +627,8 @@ pub(crate) fn build_ui_data(
             .as_ref()
             .map(|t| format!("{t}")),
         keymap_bindings: app.input.keymap.bindings.clone(),
+        // The control window's own (see the runner): the Mac's clicker.
+        clicker: crate::clicker::ClickerStatus::default(),
         transition_names: engine.mixer.transition_names,
         active_transition_name: engine.mixer.active_transition_name,
         // UI layout/selection state — owned by the UI consumer, not the engine
@@ -669,6 +698,8 @@ pub(crate) fn build_ui_data(
         cameras: engine.cameras.devices,
         camera_modes: engine.cameras.modes,
         camera_access_denied: engine.cameras.access_denied,
+        cameras_with_own_sound: engine.cameras.with_own_sound.clone(),
+        cameras_following_signal: engine.cameras.following_signal.clone(),
         camera_video_effects: engine.cameras.video_effects.clone(),
         depth_sensors: engine.depth_sensors.devices,
         capture_targets: engine.screen_capture.targets,
@@ -782,6 +813,8 @@ pub(crate) fn build_ui_data(
             .gpu_busy()
             .unwrap_or_else(|| app.mixer_ref().gpu_utilization()),
         gpu_utilization_measured: app.frame_stats.system_monitor.gpu_busy().is_some(),
+        nida_gpu: app.frame_stats.system_monitor.nida_gpu(),
+        nida_ram: app.frame_stats.system_monitor.nida_ram(),
         cpu_usage: app.frame_stats.system_monitor.cpu_usage(),
         ram_used: app.frame_stats.system_monitor.ram_used(),
         ram_total: app.frame_stats.system_monitor.ram_total(),
@@ -806,6 +839,7 @@ pub(crate) fn build_ui_data(
         target_fps: app.target_fps(),
         frames_in_flight: app.frames_in_flight(),
         control_screen_rate: app.control_screen_rate(),
+        night_shift_off: app.night_shift_off(),
         // Populated by UIRunner after build (history/pending loads live on runner, not app)
         can_undo: false,
         can_redo: false,
@@ -855,6 +889,7 @@ fn params_snapshot_to_ui(snap: &ShaderParamsSnapshot) -> ShaderParamsUI {
                 value: p.value,
                 min: p.min,
                 max: p.max,
+                choices: p.choices.clone(),
             })
             .collect(),
     }
@@ -863,7 +898,10 @@ fn params_snapshot_to_ui(snap: &ShaderParamsSnapshot) -> ShaderParamsUI {
 fn effect_snapshot_to_ui(snap: &EffectSnapshot) -> EffectInfo {
     (
         snap.uuid.clone(),
-        snap.name.clone(),
+        match snap.offline {
+            Some(_) => format!("⚠ {} — offline", snap.name),
+            None => snap.name.clone(),
+        },
         snap.enabled,
         params_snapshot_to_ui(&snap.params),
     )
@@ -893,9 +931,87 @@ fn list_available_luts(workspace: &crate::persistence::Workspace) -> Vec<String>
     files
 }
 
+/// What a channel is called in the UI: its name, or — never named, still
+/// "Ch 25" as it was made — "Input 8", by where it is in the Inputs row.
+fn shown_channel_name(name: &str, idx: usize) -> String {
+    if crate::mixer::is_default_channel_name(name) {
+        format!("Input {}", idx + 1)
+    } else {
+        name.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::channel_fps;
+    use super::{channel_fps, shown_channel_name};
+
+    /// A channel never named is called by where it is in the Inputs row,
+    /// not by the count of channels ever made; one named keeps its name.
+    #[test]
+    fn a_channel_never_named_is_called_by_its_number() {
+        assert_eq!(shown_channel_name("Ch 25", 7), "Input 8");
+        assert_eq!(shown_channel_name("Ch 0", 0), "Input 1");
+        assert_eq!(shown_channel_name("1_Forward_Momentum", 8), "1_Forward_Momentum");
+        assert_eq!(shown_channel_name("Ch A", 0), "Ch A");
+    }
+
+    /// The UI's inputs, made from the app: one never named is called by its
+    /// number there, one named by its name.
+    #[test]
+    fn the_uis_inputs_are_called_by_their_numbers_when_never_named() {
+        use crate::engine::traits::*;
+        let Some(gpu) = crate::renderer::context::GpuContext::new_headless().ok() else {
+            return;
+        };
+        let Ok(mut app) = crate::app::VardaApp::new(gpu, &crate::testing::headless_config())
+        else {
+            return;
+        };
+        app.add_channel().unwrap();
+        let made: Vec<(usize, String)> = app
+            .mixer_ref()
+            .channels()
+            .iter()
+            .enumerate()
+            .map(|(i, ch)| (i, ch.name.clone()))
+            .collect();
+        assert!(made.iter().any(|(_, n)| crate::mixer::is_default_channel_name(n)), "{made:?}");
+        let none = std::collections::HashMap::new();
+        let data = super::build_ui_data(
+            &app,
+            &crate::usecases::ui::UILayoutState::default(),
+            &std::collections::HashMap::new(),
+            &none,
+            &std::collections::HashMap::new(),
+            None,
+        );
+        for ((i, name), ch) in made.iter().zip(&data.channels) {
+            let want = if crate::mixer::is_default_channel_name(name) {
+                format!("Input {}", i + 1)
+            } else {
+                name.clone()
+            };
+            assert_eq!(ch.name, want, "{name} at {i}");
+            assert_eq!(ch.unnamed, crate::mixer::is_default_channel_name(name), "{name}");
+        }
+    }
+
+    /// Number and name, as a tile shows them; one never named, its number.
+    #[test]
+    fn an_input_is_numbered_as_its_tile() {
+        let mut ch = crate::usecases::ui::UIData::test_fixture().channels.remove(0);
+        ch.ch_idx = 8;
+        ch.name = "1_Forward_Momentum_pertrauka".into();
+        assert_eq!(ch.number(), 9);
+        assert_eq!(ch.numbered(), "9  1_Forward_Momentum_pertrauka");
+        ch.ch_idx = 7;
+        ch.name = shown_channel_name("Ch 25", 7);
+        ch.unnamed = true;
+        assert_eq!(ch.numbered(), "8  Input");
+        // One named "Input 8" by hand keeps it.
+        ch.unnamed = false;
+        assert_eq!(ch.numbered(), "8  Input 8");
+    }
 
     #[test]
     fn a_channel_runs_at_its_slowest_moving_layer_and_a_still_does_not_count() {

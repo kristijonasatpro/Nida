@@ -21,9 +21,49 @@ use crate::engine::types::{
 };
 
 /// Build a `MixerSnapshot` from the current `VardaApp` state.
+/// Where a channel is on air (see `ChannelSnapshot::on_air`): on Main, else
+/// the first bus, in order — showing any of its decks, or taken there
+/// itself: then it is on air whatever its layers show, its own effects
+/// drawing on it (a strobe over layers all muted).
+fn channel_on_air(
+    app: &VardaApp,
+    on_air: &super::state::on_air::OnAir,
+    ch: &crate::channel::Channel,
+) -> Option<String> {
+    use crate::bus::BusInputRef;
+    use crate::mixer::{MainSource, MixMode};
+    let uuid = ch.uuid();
+    let shows = |at: Option<&str>| {
+        ch.decks
+            .iter()
+            .any(|slot| on_air.at(at, slot.deck.uuid()) > 0.0)
+    };
+    let main = app.mixer.main();
+    let itself = MainSource::Channel(uuid.to_string());
+    let on_main = app.mixer.mix_mode() == MixMode::Program
+        && (main.program == itself
+            || main.fade.as_ref().is_some_and(|f| f.from == itself)
+            || (ch.overlay && main.overlay_level(uuid) > 0.0));
+    if on_main || shows(Some(crate::audio_mix::FOLLOW_MAIN)) {
+        return Some("main".to_string());
+    }
+    let taken = |input: &BusInputRef| input.addresses(uuid);
+    app.production_buses
+        .iter()
+        .find(|bus| {
+            taken(bus.effective_program())
+                || bus
+                    .transition()
+                    .is_some_and(|t| taken(&t.from) || taken(&t.to))
+                || shows(Some(bus.uuid()))
+        })
+        .map(|bus| bus.uuid().to_string())
+}
+
 pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
     let mixer = &app.mixer;
     let channel_labels = app.channel_labels();
+    let on_air = app.on_air();
 
     let channels = mixer
         .channels()
@@ -43,10 +83,11 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                         .iter()
                         .map(|e| EffectSnapshot {
                             uuid: e.uuid().to_owned(),
-                            name: e.shader.name(),
+                            name: e.name(),
                             enabled: e.enabled,
                             params: build_shader_params(&e.shader.name(), &e.params),
                             mask: e.mask.clone(),
+                    offline: e.offline().map(str::to_owned),
                         })
                         .collect();
 
@@ -205,15 +246,37 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                             .deck
                             .playlist()
                             .map(crate::deck::playlist::Playlist::snapshot),
+                        slides: app.slides_snapshot(&slot.deck),
+                        text: slot.deck.text().map(crate::deck::text::Text::snapshot),
+                        lower_third: slot
+                            .deck
+                            .lower_third()
+                            .map(crate::deck::lower_third::LowerThird::snapshot),
                         timer: slot.deck.timer().map(|timer| {
                             timer.snapshot(crate::engine::value::timer::panel_of(slot.deck.uuid()))
                         }),
+                        presentation: app.presentation_snapshot(&slot.deck),
+                        presenter_of: slot.deck.presenter().map(|p| p.follows().to_string()),
+                        presenter_layout: slot
+                            .deck
+                            .presenter()
+                            .map(crate::deck::presenter::Presenter::layout),
+                        offline: slot.deck.offline().map(|o| o.reason.clone()),
                         camera_colour: (slot.deck.source_type() == "camera")
                             .then_some(slot.deck.camera_colour),
                         camera_profile: (slot.deck.source_type() == "camera")
                             .then(|| slot.deck.camera_profile.clone()),
                         camera_lowest_latency: (slot.deck.source_type() == "camera")
                             .then_some(slot.deck.camera_lowest_latency),
+                        camera_signal: (slot.deck.source_type() == "camera")
+                            .then(|| slot.deck.camera_id())
+                            .flatten()
+                            .and_then(|id| app.camera_manager.signal(id)),
+                        camera_id: (slot.deck.source_type() == "camera")
+                            .then(|| slot.deck.camera_id())
+                            .flatten()
+                            .filter(|id| *id != crate::camera::UNBOUND_CAMERA),
+                        camera_mode: slot.deck.camera_mode,
                         is_html_interactive: {
                             #[cfg(feature = "html")]
                             {
@@ -265,10 +328,11 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                 .iter()
                 .map(|e| EffectSnapshot {
                     uuid: e.uuid().to_owned(),
-                    name: e.shader.name(),
+                    name: e.name(),
                     enabled: e.enabled,
                     params: build_shader_params(&e.shader.name(), &e.params),
                     mask: e.mask.clone(),
+                    offline: e.offline().map(str::to_owned),
                 })
                 .collect();
 
@@ -283,6 +347,8 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                 render_time_ms: ch.render_time_ms,
                 active_deck_count: ch.active_deck_count,
                 overlay: ch.overlay,
+                on_air: channel_on_air(app, &on_air, ch),
+                color: ch.color,
             }
         })
         .collect();
@@ -292,10 +358,11 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
         .iter()
         .map(|e| EffectSnapshot {
             uuid: e.uuid().to_owned(),
-            name: e.shader.name(),
+            name: e.name(),
             enabled: e.enabled,
             params: build_shader_params(&e.shader.name(), &e.params),
             mask: e.mask.clone(),
+            offline: e.offline().map(str::to_owned),
         })
         .collect();
 
@@ -328,7 +395,17 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
         active_lut: mixer
             .active_lut_filename()
             .map(std::string::ToString::to_string),
-        main: crate::mixer::MainSnapshot::of(mixer.mix_mode(), mixer.main()),
+        main: {
+            let mut main = crate::mixer::MainSnapshot::of(mixer.mix_mode(), mixer.main());
+            // Showing only if its channel is drawn: its opacity as resolved,
+            // with any automation or modulation, above 0.
+            main.overlays_showing.retain(|uuid| {
+                mixer
+                    .find_channel_by_uuid(uuid)
+                    .is_some_and(|i| mixer.channel_opacity(i) > 0.0)
+            });
+            main
+        },
     }
 }
 
@@ -348,6 +425,7 @@ fn build_shader_params(
                 value: *value,
                 min: def.and_then(|d| d.min),
                 max: def.and_then(|d| d.max),
+                choices: def.and_then(crate::isf::ISFInput::choices),
             })
         })
         .collect();
@@ -459,6 +537,7 @@ pub(crate) fn build_registry_snapshot(app: &VardaApp) -> RegistrySnapshot {
         .map(|(i, s)| (s.name(), i))
         .collect();
     generators.sort_by_key(|a| a.0.to_lowercase());
+    let broadcast = broadcast_looks(&app.registry.generators());
     // A layer's own mask is made from Input Settings, not dropped from the
     // Library: alone, it would just make the layer vanish.
     let mut filters: Vec<(String, usize)> = app
@@ -472,9 +551,61 @@ pub(crate) fn build_registry_snapshot(app: &VardaApp) -> RegistrySnapshot {
     filters.sort_by_key(|a| a.0.to_lowercase());
     RegistrySnapshot {
         generators,
+        broadcast,
         filters,
         shader_count: app.registry.count(),
     }
+}
+
+/// The Broadcast backgrounds among `generators` (by their index there): the
+/// shaders in the "Broadcast" category, each with its mood and a title from
+/// its description ("Hex field — a slow wave…" → "Hex field"), by mood then
+/// title.
+pub(crate) fn broadcast_looks(
+    generators: &[&crate::isf::ISFShader],
+) -> Vec<crate::engine::BroadcastLook> {
+    let mut looks: Vec<crate::engine::BroadcastLook> = generators
+        .iter()
+        .enumerate()
+        .filter_map(|(index, shader)| {
+            let categories = shader.metadata.categories.as_ref()?;
+            if !categories.iter().any(|c| c == "Broadcast") {
+                return None;
+            }
+            let mood = categories
+                .iter()
+                .find(|c| crate::engine::BROADCAST_MOODS.contains(&c.as_str()))
+                .cloned()
+                .unwrap_or_else(|| "Colours".to_string());
+            let name = shader.name();
+            let title = shader
+                .metadata
+                .description
+                .as_deref()
+                .and_then(|d| d.split(" — ").next())
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map_or_else(|| name.clone(), str::to_string);
+            Some(crate::engine::BroadcastLook {
+                name,
+                title,
+                mood,
+                index,
+            })
+        })
+        .collect();
+    let rank = |mood: &str| {
+        crate::engine::BROADCAST_MOODS
+            .iter()
+            .position(|m| *m == mood)
+            .unwrap_or(99)
+    };
+    looks.sort_by(|a, b| {
+        rank(&a.mood)
+            .cmp(&rank(&b.mood))
+            .then_with(|| a.title.cmp(&b.title))
+    });
+    looks
 }
 
 /// Build a `MidiSnapshot` from the current `VardaApp` state.
@@ -542,6 +673,8 @@ pub(crate) fn build_camera_snapshot(app: &VardaApp) -> CameraSnapshot {
             .map(|d| (d.id, d.modes()))
             .collect(),
         access_denied: app.camera_manager.access_denied(),
+        with_own_sound: app.camera_manager.with_own_sound(),
+        following_signal: app.camera_manager.following_signal(),
         video_effects: app
             .camera_manager
             .video_effects()
@@ -723,6 +856,7 @@ fn build_bus_snapshots(app: &VardaApp) -> Vec<crate::engine::types::BusSnapshot>
             audio_mix: bus.audio_mix().clone(),
             auto_duration: bus.auto_duration,
             hidden_layers: bus.hidden_layers().to_vec(),
+            hidden_sources: bus.hidden_sources().to_vec(),
             transition: bus.transition().map(|t| BusTransitionSnapshot {
                 from: t.from.clone(),
                 to: t.to.clone(),
@@ -786,6 +920,7 @@ fn build_pacing_snapshot(app: &VardaApp) -> crate::engine::PacingSnapshot {
         .collect();
     crate::engine::PacingSnapshot {
         clock: stats.clock.clone(),
+        tiles_seen: app.tile_channels().to_vec(),
         frames_in_flight: app.frames_in_flight(),
         frame_pacing: app.frame_pacing(),
         interval_mean_ms: mean,
@@ -811,7 +946,11 @@ fn build_pacing_snapshot(app: &VardaApp) -> crate::engine::PacingSnapshot {
         control_on_screen: stats.control_on_screen.clone(),
         control_parts: stats.control_parts.clone(),
         control_slow_frames: stats.control_slow_frames.clone(),
+        control_rate: stats.control_rate.clone(),
         gpu_busy_pct: stats.system_monitor.gpu_busy(),
+        gpu_app_pct: stats.system_monitor.nida_gpu(),
+        footprint_bytes: stats.system_monitor.nida_ram(),
+        control_monitors: stats.control_monitors,
         gpu_time: stats.gpu_time.snapshot(),
     }
 }
@@ -825,7 +964,11 @@ pub(crate) fn build_engine_state(app: &VardaApp) -> EngineState {
         buses: build_bus_snapshots(app),
         rundown: app.rundown_snapshot(),
         audio: app.audio_snapshot(),
-        audio_mix: app.audio_mix().snapshot(),
+        audio_mix: {
+            let mut mix = app.audio_mix().snapshot();
+            mix.stopping = app.sounds_stopping();
+            mix
+        },
         stream: crate::streaming::StreamSnapshot::of(app.stream_settings(), app.stream_status()),
         record: crate::record::RecordSnapshot {
             options: app.record_settings().options.clone(),
@@ -912,6 +1055,179 @@ mod tests {
         let gpu = crate::renderer::context::GpuContext::new_headless().ok()?;
         let config = crate::testing::headless_config();
         super::super::VardaApp::new(gpu, &config).ok()
+    }
+
+    /// The Broadcast backgrounds are the generators in the Broadcast
+    /// category, each by its mood, titled from its description, in mood
+    /// order; the rest are not among them.
+    #[test]
+    fn the_broadcast_looks_are_its_category_by_mood() {
+        let shader = |categories: &str, description: &str, file: &str| {
+            let mut s = crate::isf::ISFShader::from_string(&format!(
+                "/*{{\"DESCRIPTION\": \"{description}\", \"CATEGORIES\": [{categories}], \"INPUTS\": []}}*/\nvoid main() {{}}"
+            ))
+            .expect("a shader");
+            s.file_path = Some(format!("/x/{file}.fs"));
+            s
+        };
+        let calm = shader(
+            "\"Generator\", \"Broadcast\", \"Calm\"",
+            "Aurora — slow curtains",
+            "broadcast_aurora",
+        );
+        let plain = shader("\"Generator\"", "Plasma", "plasma");
+        let tech = shader(
+            "\"Generator\", \"Broadcast\", \"Tech\"",
+            "Hex field — a wave",
+            "broadcast_hex_glow",
+        );
+        let looks = broadcast_looks(&[&calm, &plain, &tech]);
+        let seen: Vec<(&str, &str, &str, usize)> = looks
+            .iter()
+            .map(|l| (l.title.as_str(), l.mood.as_str(), l.name.as_str(), l.index))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("Hex field", "Tech", "broadcast_hex_glow", 2),
+                ("Aurora", "Calm", "broadcast_aurora", 0)
+            ]
+        );
+    }
+
+    /// The shipped library holds the Broadcast backgrounds, every mood among
+    /// them, each found by its index among the generators.
+    #[test]
+    fn the_library_holds_the_broadcast_looks() {
+        let Some(app) = headless_app() else {
+            return;
+        };
+        let registry = build_registry_snapshot(&app);
+        assert!(registry.broadcast.len() >= 10, "{:?}", registry.broadcast);
+        for mood in crate::engine::BROADCAST_MOODS {
+            assert!(
+                registry.broadcast.iter().any(|l| l.mood == mood),
+                "no {mood} look"
+            );
+        }
+        let generators = app.registry.generators();
+        for look in &registry.broadcast {
+            assert_eq!(generators[look.index].name(), look.name);
+        }
+    }
+
+    /// An overlay counts as showing only while its channel is drawn: on (or
+    /// fading out), and its opacity, as resolved, above 0.
+    #[test]
+    fn an_overlay_shows_only_while_its_channel_is_drawn() {
+        use crate::engine::EngineCommand as C;
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let ch = app.mixer_ref().channels()[1].uuid().to_string();
+        app.execute_command(C::SetMixMode {
+            mode: crate::mixer::MixMode::Program,
+        });
+        app.execute_command(C::SetChannelOverlay {
+            channel_uuid: ch.clone(),
+            overlay: true,
+        });
+        app.execute_command(C::SetOverlayOn {
+            channel_uuid: ch.clone(),
+            on: true,
+            fade: false,
+        });
+        app.render_mixer_frame();
+        let showing =
+            |app: &super::super::VardaApp| build_mixer_snapshot(app).main.overlays_showing;
+        assert_eq!(showing(&app), vec![ch.clone()]);
+        app.execute_command(C::SetChannelOpacity {
+            channel_uuid: ch,
+            opacity: 0.0,
+        });
+        assert!(showing(&app).is_empty(), "its channel not drawn");
+    }
+
+    /// Where each channel is on air, as the engine reckons it: on Main; on
+    /// a bus showing it; shown inside another input that is on Main; or not.
+    #[test]
+    fn a_channel_says_where_it_is_on_air() {
+        use crate::engine::{CommandResult, EngineCommand as C};
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        app.execute_command(C::SetMixMode {
+            mode: crate::mixer::MixMode::Program,
+        });
+        let channel = |app: &mut super::super::VardaApp| {
+            let CommandResult::OkWithId { uuid } = app.execute_command(C::AddChannel) else {
+                panic!("no channel");
+            };
+            app.add_solid_color_deck(&uuid, [1.0, 0.0, 0.0, 1.0])
+                .unwrap();
+            uuid
+        };
+        let (main, inside, on_bus, off) = (
+            channel(&mut app),
+            channel(&mut app),
+            channel(&mut app),
+            channel(&mut app),
+        );
+        let shown = app.execute_command(C::AddTapDeck {
+            channel_uuid: main.clone(),
+            source: crate::scene::TapSourceConfig::Channel {
+                uuid: inside.clone(),
+            },
+        });
+        assert!(matches!(shown, CommandResult::OkWithId { .. }), "{shown:?}");
+        app.execute_command(C::TakeToMain {
+            source: crate::mixer::MainSource::Channel(main.clone()),
+            fade: false,
+        });
+        let CommandResult::OkWithId { uuid: bus } = app.execute_command(C::AddBus {
+            name: "TV".into(),
+            width: 1920,
+            height: 1080,
+        }) else {
+            panic!("no bus");
+        };
+        app.execute_command(C::SetBusPreview {
+            uuid: bus.clone(),
+            input: crate::bus::BusInputRef::Channel(on_bus.clone()),
+        });
+        app.execute_command(C::BusCut { uuid: bus.clone() });
+        let at = |app: &super::super::VardaApp, uuid: &str| {
+            build_mixer_snapshot(app)
+                .channels
+                .into_iter()
+                .find(|c| c.uuid == uuid)
+                .and_then(|c| c.on_air)
+        };
+        assert_eq!(at(&app, &main).as_deref(), Some("main"));
+        assert_eq!(
+            at(&app, &inside).as_deref(),
+            Some("main"),
+            "inside an input on Main"
+        );
+        assert_eq!(at(&app, &on_bus), Some(bus));
+        assert_eq!(at(&app, &off), None);
+
+        // Taken to Main itself with its one layer muted: on air still, its
+        // own effects drawing on it.
+        let index = app.mixer_ref().find_channel_by_uuid(&off).unwrap();
+        let layer = app.mixer_ref().channels()[index].decks[0]
+            .deck
+            .uuid()
+            .to_string();
+        app.execute_command(C::SetDeckMute {
+            deck_uuid: layer,
+            mute: true,
+        });
+        app.execute_command(C::TakeToMain {
+            source: crate::mixer::MainSource::Channel(off.clone()),
+            fade: false,
+        });
+        assert_eq!(at(&app, &off).as_deref(), Some("main"), "muted, on Main");
     }
 
     #[test]

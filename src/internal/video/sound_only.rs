@@ -107,6 +107,7 @@ impl FramePlayer for SoundOnlyPlayer {
     fn seek_and_reset(&mut self, time_secs: f64) -> Result<()> {
         self.playback.position = time_secs.clamp(0.0, self.playback.duration);
         self.playback.reverse = false;
+        self.playback.seeks = self.playback.seeks.wrapping_add(1);
         Ok(())
     }
 

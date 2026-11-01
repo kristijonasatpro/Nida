@@ -18,6 +18,13 @@ enum Named {
 struct Renaming {
     named: Named,
     text: String,
+    /// A channel never named, shown "Input 8" by where it is: left so,
+    /// nothing is renamed — it is not given that as its name, even moved
+    /// meanwhile and another number now.
+    unnamed: Option<String>,
+    /// The window it was asked in — the main window, or a panel's own (the
+    /// Audio Mixer on another screen): it opens there, by the pointer.
+    viewport: egui::ViewportId,
     at: egui::Pos2,
     /// Not yet drawn: the name is selected, to be typed over.
     fresh: bool,
@@ -34,6 +41,12 @@ fn field_id() -> egui::Id {
 /// Ask for a new name for `ch`, next to the pointer.
 pub(super) fn open(ctx: &egui::Context, ch: &ChannelUIInfo) {
     ask(ctx, Named::Channel(ch.uuid.clone()), &ch.name);
+    if ch.unnamed {
+        if let Some(mut r) = ctx.data(|d| d.get_temp::<Renaming>(state_id())) {
+            r.unnamed = Some(ch.name.clone());
+            ctx.data_mut(|d| d.insert_temp(state_id(), r));
+        }
+    }
 }
 
 /// Ask for a new name for the bus `uuid`, now `name`, next to the pointer.
@@ -51,12 +64,15 @@ fn ask(ctx: &egui::Context, named: Named, name: &str) {
     let at = ctx
         .pointer_latest_pos()
         .unwrap_or_else(|| ctx.content_rect().center());
+    let viewport = ctx.viewport_id();
     ctx.data_mut(|d| {
         d.insert_temp(
             state_id(),
             Renaming {
                 named,
                 text: name.to_string(),
+                unnamed: None,
+                viewport,
                 at,
                 fresh: true,
             },
@@ -73,10 +89,36 @@ pub(super) fn renaming(ctx: &egui::Context) -> Option<String> {
         })
 }
 
+/// The rename window, in the window it was asked in: called in each
+/// window's pass, it draws only in that one's. `open` are the panels'
+/// windows of their own still open (the main window's pass says): one asked
+/// in a window closed since is let go.
+pub(super) fn render_rename_in(
+    ctx: &egui::Context,
+    data: &UIData,
+    actions: &mut UIActions,
+    open: &[egui::ViewportId],
+) {
+    let Some(state) = ctx.data(|d| d.get_temp::<Renaming>(state_id())) else {
+        return;
+    };
+    if ctx.viewport_id() == egui::ViewportId::ROOT
+        && state.viewport != egui::ViewportId::ROOT
+        && !open.contains(&state.viewport)
+    {
+        ctx.data_mut(|d| d.remove::<Renaming>(state_id()));
+        return;
+    }
+    render_rename(ctx, data, actions);
+}
+
 pub(super) fn render_rename(ctx: &egui::Context, data: &UIData, actions: &mut UIActions) {
     let Some(mut state) = ctx.data(|d| d.get_temp::<Renaming>(state_id())) else {
         return;
     };
+    if state.viewport != ctx.viewport_id() {
+        return;
+    }
     let current = match &state.named {
         Named::Channel(uuid) => data
             .channels
@@ -125,7 +167,7 @@ pub(super) fn render_rename(ctx: &egui::Context, data: &UIData, actions: &mut UI
                     .add_enabled(!name.is_empty(), egui::Button::new("Rename"))
                     .clicked();
                 if (ok || entered) && !name.is_empty() {
-                    if name != current {
+                    if name != current && state.unnamed.as_deref() != Some(name) {
                         actions.commands.push(match &state.named {
                             Named::Channel(uuid) => EngineCommand::RenameChannel {
                                 channel_uuid: uuid.clone(),
@@ -200,6 +242,157 @@ mod tests {
         harness
     }
 
+    /// A channel never named, shown by its number, is not given that name
+    /// when the window is left as it was — even moved meanwhile, its number
+    /// another now.
+    #[test]
+    fn a_name_left_as_it_was_renames_nothing_even_moved_meanwhile() {
+        let data = std::rc::Rc::new(std::cell::RefCell::new(UIData::test_fixture()));
+        data.borrow_mut().channels[0].name = "Input 8".into();
+        data.borrow_mut().channels[0].ch_idx = 7;
+        data.borrow_mut().channels[0].unnamed = true;
+        let ch = data.borrow().channels[0].clone();
+        let shown = data.clone();
+        let mut opened = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_ui_state(
+                move |ui, commands: &mut Vec<EngineCommand>| {
+                    if !opened {
+                        open(ui.ctx(), &ch);
+                        opened = true;
+                    }
+                    let mut actions = UIActions::new();
+                    render_rename(ui.ctx(), &shown.borrow(), &mut actions);
+                    commands.extend(actions.commands);
+                },
+                Vec::new(),
+            );
+        harness.run();
+        data.borrow_mut().channels[0].name = "Input 7".into();
+        data.borrow_mut().channels[0].ch_idx = 6;
+        harness.run();
+        harness.get_by_label("Rename").click();
+        harness.run();
+        assert!(harness.state().is_empty(), "{:?}", harness.state());
+        assert_eq!(renaming(&harness.ctx), None, "closed");
+    }
+
+    /// A channel named "Input 8" by hand, renamed meanwhile from outside,
+    /// is given that name back when Rename is pressed.
+    #[test]
+    fn a_channel_named_like_its_number_is_given_its_name_back() {
+        let data = std::rc::Rc::new(std::cell::RefCell::new(UIData::test_fixture()));
+        data.borrow_mut().channels[0].name = "Input 8".into();
+        data.borrow_mut().channels[0].ch_idx = 7;
+        let ch = data.borrow().channels[0].clone();
+        let shown = data.clone();
+        let mut opened = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_ui_state(
+                move |ui, commands: &mut Vec<EngineCommand>| {
+                    if !opened {
+                        open(ui.ctx(), &ch);
+                        opened = true;
+                    }
+                    let mut actions = UIActions::new();
+                    render_rename(ui.ctx(), &shown.borrow(), &mut actions);
+                    commands.extend(actions.commands);
+                },
+                Vec::new(),
+            );
+        harness.run();
+        data.borrow_mut().channels[0].name = "Slides".into();
+        harness.run();
+        harness.get_by_label("Rename").click();
+        harness.run();
+        assert!(
+            format!("{:?}", harness.state()).contains(r#"name: "Input 8""#),
+            "{:?}",
+            harness.state()
+        );
+    }
+
+    /// A bus renamed meanwhile from outside is given back the name the
+    /// window opened with when Rename is pressed.
+    #[test]
+    fn a_bus_renamed_meanwhile_is_given_its_name_back() {
+        let data = UIData::test_fixture();
+        let uuid = data.buses[0].bus.uuid.clone();
+        let now = data.buses[0].bus.name.clone();
+        let mut opened = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_ui_state(
+                move |ui, commands: &mut Vec<EngineCommand>| {
+                    if !opened {
+                        open_bus(ui.ctx(), &uuid, "LED");
+                        opened = true;
+                    }
+                    let mut actions = UIActions::new();
+                    render_rename(ui.ctx(), &data, &mut actions);
+                    commands.extend(actions.commands);
+                },
+                Vec::new(),
+            );
+        harness.run();
+        assert_ne!(now, "LED");
+        harness.get_by_label("Rename").click();
+        harness.run();
+        assert!(
+            format!("{:?}", harness.state()).contains(r#"name: "LED""#),
+            "{:?}",
+            harness.state()
+        );
+    }
+
+    /// Asked in a panel's own window — the Audio Mixer on another screen —
+    /// it opens there, not in the main window; that window closed, it is
+    /// let go.
+    #[test]
+    fn a_rename_opens_in_the_window_it_was_asked_in() {
+        let data = std::rc::Rc::new(UIData::test_fixture());
+        let audio = egui::ViewportId::from_hash_of("audio mixer window");
+        let open = std::rc::Rc::new(std::cell::Cell::new(true));
+        let (shown, still) = (data.clone(), open.clone());
+        let mut asked = false;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .build_ui_state(
+                move |ui, commands: &mut Vec<EngineCommand>| {
+                    if !asked {
+                        ui.ctx().data_mut(|d| {
+                            d.insert_temp(
+                                state_id(),
+                                Renaming {
+                                    named: Named::AudioBus("amaster1".into()),
+                                    text: "Master".into(),
+                                    unnamed: None,
+                                    viewport: audio,
+                                    at: egui::pos2(100.0, 100.0),
+                                    fresh: true,
+                                },
+                            );
+                        });
+                        asked = true;
+                    }
+                    let mut actions = UIActions::new();
+                    let windows: Vec<egui::ViewportId> =
+                        if still.get() { vec![audio] } else { vec![] };
+                    render_rename_in(ui.ctx(), &shown, &mut actions, &windows);
+                    commands.extend(actions.commands);
+                },
+                Vec::new(),
+            );
+        harness.run();
+        assert!(harness.query_by_label("Rename").is_none(), "not in the main window");
+        assert!(harness.ctx.data(|d| d.get_temp::<Renaming>(state_id())).is_some(), "kept");
+        open.set(false);
+        harness.run();
+        assert!(harness.ctx.data(|d| d.get_temp::<Renaming>(state_id())).is_none(), "let go");
+    }
+
     #[test]
     fn typing_over_the_name_and_pressing_enter_renames_the_channel() {
         let data = UIData::test_fixture();
@@ -263,9 +456,14 @@ mod tests {
         let mut bus = crate::audio_mix::AudioBusConfig::new("Bus A");
         bus.uuid = "astream1".into();
         data.audio_mix.buses = vec![crate::audio_mix::AudioBusSnapshot {
+            dynamics: crate::audio_mix::DynamicsSnapshot::default(),
             config: bus,
             device_ok: None,
+            device_note: None,
+            live: None,
+            insert_status: None,
             meter_db: [f32::NEG_INFINITY; 2],
+            peak_db: [-96.0;2],
         }];
         let data = std::rc::Rc::new(data);
         let mut opened = false;

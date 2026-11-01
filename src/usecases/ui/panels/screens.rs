@@ -128,6 +128,8 @@ mod tests {
             label: format!("{} (1920×1080)", given.unwrap_or(model)),
             model: Some(model.into()),
             given_name: given.map(str::to_string),
+            identity: name.into(),
+            main: false,
         };
         data.available_monitors = vec![
             screen("Monitor #0 @ 1728,0", "BMD HDMI", None),

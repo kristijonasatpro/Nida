@@ -439,10 +439,12 @@ impl Deck {
             analyzers: crate::analyzer::DeckAnalyzers::new(),
             gpu_error: None,
             rendered_still: None,
+            texture_generation: 0,
             visible: None,
             drawn_visible: None,
             drawn_share: 1.0,
             placed: None,
+            frames_uploaded: 0,
             render_scale: super::DeckRenderScale::Full,
             master_size: (width, height),
         })
@@ -800,6 +802,52 @@ impl Deck {
         )
     }
 
+    /// A picture deck of `rgba`, named `name`, its file `path` (a PDF
+    /// talk's page is put in it as drawn).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blit pipeline cannot be created.
+    pub fn new_from_pixels(
+        context: &GpuContext,
+        rgba: &image::RgbaImage,
+        name: String,
+        path: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        Self::new_image_deck(context, rgba, None, name, path.to_string(), width, height)
+    }
+
+    /// A Slides layer (see [`super::slides`]): `talks` in running order,
+    /// nothing on — or `resume` started at once, a saved show opened.
+    pub fn new_slides(
+        context: &GpuContext,
+        talks: Vec<crate::engine::value::slides::Talk>,
+        settings: crate::engine::value::slides::SlidesSettings,
+        resume: Option<super::slides::Resume>,
+        next_pick: Option<String>,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let slides = super::slides::Slides::new(
+            context,
+            talks,
+            settings,
+            (width, height),
+            resume,
+            next_pick,
+        );
+        Self::build_media_deck(
+            context,
+            "📽 Slides".to_string(),
+            None,
+            DeckSource::Slides(Box::new(slides)),
+            width,
+            height,
+        )
+    }
+
     /// A playlist of clips and pictures (see [`super::playlist`]), stopped
     /// on its first item.
     pub fn new_playlist(
@@ -818,6 +866,58 @@ impl Deck {
             width,
             height,
         )
+    }
+
+    /// A text input (see [`super::text`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pipeline that places it cannot be made.
+    pub fn new_text(
+        context: &GpuContext,
+        settings: crate::engine::value::text::TextSettings,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let name = settings
+            .text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map_or_else(
+                || "Text".to_string(),
+                |l| l.trim().chars().take(24).collect(),
+            );
+        let text = super::text::Text::new(context, settings, (width, height))?;
+        Ok(Self::build_media_deck(
+            context,
+            format!("T {name}"),
+            None,
+            DeckSource::Text(Box::new(text)),
+            width,
+            height,
+        ))
+    }
+
+    /// A lower third (see [`super::lower_third`]), off air.
+    ///
+    /// # Errors
+    ///
+    /// None as yet; it returns a result as the other sources do.
+    pub fn new_lower_third(
+        context: &GpuContext,
+        settings: crate::engine::value::lower_third::LowerThirdSettings,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let lower = super::lower_third::LowerThird::new(context, settings, (width, height))?;
+        Ok(Self::build_media_deck(
+            context,
+            "▁ Lower third".to_string(),
+            None,
+            DeckSource::LowerThird(Box::new(lower)),
+            width,
+            height,
+        ))
     }
 
     /// A timer (see [`super::timer`]) that has run `elapsed` seconds, paused.
@@ -843,6 +943,58 @@ impl Deck {
             width,
             height,
         ))
+    }
+
+    /// A presenter view (see [`super::presenter`]) of the PowerPoint input
+    /// whose layer is `follows`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if its drawing pipelines cannot be made.
+    pub fn new_presenter(
+        context: &GpuContext,
+        follows: String,
+        name: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let presenter = super::presenter::Presenter::new(context, follows, (width, height))?;
+        Ok(Self::build_media_deck(
+            context,
+            format!("🗒 {name}"),
+            None,
+            DeckSource::Presenter(Box::new(presenter)),
+            width,
+            height,
+        ))
+    }
+
+    /// A layer whose input could not be opened (see [`super::OfflineSource`]):
+    /// `name` as saved, drawn clear. A file's path stays its source path, to
+    /// show which file is missing.
+    pub fn new_offline(
+        context: &GpuContext,
+        name: String,
+        saved: crate::scene::SourceConfig,
+        reason: String,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        use crate::scene::SourceConfig;
+        let path = match &saved {
+            SourceConfig::Video { path, .. }
+            | SourceConfig::Image { path, .. }
+            | SourceConfig::Shader { path, .. } => Some(path.clone()),
+            _ => None,
+        };
+        Self::build_media_deck(
+            context,
+            name,
+            path,
+            DeckSource::Offline(Box::new(super::OfflineSource { saved, reason })),
+            width,
+            height,
+        )
     }
 
     /// Create a new deck from decoded pixels. `tree` is carried by SVG decks so
@@ -1153,10 +1305,12 @@ impl Deck {
             analyzers: crate::analyzer::DeckAnalyzers::new(),
             gpu_error: None,
             rendered_still: None,
+            texture_generation: 0,
             visible: None,
             drawn_visible: None,
             drawn_share: 1.0,
             placed: None,
+            frames_uploaded: 0,
             render_scale: super::DeckRenderScale::Full,
             master_size: (width, height),
         }
@@ -1509,10 +1663,12 @@ impl Deck {
             analyzers: crate::analyzer::DeckAnalyzers::new(),
             gpu_error: None,
             rendered_still: None,
+            texture_generation: 0,
             visible: None,
             drawn_visible: None,
             drawn_share: 1.0,
             placed: None,
+            frames_uploaded: 0,
             render_scale: super::DeckRenderScale::Full,
             master_size: (width, height),
         })

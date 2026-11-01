@@ -6,7 +6,7 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
 #[derive(Deserialize, ToSchema)]
@@ -21,7 +21,7 @@ pub struct ChannelBlendModeBody {
     pub mode: crate::engine::BlendMode,
 }
 
-#[utoipa::path(post, path = "/api/channels", responses((status = 200, body = CommandResult)), tag = "Channels")]
+#[utoipa::path(post, path = "/api/channels", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Channels")]
 pub async fn add_channel(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::AddChannel).await {
         Ok(result) => command_response(result),
@@ -45,7 +45,7 @@ pub struct AddInputBody {
 ///
 /// The input is a channel at the end of the row, named after its source.
 /// Replies with the channel's UUID.
-#[utoipa::path(post, path = "/api/inputs", request_body = AddInputBody, responses((status = 200, body = CommandResult)), tag = "Channels")]
+#[utoipa::path(post, path = "/api/inputs", request_body = AddInputBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Channels")]
 pub async fn add_input(
     State(state): State<SharedState>,
     Json(body): Json<AddInputBody>,
@@ -63,7 +63,7 @@ pub async fn add_input(
     }
 }
 
-#[utoipa::path(delete, path = "/api/channels/{channel_uuid}", params(("channel_uuid" = String, Path, description = "Channel UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Channels")]
+#[utoipa::path(delete, path = "/api/channels/{channel_uuid}", params(("channel_uuid" = String, Path, description = "Channel UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Channels")]
 pub async fn remove_channel(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -77,7 +77,7 @@ pub async fn remove_channel(
     }
 }
 
-#[utoipa::path(put, path = "/api/channels/{channel_uuid}/opacity", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ChannelOpacityBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Channels")]
+#[utoipa::path(put, path = "/api/channels/{channel_uuid}/opacity", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ChannelOpacityBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Channels")]
 pub async fn set_opacity(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -95,7 +95,7 @@ pub async fn set_opacity(
     }
 }
 
-#[utoipa::path(put, path = "/api/channels/{channel_uuid}/blend-mode", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ChannelBlendModeBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Channels")]
+#[utoipa::path(put, path = "/api/channels/{channel_uuid}/blend-mode", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ChannelBlendModeBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Channels")]
 pub async fn set_blend_mode(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -119,7 +119,7 @@ pub struct ChannelNameBody {
     pub name: String,
 }
 
-#[utoipa::path(put, path = "/api/channels/{channel_uuid}/name", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ChannelNameBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Channels")]
+#[utoipa::path(put, path = "/api/channels/{channel_uuid}/name", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ChannelNameBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Channels")]
 pub async fn rename(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -137,6 +137,32 @@ pub async fn rename(
     }
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct ChannelColorBody {
+    /// Red, green, blue (0–255); left out or null, the channel takes back
+    /// the colour its place gives.
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
+}
+
+#[utoipa::path(put, path = "/api/channels/{channel_uuid}/color", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ChannelColorBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Channels")]
+pub async fn set_color(
+    State(state): State<SharedState>,
+    Path(channel_uuid): Path<String>,
+    Json(body): Json<ChannelColorBody>,
+) -> impl IntoResponse {
+    match state
+        .send_command(EngineCommand::SetChannelColor {
+            channel_uuid,
+            color: body.color,
+        })
+        .await
+    {
+        Ok(result) => command_response(result),
+        Err(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
 #[derive(Deserialize, ToSchema, Default)]
 pub struct ChannelMoveBody {
     /// The channel to go just before; left out, the channel goes last.
@@ -144,7 +170,7 @@ pub struct ChannelMoveBody {
     pub before_channel_uuid: Option<String>,
 }
 
-#[utoipa::path(put, path = "/api/channels/{channel_uuid}/move", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ChannelMoveBody, responses((status = 200, body = CommandResult), (status = 404, description = "Channel not found")), tag = "Channels")]
+#[utoipa::path(put, path = "/api/channels/{channel_uuid}/move", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = ChannelMoveBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Channel not found")), tag = "Channels")]
 pub async fn move_channel(
     State(state): State<SharedState>,
     Path(channel_uuid): Path<String>,

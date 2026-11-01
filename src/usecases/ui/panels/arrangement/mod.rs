@@ -266,7 +266,8 @@ fn build_rows(data: &UIData) -> Vec<Row<'_>> {
             ch_idx: ch.ch_idx,
             name: &ch.name,
         });
-        for deck in &ch.decks {
+        // Front first, as the other lists of a channel's layers.
+        for deck in ch.decks.iter().rev() {
             let lane = arrangement.and_then(|a| a.config.lane(&deck.uuid));
             let key = crate::arrangement::opacity_param_key(&deck.uuid);
             let curves = deck_automation_rows(data, ch.ch_idx, deck);
@@ -611,7 +612,8 @@ fn render_idle_picker(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions)
             {
                 chosen = Some(IdleBehaviour::HoldPerformance);
             }
-            for deck in data.channels.iter().flat_map(|c| &c.decks) {
+            // Front first, as the lanes.
+            for deck in data.channels.iter().flat_map(|c| c.decks.iter().rev()) {
                 let this = IdleBehaviour::ShowDeck {
                     deck_uuid: deck.uuid.clone(),
                 };
@@ -972,17 +974,24 @@ fn offer_drop_targets(ui: &egui::Ui, data: &UIData, rows: &[Row<'_>], layout: La
         .is_some_and(|p| matches!(&*p, LibraryDrag::Effect(_)));
     let fx_accent = egui::Color32::from_rgb(100, 200, 255);
 
+    // Rows scrolled under the ruler or toolbar are not seen: they take no
+    // drops there.
+    let seen = egui::Rect::from_min_max(
+        egui::pos2(header_rect.left(), lanes_rect.top()),
+        lanes_rect.max,
+    );
     for (row, (top, height)) in rows.iter().zip(row_spans(rows, lanes_rect, scroll_y)) {
         let rect = egui::Rect::from_min_max(
             egui::pos2(header_rect.left(), top),
             egui::pos2(lanes_rect.right(), top + height),
-        );
+        )
+        .intersect(seen);
+        if !rect.is_positive() {
+            continue;
+        }
         match row {
             Row::Group { ch_idx, .. } => {
-                ui.ctx().memory_mut(|mem| {
-                    mem.data
-                        .insert_temp(egui::Id::new("ch_drop_rect").with(*ch_idx), rect);
-                });
+                super::publish_drop_rect(ui, *ch_idx, rect);
                 if let Some(ch) = data.channels.get(*ch_idx) {
                     publish_channel_surface_fx(ui.ctx(), &ch.uuid, *ch_idx, rect);
                 }
@@ -1279,12 +1288,7 @@ fn handle_lane_reorder(
     }
 
     let above = pointer.y < geom.header.center().y;
-    let gap = if above {
-        lane.deck_idx
-    } else {
-        lane.deck_idx + 1
-    };
-    let to = reorder_target(from, gap);
+    let to = reorder_target(from, lane_gap(lane.deck_idx, above));
     if to == from {
         return;
     }
@@ -1308,6 +1312,17 @@ fn handle_lane_reorder(
             from_idx: from,
             to_idx: to,
         });
+    }
+}
+
+/// The gap in the stack a drop on lane `deck_idx`'s header aims at. Lanes
+/// are listed front first, so above a lane is in front of it — the gap after
+/// it — and below it the gap before it.
+fn lane_gap(deck_idx: usize, above: bool) -> usize {
+    if above {
+        deck_idx + 1
+    } else {
+        deck_idx
     }
 }
 
@@ -2574,10 +2589,10 @@ mod tests {
         });
 
         for ch in &data.channels {
-            let key = egui::Id::new("ch_drop_rect").with(ch.ch_idx);
-            let rect: Option<egui::Rect> = harness
-                .ctx
-                .memory(|mem| mem.data.get_temp::<egui::Rect>(key));
+            let rect: Option<egui::Rect> =
+                crate::usecases::ui::panels::drop_rects(&harness.ctx, ch.ch_idx)
+                    .first()
+                    .copied();
             assert!(
                 rect.is_some_and(|r| r.width() > 0.0),
                 "channel {} published no drop target",
@@ -2966,8 +2981,10 @@ mod tests {
         let (_, (top, height)) = rows
             .iter()
             .zip(&spans)
-            .find(|(row, _)| matches!(row, Row::Lane(_)))
-            .expect("a deck lane");
+            .find(
+                |(row, _)| matches!(row, Row::Lane(l) if l.uuid == data.channels[0].decks[0].uuid),
+            )
+            .expect("the selected deck's lane");
         let armed = selection::Selection {
             start: 4.0,
             end: 12.0,
@@ -3002,6 +3019,37 @@ mod tests {
         );
     }
 
+    /// A channel's lanes are listed front first, as its other lists.
+    #[test]
+    fn lanes_are_listed_front_first() {
+        let data = fixture_with_arrangement();
+        let rows = build_rows(&data);
+        let listed: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Lane(lane) if lane.ch_idx == 0 => Some(lane.uuid),
+                _ => None,
+            })
+            .collect();
+        let front_first: Vec<&str> = data.channels[0]
+            .decks
+            .iter()
+            .rev()
+            .map(|d| d.uuid.as_str())
+            .collect();
+        assert_eq!(listed, front_first);
+    }
+
+    /// Listed front first: dropped above a lane, a deck goes in front of it;
+    /// below it, behind it.
+    #[test]
+    fn a_lane_dropped_above_another_goes_in_front_of_it() {
+        // Three decks, 0 at the back: deck 0 dropped above deck 2's lane goes
+        // to the front, deck 2 dropped below deck 0's to the back.
+        assert_eq!(reorder_target(0, lane_gap(2, true)), 2);
+        assert_eq!(reorder_target(2, lane_gap(0, false)), 0);
+    }
+
     /// The whole gesture through the real event path: an armed selection dragged
     /// sideways moves its region in one batch, and the lane it was dragged
     /// across does not also author a region or move the region by itself.
@@ -3018,19 +3066,28 @@ mod tests {
         // The published channel drop rect is the first row of the lane area, so
         // the axis and the first deck lane's centre follow from it and the row
         // constants rather than from guessed screen coordinates.
-        let group: egui::Rect = harness
-            .ctx
-            .memory(|mem| {
-                mem.data
-                    .get_temp(egui::Id::new("ch_drop_rect").with(0_usize))
-            })
+        let group: egui::Rect = crate::usecases::ui::panels::drop_rects(&harness.ctx, 0)
+            .first()
+            .copied()
             .expect("the first channel publishes its row");
         let axis = TimeAxis {
             left: group.left() + HEADER_WIDTH,
             scroll: data.arrangement_scroll,
             pps: data.arrangement_pixels_per_second,
         };
-        let y = group.bottom() + LANE_HEIGHT / 2.0;
+        // Its deck's lane, wherever the front-first listing puts it.
+        let rows = build_rows(&data);
+        let spans = row_spans(
+            &rows,
+            egui::Rect::from_min_size(group.left_top(), egui::vec2(group.width(), 4_000.0)),
+            0.0,
+        );
+        let (_, (top, height)) = rows
+            .iter()
+            .zip(&spans)
+            .find(|(row, _)| matches!(row, Row::Lane(l) if l.uuid == deck.as_str()))
+            .expect("the deck's lane");
+        let y = top + height / 2.0;
 
         selection::store(
             &harness.ctx,

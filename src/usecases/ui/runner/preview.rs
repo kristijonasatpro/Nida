@@ -49,6 +49,10 @@ fn encode_preview(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let uv = (vec2<f32>(id.xy) + vec2<f32>(0.5)) / vec2<f32>(size);
+    // One tap: a thumbnail's fine detail may flicker, but averaging what
+    // each pixel covers (scaled_sample.wgsl) cost every preview eight times
+    // the GPU time — a quarter of a second each second on a 4K show of ten
+    // channels (M5 Max, 2026-10-29).
     let color = textureSampleLevel(source_texture, texture_sampler, uv, 0.0);
     textureStore(
         preview,
@@ -99,7 +103,7 @@ impl PreviewEncoder {
     /// Long-edge cap for preview targets.
     const MAX_DIM: u32 = 960;
 
-    fn new(device: &wgpu::Device) -> Self {
+    pub(super) fn new(device: &wgpu::Device) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Preview Encode"),
             source: wgpu::ShaderSource::Wgsl(ENCODE_SHADER.into()),
@@ -183,7 +187,7 @@ impl PreviewEncoder {
     }
 
     /// Scale `(w, h)` down so the long edge is at most `MAX_DIM`, preserving aspect.
-    fn preview_size(w: u32, h: u32) -> (u32, u32) {
+    pub(super) fn preview_size(w: u32, h: u32) -> (u32, u32) {
         let long = w.max(h);
         if long <= Self::MAX_DIM || long == 0 {
             return (w.max(1), h.max(1));
@@ -207,7 +211,7 @@ impl PreviewEncoder {
     /// Grown at once; shrunk only once drawn two-thirds of `current` or
     /// less, so a window being resized does not remake it every frame. Not
     /// drawn, it stays as it is.
-    fn target_size(
+    pub(super) fn target_size(
         full: (u32, u32),
         drawn: Option<[u32; 2]>,
         current: Option<[u32; 2]>,
@@ -250,28 +254,34 @@ impl PreviewEncoder {
             .get(key)
             .is_none_or(|(t, _)| t.width() != w || t.height() != h);
         if stale {
-            let texture = context.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Preview Encode Target"),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::STORAGE_BINDING
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let (texture, view) = Self::new_target(&context.device, w, h);
             self.targets.insert(key.to_string(), (texture, view));
             // A new target holds nothing yet.
             self.encoded.remove(key);
         }
         stale
+    }
+
+    /// A target of `w`×`h` to encode a preview into.
+    pub(super) fn new_target(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Preview Encode Target"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
     }
 
     fn target_view(&self, key: &str) -> Option<&wgpu::TextureView> {
@@ -294,7 +304,24 @@ impl PreviewEncoder {
         context: &crate::renderer::GpuContext,
         sources: &[(PreviewSlot, &wgpu::TextureView, u32, u32)],
     ) {
-        if sources.is_empty() {
+        let pairs: Vec<(&wgpu::TextureView, &wgpu::Texture, &wgpu::TextureView)> = sources
+            .iter()
+            .filter_map(|(slot, src, ..)| {
+                let (target, view) = self.targets.get(&slot.key())?;
+                Some((*src, target, view))
+            })
+            .collect();
+        self.encode_into(context, &pairs);
+    }
+
+    /// Encode each source into the target beside it — (source, target,
+    /// the target's view) — in one command buffer.
+    pub(super) fn encode_into(
+        &self,
+        context: &crate::renderer::GpuContext,
+        pairs: &[(&wgpu::TextureView, &wgpu::Texture, &wgpu::TextureView)],
+    ) {
+        if pairs.is_empty() {
             return;
         }
         let mut encoder = context
@@ -308,11 +335,7 @@ impl PreviewEncoder {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            for (slot, src, ..) in sources {
-                let key = slot.key();
-                let Some((target, target_view)) = self.targets.get(&key) else {
-                    continue;
-                };
+            for (src, target, target_view) in pairs {
                 let bind_group = context
                     .device
                     .create_bind_group(&wgpu::BindGroupDescriptor {

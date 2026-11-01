@@ -6,7 +6,6 @@
 
 use crate::app::render::{DeckLoadResult, FileDialogKind, FileDialogResult};
 use crate::app::{AppConfig, VardaApp};
-use crate::renderer::blit::BlitPipeline;
 use crate::renderer::context::{GpuContext, WindowSurface};
 use crate::usecases::ui;
 
@@ -21,6 +20,8 @@ mod detect;
 mod drag_position;
 mod engine_thread;
 mod event_loop;
+mod monitor_frames;
+mod panel_windows;
 mod preview;
 mod shows;
 mod vsync;
@@ -42,7 +43,6 @@ pub struct UIRunner {
     // ── Window / egui state (delivery layer) ────────────────────────
     window: Option<&'static Window>,
     window_surface: Option<WindowSurface>,
-    blit_pipeline: Option<BlitPipeline>,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     egui_renderer: Option<egui_wgpu::Renderer>,
@@ -50,6 +50,20 @@ pub struct UIRunner {
     /// The textures this frame's UI draws, tessellated: the previews to
     /// encode (see `encode_previews`).
     textures_drawn: std::collections::HashSet<egui::TextureId>,
+    /// The channels whose picture — the channel's, or a layer's of it — the
+    /// windows drew last frame (see `visible_tiles`).
+    visible_tiles: Vec<usize>,
+    /// The channels the UI showed big or under the pointer last frame, by
+    /// UUID (see `UISession::shown_full`): drawn at the show's rate.
+    shown_full: Vec<String>,
+    /// What a hold of the engine did besides its timed parts — the
+    /// commands it ran (see `report_long_hold`).
+    hold_notes: Vec<String>,
+    /// When a long hold was last said.
+    long_hold_reported: Option<std::time::Instant>,
+    /// The control window minimised or covered (macOS says): what it draws
+    /// is not seen.
+    ui_occluded: bool,
     /// The largest each texture was drawn at, in pixels: the size its
     /// preview is made (see `PreviewEncoder::target_size`).
     drawn_px: std::collections::HashMap<egui::TextureId, [u32; 2]>,
@@ -65,6 +79,22 @@ pub struct UIRunner {
     ui_due: bool,
     /// When the control window last drew a frame.
     last_ui_frame: Option<std::time::Instant>,
+    /// What moved in the show at the last frame drawn: how often the next
+    /// are drawn (see [`UIRunner::ui_period`]).
+    ui_motion: crate::app::state::ui_motion::UiMotion,
+    /// When a hand was last on the control window or a panel's window: the
+    /// mouse, a key, a scroll, a file dragged.
+    last_input: Option<std::time::Instant>,
+    /// How soon egui asked to be drawn again at the last frame — an
+    /// animation, a blink, a tooltip's delay; `Duration::MAX` for not.
+    egui_wants: std::time::Duration,
+    /// The wait the frames now drawn were meant to have between them — none
+    /// at full rate — and the longer of it and the wait before: a frame
+    /// drawn at the idle rate is not taken for a slow one, nor its gap on
+    /// screen for a hitch, nor the idle gap before a frame drawn at full
+    /// rate again (a hand back on the window).
+    ui_frame_period: std::time::Duration,
+    ui_frame_allowance: std::time::Duration,
     /// Where the control window's frames' time goes (see `app::frame_parts`).
     ui_parts: crate::app::frame_parts::FrameParts,
     /// Control window frames drawn.
@@ -83,6 +113,10 @@ pub struct UIRunner {
     ui_frame_hold: Option<f64>,
     /// How evenly the control window's frames reached its screen.
     ui_on_screen: crate::renderer::on_screen::OnScreen,
+    /// Each control frame presented and not yet reported on screen: the wait
+    /// it was drawn for (see `ui_frame_allowance`), oldest first — macOS
+    /// reports frames a little later, after the rate may have changed.
+    ui_presented_allowances: std::collections::VecDeque<f64>,
     /// The control window's frames waiting to be shown, and the most seen
     /// since the last report.
     ui_queue: crate::renderer::on_screen::Waiting,
@@ -90,6 +124,13 @@ pub struct UIRunner {
     /// The control window's screen held at the show's rate (see
     /// `crate::screen_rate`).
     screen_rate: crate::screen_rate::ScreenRate,
+    /// What keeping it needs, read while the show was held: the output
+    /// windows' screens, the show's rate, and whether it is wanted (see
+    /// `keep_screen_rate`).
+    screen_rate_asked: Option<(Option<Vec<u32>>, u32, bool)>,
+    /// What was done to it, to tell the show.
+    screen_rate_kept: Option<crate::screen_rate::Kept>,
+    night_shift: crate::night_shift::NightShift,
     /// Shows opened lately, for the Show menu.
     recent_shows: std::sync::Arc<Vec<std::path::PathBuf>>,
     /// The show folder the window is named after (see `show_changed`).
@@ -101,6 +142,13 @@ pub struct UIRunner {
     channel_preview_textures: std::collections::HashMap<usize, egui::TextureId>,
     output_preview_textures: std::collections::HashMap<usize, egui::TextureId>,
     main_output_texture: Option<egui::TextureId>,
+    /// The Main and Preview monitors' frames as the window shows them, and
+    /// the texture of each this frame (see `pick_monitor_frames`).
+    monitor_picker: monitor_frames::Picker,
+    monitor_picked: [Option<egui::TextureId>; 2],
+    /// The Preview monitor was drawn last frame (it says so — its texture
+    /// is a tile's too, until its frames come).
+    preview_monitor_shown: bool,
     dome_preview_renderer: Option<crate::renderer::dome_preview::DomePreviewRenderer>,
     dome_preview_texture: Option<egui::TextureId>,
     // Camera detection mode state
@@ -115,6 +163,12 @@ pub struct UIRunner {
 
     // ── UI-consumer-owned layout/selection state ─────────────────────
     layout: super::UILayoutState,
+    /// What the selection was on, by UUID, as the last frame ended: found
+    /// again as the next starts, wherever the API has moved it meanwhile.
+    selection_anchor: super::state::SelectionAnchor,
+    /// The channels this frame's UI was drawn from: what its clicks'
+    /// positions name (see [`settle_selection`]).
+    frame_order: super::state::ChannelOrder,
     /// The operator's saved screen layouts, kept for the user.
     saved_layouts: crate::usecases::ui::screen_layout::SavedLayoutStore,
     /// Choices made in windows, kept for the user across shows and runs.
@@ -185,6 +239,19 @@ pub struct UIRunner {
     egui_start_time: std::time::Instant,
     cached_screen_size: winit::dpi::PhysicalSize<u32>,
     cached_scale_factor: f32,
+    /// The share of the window's pixels the control window is drawn at (see
+    /// `ui_render_scale`): 1, or less on a scaled display mode.
+    ui_render_scale: f32,
+    /// When the share was last worked out: again every couple of seconds,
+    /// a screen's mode changed under a window that did not move.
+    ui_render_scale_at: Option<std::time::Instant>,
+
+    // ── Panels in windows of their own (see `panel_windows`) ─────────
+    panel_windows: panel_windows::PanelWindows,
+    /// The control window has the keyboard (a panel's window may, too).
+    main_focused: bool,
+    /// The control window's keys pressed and not let go (see `HeldKeys`).
+    main_held: panel_windows::HeldKeys,
 }
 
 impl UIRunner {
@@ -197,12 +264,21 @@ impl UIRunner {
             config,
             window: None,
             window_surface: None,
-            blit_pipeline: None,
-            egui_ctx: egui::Context::default(),
+            egui_ctx: {
+                let ctx = egui::Context::default();
+                ui::one_pass_a_frame(&ctx);
+                ui::always_dark(&ctx);
+                ctx
+            },
             egui_state: None,
             egui_renderer: None,
             preview_encoder: None,
             textures_drawn: std::collections::HashSet::new(),
+            visible_tiles: Vec::new(),
+            shown_full: Vec::new(),
+            hold_notes: Vec::new(),
+            long_hold_reported: None,
+            ui_occluded: false,
             drawn_px: std::collections::HashMap::new(),
             deck_preview_textures: std::collections::HashMap::new(),
             record_folder_pick: None,
@@ -210,6 +286,11 @@ impl UIRunner {
             proxy: None,
             ui_due: false,
             last_ui_frame: None,
+            ui_motion: crate::app::state::ui_motion::UiMotion::default(),
+            last_input: None,
+            egui_wants: std::time::Duration::ZERO,
+            ui_frame_period: std::time::Duration::ZERO,
+            ui_frame_allowance: std::time::Duration::ZERO,
             ui_parts: crate::app::frame_parts::FrameParts::default(),
             ui_frames: 0,
             stashed_actions: None,
@@ -218,16 +299,31 @@ impl UIRunner {
             last_ui_stall: None,
             ui_frame_hold: None,
             ui_on_screen: crate::renderer::on_screen::OnScreen::default(),
+            ui_presented_allowances: std::collections::VecDeque::new(),
             ui_queue: crate::renderer::on_screen::Waiting::default(),
             ui_waiting_most: 0,
             screen_rate: crate::screen_rate::ScreenRate::default(),
+            screen_rate_asked: None,
+            screen_rate_kept: None,
+            night_shift: crate::night_shift::NightShift::default(),
             recent_shows: std::sync::Arc::default(),
             named_after: std::path::PathBuf::new(),
-            recent_file: crate::app::shows::recent_file(),
+            // A test's runner never reads or writes this computer's Recent
+            // list, saved layouts or window choices: a first frame names the
+            // window after its scratch show, which put that show at the head
+            // of the operator's list for Nida to reopen.
+            recent_file: if cfg!(test) {
+                None
+            } else {
+                crate::app::shows::recent_file()
+            },
             layout_writes: LayoutWrites::default(),
             channel_preview_textures: std::collections::HashMap::new(),
             output_preview_textures: std::collections::HashMap::new(),
             main_output_texture: None,
+            monitor_picker: monitor_frames::Picker::default(),
+            monitor_picked: [None, None],
+            preview_monitor_shown: false,
             dome_preview_renderer: None,
             dome_preview_texture: None,
             camera_detect_texture: None,
@@ -238,8 +334,18 @@ impl UIRunner {
             detect_in_flight: false,
             main_window_id: None,
             layout: super::UILayoutState::default(),
-            saved_layouts: crate::usecases::ui::screen_layout::SavedLayoutStore::open_default(),
-            window_choices: crate::usecases::ui::window_choices::WindowChoiceStore::open_default(),
+            selection_anchor: super::state::SelectionAnchor::default(),
+            frame_order: super::state::ChannelOrder::default(),
+            saved_layouts: if cfg!(test) {
+                crate::usecases::ui::screen_layout::SavedLayoutStore::default()
+            } else {
+                crate::usecases::ui::screen_layout::SavedLayoutStore::open_default()
+            },
+            window_choices: if cfg!(test) {
+                crate::usecases::ui::window_choices::WindowChoiceStore::default()
+            } else {
+                crate::usecases::ui::window_choices::WindowChoiceStore::open_default()
+            },
             file_dialog_tx,
             file_dialog_rx,
             deck_load_tx,
@@ -261,6 +367,11 @@ impl UIRunner {
             egui_start_time: std::time::Instant::now(),
             cached_screen_size: winit::dpi::PhysicalSize::new(0, 0),
             cached_scale_factor: 1.0,
+            ui_render_scale: 1.0,
+            ui_render_scale_at: None,
+            panel_windows: panel_windows::PanelWindows::default(),
+            main_focused: true,
+            main_held: panel_windows::HeldKeys::default(),
         }
     }
 
@@ -283,11 +394,21 @@ impl UIRunner {
         let session = &mut ui_actions.session;
         // A fold is kept with the workspace too.
         let mut changed = session.toggle_collapsed_channel.is_some();
-        if let Some(screen) = session.screen_layout.take() {
+        if let Some(mut screen) = session.screen_layout.take() {
             let old = &self.layout.screen;
             changed = screen.name != old.name
                 || screen.locked != old.locked
+                || screen.windows != old.windows
                 || !crate::usecases::ui::screen_layout::same_arrangement(&screen.dock, &old.dock);
+            // A layout chosen puts its panels' windows where it keeps them:
+            // one open already is moved there.
+            for window in screen.windows.iter_mut().filter(|w| w.place) {
+                if let Some(rect) = window.rect {
+                    let zoom = self.egui_ctx.zoom_factor();
+                    self.panel_windows.place(ui::panels::window_viewport(window.pane), rect, zoom);
+                }
+                window.place = false;
+            }
             self.layout.screen = screen;
         }
         // The files below are written in the background, as a save is: the
@@ -301,7 +422,7 @@ impl UIRunner {
             let writes = self.layout_writes.clone();
             let result =
                 self.saved_layouts
-                    .save_as_with(&name, &self.layout.screen.dock, |path, text| {
+                    .save_as_with(&name, &self.layout.screen.dock, &self.layout.screen.windows, |path, text| {
                         let failed = ui::screen_layout::not_saved(path);
                         let then = Some(writes.landing());
                         keep_file(varda, "the saved layouts", path, text, said, failed, then)
@@ -467,6 +588,23 @@ fn channel_moves(
     moves
 }
 
+/// The selection kept on what the operator had selected — `selected`, by
+/// UUID from the channels the frame was drawn from — wherever that is in
+/// the show now. Held by position, an undo or redo, a layer moved into
+/// another input, or the API reordering channels while the frame was drawn
+/// left it on whichever channel took that place, and the next take sent
+/// that one.
+fn settle_selection(
+    layout: &mut super::UILayoutState,
+    selected: &super::state::SelectionAnchor,
+    varda: &VardaApp,
+) {
+    layout.reanchor(
+        selected,
+        &super::state::ChannelOrder::of(varda.mixer_ref().channels()),
+    );
+}
+
 /// Whether this frame's mutations deserve their own undo entry.
 ///
 /// A held drag reports a mutation on every frame it moves, so only the frame
@@ -483,7 +621,168 @@ fn wants_history_snapshot(
     dirty && !continuation
 }
 
+/// A command's name — its kind, without what it carries: its `Debug` cut
+/// off at the name's end, so a command carrying a whole list does not
+/// write it out (Codex: every lower-third row, each slider move).
+fn command_name(command: &crate::engine::EngineCommand) -> String {
+    use std::fmt::Write as _;
+    /// Takes the name, then refuses the rest — which ends the formatting.
+    struct NameOnly(String);
+    impl std::fmt::Write for NameOnly {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            if let Some(end) = s.find(|c: char| !c.is_alphanumeric() && c != '_') {
+                self.0.push_str(&s[..end]);
+                Err(std::fmt::Error)
+            } else {
+                self.0.push_str(s);
+                Ok(())
+            }
+        }
+    }
+    let mut name = NameOnly(String::new());
+    let _ = write!(name, "{command:?}");
+    name.0
+}
+
+/// A hold of the engine this long holds up the outputs' frame: said.
+const LONG_HOLD: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Where a hold went: each part's time now less what it had before it,
+/// longest first, the notable ones.
+fn held_parts(before: &[(String, f32)], now: &[(String, f32)]) -> String {
+    let mut parts: Vec<(&str, f32)> = now
+        .iter()
+        .map(|(name, ms)| {
+            let had = before.iter().find(|(b, _)| b == name).map_or(0.0, |(_, ms)| *ms);
+            (name.as_str(), ms - had)
+        })
+        .filter(|(_, ms)| *ms >= 0.5)
+        .collect();
+    parts.sort_by(|a, b| b.1.total_cmp(&a.1));
+    if parts.is_empty() {
+        return "no part over half a millisecond".to_string();
+    }
+    parts
+        .iter()
+        .map(|(name, ms)| format!("{name} {ms:.1}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Where the channels of `uuids` are now (those still there).
+fn channels_of(channels: &[crate::channel::Channel], uuids: &[String]) -> Vec<usize> {
+    uuids
+        .iter()
+        .filter_map(|uuid| channels.iter().position(|c| c.uuid() == uuid))
+        .collect()
+}
+
+/// The channels the control window watches at the show's rate: the cued
+/// one(s), and those it shows big or under the pointer.
+fn watched_now(layout: &super::UILayoutState, shown_full: &[usize]) -> Vec<usize> {
+    let mut watched = layout.preview_channels();
+    for &ch in shown_full {
+        if !watched.contains(&ch) {
+            watched.push(ch);
+        }
+    }
+    watched
+}
+
+/// The channels whose picture the windows drew — the channel's own tile, or
+/// a layer's of it — from the textures drawn and what each preview texture
+/// is of.
+fn visible_tiles(
+    drawn: &std::collections::HashSet<egui::TextureId>,
+    channel_textures: &std::collections::HashMap<usize, egui::TextureId>,
+    deck_textures: &std::collections::HashMap<String, egui::TextureId>,
+    channels: &[crate::channel::Channel],
+) -> Vec<usize> {
+    let mut seen: Vec<usize> = channel_textures
+        .iter()
+        .filter(|(_, texture)| drawn.contains(texture))
+        .map(|(ch, _)| *ch)
+        .collect();
+    for (ch, channel) in channels.iter().enumerate() {
+        let layer_seen = channel.decks.iter().any(|slot| {
+            deck_textures
+                .get(slot.deck.uuid())
+                .is_some_and(|texture| drawn.contains(texture))
+        });
+        if layer_seen && !seen.contains(&ch) {
+            seen.push(ch);
+        }
+    }
+    seen.sort_unstable();
+    seen
+}
+
+/// The share of its pixels a window on `monitor` is drawn at: on a scaled
+/// display mode — a 4K panel set to look like 2560×1440 is drawn at
+/// 5120×2880 and scaled down by macOS — the panel's own pixels, no more
+/// than it shows (Max5 measured the control window's drawing at 5K costing
+/// the Studio a third of its GPU); else 1. `NIDA_FULL_RES_UI=1` keeps 1.
+fn ui_render_scale(monitor: Option<&winit::monitor::MonitorHandle>) -> f32 {
+    if std::env::var_os("NIDA_FULL_RES_UI").is_some() {
+        return 1.0;
+    }
+    let Some(monitor) = monitor else {
+        return 1.0;
+    };
+    let Some((panel, _)) = crate::app::screens::panel_of(monitor) else {
+        return 1.0;
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let share = panel as f32 / monitor.size().width.max(1) as f32;
+    if share < 0.99 {
+        share.max(0.25)
+    } else {
+        1.0
+    }
+}
+
 impl UIRunner {
+    /// The control window drawn at the share of its pixels its screen calls
+    /// for (see [`ui_render_scale`]), its surface sized to suit — on
+    /// starting, and when it is resized, moved or its scale changes.
+    fn apply_ui_render_scale(&mut self) {
+        let Some(window) = self.window else {
+            return;
+        };
+        self.ui_render_scale = ui_render_scale(window.current_monitor().as_ref());
+        self.ui_render_scale_at = Some(std::time::Instant::now());
+        let size = window.inner_size();
+        self.resize_ui_surface(size);
+    }
+
+    /// The share worked out again if it has not been for a couple of
+    /// seconds — a "looks like" mode changed, or a window widened onto
+    /// another screen without moving, says nothing to it.
+    fn refresh_ui_render_scale(&mut self) {
+        if self
+            .ui_render_scale_at
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(2))
+        {
+            self.apply_ui_render_scale();
+        }
+    }
+
+    /// The control window's surface for a window of `size` pixels, at the
+    /// share of them it is drawn at.
+    fn resize_ui_surface(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        let scale = self.ui_render_scale;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        let drawn = winit::dpi::PhysicalSize::new(
+            ((size.width as f32 * scale).round() as u32).max(1),
+            ((size.height as f32 * scale).round() as u32).max(1),
+        );
+        if let (Some(ws), Some(gpu)) = (&mut self.window_surface, &self.gpu) {
+            if ws.size != drawn {
+                ws.resize(gpu, drawn);
+            }
+        }
+    }
+
     /// Complete initialization once GPU context is available.
     /// Called from `resumed()` for headless or from `about_to_wait()` for windowed.
     fn finish_init(
@@ -493,12 +792,11 @@ impl UIRunner {
         startup_t0: std::time::Instant,
         event_loop: &ActiveEventLoop,
     ) {
-        // Set up egui + blit pipeline for windowed mode
+        // Set up egui for windowed mode
         if let (Some(window_static), Some(ws)) = (self.window, &win_surface) {
             self.cached_screen_size = window_static.inner_size();
             self.cached_scale_factor = window_static.scale_factor() as f32;
             self.egui_start_time = std::time::Instant::now();
-            self.blit_pipeline = BlitPipeline::new(&gpu.device, ws.surface_config.format).ok();
             self.egui_state = Some(egui_winit::State::new(
                 self.egui_ctx.clone(),
                 egui::ViewportId::ROOT,
@@ -512,6 +810,8 @@ impl UIRunner {
                 ws.surface_config.format,
                 egui_wgpu::RendererOptions::default(),
             ));
+            // Panels in windows of their own: windows of the runner's.
+            self.panel_windows.install(&self.egui_ctx);
 
             // Set the application icon on egui's viewport (controls dock/taskbar icon)
             {
@@ -537,7 +837,10 @@ impl UIRunner {
         // Create engine now that GPU is ready
         log::info!("[STARTUP] Creating engine (audio, MIDI, shaders, mixer)...");
         let mut varda = match VardaApp::new(gpu, &self.config) {
-            Ok(v) => Box::new(v),
+            Ok(mut v) => {
+                self.share_shutdown(&mut v);
+                Box::new(v)
+            }
             Err(e) => {
                 log::error!("Failed to initialize engine: {e}");
                 event_loop.exit();
@@ -576,8 +879,22 @@ impl UIRunner {
             self.layout = loaded_layout;
             self.saved_layouts.reconnect(&mut self.layout.screen);
         }
+        for pane in test_panel_windows() {
+            self.layout.screen.open_in_window(pane);
+        }
         // `load_workspace` clears the engine-owned undo/redo timeline.
         log::info!("[STARTUP] Workspace loaded ({:.0?})", startup_t0.elapsed());
+
+        // The clicker, heard with another app in front: the one learned
+        // before read again (nothing is asked of macOS at start).
+        if !self.config.headless {
+            crate::clicker::start(varda.command_sender());
+            // Whether the control window has the keyboard, as macOS has it
+            // now: a focus event before this may have come and gone.
+            if let Some(window) = self.window {
+                crate::clicker::set_focused(window.has_focus());
+            }
+        }
 
         // Start HTTP API server on background thread
         if self.api_handle.is_none() {
@@ -586,9 +903,19 @@ impl UIRunner {
                 varda.command_sender(),
                 varda.state_reader(),
             );
+            // The log says why, but an app opened from the Finder logs to a
+            // file no one is watching: the window says it too, once.
+            if self.api_handle.is_none() && !self.config.headless {
+                varda.session.notifications.notify_once(
+                    "api-off",
+                    crate::notifications::NotificationLevel::Warning,
+                    api_off(self.config.api_port),
+                );
+            }
         }
 
         self.gpu = Some(varda.gpu_context().clone());
+        self.apply_ui_render_scale();
         // The show it starts in moves nothing (see `show_moved`).
         self.named_after = varda.show_folder().to_path_buf();
         self.varda = Some(varda);
@@ -641,6 +968,12 @@ impl UIRunner {
         );
     }
 
+    /// The API's Shutdown and Ctrl-C raise the one flag the loop reads,
+    /// windowed or headless (see `about_to_wait`).
+    fn share_shutdown(&self, varda: &mut VardaApp) {
+        varda.shutdown_requested = std::sync::Arc::clone(&self.shutdown_flag);
+    }
+
     /// Headless render loop — engine processing without UI/egui.
     fn render_headless(&mut self, host: &dyn WindowHost) {
         // The frame's slot on the even cadence the loop sleeps to.
@@ -650,7 +983,9 @@ impl UIRunner {
         };
 
         // Check for shutdown request (from API or SIGINT/SIGTERM)
-        if varda.shutdown_requested
+        if varda
+            .shutdown_requested
+            .load(std::sync::atomic::Ordering::Relaxed)
             || self
                 .shutdown_flag
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -660,8 +995,12 @@ impl UIRunner {
                 log::error!("{e}");
             }
             varda.refuse_commands();
+            crate::decklink::input::shutdown();
             if let Some(api) = self.api_handle.take() {
                 api.shutdown();
+            }
+            if let Some(kept) = self.night_shift.give_back_now() {
+                log::info!("Shutdown: {kept:?}");
             }
             host.exit();
             return;
@@ -679,11 +1018,22 @@ impl UIRunner {
         // Create pending output windows (API-driven in headless)
         host.create_pending_outputs(varda);
         host.refresh_monitors(varda);
+        // Night Shift off while an output is on a screen (see `night_shift`).
+        if let Some(kept) = self
+            .night_shift
+            .keep(varda.outputs_on_screens(), varda.night_shift_off())
+        {
+            varda.note_night_shift(kept);
+        }
         #[cfg(feature = "html")]
         host.create_pending_interactive(varda);
 
         // Publish the cued channel(s) so off-air previews render live (issue #72).
-        varda.set_preview_channels(self.layout.preview_channels());
+        let shown = channels_of(varda.mixer_ref().channels(), &self.shown_full);
+        varda.set_preview_channels(watched_now(&self.layout, &shown));
+        // And the tiles shown: an off-air input is drawn for its tile only
+        // while it is seen.
+        varda.set_tile_channels(self.visible_tiles.clone());
         varda.set_ui_selected_deck(self.layout.selected_deck);
 
         // GPU render (mixer compositing)
@@ -722,6 +1072,7 @@ impl UIRunner {
     /// without it — so neither holds up an output.
     fn render(&mut self, event_loop: &ActiveEventLoop) {
         self.take_lost_layouts();
+        self.refresh_ui_render_scale();
         let started = std::time::Instant::now();
         self.last_ui_frame = Some(started);
         self.ui_parts.begin(started, None);
@@ -729,16 +1080,21 @@ impl UIRunner {
         if let Some(stashed) = self.stashed_actions.take() {
             let mut actions = Some(stashed);
             if self
-                .with_engine(|this| this.ui_after(actions.take().expect("once")))
+                .with_engine("applying what was done", |this| {
+                    this.ui_after(actions.take().expect("once"))
+                })
                 .is_none()
             {
                 self.stashed_actions = actions;
                 return;
             }
         }
-        let Some(Some(ui_data)) = self.with_engine(|this| this.ui_before(event_loop)) else {
+        let Some(Some(ui_data)) =
+            self.with_engine("reading the show", |this| this.ui_before(event_loop))
+        else {
             return;
         };
+        self.keep_screen_rate();
         let Some(window) = self.window else { return };
         self.stall_for_test();
 
@@ -765,11 +1121,14 @@ impl UIRunner {
                 ));
             }
             input.viewport_id = egui::ViewportId::ROOT;
+            // Laid out in points as ever (above), drawn at the share of the
+            // window's pixels `ui_render_scale` says: egui lays out, draws
+            // its letters and tessellates at that density alike.
             input
                 .viewports
                 .entry(egui::ViewportId::ROOT)
                 .or_default()
-                .native_pixels_per_point = Some(display_scale);
+                .native_pixels_per_point = Some(display_scale * self.ui_render_scale);
             // Files dragged in from another app: give egui the real pointer,
             // which the OS does not send while the drag is running.
             if !input.hovered_files.is_empty() || !input.dropped_files.is_empty() {
@@ -784,9 +1143,23 @@ impl UIRunner {
             input.take()
         };
         let mut ui_actions = ui::UIActions::new();
-        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+        self.panel_windows.begin_frame(self.cached_scale_factor);
+        let mut full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             ui_actions = ui::panels::render_ui(ui, &ui_data);
         });
+        // How soon egui wants the next frame, in this window or a panel's.
+        self.egui_wants = full_output
+            .viewport_output
+            .values()
+            .map(|v| v.repaint_delay)
+            .min()
+            .unwrap_or(std::time::Duration::MAX);
+        // After the panels' windows' own, whose passes ran inside this one;
+        // applied at the next frame painted, should this one not be.
+        self.panel_windows
+            .push_textures(std::mem::take(&mut full_output.textures_delta));
+        self.panel_windows.close_unshown();
+        self.make_panel_windows(event_loop, &mut ui_actions);
         {
             let Some(egui_state) = &mut self.egui_state else {
                 return;
@@ -798,13 +1171,15 @@ impl UIRunner {
         // textures this frame draws — on screen, not scrolled or clipped
         // away — and only those previews are encoded.
         let t_part = std::time::Instant::now();
+        // (At the share of the window's pixels `ui_render_scale` says — see
+        // the input above.)
+        let pixels_per_point = full_output.pixels_per_point;
         let paint_jobs = self
             .egui_ctx
-            .tessellate(full_output.shapes, full_output.pixels_per_point);
+            .tessellate(full_output.shapes, pixels_per_point);
         self.textures_drawn.clear();
         self.drawn_px.clear();
-        let pixels_per_point = full_output.pixels_per_point;
-        for job in &paint_jobs {
+        for job in paint_jobs.iter().filter(|_| !self.ui_occluded) {
             if let egui::epaint::Primitive::Mesh(mesh) = &job.primitive {
                 self.textures_drawn.insert(mesh.texture_id);
                 let size = mesh.calc_bounds().size() * pixels_per_point;
@@ -813,10 +1188,20 @@ impl UIRunner {
                 *largest = [largest[0].max(size[0]), largest[1].max(size[1])];
             }
         }
+        // And the panels' windows': their previews are kept up too.
+        let (drawn, drawn_px) = (&mut self.textures_drawn, &mut self.drawn_px);
+        self.panel_windows.for_each_drawn(|texture, size| {
+            drawn.insert(texture);
+            let largest = drawn_px.entry(texture).or_insert(size);
+            *largest = [largest[0].max(size[0]), largest[1].max(size[1])];
+        });
+
         self.part("ui tessellate", t_part);
 
         let mut actions = Some(ui_actions);
-        let shown = match self.with_engine(|this| this.ui_after(actions.take().expect("once"))) {
+        let shown = match self.with_engine("applying what was done", |this| {
+            this.ui_after(actions.take().expect("once"))
+        }) {
             Some(Some(shown)) => shown,
             Some(None) => return,
             // Kept for the next frame, not lost.
@@ -826,17 +1211,14 @@ impl UIRunner {
             }
         };
 
-        // The control window's own frame: the show's picture under the UI.
+        self.ui_motion = shown.motion;
+        // The control window's own frame: the UI.
         let t_submit = std::time::Instant::now();
-        self.submit_frame(
-            &paint_jobs,
-            full_output.pixels_per_point,
-            full_output.textures_delta,
-            &shown,
-        );
+        self.submit_frame(&paint_jobs, pixels_per_point, &shown);
         self.part("ui submit", t_submit);
         #[allow(clippy::cast_precision_loss)]
-        let frame_ms = 1000.0 / shown.target_fps.max(1) as f32;
+        let frame_ms =
+            (1000.0 / shown.target_fps.max(1) as f32).max(self.ui_frame_allowance.as_secs_f32() * 1000.0);
         self.ui_parts.end(std::time::Instant::now(), frame_ms);
     }
 
@@ -851,7 +1233,7 @@ impl UIRunner {
         }
         self.last_ui_stall = Some(std::time::Instant::now());
         if stall.holding_engine {
-            let _ = self.with_engine(|_| std::thread::sleep(stall.freeze));
+            let _ = self.with_engine("a test's stall", |_| std::thread::sleep(stall.freeze));
         } else {
             std::thread::sleep(stall.freeze);
         }
@@ -865,7 +1247,7 @@ impl UIRunner {
     /// thread then goes back to macOS's event loop rather than wait on — the
     /// engine thread may be waiting for it (a call only the main thread can
     /// answer, which the engine should never make), and would never finish.
-    fn with_engine<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+    fn with_engine<R>(&mut self, what: &'static str, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
         let borrowed = match (&self.engine, &self.varda) {
             (Some(engine), None) => {
                 let t = std::time::Instant::now();
@@ -883,13 +1265,120 @@ impl UIRunner {
             }
             _ => false,
         };
+        let before = borrowed.then(|| (std::time::Instant::now(), self.ui_parts.so_far()));
+        self.hold_notes.clear();
         let result = f(self);
         if borrowed {
             if let (Some(engine), Some(app)) = (&self.engine, self.varda.take()) {
                 engine.baton().put(app);
             }
         }
+        if let Some((at, parts)) = before {
+            self.report_long_hold(what, at.elapsed(), &parts);
+        }
         Some(result)
+    }
+
+    /// Say — at most once a second — that the control window held the show
+    /// long enough to hold up the outputs, doing what, part by part (Max5:
+    /// "ui hold" 20–50 ms frames, to match with the operator's clicks).
+    fn report_long_hold(&mut self, what: &str, held: std::time::Duration, before: &[(String, f32)]) {
+        if held < LONG_HOLD
+            || self.engine.as_ref().is_some_and(engine_thread::EngineThread::starting)
+            || self
+                .long_hold_reported
+                .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(1))
+        {
+            return;
+        }
+        self.long_hold_reported = Some(std::time::Instant::now());
+        let parts = held_parts(before, &self.ui_parts.so_far());
+        let notes = if self.hold_notes.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", self.hold_notes.join(", "))
+        };
+        log::warn!(
+            "The control window held the show {:.1} ms ({what}): {parts}{notes}",
+            held.as_secs_f64() * 1000.0
+        );
+    }
+
+    /// The control window's screen at the show's rate (see `screen_rate`),
+    /// set — or given back — without the show held: changing a screen's
+    /// mode takes macOS a moment, and done while the window held the show,
+    /// every output and recording stood still through it (a freeze after
+    /// each change of the show's rate, Max5). Told to the show next time.
+    fn keep_screen_rate(&mut self) {
+        let (Some(window), Some((outputs, fps, on))) = (self.window, self.screen_rate_asked.take()) else {
+            return;
+        };
+        let display = || window.current_monitor().and_then(|m| display_id(&m));
+        if let Some(kept) = self.screen_rate.keep(display, || outputs, fps, on) {
+            self.screen_rate_kept = Some(kept);
+        }
+    }
+
+    /// The Main and Preview monitors' next frames (see `monitor_frames`):
+    /// say what the window shows — the cued input, the sizes drawn — and
+    /// step each to the frame after the one it showed.
+    fn pick_monitor_frames(&mut self) {
+        let (Some(engine), Some(varda), Some(egui_renderer)) =
+            (&self.engine, &self.varda, self.egui_renderer.as_mut())
+        else {
+            self.monitor_picked = [None, None];
+            return;
+        };
+        let share = std::sync::Arc::clone(engine.monitors());
+        let cued = self
+            .layout
+            .preview_channels()
+            .first()
+            .and_then(|&ch| varda.mixer_ref().channels().get(ch))
+            .map(|ch| ch.uuid().to_string());
+        let drawn_px = &self.drawn_px;
+        let drawn = |texture: Option<egui::TextureId>| texture.and_then(|t| drawn_px.get(&t).copied());
+        let mut shared = monitor_frames::lock(&share);
+        // Only a monitor drawn last frame, in a window seen, is wanted: none
+        // is copied while the monitors are hidden. Main's picture is drawn
+        // wherever the master is (the LED panel too).
+        let main_drawn = drawn(self.monitor_picked[monitor_frames::MAIN])
+            .or_else(|| drawn(self.main_output_texture));
+        // The Preview monitor says it is laid out; drawn in a window seen —
+        // the control window or a panel's — its picture is among those drawn
+        // (its own frames, or the input's thumbnail until they come).
+        let cued_thumbnail = self
+            .layout
+            .preview_channels()
+            .first()
+            .and_then(|ch| self.channel_preview_textures.get(ch).copied());
+        let preview_seen = self.preview_monitor_shown
+            && (drawn(self.monitor_picked[monitor_frames::PREVIEW]).is_some()
+                || drawn(cued_thumbnail).is_some());
+        shared.wants = [
+            main_drawn.map(|size| monitor_frames::Want {
+                channel: None,
+                drawn: Some(size),
+            }),
+            cued.filter(|_| preview_seen).map(|uuid| monitor_frames::Want {
+                channel: Some(uuid),
+                drawn: drawn(self.monitor_picked[monitor_frames::PREVIEW]),
+            }),
+        ];
+        for at in [monitor_frames::MAIN, monitor_frames::PREVIEW] {
+            self.monitor_picked[at] = None;
+            let Some(frames) = shared.frames[at].as_ref() else {
+                continue;
+            };
+            // Frames of what it shows now, not what it showed.
+            let wanted = shared.wants[at].as_ref().map(|w| w.channel.clone());
+            if wanted != Some(frames.source.clone()) {
+                continue;
+            }
+            self.monitor_picked[at] =
+                self.monitor_picker
+                    .pick(at, frames, varda.gpu_context(), egui_renderer);
+        }
     }
 
     /// Say — now and then — that the engine thread kept the engine too long,
@@ -915,6 +1404,7 @@ impl UIRunner {
     }
 
     /// Time `took` since `since` on `part` of the control window's frame.
+    /// (Inside a hold, it names where the hold went — see `held_parts`.)
     fn part(&mut self, part: &str, since: std::time::Instant) {
         self.ui_parts.add(part, since.elapsed());
     }
@@ -947,25 +1437,26 @@ impl UIRunner {
             varda.reopen_unshown_outputs(event_loop);
             varda.refresh_monitors(event_loop);
             varda.note_control_window(window.current_monitor());
-            // The control window's screen at the show's rate (see
-            // `screen_rate`) — with the output windows just made counted, and
-            // every output window's screen asked now, not as last read.
-            let display = || window.current_monitor().and_then(|m| display_id(&m));
-            let outputs = || {
+            // What the control window's screen at the show's rate needs (see
+            // `keep_screen_rate`): every output window's screen asked now,
+            // with those just made — and what was done last time told.
+            self.screen_rate_asked = Some((
                 varda
-                    .output_screens_now()?
-                    .iter()
-                    .map(display_id)
-                    .collect::<Option<Vec<u32>>>()
-            };
-            let kept = self.screen_rate.keep(
-                display,
-                outputs,
+                    .output_screens_now()
+                    .and_then(|screens| screens.iter().map(display_id).collect::<Option<Vec<u32>>>()),
                 varda.target_fps(),
                 varda.control_screen_rate(),
-            );
-            if let Some(kept) = kept {
+            ));
+            if let Some(kept) = self.screen_rate_kept.take() {
                 varda.note_screen_rate(&kept);
+            }
+            // Night Shift off while an output is on a screen (see
+            // `night_shift`).
+            if let Some(kept) = self
+                .night_shift
+                .keep(varda.outputs_on_screens(), varda.night_shift_off())
+            {
+                varda.note_night_shift(kept);
             }
             #[cfg(feature = "html")]
             varda.create_pending_interactive(event_loop);
@@ -1012,6 +1503,19 @@ impl UIRunner {
         // 4. Collect UI data snapshot (engine → UI, with UI-owned layout state)
         let t_part = std::time::Instant::now();
         let varda_ref = self.varda.as_ref()?;
+        // The selection on what it was on as the last frame ended, wherever
+        // that is now: the API may have moved channels since. The channels
+        // as they are now are what this frame is drawn from.
+        self.frame_order = super::state::ChannelOrder::of(varda_ref.mixer_ref().channels());
+        self.layout
+            .reanchor(&self.selection_anchor, &self.frame_order);
+        // The monitors' next frames, for the selection as it now is.
+        self.pick_monitor_frames();
+        let stats = self.monitor_picker.stats();
+        if let Some(varda) = self.varda.as_mut() {
+            varda.set_control_monitors(stats);
+        }
+        let varda_ref = self.varda.as_ref()?;
         let mut ui_data = crate::usecases::ui::build_ui_data(
             varda_ref,
             &self.layout,
@@ -1020,6 +1524,23 @@ impl UIRunner {
             &self.output_preview_textures,
             self.main_output_texture,
         );
+        if !self.config.headless {
+            crate::clicker::frame(
+                &ui_data.keymap_bindings,
+                crate::clicker::WindowKeys {
+                    keyboard_learn: ui_data.keyboard_learn_active,
+                    stage_editor: ui_data.stage_editor_open,
+                },
+            );
+            ui_data.clicker = crate::clicker::status();
+        }
+        // The monitors' pictures stepped a show frame a window frame.
+        if let Some(main) = self.monitor_picked[monitor_frames::MAIN] {
+            ui_data.main_output_texture = Some(main);
+        }
+        ui_data.preview_monitor_texture = self.monitor_picked[monitor_frames::PREVIEW]
+            .zip(self.layout.preview_channels().first().copied())
+            .map(|(texture, ch)| (ch, texture));
         ui_data.saved_layouts = self.saved_layouts.layouts();
         ui_data.window_choices = self.window_choices.choices();
         ui_data.recent_shows = std::sync::Arc::clone(&self.recent_shows);
@@ -1082,7 +1603,13 @@ impl UIRunner {
         // How the control window has been doing, for the performance figures.
         self.ui_frames += 1;
         if self.ui_frames.is_multiple_of(10) {
+            #[allow(clippy::cast_precision_loss)]
+            let period_ms = self.ui_period().as_secs_f32() * 1000.0;
+            let hands_on = self.last_input.is_some_and(|at| at.elapsed() < HANDS_ON);
+            let widgets_ms = (self.egui_wants < std::time::Duration::from_secs(3600))
+                .then_some(self.egui_wants.as_secs_f32() * 1000.0);
             if let Some(varda) = self.varda.as_mut() {
+                varda.set_control_rate(period_ms, hands_on, widgets_ms);
                 varda.set_control_on_screen(
                     self.ui_on_screen.stats(),
                     crate::engine::ControlQueueStats {
@@ -1101,10 +1628,15 @@ impl UIRunner {
     /// Returns what the control window shows under the UI.
     fn ui_after(&mut self, mut ui_actions: ui::UIActions) -> Option<Shown> {
         let t_part = std::time::Instant::now();
+        self.shown_full = std::mem::take(&mut ui_actions.session.shown_full);
+        self.preview_monitor_shown = ui_actions.session.preview_monitor_shown;
 
         // 6. Apply all UI actions
         // 6a. UI-consumer-owned selection/layout state
         self.layout.apply_selections(&ui_actions);
+        // What the operator has selected, as drawn: settled where it is once
+        // this frame's changes are in (see `settle_selection`).
+        let selected = self.layout.anchor(&self.frame_order);
         self.apply_screen_layout_actions(&mut ui_actions);
 
         // 6a2. Dome camera actions — apply to renderer (not layout state)
@@ -1171,16 +1703,21 @@ impl UIRunner {
                 dirty,
                 ui_actions.session.gesture_active || varda.is_recording(),
             ) {
+                let t = std::time::Instant::now();
                 let snapshot = varda.history_snapshot(&self.layout);
                 varda.push_history(snapshot);
+                self.ui_parts.add("undo snapshot", t.elapsed());
             }
 
             // Intercept shader_to_add: resolve and route to background loading
             if let Some((place, gen_idx)) = ui_actions.session.shader_to_add.take() {
                 if let Some(shader) = varda.resolve_generator(gen_idx) {
-                    let token = self
-                        .deck_load_targets
-                        .record_before(place.channel_uuid, place.before_deck_uuid);
+                    let spot = if place.back {
+                        deck_load::Spot::Back(self.deck_load_targets.batch())
+                    } else {
+                        deck_load::Spot::Before(place.before_deck_uuid)
+                    };
+                    let token = self.deck_load_targets.record_spot(place.channel_uuid, spot);
                     let context = varda.gpu_context();
                     VardaApp::spawn_deck_loads(
                         &self.deck_load_tx,
@@ -1198,7 +1735,16 @@ impl UIRunner {
             // Where each channel moved this frame will end up, found before the
             // move: the selection is held by position and follows it after.
             let moves = channel_moves(varda, &ui_actions.commands);
+            // The commands run, named for a long hold's report.
+            for command in &ui_actions.commands {
+                let name = command_name(command);
+                if self.hold_notes.len() < 8 && !self.hold_notes.contains(&name) {
+                    self.hold_notes.push(name);
+                }
+            }
+            let t = std::time::Instant::now();
             let engine_outcome = varda.apply_engine_actions(&mut ui_actions);
+            self.ui_parts.add("commands", t.elapsed());
             for (uuid, from, to) in moves {
                 if varda
                     .mixer_ref()
@@ -1310,6 +1856,9 @@ impl UIRunner {
             if let Some(file) = ui_actions.session.reveal_file.take() {
                 reveal_in_file_manager(&file);
             }
+            if let Some(ask) = ui_actions.session.clicker_ask.take() {
+                crate::clicker::ask(ask);
+            }
 
             // Spawn file dialogs on background threads (non-blocking)
             if let Some(uuid) = ui_actions.session.open_image_dialog_for_channel.take() {
@@ -1335,6 +1884,18 @@ impl UIRunner {
                     &self.pending_deck_loads,
                     &place,
                     paths,
+                );
+            }
+            // Dropped where no channel is: an input each.
+            let as_inputs = std::mem::take(&mut ui_actions.session.files_as_inputs);
+            if !as_inputs.is_empty() {
+                deck_load::add_dropped_files_as_inputs(
+                    varda,
+                    &mut self.deck_load_targets,
+                    &mut self.inputs_awaiting_files,
+                    &self.deck_load_tx,
+                    &self.pending_deck_loads,
+                    as_inputs,
                 );
             }
 
@@ -1369,12 +1930,22 @@ impl UIRunner {
                 };
                 // One loader thread, in the order picked: with a thread per
                 // file, several slides picked together landed shuffled.
-                let files = result
+                // Stacked in one input: behind its layers — what it shows,
+                // on air perhaps, stays — last first, so they keep the order
+                // picked down the lists of layers (see
+                // `deck_load::add_dropped_files`).
+                let stacked = result.channel_uuid.is_some();
+                let spot = if stacked {
+                    deck_load::Spot::Back(self.deck_load_targets.batch())
+                } else {
+                    deck_load::Spot::Before(None)
+                };
+                let mut files: Vec<_> = result
                     .paths
                     .into_iter()
                     .zip(targets)
                     .map(|(path, channel_uuid)| {
-                        let token = self.deck_load_targets.record(channel_uuid);
+                        let token = self.deck_load_targets.record_spot(channel_uuid, spot.clone());
                         let file = match result.kind {
                             FileDialogKind::Image => crate::app::DeckFile::Image(path),
                             FileDialogKind::Video => crate::app::DeckFile::Video(path),
@@ -1382,6 +1953,9 @@ impl UIRunner {
                         (token, file)
                     })
                     .collect();
+                if stacked {
+                    files.reverse();
+                }
                 VardaApp::spawn_ordered_deck_loads(
                     &self.deck_load_tx,
                     varda.gpu_context(),
@@ -1400,7 +1974,7 @@ impl UIRunner {
                         // can change while a decode or shader compile runs, and an
                         // index captured back then would now name a different
                         // channel. See `/spec/api-addressing.md`.
-                        let Some((channel_uuid, before_deck)) = target else {
+                        let Some((channel_uuid, spot)) = target else {
                             log::warn!(
                                 "Dropping background load '{}': no target channel was recorded",
                                 result.name
@@ -1422,17 +1996,28 @@ impl UIRunner {
                         // dropped from the Library renders against blank
                         // preprocessor textures with no error shown.
                         let mut deck = deck;
+                        // A deck that cannot be finalized is not added (the
+                        // notice is logged too); an input made for its file
+                        // goes with it.
                         if let Err(e) = varda.finalize_new_deck(&mut deck) {
-                            log::error!("Failed to add deck: {e}");
                             varda.notify_error(format!("Failed to add deck: {e}"));
+                            if self.inputs_awaiting_files.remove(&channel_uuid) {
+                                deck_load::remove_if_empty(varda, &channel_uuid);
+                            }
                             continue;
                         }
                         let deck_uuid = deck.uuid().to_string();
                         self.inputs_awaiting_files.remove(&channel_uuid);
                         if let Some(ch) = varda.mixer_mut().channel_mut(ch_idx) {
-                            // Before the deck it was dropped in front of, if
-                            // that deck is still in this channel; else last.
-                            let idx = ch.insert_deck_before(deck, before_deck.as_deref());
+                            // Where it was dropped, as the channel is now:
+                            // before the deck it was dropped in front of, if
+                            // that deck is still in it (else last), or
+                            // behind its layers.
+                            let decks: Vec<String> =
+                                ch.decks.iter().map(|s| s.deck.uuid().to_string()).collect();
+                            let decks: Vec<&str> = decks.iter().map(String::as_str).collect();
+                            let at = self.deck_load_targets.landing(&spot, &decks, &deck_uuid);
+                            let idx = ch.insert_deck_at(deck, at);
                             log::info!(
                                 "Background load complete: deck {} to channel {}: {}",
                                 idx,
@@ -1472,12 +2057,30 @@ impl UIRunner {
         self.part("actions", t_part);
 
         // What the engine keeps of the UI: the cued channels (their off-air
-        // previews render live, issue #72), the deck being edited, and the
-        // dome's content rotation (real-time, MIDI-mappable).
+        // previews render live, issue #72), the tiles seen (an off-air input
+        // is drawn for its tile only while it is), the deck being edited,
+        // and the dome's content rotation (real-time, MIDI-mappable).
         {
             let varda = self.varda.as_mut()?;
-            varda.set_preview_channels(self.layout.preview_channels());
+            // What was done to the control window's screen, told at the
+            // first hold after (see `keep_screen_rate`).
+            if let Some(kept) = self.screen_rate_kept.take() {
+                varda.note_screen_rate(&kept);
+            }
+            settle_selection(&mut self.layout, &selected, varda);
+            let shown = channels_of(varda.mixer_ref().channels(), &self.shown_full);
+            varda.set_preview_channels(watched_now(&self.layout, &shown));
+            self.visible_tiles = visible_tiles(
+                &self.textures_drawn,
+                &self.channel_preview_textures,
+                &self.deck_preview_textures,
+                varda.mixer_ref().channels(),
+            );
+            varda.set_tile_channels(self.visible_tiles.clone());
             varda.set_ui_selected_deck(self.layout.selected_deck);
+            self.selection_anchor = self.layout.anchor(&super::state::ChannelOrder::of(
+                varda.mixer_ref().channels(),
+            ));
             let dome = &self.layout.dome_geometry;
             varda.set_domemaster_content_rotation(
                 dome.content_azimuth_degrees.to_radians(),
@@ -1506,8 +2109,8 @@ impl UIRunner {
             },
         );
         Some(Shown {
-            picture: Some(varda.mixer_ref().composite_view().clone()),
             target_fps: varda.target_fps(),
+            motion: varda.ui_motion(),
         })
     }
 
@@ -1520,26 +2123,33 @@ impl UIRunner {
         &mut self,
         paint_jobs: &[egui::ClippedPrimitive],
         pixels_per_point: f32,
-        mut textures_delta: egui::TexturesDelta,
         shown: &Shown,
     ) {
         let t_part = std::time::Instant::now();
+        // Every pass's textures since the last frame painted — the panels'
+        // windows' and this window's, in the order egui made them.
+        let mut textures = self.panel_windows.take_textures();
         if let (Some(context), Some(egui_renderer)) = (&self.gpu, &mut self.egui_renderer) {
-            for (id, deltas) in &textures_delta.set {
+            for (id, deltas) in textures.iter().flat_map(|t| &t.set) {
                 for delta in deltas {
                     egui_renderer.update_texture(&context.device, &context.queue, *id, delta);
                 }
             }
         }
         self.part("ui textures", t_part);
-        let parts = self.present_ui(paint_jobs, pixels_per_point, shown.picture.as_ref());
+        let parts = self.present_ui(paint_jobs, pixels_per_point);
         if let Some(ws) = &self.window_surface {
             let times = crate::renderer::context::take_presented_times(&ws.surface);
             self.ui_queue.reported(times.len());
             self.ui_waiting_most = self.ui_waiting_most.max(self.ui_queue.waiting());
             if !times.is_empty() {
                 let frame = 1.0 / f64::from(shown.target_fps.max(1));
-                self.ui_on_screen.record(&times, frame);
+                record_presented(
+                    &mut self.ui_on_screen,
+                    &times,
+                    &mut self.ui_presented_allowances,
+                    frame,
+                );
                 crate::renderer::present_trace::TRACE.note(
                     CONTROL,
                     0,
@@ -1550,21 +2160,70 @@ impl UIRunner {
         for (part, took) in parts {
             self.ui_parts.add(part, took);
         }
+        let t_part = std::time::Instant::now();
+        if let (Some(context), Some(egui_renderer)) = (&self.gpu, &mut self.egui_renderer) {
+            self.panel_windows.paint(context, egui_renderer);
+        }
+        self.part("ui panel windows", t_part);
         if let Some(egui_renderer) = &mut self.egui_renderer {
-            for id in &textures_delta.free {
+            for id in textures.iter().flat_map(|t| &t.free) {
                 egui_renderer.free_texture(id);
             }
         }
-        textures_delta.clear();
+        for delta in &mut textures {
+            delta.clear();
+        }
     }
 
-    /// Blit mixer output to screen, overlay egui, and present. Returns the
-    /// time each part took, for the frame's parts.
+    /// The panels' windows the dock showed for the first time this frame,
+    /// made: a panel whose window could not be had put back — in the layout
+    /// this frame hands back (`actions`), which the runner keeps once the
+    /// frame is done — and said.
+    fn make_panel_windows(&mut self, event_loop: &ActiveEventLoop, actions: &mut ui::UIActions) {
+        let (Some(gpu), Some(ws)) = (&self.gpu, &self.window_surface) else {
+            return;
+        };
+        let failed = self.panel_windows.make_wanted(
+            &self.egui_ctx,
+            event_loop,
+            gpu,
+            &ws.surface_config,
+            self.window,
+        );
+        for (id, why) in failed {
+            let screen = match actions.session.screen_layout.as_mut() {
+                Some(screen) => screen,
+                None => &mut self.layout.screen,
+            };
+            let pane = screen
+                .windows
+                .iter()
+                .map(|w| w.pane)
+                .find(|pane| ui::panels::window_viewport(*pane) == id);
+            if let Some(pane) = pane {
+                screen.put_back(pane);
+            }
+            let said = format!("A panel's window could not be opened — it is back in the panels: {why}");
+            let _ = self.with_engine("a dialog's answer", |this| {
+                if let Some(varda) = this.varda.as_mut() {
+                    varda.notify_error(said);
+                }
+            });
+        }
+    }
+
+    /// Draw the UI and present it. Returns the time each part took, for the
+    /// frame's parts.
+    ///
+    /// Nothing is drawn under the UI: its panels cover the window edge to
+    /// edge in an opaque fill, so the show's picture blitted beneath them —
+    /// as Varda's window did — was never seen, yet cost a full-window draw
+    /// of a 16-bit picture every frame (about 2 ms of GPU a frame for a 4K
+    /// window on an M5 Max; most of the window's GPU time).
     fn present_ui(
         &mut self,
         paint_jobs: &[egui::ClippedPrimitive],
         pixels_per_point: f32,
-        picture: Option<&wgpu::TextureView>,
     ) -> Vec<(&'static str, std::time::Duration)> {
         use crate::renderer::present_trace::{Step, TRACE};
         let mut parts = Vec::with_capacity(4);
@@ -1623,11 +2282,6 @@ impl UIRunner {
                 label: Some("Screen Encoder"),
             });
 
-        let bind_group = match (&self.blit_pipeline, picture) {
-            (Some(blit), Some(picture)) => Some(blit.create_bind_group(&context.device, picture)),
-            _ => None,
-        };
-
         // The scale egui laid this frame out and read the pointer at — zoom
         // (Cmd +/−) included. The bare window scale factor drops the zoom, so
         // at any zoom but 100% the drawn UI and the pointer drift apart.
@@ -1645,7 +2299,7 @@ impl UIRunner {
         );
 
         {
-            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Control Window Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -1666,9 +2320,6 @@ impl UIRunner {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if let (Some(bg), Some(blit)) = (&bind_group, &self.blit_pipeline) {
-                blit.render(&mut rp, bg);
-            }
             let mut rp_static = rp.forget_lifetime();
             egui_renderer.render(&mut rp_static, paint_jobs, &screen_desc);
         }
@@ -1678,11 +2329,35 @@ impl UIRunner {
         parts.push(("ui draw", t_draw.elapsed()));
         let t_part = std::time::Instant::now();
         context.queue.present(output);
+        // The wait this frame was drawn for, for when macOS reports it shown.
+        if self.ui_presented_allowances.len() >= PRESENTED_KEPT {
+            self.ui_presented_allowances.pop_front();
+        }
+        self.ui_presented_allowances
+            .push_back(self.ui_frame_allowance.as_secs_f64());
         TRACE.note(CONTROL, u64::from(self.ui_frames), Step::Presented);
         self.ui_queue.presented();
         parts.push(("ui present", t_part.elapsed()));
         parts
     }
+}
+
+/// A test hook: `NIDA_TEST_PANEL_WINDOWS=Switcher,Audio` opens those panels
+/// in windows of their own at start — named as `Pane` names them — for a
+/// look at the windows with no hand on the mouse.
+fn test_panel_windows() -> Vec<ui::screen_layout::Pane> {
+    let Ok(names) = std::env::var("NIDA_TEST_PANEL_WINDOWS") else {
+        return Vec::new();
+    };
+    log::warn!("Test hook: panels in windows of their own at start: {names}");
+    names
+        .split(',')
+        .filter_map(|name| {
+            ui::screen_layout::Pane::ALL
+                .into_iter()
+                .find(|pane| format!("{pane:?}").eq_ignore_ascii_case(name.trim()))
+        })
+        .collect()
 }
 
 /// A test hook: the control window freezes `freeze` once a second, as a busy
@@ -1741,17 +2416,157 @@ fn display_id(monitor: &winit::monitor::MonitorHandle) -> Option<u32> {
     }
 }
 
-/// What the control window shows under its UI, taken with the engine.
+/// What the control window's frame is drawn at, taken with the engine.
 struct Shown {
-    /// The show's composited picture.
-    picture: Option<wgpu::TextureView>,
     target_fps: u32,
+    /// What moves in the show: how often the next frames are drawn.
+    motion: crate::app::state::ui_motion::UiMotion,
+}
+
+/// The wait between the control window's frames: none with a hand on it or
+/// pictures moving, [`SOUND_PERIOD`] while only sound moves,
+/// [`IDLE_PERIOD`] while the show stands still — but no longer than egui
+/// asked for (`egui_wants`).
+fn frame_period(
+    hands_on: bool,
+    motion: crate::app::state::ui_motion::UiMotion,
+    egui_wants: std::time::Duration,
+) -> std::time::Duration {
+    use crate::app::state::ui_motion::UiMotion;
+    let rate = if hands_on {
+        std::time::Duration::ZERO
+    } else {
+        match motion {
+            UiMotion::Pictures => std::time::Duration::ZERO,
+            UiMotion::Sound => SOUND_PERIOD,
+            UiMotion::Still => IDLE_PERIOD,
+        }
+    };
+    rate.min(egui_wants)
+}
+
+/// Control frames presented whose report on screen is awaited, at most: one
+/// never reported does not hold the rest back.
+const PRESENTED_KEPT: usize = 16;
+
+/// Take the control frames macOS reports shown, each judged against the
+/// wait it was drawn for — taken from `allowances` in the order they were
+/// presented — or a frame (`frame`) where that was less.
+fn record_presented(
+    on_screen: &mut crate::renderer::on_screen::OnScreen,
+    times: &[f64],
+    allowances: &mut std::collections::VecDeque<f64>,
+    frame: f64,
+) {
+    for &shown in times {
+        let allowance = allowances.pop_front().unwrap_or(0.0);
+        on_screen.record(&[shown], frame.max(allowance));
+    }
+}
+
+/// The wait a control frame is judged against: the longer of the wait it
+/// is drawn after (`period`) and the one before (`previous`) — a hand back
+/// on a window drawn at the idle rate makes the next frame come after an
+/// idle wait, not a slow one.
+fn frame_allowance(previous: std::time::Duration, period: std::time::Duration) -> std::time::Duration {
+    previous.max(period)
+}
+
+#[cfg(test)]
+mod frame_period_tests {
+    use super::*;
+    use crate::app::state::ui_motion::UiMotion;
+    use std::time::Duration;
+
+    /// Every frame with a hand on the window or pictures moving; about 30
+    /// a second for sound alone; about 15 standing still — sooner when egui
+    /// asks, never later.
+    #[test]
+    fn the_window_is_drawn_as_often_as_what_moves_needs() {
+        let never = Duration::MAX;
+        assert_eq!(frame_period(true, UiMotion::Still, never), Duration::ZERO);
+        assert_eq!(frame_period(false, UiMotion::Pictures, never), Duration::ZERO);
+        assert_eq!(frame_period(false, UiMotion::Sound, never), SOUND_PERIOD);
+        assert_eq!(frame_period(false, UiMotion::Still, never), IDLE_PERIOD);
+        let blink = Duration::from_millis(40);
+        assert_eq!(frame_period(false, UiMotion::Still, blink), blink, "egui's sooner");
+        assert_eq!(
+            frame_period(false, UiMotion::Sound, Duration::from_millis(100)),
+            SOUND_PERIOD,
+            "never later than the motion needs"
+        );
+        assert_eq!(frame_period(false, UiMotion::Still, Duration::ZERO), Duration::ZERO);
+        assert!(IDLE_PERIOD <= Duration::from_millis(70), "about 15 a second");
+    }
+
+    /// A frame reported shown after the rate went back to full is judged by
+    /// the wait it was drawn for, not the rate now: its idle gap is no hitch.
+    #[test]
+    fn a_frame_reported_late_is_judged_by_its_own_wait() {
+        let frame = 1.0 / 60.0;
+        let idle = IDLE_PERIOD.as_secs_f64();
+        // Shown 16.7 ms apart, then an idle gap, then 16.7 ms again.
+        let times = [1.0, 1.0 + frame, 1.0 + frame + 0.0667, 1.0 + 2.0 * frame + 0.0667];
+        let mut on_screen = crate::renderer::on_screen::OnScreen::default();
+        let mut allowances: std::collections::VecDeque<f64> =
+            [0.0, 0.0, idle, 0.0].into_iter().collect();
+        // Reported in two goes, the idle frame's in the second.
+        record_presented(&mut on_screen, &times[..2], &mut allowances, frame);
+        record_presented(&mut on_screen, &times[2..], &mut allowances, frame);
+        assert_eq!(on_screen.stats().hitches, 0);
+        assert!(allowances.is_empty());
+    }
+
+    /// Back to full rate after the idle rate, the frame after the idle wait
+    /// is judged by it; at full rate again, by a frame.
+    #[test]
+    fn a_frame_after_an_idle_wait_is_judged_by_it() {
+        assert_eq!(frame_allowance(IDLE_PERIOD, Duration::ZERO), IDLE_PERIOD);
+        assert_eq!(frame_allowance(Duration::ZERO, IDLE_PERIOD), IDLE_PERIOD);
+        assert_eq!(frame_allowance(Duration::ZERO, Duration::ZERO), Duration::ZERO);
+    }
+}
+
+/// A hand on the window keeps it drawn every frame this long after.
+const HANDS_ON: std::time::Duration = std::time::Duration::from_secs(1);
+/// Between frames while only sound moves: about 30 a second, the meters
+/// smooth enough.
+const SOUND_PERIOD: std::time::Duration = std::time::Duration::from_millis(30);
+/// Between frames while the show stands still: about 15 a second — a
+/// clock's seconds, a slide changed by the clicker or the API, a meter
+/// coming up, all shown within a few hundredths of a second.
+const IDLE_PERIOD: std::time::Duration = std::time::Duration::from_millis(60);
+
+impl UIRunner {
+    /// How long the control window waits between frames: none while a hand
+    /// is on it or pictures move in the show; [`SOUND_PERIOD`] while only
+    /// sound moves; [`IDLE_PERIOD`] while the show stands still — sooner
+    /// when egui asks for a frame (an animation, a blink, a tooltip).
+    fn ui_period(&self) -> std::time::Duration {
+        let hands_on = self.last_input.is_some_and(|at| at.elapsed() < HANDS_ON);
+        frame_period(hands_on, self.ui_motion, self.egui_wants)
+    }
+
+    /// A hand on the control window or a panel's window: drawn at once, and
+    /// every frame for [`HANDS_ON`] after.
+    fn note_input(&mut self) {
+        self.last_input = Some(std::time::Instant::now());
+        self.ui_due = true;
+    }
 }
 
 /// Whether a show folder was named on the command line (`--workspace`),
 /// rather than by the app bundle's environment.
 fn workspace_on_command_line() -> bool {
     std::env::args().any(|a| a == "--workspace" || a.starts_with("--workspace="))
+}
+
+/// What the window says when the HTTP API could not start on `port`.
+fn api_off(port: u16) -> String {
+    format!(
+        "No HTTP API: port {port} is busy, most likely with another program. Nothing can \
+         control Nida over HTTP until Nida is opened again with the port free."
+    )
 }
 
 /// Show `file` selected in Finder — or open its folder in the file manager
@@ -1783,6 +2598,179 @@ mod tests {
 
     fn runner() -> UIRunner {
         UIRunner::new(AppConfig::parse_from(["varda", "--headless"]))
+    }
+
+    /// A hold's report names where it went: each part's time less what it
+    /// had before the hold, longest first; parts under half a millisecond
+    /// left out.
+    #[test]
+    fn a_long_holds_parts_are_what_it_added() {
+        let before = vec![("ui data".to_string(), 3.0), ("textures".to_string(), 0.2)];
+        let now = vec![
+            ("ui data".to_string(), 4.0),
+            ("textures".to_string(), 0.4),
+            ("commands".to_string(), 31.5),
+            ("undo snapshot".to_string(), 12.25),
+        ];
+        assert_eq!(
+            super::held_parts(&before, &now),
+            "commands 31.5, undo snapshot 12.2, ui data 1.0"
+        );
+        assert_eq!(
+            super::held_parts(&now, &now),
+            "no part over half a millisecond"
+        );
+    }
+
+    /// A command is named by its kind alone, its payload not written out.
+    #[test]
+    fn a_command_is_named_by_its_kind() {
+        use crate::engine::EngineCommand;
+        assert_eq!(super::command_name(&EngineCommand::SetCrossfader(0.5)), "SetCrossfader");
+        assert_eq!(super::command_name(&EngineCommand::UnloadLut), "UnloadLut");
+        assert_eq!(
+            super::command_name(&EngineCommand::LoadLut { filename: "x".repeat(10_000) }),
+            "LoadLut"
+        );
+    }
+
+    /// Channels shown big or under the pointer are drawn at the show's rate
+    /// with the cued one, each once.
+    #[test]
+    fn channels_shown_big_are_watched_with_the_cued_one() {
+        let mut layout = crate::usecases::ui::UILayoutState {
+            selected_channel: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(super::watched_now(&layout, &[5, 2, 7]), vec![2, 5, 7]);
+        layout.selected_channel = None;
+        assert_eq!(super::watched_now(&layout, &[]), Vec::<usize>::new());
+    }
+
+    /// The tiles seen: channels whose own tile was drawn, or a layer's; not
+    /// ones whose tiles were not.
+    #[test]
+    fn the_tiles_seen_are_the_channels_whose_pictures_were_drawn() {
+        let Some(mut app) = headless_app_with(3) else {
+            return;
+        };
+        let deck = crate::deck::Deck::new_solid_color(
+            app.gpu_context(),
+            [1.0, 0.0, 0.0, 1.0],
+            64,
+            64,
+        )
+        .expect("deck");
+        let uuid = deck.uuid().to_string();
+        app.mixer_mut().channel_mut(2).expect("ch 2").add_deck(deck);
+        let channel_textures: std::collections::HashMap<usize, egui::TextureId> = (0..3)
+            .map(|ch| (ch, egui::TextureId::User(ch as u64)))
+            .collect();
+        let deck_textures: std::collections::HashMap<String, egui::TextureId> =
+            [(uuid, egui::TextureId::User(10))].into_iter().collect();
+        // Ch 0's tile drawn, and Ch 2's layer's.
+        let drawn: std::collections::HashSet<egui::TextureId> =
+            [egui::TextureId::User(0), egui::TextureId::User(10)].into_iter().collect();
+        assert_eq!(
+            visible_tiles(&drawn, &channel_textures, &deck_textures, app.mixer_ref().channels()),
+            vec![0, 2]
+        );
+    }
+
+    fn headless_app_with(channels: usize) -> Option<VardaApp> {
+        let gpu = GpuContext::new_headless().ok()?;
+        let mut app = VardaApp::new(gpu, &crate::testing::headless_config()).ok()?;
+        while app.mixer_ref().channels().len() < channels {
+            app.execute_command(crate::engine::EngineCommand::AddChannel);
+        }
+        Some(app)
+    }
+
+    fn channel_order(app: &VardaApp) -> Vec<String> {
+        let channels = app.mixer_ref().channels();
+        channels.iter().map(|c| c.uuid().to_string()).collect()
+    }
+
+    /// Undo puts a moved input back; the selection stays on that input, so
+    /// the next take sends it — held by position, it stayed where the input
+    /// had been, on another one.
+    #[test]
+    fn undoing_a_move_keeps_the_selection_on_its_input() {
+        use crate::engine::{CommandOutcome, EngineCommand};
+        let Some(mut app) = headless_app_with(3) else {
+            return;
+        };
+        let before = channel_order(&app);
+        let b = before[1].clone();
+        let mut layout = super::super::UILayoutState {
+            selected_channel: Some(1),
+            ..Default::default()
+        };
+        // As a frame does: the snapshot, the move, the selection along.
+        let snapshot = app.history_snapshot(&layout);
+        app.push_history(snapshot);
+        app.execute_command(EngineCommand::MoveChannel {
+            channel_uuid: b.clone(),
+            before_channel_uuid: None,
+        });
+        layout.fixup_channel_move(1, 2);
+        assert_eq!(channel_order(&app)[2], b);
+
+        // The next frames, drawn from the channels as they are: Undo, Redo.
+        for (undo, at) in [(true, 1), (false, 2)] {
+            let drawn = super::super::state::ChannelOrder::of(app.mixer_ref().channels());
+            let selected = layout.anchor(&drawn);
+            let restored = app.history_gui(&layout, undo);
+            assert!(matches!(restored, CommandOutcome::HistoryRestored { .. }));
+            settle_selection(&mut layout, &selected, &app);
+            assert_eq!(channel_order(&app)[at], b, "undo {undo}");
+            assert_eq!(
+                layout.selected_channel,
+                Some(at),
+                "still on it, undo {undo}"
+            );
+        }
+    }
+
+    /// A layer selected and dragged into another input while the API moves
+    /// that input, both in one frame: the selection stays on the layer,
+    /// so the next take sends the input it is in now.
+    #[test]
+    fn the_selection_follows_its_layer_into_another_input_mid_frame() {
+        use crate::engine::{CommandResult, EngineCommand};
+        let Some(mut app) = headless_app_with(3) else {
+            return;
+        };
+        let order = channel_order(&app);
+        let layer =
+            |app: &mut VardaApp| match app.execute_command(EngineCommand::AddSolidColorDeck {
+                channel_uuid: order[0].clone(),
+                color: [1.0, 0.0, 0.0, 1.0],
+            }) {
+                CommandResult::OkWithId { uuid } => uuid,
+                other => panic!("{other:?}"),
+            };
+        let (d, _e) = (layer(&mut app), layer(&mut app));
+        let mut layout = super::super::UILayoutState {
+            selected_deck: Some((0, 0)),
+            ..Default::default()
+        };
+        let drawn = super::super::state::ChannelOrder::of(app.mixer_ref().channels());
+        let selected = layout.anchor(&drawn);
+        app.execute_command(EngineCommand::MoveDeck {
+            deck_uuid: d.clone(),
+            dst_channel_uuid: order[2].clone(),
+            before_deck_uuid: None,
+        });
+        app.execute_command(EngineCommand::MoveChannel {
+            channel_uuid: order[2].clone(),
+            before_channel_uuid: Some(order[1].clone()),
+        });
+        settle_selection(&mut layout, &selected, &app);
+        let (ch, dk) = layout.selected_deck.expect("still selected");
+        let channel = &app.mixer_ref().channels()[ch];
+        assert_eq!(channel.decks[dk].deck.uuid(), d, "the layer it was on");
+        assert_eq!(channel.uuid(), order[2], "in the input it went to");
     }
 
     #[test]
@@ -2042,6 +3030,27 @@ mod tests {
 
     /// A flagged shutdown exits and skips the frame's work entirely, so nothing
     /// is rendered or reconciled after the signal.
+    /// The API's Shutdown raises the flag the window loop reads: answered
+    /// "ok", the windowed app went on running.
+    #[test]
+    fn the_apis_shutdown_raises_the_flag_the_loop_quits_on() {
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        let mut varda = runner.varda.take().unwrap();
+        runner.share_shutdown(&mut varda);
+        assert!(!runner
+            .shutdown_flag
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            varda.execute_command(crate::engine::EngineCommand::Shutdown),
+            crate::engine::CommandResult::Ok
+        ));
+        assert!(runner
+            .shutdown_flag
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     #[test]
     fn render_headless_exits_and_skips_work_when_shutdown_flagged() {
         let Some(mut runner) = headless_runner() else {
@@ -2236,6 +3245,7 @@ mod tests {
         let saved = SavedLayout {
             name: "Broadcast".into(),
             dock: mine.clone(),
+            windows: Vec::new(),
             was: None,
         };
         store_saved(&path, &[saved]).unwrap();
@@ -2246,6 +3256,7 @@ mod tests {
             dock: mine,
             locked: false,
             naming: 0,
+            windows: Vec::new(),
         };
         let varda = runner.varda.as_mut().unwrap();
         varda.save_workspace(&runner.layout).unwrap();
@@ -2433,5 +3444,18 @@ mod tests {
         runner.shut_down();
         assert_eq!(recent_in(&recent).first(), Some(&target));
         assert!(target.join(".varda/scene.json").is_file());
+    }
+
+    /// A test's runner keeps no Recent list of this computer's: its first
+    /// frame names the window after its scratch show, which once put that
+    /// show at the head of the operator's list, for Nida to reopen.
+    #[test]
+    fn a_test_runner_keeps_no_recent_list_of_this_computers() {
+        assert_eq!(runner().recent_file, None);
+        let Some(mut runner) = headless_runner() else {
+            return;
+        };
+        runner.show_moved();
+        assert_eq!(runner.recent_file, None, "nowhere to write it");
     }
 }

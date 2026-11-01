@@ -44,12 +44,16 @@ mod native {
         None
     }
 
+    pub(super) fn open_for_record(_: VideoCodec, _: (u32, u32), _: u32, _: u32) -> Option<Opened> {
+        None
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn start(
         opened: Opened,
         _: std::process::ChildStdin,
         _: mpsc::Receiver<(Instant, Vec<u8>)>,
-        _: (u32, VideoCodec, u32),
+        _: (u32, VideoCodec, u32, u64),
         _: FrameCounters,
         _: (Arc<AtomicBool>, Arc<AtomicBool>),
         _: &str,
@@ -1175,6 +1179,12 @@ const MAX_GAP_SECS: f64 = 120.0;
 /// waited for the encoder, and every hold-up after, went into the picture's
 /// timeline but not the sound's, and the two came apart.
 struct Timeline {
+    /// The show's frames as the take's slots, when its rate is a whole
+    /// multiple or share of the take's (see [`Timeline::on_grid`]).
+    grid: Option<Grid>,
+    /// The show's rate the grid was made for, when it follows the engine's
+    /// as it changes (a take's; not a test's).
+    follows: Option<u32>,
     start: Option<std::time::Instant>,
     /// When the frame written last was drawn: one drawn no later is left out.
     last: Option<std::time::Instant>,
@@ -1205,6 +1215,167 @@ const SLOT_LATE: f64 = 1.0;
 const SLOT_EARLY: f64 = 0.5;
 
 
+/// Frames waiting for a live stream's writer at which it is behind real
+/// time and takes only the newest (see [`take_live`]); and slots a frame may
+/// fall past the next to write and still have them filled (see
+/// [`Timeline::place_live`]): more, they are skipped. Counted, not timed:
+/// however long a frame takes to come back from the GPU, frames come one by
+/// one, and a show slower than the stream leaves a slot or two to fill.
+const LIVE_BACKLOG: usize = 5;
+
+/// The longest a live stream skips at once, seconds; further behind, one
+/// frame goes out at each step. A gap of ten seconds or more in its time
+/// the sender's FFmpeg closes up, its sound not — the two apart for good —
+/// and a platform wants a keyframe at least every four seconds (`YouTube`),
+/// which the engine puts in only on a frame it gets: half a second keeps
+/// both, even with a step's frame dropped by the engine.
+const LONGEST_SKIP: f64 = 0.5;
+
+/// The show's frame rate as the engine last gave it (see [`set_show_fps`]);
+/// 0 while unknown.
+static SHOW_FPS: AtomicU32 = AtomicU32::new(0);
+
+/// The show's frame rate, for the takes' timelines (see `Timeline::on_grid`):
+/// set by the engine as it draws.
+pub fn set_show_fps(fps: u32) {
+    SHOW_FPS.store(fps, Ordering::Relaxed);
+}
+
+/// The engine's frames lately: when each was drawn — the time a recording
+/// or stream is given with it — and its number, counted as drawn. Counted
+/// by number, a refresh call that came late cannot make a frame look like
+/// the next one (Codex: one 10 ms late took frames 0, 2, 3, 6).
+static FRAMES_DRAWN: std::sync::Mutex<std::collections::VecDeque<(std::time::Instant, u64, u32)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+static FRAMES_COUNTED: AtomicU64 = AtomicU64::new(0);
+/// Over a minute of a 60 fps show: a frame further behind than that is
+/// placed by its time alone.
+const FRAMES_KEPT: usize = 4096;
+
+/// The engine drew a frame at `at` (the time its recordings and streams get
+/// with it), frames coming at `fps` then.
+pub fn note_frame_drawn(at: std::time::Instant, fps: u32) {
+    let number = FRAMES_COUNTED.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut drawn) = FRAMES_DRAWN.lock() {
+        if drawn.len() >= FRAMES_KEPT {
+            drawn.pop_front();
+        }
+        drawn.push_back((at, number, fps));
+    }
+}
+
+/// The number of the engine's frame drawn at `at`, if it is one of late.
+pub fn frame_number(at: std::time::Instant) -> Option<u64> {
+    frame_drawn(at).map(|(number, _)| number)
+}
+
+/// The number of the engine's frame drawn at `at`, and the rate frames came
+/// at then, if it is one of late.
+pub fn frame_drawn(at: std::time::Instant) -> Option<(u64, u32)> {
+    let drawn = FRAMES_DRAWN.lock().ok()?;
+    drawn
+        .iter()
+        .rev()
+        .find(|(when, ..)| *when == at)
+        .map(|(_, n, fps)| (*n, *fps))
+}
+
+/// A take at a whole share or multiple of the show's rate, placed by the
+/// show's frames themselves: 60 to 30, every second frame; 30 to 60, each
+/// twice. Placed by the moment each was drawn instead, every other frame of
+/// a 60 fps show fell right on a 30 fps slot's edge, and the least jitter
+/// took it in or left it out — steps of one and three frames, a recording
+/// that "stutters a lot" (the Studio, the user's 60 show recorded at 30).
+#[derive(Debug, Clone, Copy)]
+struct Grid {
+    /// Show frames to a slot (2 for 60 to 30), or slots to a show frame (2
+    /// for 30 to 60); one of them 1.
+    per_slot: u64,
+    per_frame: u64,
+    /// The show's own rate.
+    show: u32,
+    /// The first frame's place among the show's frames, counted from the
+    /// take's start, less a whole frame: where its frames fall.
+    offset: Option<f64>,
+    /// The last frame's place among the show's frames, when it was drawn,
+    /// and its number as the engine counted it (see [`note_frame_drawn`]).
+    last: Option<(u64, std::time::Instant, Option<u64>)>,
+}
+
+/// How far, in show frames, counting frames may stray from their time
+/// before it is put right — a show slower or faster than its rate, a frame
+/// it never drew: one frame repeated or left out then, not each edge
+/// crossed and crossed back.
+const GRID_STRAY: f64 = 0.75;
+
+impl Grid {
+    /// The grid of a take at `fps` from a show at `show` fps, when one is a
+    /// whole multiple of the other (not the same) — exactly: 239 for 120
+    /// would drift from the take's time (Codex).
+    fn of(fps: u32, show: u32) -> Option<Self> {
+        if fps == 0 || show == 0 || fps == show {
+            return None;
+        }
+        let (per_slot, per_frame) = if show.is_multiple_of(fps) {
+            (u64::from(show / fps), 1)
+        } else if fps.is_multiple_of(show) {
+            (1, u64::from(fps / show))
+        } else {
+            return None;
+        };
+        Some(Self {
+            per_slot,
+            per_frame,
+            show,
+            offset: None,
+            last: None,
+        })
+    }
+
+    /// The place among the show's frames of the one drawn at `made`, `since`
+    /// seconds into the take: one on from the last for each frame the engine
+    /// drew between them (by number; by the time between them when a frame
+    /// has none), put right to its own time only when that strays more than
+    /// [`GRID_STRAY`]. `None` before the take.
+    fn place(&mut self, made: std::time::Instant, since: f64) -> Option<u64> {
+        let show = f64::from(self.show);
+        let number = frame_number(made);
+        let frames = since * show;
+        let offset = *self.offset.get_or_insert(frames - frames.round());
+        let own = frames - offset;
+        if own < -0.5 {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Non-negative, bounded.
+        let at = match self.last {
+            None => own.round() as u64,
+            Some((last, then, last_number)) => {
+                let between = match (number, last_number) {
+                    (Some(n), Some(l)) if n > l => n - l,
+                    _ => (made.saturating_duration_since(then).as_secs_f64() * show)
+                        .round()
+                        .max(1.0) as u64,
+                };
+                let counted = last + between;
+                #[allow(clippy::cast_precision_loss)] // Frame counts stay far below 2^52.
+                let stray = own - counted as f64;
+                if stray.abs() > GRID_STRAY {
+                    own.round().max(0.0) as u64
+                } else {
+                    counted
+                }
+            }
+        };
+        self.last = Some((at, made, number));
+        Some(at)
+    }
+
+    /// The slot of the show's frame `at`.
+    fn slot(&self, at: u64) -> u64 {
+        at / self.per_slot * self.per_frame
+    }
+}
+
 /// What [`Timeline::place`] makes of a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Placed {
@@ -1217,6 +1388,8 @@ enum Placed {
 impl Timeline {
     fn new(start: Option<std::time::Instant>, fps: f64) -> Self {
         Self {
+            grid: None,
+            follows: None,
             start,
             last: None,
             fps,
@@ -1225,9 +1398,93 @@ impl Timeline {
         }
     }
 
+    /// The take's rate, whole.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Made from a u32.
+    fn whole_fps(&self) -> u32 {
+        self.fps.round() as u32
+    }
+
+    /// A take of a show at `show` fps: on the show's frames when the rates
+    /// divide evenly.
+    fn with_show(mut self, show: u32) -> Self {
+        self.grid = Grid::of(self.whole_fps(), show);
+        self
+    }
+
+    /// A take of the show at its rate now, following it as it changes (see
+    /// [`set_show_fps`]).
+    fn of_show(start: Option<std::time::Instant>, fps: f64) -> Self {
+        let show = SHOW_FPS.load(Ordering::Relaxed);
+        let mut timeline = Self::new(start, fps).with_show(show);
+        timeline.follows = Some(show);
+        timeline
+    }
+
+    /// The show's rate changed mid-take — as frames came, the frame `made`
+    /// at the new rate (the engine notes each frame's; a screen's clock
+    /// follows a new target only after a moment): the grid made for the new
+    /// one, its frames counted afresh from this one's time, and the slots'
+    /// phase taken from it for the old way — its start and the slots
+    /// written kept. Kept on the old rate, the count ran at the wrong share
+    /// until put right, then waited for the clock: a second and a half of
+    /// double speed then a freeze at each change (Max5 on the Studio).
+    fn follow_show(&mut self, made: std::time::Instant) {
+        const WHOLE: f64 = 1e-6;
+        let Some(was) = self.follows else {
+            return;
+        };
+        let now = frame_drawn(made).map_or_else(|| SHOW_FPS.load(Ordering::Relaxed), |(_, fps)| fps);
+        if now == was {
+            return;
+        }
+        self.follows = Some(now);
+        self.grid = Grid::of(self.whole_fps(), now);
+        if let (Some(start), Some(_)) = (self.start, self.phase) {
+            let since = made.saturating_duration_since(start).as_secs_f64() * self.fps;
+            let first = since - (since + WHOLE).floor();
+            self.phase = Some((first, first));
+        }
+    }
+
+    /// [`Self::place`] on the show's own frames (see [`Grid`]): each to the
+    /// slot its frame falls in, those no frame came for filled with the one
+    /// before, one for a slot already written left out.
+    fn on_grid(&mut self, made: std::time::Instant) -> Option<Placed> {
+        self.follow_show(made);
+        let mut grid = self.grid?;
+        let start = *self.start.get_or_insert(made);
+        if made < start || self.last.is_some_and(|last| made <= last) {
+            return Some(Placed::LeftOut);
+        }
+        let since = (made - start).as_secs_f64();
+        let placed = match grid.place(made, since) {
+            None => Placed::LeftOut,
+            Some(at) => {
+                let slot = grid.slot(at);
+                if slot < self.written {
+                    Placed::LeftOut
+                } else {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Bounded.
+                    let most = (self.fps * MAX_GAP_SECS) as u64;
+                    let repeats = (slot - self.written).min(most);
+                    self.written += repeats + 1;
+                    self.last = Some(made);
+                    // Where the slots fall, for a live stream's skips.
+                    self.phase.get_or_insert((0.0, 0.0));
+                    Placed::After(repeats)
+                }
+            }
+        };
+        self.grid = Some(grid);
+        Some(placed)
+    }
+
     fn place(&mut self, made: std::time::Instant) -> Placed {
         // Clear of rounding at whole frames, where steady frames fall.
         const WHOLE: f64 = 1e-6;
+        if let Some(placed) = self.on_grid(made) {
+            return placed;
+        }
         let start = *self.start.get_or_insert(made);
         if made < start || self.last.is_some_and(|last| made <= last) {
             return Placed::LeftOut;
@@ -1261,6 +1518,174 @@ impl Timeline {
         self.written += repeats + 1;
         Placed::After(repeats)
     }
+
+    /// [`Self::place_live`] on the show's own frames (see [`Grid`]), each
+    /// frame's slot worked out once and used for all: the first frame at the
+    /// first slot, nothing filled before it; one more than `fill` slots past
+    /// the next to write skipped to (at most [`LONGEST_SKIP`] at once, the
+    /// frame before marking each step); else written after the slots before
+    /// it filled. Worked out apart, skips and slots came apart for good and
+    /// every frame was left out (Codex: a 24 fps show streamed at 120).
+    fn live_on_grid(&mut self, made: std::time::Instant, fill: u64) -> Option<(u64, Option<Placed>)> {
+        self.follow_show(made);
+        let mut grid = self.grid?;
+        let start = *self.start.get_or_insert(made);
+        if made < start || self.last.is_some_and(|last| made <= last) {
+            return Some((0, Some(Placed::LeftOut)));
+        }
+        let since = (made - start).as_secs_f64();
+        let at = grid.place(made, since);
+        self.grid = Some(grid);
+        let Some(slot) = at.map(|at| grid.slot(at)) else {
+            return Some((0, Some(Placed::LeftOut)));
+        };
+        self.phase.get_or_insert((0.0, 0.0));
+        if self.written == 0 {
+            // The first frame, however late: at the first slot, nothing
+            // filled before it; the frames after skip on to their own.
+            self.written = 1;
+            self.last = Some(made);
+            return Some((0, Some(Placed::After(0))));
+        }
+        if slot < self.written {
+            return Some((0, Some(Placed::LeftOut)));
+        }
+        let ahead = slot - self.written;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Positive, bounded.
+        let longest = (LONGEST_SKIP * self.fps) as u64;
+        if ahead > fill {
+            let skipped = ahead.min(longest);
+            self.written += skipped;
+            if ahead > longest {
+                return Some((skipped, None));
+            }
+            self.written += 1;
+            self.last = Some(made);
+            return Some((skipped, Some(Placed::After(0))));
+        }
+        self.written += ahead + 1;
+        self.last = Some(made);
+        Some((0, Some(Placed::After(ahead))))
+    }
+
+    /// For a live stream, each frame sent with its own time: on to the slot
+    /// of the frame drawn at `made`, those before it skipped rather than
+    /// filled, at most [`LONGEST_SKIP`]. The slots skipped, and whether that
+    /// stopped short of it.
+    fn skip_to(&mut self, made: std::time::Instant) -> (u64, bool) {
+        const WHOLE: f64 = 1e-6;
+        let (Some(start), Some((phase, _))) = (self.start, self.phase) else {
+            return (0, false);
+        };
+        #[allow(clippy::cast_precision_loss)] // Frame counts stay far below 2^52.
+        let written = self.written as f64;
+        let own = (made.saturating_duration_since(start).as_secs_f64() * self.fps - phase + WHOLE)
+            .floor();
+        if own <= written {
+            return (0, false);
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Positive, bounded.
+        let (gap, longest) = ((own - written) as u64, (LONGEST_SKIP * self.fps) as u64);
+        let skipped = gap.min(longest);
+        self.written += skipped;
+        (skipped, gap > longest)
+    }
+
+    /// One slot written outside [`Self::place`]: a frame repeated to mark
+    /// a step of a long skip (see [`Self::place_live`]).
+    fn wrote_one(&mut self) {
+        self.written += 1;
+    }
+
+    /// [`Self::place`] for a live stream, each frame sent with its own time:
+    /// a frame more than [`LIVE_BACKLOG`] slots past the next to write — the
+    /// writer fallen behind real time, or the show held up — goes to its own
+    /// slot, those before it skipped rather than filled, at most
+    /// [`LONGEST_SKIP`] at once. Filled at the stream's own rate, it never
+    /// came level again: each frame taken owed the time since the one before
+    /// it, frames were refused while those were made up, and the picture
+    /// stood still for good (a 4K60 stream with a 4K60 recording started
+    /// beside it, 2026-10-29). The slots skipped, and where the frame goes —
+    /// nowhere when the skip stopped short of it: a step, the frame before
+    /// to go out once there.
+    fn place_live(&mut self, made: std::time::Instant, fill: u64) -> (u64, Option<Placed>) {
+        const WHOLE: f64 = 1e-6;
+        if let Some(placed) = self.live_on_grid(made, fill) {
+            return placed;
+        }
+        // The first frame, late — the encoder slow to start: at the first
+        // slot, nothing filled before it, so the picture's time starts at
+        // the sound's. FFmpeg starts each input at nought: a first frame at
+        // its own slot, half a second in, had the picture half a second
+        // ahead of the sound for good; filled up to it, a late start cost
+        // the encoder every slot it missed. The frames after it skip ahead
+        // from there, the first marking each step.
+        if let (Some(start), None) = (self.start, self.phase) {
+            let since = made.saturating_duration_since(start).as_secs_f64() * self.fps;
+            let first = since - (since + WHOLE).floor();
+            self.phase = Some((first, first));
+            self.last = Some(made);
+            self.written = 1;
+            return (0, Some(Placed::After(0)));
+        }
+        if let (Some(start), Some((phase, _))) = (self.start, self.phase) {
+            #[allow(clippy::cast_precision_loss)] // Frame counts stay far below 2^52.
+            let ahead = made.saturating_duration_since(start).as_secs_f64() * self.fps - phase
+                + WHOLE
+                - self.written as f64;
+            #[allow(clippy::cast_precision_loss)] // A handful.
+            if ahead > fill as f64 {
+                let (skipped, step) = self.skip_to(made);
+                if step {
+                    return (skipped, None);
+                }
+                return (skipped, Some(self.place(made)));
+            }
+        }
+        (0, Some(self.place(made)))
+    }
+}
+
+/// A live stream's frames waiting for its writer (see `native::encode_in`),
+/// the one it took first: each in turn — unless [`LIVE_BACKLOG`] or more
+/// wait, the writer fallen behind real time, an engine shared or held up:
+/// then only the newest, its time skipped to as it is placed (see
+/// [`Timeline::place_live`]). With how many were let go.
+fn take_live<F>(mut waiting: Vec<(std::time::Instant, F)>) -> (Vec<(std::time::Instant, F)>, u64) {
+    if waiting.len() < LIVE_BACKLOG {
+        return (waiting, 0);
+    }
+    let let_go = waiting.len() as u64 - 1;
+    let newest = waiting.split_off(waiting.len() - 1);
+    (newest, let_go)
+}
+
+/// Frames a live stream's render thread could not hand on, not yet matched
+/// to the slots they left (see `native::encode_in`): a skip over their
+/// slots counts only past them, already counted as lost; slots filled over
+/// them use them up too.
+#[derive(Debug, Default)]
+struct RefusedCredit {
+    open: u64,
+}
+
+impl RefusedCredit {
+    /// `n` more frames refused.
+    fn refused(&mut self, n: u64) {
+        self.open += n;
+    }
+
+    /// `slots` skipped: those lost beyond frames already counted.
+    fn skipped(&mut self, slots: u64) -> u64 {
+        let matched = slots.min(self.open);
+        self.open -= matched;
+        slots - matched
+    }
+
+    /// `slots` filled with repeats, over refused frames' slots first.
+    fn filled(&mut self, slots: u64) {
+        self.open = self.open.saturating_sub(slots);
+    }
 }
 
 /// What the writer thread has put down the pipe, split by where it came from.
@@ -1278,6 +1703,12 @@ struct FrameCounters {
     /// Frames left out by the writer: drawn before the take began, or for a
     /// slot already written — the show running faster than the encoder's rate.
     left_out: Arc<AtomicU64>,
+    /// Slots a live stream skipped, fallen behind real time (see
+    /// [`take_live`]): its encoder's trouble.
+    skipped: Arc<AtomicU64>,
+    /// Slots a live stream skipped that the show drew no frame for, held up
+    /// (see [`Timeline::place_live`]): not the encoder's.
+    held: Arc<AtomicU64>,
     /// The time the dropped frames would have covered.
     drop_clock: Arc<std::sync::Mutex<DropClock>>,
 }
@@ -1289,6 +1720,8 @@ impl FrameCounters {
             padded: Arc::new(AtomicU64::new(0)),
             dropped: Arc::new(AtomicU64::new(0)),
             left_out: Arc::new(AtomicU64::new(0)),
+            skipped: Arc::new(AtomicU64::new(0)),
+            held: Arc::new(AtomicU64::new(0)),
             drop_clock: Arc::default(),
         }
     }
@@ -1645,6 +2078,19 @@ impl AudioPipe {
         })
     }
 
+    /// Tell the writer thread to stop, not waiting for it (see
+    /// [`Self::stop`]).
+    fn begin_stop(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the writer thread has ended.
+    fn is_finished(&self) -> bool {
+        self.writer_thread
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
     /// Tear down the writer thread. Idempotent. Setting `shutting_down` unblocks
     /// a pending accept-poll (~20ms) or `recv_timeout` drain (~100ms).
     fn stop(&mut self) {
@@ -1697,7 +2143,7 @@ impl FfmpegSubprocess {
         std::thread::Builder::new()
             .name(format!("ffmpeg-writer-{label}"))
             .spawn(move || {
-                let mut timeline = Timeline::new(start, f64::from(fps.max(1)));
+                let mut timeline = Timeline::of_show(start, f64::from(fps.max(1)));
                 // The frame written last, repeated over slots no frame came
                 // for: what was on screen through them.
                 let mut last: Option<Vec<u8>> = None;
@@ -2425,7 +2871,12 @@ impl FfmpegSubprocess {
                     opened,
                     stdin,
                     rx,
-                    (out_fps, options.codec, options.audio_kbps),
+                    (
+                        out_fps,
+                        options.codec,
+                        options.audio_kbps,
+                        LIVE_BACKLOG as u64,
+                    ),
                     counters.clone(),
                     (write_failed.clone(), shutting_down.clone()),
                     &label,
@@ -2552,9 +3003,22 @@ impl FfmpegSubprocess {
                 out,
             )
         };
+        let out_fps = options.fps.unwrap_or(fps).max(1);
+        // H.264 or HEVC on the media engine: encoded in Nida, each frame at
+        // its own time (see `native::open_for_record`); else ffmpeg encodes.
+        let native = options.engine_codec().filter(|_| nv12).and_then(|codec| {
+            let kbps = options.effective_kbps((width, height), out_fps);
+            native::open_for_record(codec, (width, height), out_fps, kbps).map(|o| (o, codec))
+        });
         let mut cmd = Command::new("ffmpeg");
-        cmd.args(["-hide_banner", "-nostats", "-y"])
-            .args([
+        cmd.args(["-hide_banner", "-nostats", "-y"]);
+        if native.is_some() {
+            cmd.args(["-f", "flv", "-probesize", "32", "-analyzeduration", "0"])
+                .args(["-i", "pipe:0"])
+                .args(&a_in)
+                .args(options.copied_video_args());
+        } else {
+            cmd.args([
                 "-f",
                 "rawvideo",
                 "-pix_fmt",
@@ -2565,8 +3029,9 @@ impl FfmpegSubprocess {
             .args(["-r", &fps.to_string()])
             .args(["-i", "-"])
             .args(&a_in)
-            .args(options.output_args_for((width, height), fps, nv12))
-            .args(&a_out)
+            .args(options.output_args_for((width, height), fps, nv12));
+        }
+        cmd.args(&a_out)
             .arg(path)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -2576,9 +3041,14 @@ impl FfmpegSubprocess {
         })?;
         let label = path.display().to_string();
         log::info!(
-            "Recording started: {label} ({width}x{height} @ {}fps, {})",
+            "Recording started: {label} ({width}x{height} @ {}fps, {}{})",
             options.fps.unwrap_or(fps),
-            options.codec.label()
+            options.codec.label(),
+            if native.is_some() {
+                ", the media engine, in Nida"
+            } else {
+                ""
+            }
         );
         let stdin = child.stdin.take().expect("ffmpeg stdin not piped");
         let stderr_tail = StderrTail::attach(&mut child);
@@ -2586,23 +3056,44 @@ impl FfmpegSubprocess {
         let write_failed = Arc::new(AtomicBool::new(false));
         let shutting_down = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel(stream_frame_capacity(width, height, fps, nv12));
-        let writer_thread = Self::start_writer_thread(
-            stdin,
-            rx,
-            fps,
-            counters.clone(),
-            write_failed.clone(),
-            shutting_down.clone(),
-            label.clone(),
-            prepared.as_ref().map(|p| p.started),
-        );
+        let started = prepared.as_ref().map(|p| p.started);
+        let (writer_thread, native) = match native {
+            // Gaps up to a second filled, so the file keeps its frame rate
+            // through a hitch; frames backed up, it skips ahead.
+            Some((opened, codec)) => {
+                let (writer, native) = native::start(
+                    opened,
+                    stdin,
+                    rx,
+                    (out_fps, codec, options.audio_kbps, u64::from(out_fps)),
+                    counters.clone(),
+                    (write_failed.clone(), shutting_down.clone()),
+                    &label,
+                    started,
+                );
+                (writer, Some(native))
+            }
+            None => (
+                Self::start_writer_thread(
+                    stdin,
+                    rx,
+                    fps,
+                    counters.clone(),
+                    write_failed.clone(),
+                    shutting_down.clone(),
+                    label.clone(),
+                    started,
+                ),
+                None,
+            ),
+        };
         let audio = finalize_audio(prepared, label.clone())?;
         Ok(Self {
             child,
             stderr_tail,
             fanout: None,
             rate_plan: None,
-            native: None,
+            native,
             frame_tx: Some(tx),
             writer_thread: Some(writer_thread),
             counters,
@@ -2996,20 +3487,39 @@ impl FfmpegSubprocess {
                     const FINALIZE_TIMEOUT: std::time::Duration =
                         std::time::Duration::from_secs(30);
 
-                    // 3a. Tear down the audio writer/socket so ffmpeg sees EOF on
-                    //     both inputs.
+                    // 3. Both writers told to stop — the sound's closes its
+                    //    socket, the video's drains its last frames and drops
+                    //    stdin — so ffmpeg sees the end of both inputs; waited
+                    //    for within the deadline: an encoder in Nida the media
+                    //    engine stopped answering held the video writer, and
+                    //    ffmpeg, no longer reading, the sound's, for ever.
+                    //    Past it ffmpeg is stopped, which frees both.
+                    let deadline = std::time::Instant::now() + FINALIZE_TIMEOUT;
+                    if let Some(ref a) = audio {
+                        a.begin_stop();
+                    }
+                    let finished = |audio: &Option<AudioPipe>| {
+                        audio.as_ref().is_none_or(AudioPipe::is_finished)
+                            && writer_thread
+                                .as_ref()
+                                .is_none_or(std::thread::JoinHandle::is_finished)
+                    };
+                    while !finished(&audio) && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    if !finished(&audio) {
+                        log::warn!("The writers for '{label}' did not finish; stopping ffmpeg");
+                        let _ = child.kill();
+                    }
                     if let Some(ref mut a) = audio {
                         a.stop();
                     }
-
-                    // 3b. Join the video writer thread — drains remaining ≤2
-                    //     frames, flushes & drops stdin → ffmpeg sees video EOF.
-                    if let Some(handle) = writer_thread {
+                    if let Some(handle) = writer_thread.filter(std::thread::JoinHandle::is_finished)
+                    {
                         let _ = handle.join();
                     }
 
                     // 4. Wait for ffmpeg to finalize the container (moov atom).
-                    let deadline = std::time::Instant::now() + FINALIZE_TIMEOUT;
                     loop {
                         match child.try_wait() {
                             Ok(Some(_status)) => break,
@@ -3043,6 +3553,8 @@ impl FfmpegSubprocess {
                         Self::timeline_summary(
                             counters.padded.load(Ordering::Relaxed),
                             counters.left_out.load(Ordering::Relaxed),
+                            counters.skipped.load(Ordering::Relaxed),
+                            counters.held.load(Ordering::Relaxed),
                         ),
                         duration.as_secs_f32()
                     );
@@ -3103,7 +3615,12 @@ impl FfmpegSubprocess {
                 "ffmpeg finished: {} ({} frames{}, {:.1}s)",
                 self.label,
                 frames,
-                Self::timeline_summary(padded, left_out),
+                Self::timeline_summary(
+                    padded,
+                    left_out,
+                    self.counters.skipped.load(Ordering::Relaxed),
+                    self.counters.held.load(Ordering::Relaxed),
+                ),
                 duration.as_secs_f32()
             );
         }
@@ -3113,7 +3630,7 @@ impl FfmpegSubprocess {
     /// when there were none. Neither is an error — repeats are how a hitchy
     /// session still comes out in sync, and a show drawn a little faster than
     /// the encoder's rate leaves the odd frame out — but it is worth knowing.
-    fn timeline_summary(padded: u64, left_out: u64) -> String {
+    fn timeline_summary(padded: u64, left_out: u64, skipped: u64, held: u64) -> String {
         let repeated = if padded > 0 {
             format!(" + {padded} repeated to cover renderer gaps")
         } else {
@@ -3124,7 +3641,17 @@ impl FfmpegSubprocess {
         } else {
             String::new()
         };
-        repeated + &left
+        let behind = if skipped > 0 {
+            format!(", {skipped} skipped to stay live")
+        } else {
+            String::new()
+        };
+        let still = if held > 0 {
+            format!(", {held} the show drew nothing for, skipped")
+        } else {
+            String::new()
+        };
+        repeated + &left + &behind + &still
     }
 
     /// Duration since the subprocess was started.
@@ -3155,6 +3682,7 @@ impl FfmpegSubprocess {
     /// encoded in Nida, frames the media engine dropped.
     pub fn frames_dropped(&self) -> u64 {
         self.counters.dropped.load(Ordering::Relaxed)
+            + self.counters.skipped.load(Ordering::Relaxed)
             + self.native.as_ref().map_or(0, |n| n.shared.dropped())
     }
 
@@ -3166,11 +3694,13 @@ impl FfmpegSubprocess {
             .drop_clock
             .lock()
             .map_or(0.0, |clock| clock.lost.as_secs_f64());
+        // The media engine's drops and the slots skipped to stay live (see
+        // `take_live`), each a slot of the stream's.
         #[allow(clippy::cast_precision_loss)] // Frame counts stay far below 2^52.
-        let engine = self
-            .native
-            .as_ref()
-            .map_or(0.0, |n| n.shared.dropped() as f64 / f64::from(n.shared.fps));
+        let engine = self.native.as_ref().map_or(0.0, |n| {
+            (n.shared.dropped() + self.counters.skipped.load(Ordering::Relaxed)) as f64
+                / f64::from(n.shared.fps)
+        });
         offered + engine
     }
 
@@ -3195,6 +3725,9 @@ impl Drop for FfmpegSubprocess {
 
 #[cfg(test)]
 mod tests {
+    /// What a live stream fills before it skips (see `Timeline::place_live`).
+    const LIVE_FILL: u64 = super::LIVE_BACKLOG as u64;
+
     use super::*;
 
     /// Threads that end in time are joined; one that never does is left,
@@ -4294,6 +4827,191 @@ mod tests {
 
     // ── A/V sync: holding the video timeline against the audio clock ────
 
+    /// The show frames written by `timeline` for frames drawn at
+    /// `times` (seconds from `start`), slot by slot: a repeat writes the
+    /// frame before again.
+    fn written_frames(timeline: &mut Timeline, start: std::time::Instant, times: &[f64]) -> Vec<usize> {
+        let mut slots = Vec::new();
+        for (i, secs) in times.iter().enumerate() {
+            if let Placed::After(repeats) = timeline.place(start + std::time::Duration::from_secs_f64(*secs)) {
+                let before = slots.last().copied().unwrap_or(i);
+                slots.extend(std::iter::repeat_n(before, repeats as usize));
+                slots.push(i);
+            }
+        }
+        slots
+    }
+
+    /// A little late, as refresh calls come: 0–5 ms, scattered.
+    fn late_by(i: usize) -> f64 {
+        ((i * 7919) % 11) as f64 * 0.0005
+    }
+
+    /// A 60 fps show recorded at 30 takes every second frame, exactly —
+    /// with its frames falling right on the slots' edges (the take started
+    /// as a frame was drawn) and each call a little late: placed by the
+    /// moment drawn, the jitter took edge frames in and out, steps of one
+    /// and three frames (the user's 60 show recorded at 30 "stutters a
+    /// lot").
+    #[test]
+    fn a_60_show_recorded_at_30_takes_every_second_frame() {
+        let start = std::time::Instant::now();
+        let times: Vec<f64> = (0..600).map(|i| i as f64 / 60.0 + late_by(i)).collect();
+        let mut timeline = Timeline::new(Some(start), 30.0).with_show(60);
+        let slots = written_frames(&mut timeline, start, &times);
+        let steps: std::collections::BTreeSet<usize> = slots.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(steps, [2].into(), "every second frame: {:?}", &slots[..20]);
+        assert_eq!(slots.len(), 300);
+        // A take started between frames, too.
+        let mut timeline = Timeline::new(Some(start), 30.0).with_show(60);
+        let later: Vec<f64> = times.iter().map(|t| t + 0.007).collect();
+        let slots = written_frames(&mut timeline, start, &later);
+        assert!(slots.windows(2).skip(1).all(|w| w[1] - w[0] == 2), "{:?}", &slots[..20]);
+    }
+
+    /// A 30 fps show recorded at 60 shows each frame twice, evenly.
+    #[test]
+    fn a_30_show_recorded_at_60_shows_each_frame_twice() {
+        let start = std::time::Instant::now();
+        let times: Vec<f64> = (0..300).map(|i| i as f64 / 30.0 + late_by(i)).collect();
+        let mut timeline = Timeline::new(Some(start), 60.0).with_show(30);
+        let slots = written_frames(&mut timeline, start, &times);
+        // (The last frame's second slot is written with the next frame.)
+        for (i, pair) in slots.as_chunks::<2>().0.iter().enumerate() {
+            assert_eq!(*pair, [i, i], "frame {i} twice: {:?}", &slots[..20]);
+        }
+        assert_eq!(slots.len(), 599);
+    }
+
+    /// A show a little slower than its rate (59.94 for 60), recorded at 30:
+    /// a frame repeated now and then to keep up with the sound — the take
+    /// within a frame of its time throughout, and the steps otherwise two.
+    #[test]
+    fn a_show_a_little_slow_recorded_at_half_keeps_its_time() {
+        let start = std::time::Instant::now();
+        let times: Vec<f64> = (0..36_000).map(|i| i as f64 / 59.94 + late_by(i)).collect();
+        let mut timeline = Timeline::new(Some(start), 30.0).with_show(60);
+        let slots = written_frames(&mut timeline, start, &times);
+        let end = times.last().copied().unwrap_or_default() * 30.0;
+        assert!((slots.len() as f64 - end).abs() < 2.0, "{} slots for {end:.1}", slots.len());
+        let odd = slots.windows(2).filter(|w| w[1] - w[0] != 2).count();
+        // 600 s at 0.06 frames a second short: about 36 frames' worth, each
+        // a repeat (a step of nought) or a step of one.
+        assert!(odd < 80, "{odd} uneven steps");
+    }
+
+    /// A refresh call 10 ms late does not make its frame look like the next
+    /// one: frames are counted by the engine's numbers (Codex: frames 0, 2,
+    /// 3, 6 by the time between them).
+    #[test]
+    fn a_late_call_does_not_take_the_next_frames_place() {
+        let start = std::time::Instant::now();
+        let at: Vec<std::time::Instant> = (0..60)
+            .map(|i| {
+                let late = if i == 3 { 0.010 } else { 0.0 };
+                start + std::time::Duration::from_secs_f64(f64::from(i) / 60.0 + late)
+            })
+            .collect();
+        for made in &at {
+            note_frame_drawn(*made, 60);
+        }
+        let mut timeline = Timeline::new(Some(start), 30.0).with_show(60);
+        let mut slots = Vec::new();
+        for (i, made) in at.iter().enumerate() {
+            if let Placed::After(repeats) = timeline.place(*made) {
+                slots.extend(std::iter::repeat_n(slots.last().copied().unwrap_or(i), repeats as usize));
+                slots.push(i);
+            }
+        }
+        assert!(slots.windows(2).all(|w| w[1] - w[0] == 2), "{slots:?}");
+    }
+
+    /// A live stream whose first frame comes late, the show at a whole
+    /// share of its rate: its frames skip on and keep going out (Codex: a
+    /// 24 fps show streamed at 120 left every frame out).
+    #[test]
+    fn a_live_stream_on_the_shows_frames_keeps_going_after_a_late_start() {
+        let start = std::time::Instant::now();
+        let mut timeline = Timeline::new(Some(start), 120.0).with_show(24);
+        let mut out = 0;
+        for i in 0..240 {
+            let made = start + std::time::Duration::from_secs_f64(0.010 + f64::from(i) / 24.0);
+            if let (_, Some(Placed::After(_))) = timeline.place_live(made, LIVE_FILL) {
+                out += 1;
+            }
+        }
+        assert!(out >= 238, "{out} of 240 went out");
+    }
+
+    /// The show's rate changed mid-take — 60, 30, then 60 again, each frame
+    /// noted at the rate it came — recorded at 30: each slot a frame a
+    /// slot's time on from the last, but for a slot or two at each change
+    /// (Max5: a second and a half of double speed then a freeze at each).
+    #[test]
+    fn a_take_follows_the_shows_rate_as_it_changes() {
+        let start = std::time::Instant::now();
+        let mut drawn: Vec<(f64, u32)> = Vec::new();
+        let mut t = 0.0;
+        for (secs, fps) in [(2.0, 60_u32), (2.0, 30), (2.0, 60)] {
+            let until = t + secs;
+            while t < until - 1e-9 {
+                drawn.push((t + late_by(drawn.len()) * 0.5, fps));
+                t += 1.0 / f64::from(fps);
+            }
+        }
+        let at = |secs: f64| start + std::time::Duration::from_secs_f64(secs);
+        for (secs, fps) in &drawn {
+            note_frame_drawn(at(*secs), *fps);
+        }
+        let mut timeline = Timeline::new(Some(start), 30.0).with_show(60);
+        timeline.follows = Some(60);
+        let mut shown: Vec<f64> = Vec::new();
+        for (secs, _) in &drawn {
+            if let Placed::After(repeats) = timeline.place(at(*secs)) {
+                let before = shown.last().copied().unwrap_or(*secs);
+                shown.extend(std::iter::repeat_n(before, repeats as usize));
+                shown.push(*secs);
+            }
+        }
+        let uneven: Vec<(usize, f64)> = shown
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .enumerate()
+            .filter(|(_, step)| (step - 1.0 / 30.0).abs() > 0.006)
+            .collect();
+        assert!(uneven.len() <= 4, "{} uneven slots: {uneven:?}", uneven.len());
+        // And the take keeps its time: as many slots as seconds at 30.
+        assert!((shown.len() as f64 - 6.0 * 30.0).abs() <= 2.0, "{} slots", shown.len());
+    }
+
+    /// Rates that only nearly divide are not taken as a whole share.
+    #[test]
+    fn only_rates_that_divide_exactly_are_on_the_shows_frames() {
+        assert!(Grid::of(30, 60).is_some());
+        assert!(Grid::of(60, 30).is_some());
+        assert!(Grid::of(25, 50).is_some());
+        assert!(Grid::of(120, 239).is_none());
+        assert!(Grid::of(60, 60).is_none(), "the same rate: as before");
+        assert!(Grid::of(50, 60).is_none());
+        assert!(Grid::of(30, 0).is_none());
+    }
+
+    /// A live stream at half the show's rate takes every second frame too.
+    #[test]
+    fn a_live_stream_at_half_the_shows_rate_takes_every_second_frame() {
+        let start = std::time::Instant::now();
+        let mut timeline = Timeline::new(Some(start), 30.0).with_show(60);
+        let mut sent = Vec::new();
+        for i in 0..600 {
+            let made = start + std::time::Duration::from_secs_f64(i as f64 / 60.0 + late_by(i));
+            if let (0, Some(Placed::After(0))) = timeline.place_live(made, LIVE_FILL) {
+                sent.push(i);
+            }
+        }
+        assert!(sent.windows(2).all(|w| w[1] - w[0] == 2), "{:?}", &sent[..20]);
+        assert_eq!(sent.len(), 300);
+    }
+
     /// `n` frames of a 60 fps show drawn from `start` on, each moved by
     /// `jitter(i)` seconds, placed in order on a 60 fps timeline.
     fn placed(
@@ -4310,6 +5028,184 @@ mod tests {
             })
             .collect();
         (timeline, placed)
+    }
+
+    /// A writer taking 60 fps frames — drawn every `every` show frames,
+    /// each coming back from the GPU `readback` seconds on — through a
+    /// queue of ten into an engine that does `rate` slots a second, held up
+    /// for `held` seconds at 10 s (a recording started beside it), as a live
+    /// stream takes them (see `take_live`) or each in turn (`live` false),
+    /// for 40 s: the frames it refused, and the fresh frames it took, each
+    /// second from 30 s on; and the slots it skipped in all.
+    fn writer_held_up(
+        rate: f64,
+        live: bool,
+        held: f64,
+        (every, readback): (u32, f64),
+    ) -> (f64, f64, u64) {
+        let start = std::time::Instant::now();
+        let at = |secs: f64| start + std::time::Duration::from_secs_f64(secs);
+        let mut timeline = Timeline::new(Some(start), 60.0);
+        let mut queue: std::collections::VecDeque<(std::time::Instant, ())> =
+            std::collections::VecDeque::new();
+        let (mut free_at, mut refused, mut taken, mut skipped) = (0.0_f64, 0_u32, 0_u32, 0_u64);
+        for tick in 0..(40 * 60) {
+            let now = f64::from(tick) / 60.0;
+            // Engine free: what waits is taken, until it is busy past now.
+            while free_at <= now && !queue.is_empty() {
+                let from = free_at.max(now.min(free_at + 1.0 / 60.0));
+                let waiting: Vec<_> = if live {
+                    queue.drain(..).collect()
+                } else {
+                    queue.pop_front().into_iter().collect()
+                };
+                let frames = if live { take_live(waiting).0 } else { waiting };
+                let mut slots = 0.0;
+                for (made, ()) in frames {
+                    let placed = if live {
+                        let (more, placed) = timeline.place_live(made, LIVE_FILL);
+                        skipped += more;
+                        placed.or_else(|| {
+                            timeline.wrote_one();
+                            None
+                        })
+                    } else {
+                        Some(timeline.place(made))
+                    };
+                    if let Some(Placed::After(repeats)) = placed {
+                        #[allow(clippy::cast_precision_loss)]
+                        let more = (repeats + 1) as f64;
+                        slots += more;
+                        if now >= 30.0 {
+                            taken += 1;
+                        }
+                    }
+                }
+                free_at = from + slots.max(1.0) / rate;
+                if from < 10.0 + held && free_at > 10.0 {
+                    free_at = free_at.max(10.0 + held);
+                }
+            }
+            // The frame drawn `readback` ago comes in, if one was drawn then.
+            let drawn = now - readback;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let drawn_tick = (drawn * 60.0).round() as i64;
+            if drawn >= 0.0 && drawn_tick % i64::from(every) == 0 {
+                if queue.len() >= 10 {
+                    if now >= 30.0 {
+                        refused += 1;
+                    }
+                } else {
+                    queue.push_back((at(drawn), ()));
+                }
+            }
+        }
+        (f64::from(refused) / 10.0, f64::from(taken) / 10.0, skipped)
+    }
+
+    /// A live stream held up for a moment comes back: fallen behind real
+    /// time, it takes the newest frame and skips ahead to it, rather than
+    /// making up the time at its own rate — made up, each frame taken owed
+    /// the time since the one before, and it never came level again (a
+    /// 4K60 stream with a 4K60 recording started beside it, 2026-10-29).
+    #[test]
+    fn a_live_stream_held_up_skips_ahead_and_comes_back() {
+        let (refused, taken, skipped) = writer_held_up(61.0, true, 0.5, (1, 0.02));
+        assert!(refused < 1.0, "refused {refused:.1} a second");
+        assert!(taken > 55.0, "took {taken:.1} fresh frames a second");
+        assert!(skipped > 0, "skipped ahead");
+        // Each in turn: twenty seconds on, still refusing frames.
+        let (refused, taken, _) = writer_held_up(61.0, false, 0.5, (1, 0.02));
+        assert!(
+            refused > 10.0 && taken < 50.0,
+            "each in turn: {refused:.1} refused, {taken:.1} taken a second"
+        );
+        // Held up for twenty seconds: back all the same, in steps of no
+        // more than five seconds each.
+        let (refused, taken, skipped) = writer_held_up(61.0, true, 20.0, (1, 0.02));
+        assert!(
+            refused < 1.0 && taken > 55.0,
+            "{refused:.1} refused, {taken:.1} taken"
+        );
+        assert!(skipped > 0);
+    }
+
+    /// A live stream that keeps up never skips — even for a show at half
+    /// its rate whose frames take long to come back from the GPU: each
+    /// frame comes on its own, and the gaps between are filled.
+    #[test]
+    fn a_live_stream_keeping_up_never_skips() {
+        let (refused, taken, skipped) = writer_held_up(240.0, true, 0.0, (2, 0.12));
+        assert_eq!(skipped, 0, "skipped while keeping up");
+        assert!(refused < 0.1, "refused {refused:.1} a second");
+        assert!(taken > 29.0, "took {taken:.1} a second");
+    }
+
+    /// A live stream's frames waiting: fewer than `LIVE_BACKLOG`, each in
+    /// turn; that many or more, only the newest. A frame a slot or two past
+    /// the next to write has them filled; one further on skips to its own
+    /// slot, nothing filled; one further than `LONGEST_SKIP`, a step that
+    /// far, the frame let go.
+    #[test]
+    fn a_live_stream_skips_ahead_only_once_behind() {
+        let start = std::time::Instant::now();
+        let at = |secs: f64| start + std::time::Duration::from_secs_f64(secs);
+        let mut timeline = Timeline::new(Some(start), 60.0);
+        assert_eq!(timeline.place(at(0.0)), Placed::After(0));
+        let (few, let_go) = take_live(vec![(at(0.05), 1), (at(0.07), 2)]);
+        assert_eq!((few.len(), let_go), (2, 0), "in turn");
+        assert_eq!(
+            timeline.place_live(at(0.05), LIVE_FILL),
+            (0, Some(Placed::After(2))),
+            "filled"
+        );
+        let many: Vec<_> = (0..5).map(|i| (at(0.4 + f64::from(i) / 60.0), i)).collect();
+        let (newest, let_go) = take_live(many);
+        assert_eq!((newest.len(), newest[0].1, let_go), (1, 4, 4), "the newest");
+        let (skipped, placed) = timeline.place_live(newest[0].0, LIVE_FILL);
+        assert_eq!(
+            (skipped, placed),
+            (28 - 4, Some(Placed::After(0))),
+            "nothing filled"
+        );
+        // Twelve seconds further on: a step of half a second, the frame let
+        // go.
+        assert_eq!(timeline.place_live(at(13.4), LIVE_FILL), (30, None));
+    }
+
+    /// Refused frames are matched to the slots skipped once, across as many
+    /// catch-ups as it takes, and to slots filled over them: never counted
+    /// lost twice.
+    #[test]
+    fn refused_frames_are_counted_lost_once() {
+        let mut credit = super::RefusedCredit::default();
+        credit.refused(30);
+        assert_eq!(credit.skipped(10), 0, "all already counted");
+        assert_eq!(credit.skipped(25), 5, "the rest of the 30, then new");
+        assert_eq!(credit.skipped(7), 7, "none left to match");
+        credit.refused(4);
+        credit.filled(3);
+        assert_eq!(credit.skipped(5), 4, "one left after the fill");
+    }
+
+    /// A live stream's first frame, late — its encoder slow to start — goes
+    /// to the first slot, nothing filled before it, so picture and sound
+    /// start together; the frames after it skip ahead from there.
+    #[test]
+    fn a_live_streams_late_first_frame_fills_nothing() {
+        let start = std::time::Instant::now();
+        let at = |secs: f64| start + std::time::Duration::from_secs_f64(secs);
+        let mut timeline = Timeline::new(Some(start), 60.0);
+        assert_eq!(
+            timeline.place_live(at(20.0), LIVE_FILL),
+            (0, Some(Placed::After(0))),
+            "at the first slot"
+        );
+        // The next: on from there, a step at a time.
+        assert_eq!(
+            timeline.place_live(at(20.0 + 1.0 / 60.0), LIVE_FILL),
+            (30, None)
+        );
     }
 
     /// Frames drawn on time are written once each, nothing repeated or left

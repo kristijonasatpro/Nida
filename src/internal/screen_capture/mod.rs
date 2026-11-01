@@ -57,6 +57,14 @@ pub const UNBOUND_CAPTURE_ID: CaptureId = CaptureId::MAX;
 struct ActiveCapture {
     /// Handle-free identity, used to dedupe `open` onto an existing session.
     identity: TargetIdentity,
+    /// The OS handle of what it captures: two windows of one app and title
+    /// (a show started again) are two sessions.
+    platform_id: u64,
+    /// What it captures' size when opened, as the platform gives it.
+    target_size: (u32, u32),
+    /// The size its backend delivers, as it said when opened: another for
+    /// the same window when the window went to a screen of other pixels.
+    backend_size: (u32, u32),
     label: String,
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
@@ -74,6 +82,14 @@ struct ActiveCapture {
     stop_flag: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Frames put in its texture: none yet, and its texture shows nothing.
+    uploaded: u64,
+    /// Of those, the ones from the capture running now — none yet after it
+    /// replaced another, though the texture still shows that one's last.
+    fresh: u64,
+    /// When the last frame was put in its texture: macOS sends a capture's
+    /// frames only as what it shows changes, so a still slide sends none.
+    last_picture: Option<std::time::Instant>,
 }
 
 /// Manages capture-target enumeration, capture sessions, and shared textures.
@@ -112,6 +128,19 @@ impl ScreenCaptureManager {
             next_id: 0,
             permission: PermissionState::NotRequired,
             disabled: true,
+        }
+    }
+
+    /// Enabled, as `new`, without asking the platform for permission or
+    /// targets.
+    #[cfg(test)]
+    fn enabled_for_tests() -> Self {
+        Self {
+            targets: Vec::new(),
+            active: HashMap::new(),
+            next_id: 0,
+            permission: PermissionState::NotRequired,
+            disabled: false,
         }
     }
 
@@ -234,20 +263,184 @@ impl ScreenCaptureManager {
             }
         }
 
-        let identity = target.identity();
-        if let Some((id, active)) = self
-            .active
-            .iter_mut()
-            .find(|(_, a)| a.identity == identity)
-            .map(|(id, a)| (*id, a))
-        {
-            active.ref_count += 1;
-            return Ok((id, active.width, active.height));
+        if let Some(shared) = self.share(target) {
+            return Ok(shared);
         }
 
         let config = config.sanitized();
         let session = platform::open(target, &config)?;
         self.start_session(target, session, config, device)
+    }
+
+    /// The session already capturing `target` — the same window, not only
+    /// one of its app and title — with one more holder.
+    fn share(&mut self, target: &CaptureTargetInfo) -> Option<(CaptureId, u32, u32)> {
+        let identity = target.identity();
+        let (id, active) = self
+            .active
+            .iter_mut()
+            .find(|(_, a)| a.identity == identity && a.platform_id == target.platform_id)?;
+        active.ref_count += 1;
+        Some((*id, active.width, active.height))
+    }
+
+    /// Take a capture of `target` opened elsewhere — the slow part, done off
+    /// the render thread (a PowerPoint show's window) — set to `config`.
+    ///
+    /// That window already captured, the same size and so set: shared. Opened
+    /// again at a new size or with new settings (a show's window resized):
+    /// put in the running one's place, under its id, so what shows it carries
+    /// on — the running one sizes its frames from the window as it was.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError::Unavailable`] when disabled, or
+    /// [`CaptureError::Backend`] if the session's thread cannot start.
+    pub fn adopt(
+        &mut self,
+        target: &CaptureTargetInfo,
+        session: Box<dyn ScreenCaptureBackend>,
+        config: CaptureConfig,
+        device: &wgpu::Device,
+    ) -> Result<(CaptureId, u32, u32), CaptureError> {
+        self.adopt_with(target, session, config, device, true)
+    }
+
+    /// [`Self::adopt`], but never shared: the window already captured has
+    /// the running capture's place taken by this one, under its id — one
+    /// opened again because the running one never sent a picture.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::adopt`].
+    pub fn adopt_afresh(
+        &mut self,
+        target: &CaptureTargetInfo,
+        session: Box<dyn ScreenCaptureBackend>,
+        config: CaptureConfig,
+        device: &wgpu::Device,
+    ) -> Result<(CaptureId, u32, u32), CaptureError> {
+        self.adopt_with(target, session, config, device, false)
+    }
+
+    fn adopt_with(
+        &mut self,
+        target: &CaptureTargetInfo,
+        mut session: Box<dyn ScreenCaptureBackend>,
+        config: CaptureConfig,
+        device: &wgpu::Device,
+        share: bool,
+    ) -> Result<(CaptureId, u32, u32), CaptureError> {
+        if self.disabled {
+            return Err(CaptureError::Unavailable(
+                "screen capture disabled via --no-screen-capture".into(),
+            ));
+        }
+        let config = config.sanitized();
+        let identity = target.identity();
+        let running = self
+            .active
+            .iter()
+            .find(|(_, a)| a.identity == identity && a.platform_id == target.platform_id)
+            .map(|(id, a)| {
+                let same = a.target_size == (target.width, target.height)
+                    && a.backend_size == session.resolution()
+                    && a.config.lock().is_ok_and(|c| *c == config);
+                (*id, same)
+            });
+        match running {
+            Some((_, true)) if share => {
+                if let Some(shared) = self.share(target) {
+                    return Ok(shared);
+                }
+            }
+            Some((id, _)) => {
+                if let Err(e) = session.set_config(&config) {
+                    log::warn!(
+                        "Screen capture of '{}': settings not taken: {e}",
+                        target.label
+                    );
+                }
+                return self.replace_session(id, target, session, config);
+            }
+            None => {}
+        }
+        // Opened to the opener's settings: the thread only follows changes
+        // made after it starts.
+        if let Err(e) = session.set_config(&config) {
+            log::warn!(
+                "Screen capture of '{}': settings not taken: {e}",
+                target.label
+            );
+        }
+        self.start_session(target, session, config, device)
+    }
+
+    /// Capture `id` from `session` from now on, set to `config`: its thread
+    /// stopped and one started for `session`, the frames going where they
+    /// went. Its texture follows the new frames' size (see `upload_frame`).
+    fn replace_session(
+        &mut self,
+        id: CaptureId,
+        target: &CaptureTargetInfo,
+        mut session: Box<dyn ScreenCaptureBackend>,
+        config: CaptureConfig,
+    ) -> Result<(CaptureId, u32, u32), CaptureError> {
+        let backend_size = session.resolution();
+        let Some(active) = self.active.get_mut(&id) else {
+            return Err(CaptureError::Backend(format!("capture {id} is gone")));
+        };
+        active.stop_flag.store(true, Ordering::Relaxed);
+        if let Some(thread) = active.thread.take() {
+            let _ = thread.join();
+        }
+        if let Ok(mut guard) = active.config.lock() {
+            *guard = config;
+        }
+        // What the one replaced sent and is not yet shown is not this one's.
+        if let Ok(mut picker) = active.frame_data.lock() {
+            picker.discard_waiting();
+        }
+        active.fresh = 0;
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let frame_tx = Arc::clone(&active.frame_data);
+        let config_rx = Arc::clone(&active.config);
+        let stop_rx = Arc::clone(&stop_flag);
+        let connected_tx = Arc::clone(&active.connected);
+        let spawned = std::thread::Builder::new()
+            .name(format!("screen-capture-{id}"))
+            .spawn(move || {
+                capture_loop(
+                    session.as_mut(),
+                    id,
+                    &frame_tx,
+                    &config_rx,
+                    &stop_rx,
+                    &connected_tx,
+                );
+            });
+        let thread = match spawned {
+            Ok(thread) => thread,
+            Err(e) => {
+                // Its thread stopped and none to follow: gone, not shared.
+                self.active.remove(&id);
+                return Err(CaptureError::Backend(format!(
+                    "failed to spawn capture thread: {e}"
+                )));
+            }
+        };
+        active.stop_flag = stop_flag;
+        active.thread = Some(thread);
+        active.target_size = (target.width, target.height);
+        active.backend_size = backend_size;
+        active.ref_count += 1;
+        log::info!(
+            "Screen capture {id}: '{}' opened again at {}x{}",
+            target.label,
+            target.width,
+            target.height
+        );
+        Ok((id, active.width, active.height))
     }
 
     /// Open a synthetic capture. Always available — used by tests, benches, and
@@ -262,15 +455,8 @@ impl ScreenCaptureManager {
         config: CaptureConfig,
         device: &wgpu::Device,
     ) -> Result<(CaptureId, u32, u32), CaptureError> {
-        let identity = target.identity();
-        if let Some((id, active)) = self
-            .active
-            .iter_mut()
-            .find(|(_, a)| a.identity == identity)
-            .map(|(id, a)| (*id, a))
-        {
-            active.ref_count += 1;
-            return Ok((id, active.width, active.height));
+        if let Some(shared) = self.share(target) {
+            return Ok(shared);
         }
         let config = config.sanitized();
         let session: Box<dyn ScreenCaptureBackend> = Box::new(MockBackend::new(
@@ -352,6 +538,9 @@ impl ScreenCaptureManager {
             id,
             ActiveCapture {
                 identity: target.identity(),
+                platform_id: target.platform_id,
+                target_size: (target.width, target.height),
+                backend_size: (width, height),
                 label: target.label.clone(),
                 texture,
                 texture_view,
@@ -364,6 +553,9 @@ impl ScreenCaptureManager {
                 stop_flag,
                 connected,
                 thread: Some(thread),
+                uploaded: 0,
+                fresh: 0,
+                last_picture: None,
             },
         );
 
@@ -478,6 +670,27 @@ impl ScreenCaptureManager {
 
     pub fn is_active(&self, id: CaptureId) -> bool {
         self.active.contains_key(&id)
+    }
+
+    /// Whether a frame has been put in the capture's texture: until then it
+    /// shows nothing — a talk starting waits for it.
+    pub fn has_picture(&self, id: CaptureId) -> bool {
+        self.active.get(&id).is_some_and(|a| a.uploaded > 0)
+    }
+
+    /// Whether the capture sent a new frame within `within`: a screen not
+    /// there sends none, nor one whose picture is not changing.
+    pub fn receiving(&self, id: CaptureId, within: std::time::Duration) -> bool {
+        self.active
+            .get(&id)
+            .and_then(|a| a.last_picture)
+            .is_some_and(|at| at.elapsed() <= within)
+    }
+
+    /// Whether the capture running now has sent a picture — not only one
+    /// it replaced, whose last its texture may still show.
+    pub fn has_fresh_picture(&self, id: CaptureId) -> bool {
+        self.active.get(&id).is_some_and(|a| a.fresh > 0)
     }
 
     /// Whether the capture has delivered at least one frame and is still healthy.
@@ -612,7 +825,11 @@ impl ScreenCaptureManager {
         if let Some(surface) = frame.surface {
             if let Err(e) = surface::copy_into(context, surface, &active.texture) {
                 log::warn!("Screen capture {id}: frame not copied: {e}");
+                return;
             }
+            active.uploaded += 1;
+            active.fresh += 1;
+            active.last_picture = Some(std::time::Instant::now());
             return;
         }
 
@@ -640,6 +857,9 @@ impl ScreenCaptureManager {
                 depth_or_array_layers: 1,
             },
         );
+        active.uploaded += 1;
+        active.fresh += 1;
+        active.last_picture = Some(std::time::Instant::now());
     }
 }
 
@@ -739,7 +959,10 @@ fn capture_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::backend::{mock_targets, CaptureConfig, CaptureError, CropRect, TargetIdentity};
+    use super::backend::{
+        mock_targets, CaptureConfig, CaptureError, CaptureTargetInfo, CropRect, MockBackend,
+        ScreenCaptureBackend, TargetIdentity,
+    };
     use super::{poll_interval, ScreenCaptureManager, SELF_PACED_MAX_POLL, SELF_PACED_MIN_POLL};
     use std::time::Duration;
 
@@ -1032,6 +1255,88 @@ mod tests {
             !mgr.is_active(id),
             "a stale ref count must not keep the session alive"
         );
+    }
+
+    #[test]
+    fn a_window_opened_again_at_a_new_size_is_captured_anew_under_its_id() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        let mut mgr = ScreenCaptureManager::enabled_for_tests();
+        let target = mock_targets().remove(0);
+        let mock = |t: &CaptureTargetInfo, c: &CaptureConfig| -> Box<dyn ScreenCaptureBackend> {
+            Box::new(MockBackend::new(
+                t.label.clone(),
+                t.width,
+                t.height,
+                c.clone(),
+            ))
+        };
+        let config = CaptureConfig::default();
+        let (id, _, _) = mgr
+            .adopt(&target, mock(&target, &config), config.clone(), &gpu.device)
+            .expect("adopted");
+        // The same window, size and settings: shared.
+        let (again, _, _) = mgr
+            .adopt(&target, mock(&target, &config), config.clone(), &gpu.device)
+            .expect("shared");
+        assert_eq!(again, id);
+        // Resized, its top cut off anew: the new capture, under that id.
+        let mut resized = target.clone();
+        resized.width /= 2;
+        let cropped = CaptureConfig {
+            crop: CropRect {
+                x: 0.0,
+                y: 0.1,
+                w: 1.0,
+                h: 0.9,
+            },
+            ..config
+        };
+        let (swapped, _, _) = mgr
+            .adopt(
+                &resized,
+                mock(&resized, &cropped),
+                cropped.clone(),
+                &gpu.device,
+            )
+            .expect("replaced");
+        assert_eq!(swapped, id);
+        assert_eq!(
+            mgr.config(id).map(|c| c.crop),
+            Some(cropped.clone().sanitized().crop)
+        );
+        // The same window, size and settings from a screen of twice the
+        // pixels: its own capture, not the one sized for the other screen.
+        let sharp = |t: &CaptureTargetInfo, c: &CaptureConfig| -> Box<dyn ScreenCaptureBackend> {
+            Box::new(MockBackend::new(
+                t.label.clone(),
+                t.width * 2,
+                t.height * 2,
+                c.clone(),
+            ))
+        };
+        let (retina, _, _) = mgr
+            .adopt(
+                &resized,
+                sharp(&resized, &cropped),
+                cropped.clone(),
+                &gpu.device,
+            )
+            .expect("replaced again");
+        assert_eq!(retina, id);
+        // Its frames come at the new size.
+        let want = sharp(&resized, &cropped).resolution();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while mgr.resolution(id) != Some(want) && std::time::Instant::now() < deadline {
+            mgr.update(&gpu, f64::MAX);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(mgr.resolution(id), Some(want));
+        for _ in 0..4 {
+            mgr.release(id);
+        }
+        assert!(!mgr.is_active(id));
     }
 
     #[test]

@@ -164,6 +164,28 @@ pub struct ISFInput {
     pub identity: Option<bool>,
 }
 
+impl ISFInput {
+    /// A "long" input's choices — each value and what it is called (its
+    /// label, else the number) — when it lists its VALUES.
+    pub fn choices(&self) -> Option<Vec<(i32, String)>> {
+        if self.input_type != "long" {
+            return None;
+        }
+        let values = self.values.as_ref()?;
+        let labels = self.labels.as_deref().unwrap_or_default();
+        let choices: Vec<(i32, String)> = values
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| {
+                let n = i32::try_from(v.as_i64()?).ok()?;
+                let label = labels.get(i).cloned().unwrap_or_else(|| n.to_string());
+                Some((n, label))
+            })
+            .collect();
+        (!choices.is_empty()).then_some(choices)
+    }
+}
+
 /// ISF pass definition for multi-pass rendering
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ISFPass {
@@ -214,6 +236,13 @@ pub struct PhaseInput {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub multiply_by: Vec<String>,
+
+    /// Kept below this, starting again from 0 as it reaches it — for a
+    /// shader that runs all day: a float growing without end loses the
+    /// precision its motion needs, hours in, and moves in steps. Absent,
+    /// it grows on.
+    #[serde(rename = "WRAP", default, skip_serializing_if = "Option::is_none")]
+    pub wrap: Option<f32>,
 }
 
 /// Accept `"MULTIPLY_BY": "rot_speed"` and `"MULTIPLY_BY": ["a", "b"]` alike, so the

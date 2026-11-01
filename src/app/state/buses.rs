@@ -250,6 +250,39 @@ impl VardaApp {
         }
     }
 
+    /// Take a source's button off a bus's switcher row, or put it back. The
+    /// row offers Black, Master and channels, so a deck is refused; so is a
+    /// channel that is not there to hide.
+    pub fn cmd_set_bus_source_hidden(
+        &mut self,
+        uuid: &str,
+        input: &BusInputRef,
+        hidden: bool,
+    ) -> CommandResult {
+        match input {
+            BusInputRef::Deck(_) => {
+                return CommandResult::Err {
+                    code: ErrorCode::InvalidInput,
+                    message: "A bus's row has buttons for Black, Master and channels, not layers"
+                        .into(),
+                };
+            }
+            BusInputRef::Channel(channel_uuid) if hidden => {
+                if let Err(unknown) = self.resolve_channel(channel_uuid) {
+                    return unknown.into();
+                }
+            }
+            _ => {}
+        }
+        match self.production_buses.get_mut(uuid) {
+            Some(bus) => {
+                bus.set_source_hidden(input, hidden);
+                CommandResult::Ok
+            }
+            None => no_such_bus(uuid),
+        }
+    }
+
     /// Put one bus fullscreen on a monitor, or take it off screen with `None`.
     ///
     /// A bus's screen is an output window showing a single full-frame surface
@@ -432,6 +465,7 @@ impl VardaApp {
                     device: device.to_string(),
                     mode: format.name.clone(),
                     full_range: false,
+                    follow_show: true,
                 },
                 self.render_width,
                 self.render_height,
@@ -625,7 +659,44 @@ impl VardaApp {
                 }
             }
         }
+        // A channel, or a deck of one, an output, an LED screen or a surface
+        // shows by itself: drawn every frame, on air or not.
+        for source in self.shown_sources() {
+            let channels = match source {
+                OutputSource::Channel(ch) | OutputSource::Deck(ch, _) => vec![*ch],
+                OutputSource::Channels(shown) => shown.clone(),
+                _ => continue,
+            };
+            for channel in channels {
+                if !watched.contains(&channel) {
+                    watched.push(channel);
+                }
+            }
+        }
         watched
+    }
+
+    /// What every surface, output and LED screen shows.
+    fn shown_sources(&self) -> Vec<&OutputSource> {
+        let mut sources: Vec<&OutputSource> = self
+            .output
+            .surface_manager
+            .surfaces
+            .iter()
+            .map(|surface| &surface.source)
+            .collect();
+        for output in &self.output.outputs {
+            let (source, led) = match output {
+                crate::renderer::UnifiedOutput::Window(w) => (None, w.led.as_ref()),
+                crate::renderer::UnifiedOutput::Headless(h) => (Some(&h.source), h.led.as_ref()),
+            };
+            sources.extend(source);
+            sources.extend(
+                led.into_iter()
+                    .flat_map(|l| l.screens.iter().map(|s| &s.source)),
+            );
+        }
+        sources
     }
 
     /// Decks shown on their own outside Main — alone on a bus's Program or
@@ -652,25 +723,7 @@ impl VardaApp {
             }
         }
         // A deck an output, an LED screen or a surface shows by itself.
-        let mut sources: Vec<&OutputSource> = self
-            .output
-            .surface_manager
-            .surfaces
-            .iter()
-            .map(|surface| &surface.source)
-            .collect();
-        for output in &self.output.outputs {
-            let (source, led) = match output {
-                crate::renderer::UnifiedOutput::Window(w) => (None, w.led.as_ref()),
-                crate::renderer::UnifiedOutput::Headless(h) => (Some(&h.source), h.led.as_ref()),
-            };
-            sources.extend(source);
-            sources.extend(
-                led.into_iter()
-                    .flat_map(|l| l.screens.iter().map(|s| &s.source)),
-            );
-        }
-        for source in sources {
+        for source in self.shown_sources() {
             if let OutputSource::Deck(ch, dk) = source {
                 if let Some(slot) = self
                     .mixer

@@ -58,6 +58,7 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::channels::add_input,
         routes::channels::set_opacity, routes::channels::set_blend_mode,
         routes::channels::rename, routes::channels::move_channel,
+        routes::channels::set_color,
         // Decks
         routes::decks::add_shader_deck, routes::decks::remove_deck,
         routes::decks::set_opacity, routes::decks::set_blend_mode, routes::decks::set_layer_mask,
@@ -215,6 +216,10 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::audio_mix::create_bus, routes::audio_mix::delete_bus,
         routes::audio_mix::rename_bus, routes::audio_mix::set_bus_gain,
         routes::audio_mix::set_bus_mute, routes::audio_mix::set_bus_delay,
+        routes::audio_mix::set_bus_live, routes::audio_mix::set_bus_insert,
+        routes::audio_mix::set_bus_pre_fader,
+        routes::audio_mix::set_bus_insert_bypass, routes::audio_mix::open_bus_insert,
+        routes::audio_mix::close_bus_insert,
         routes::audio_mix::set_bus_device, routes::audio_mix::create_input,
         routes::audio_mix::create_app_sound,
         routes::audio_mix::delete_input, routes::audio_mix::set_source_gain,
@@ -225,6 +230,13 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::audio_mix::rescan_devices, routes::audio_mix::set_solo,
         routes::audio_mix::set_monitor_device, routes::audio_mix::set_monitor_gain,
         routes::audio_mix::set_monitor_listen,
+        routes::audio_mix::set_source_low_cut, routes::audio_mix::set_source_leveler,
+        routes::audio_mix::set_source_gate, routes::audio_mix::set_source_eq,
+        routes::audio_mix::set_source_de_esser,
+        routes::audio_mix::set_source_compressor, routes::audio_mix::apply_speech_preset,
+        routes::audio_mix::set_bus_compressor, routes::audio_mix::set_bus_limiter,
+        routes::audio_mix::reset_bus_meters, routes::audio_mix::reset_source_meters,
+        routes::audio_mix::reset_bus_loudness,
         // Main
         routes::main_program::set_mode, routes::main_program::take,
         routes::main_program::set_fade_time, routes::main_program::set_transition,
@@ -235,7 +247,9 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::rundown::duplicate_step, routes::rundown::rename_step,
         routes::rundown::move_step, routes::rundown::set_screen,
         routes::rundown::set_main, routes::rundown::set_overlay,
-        routes::rundown::set_play, routes::rundown::set_then,
+        routes::rundown::set_play, routes::rundown::set_until_next,
+        routes::rundown::set_timer, routes::rundown::set_then,
+        routes::rundown::set_at,
         routes::rundown::capture_step, routes::rundown::take_step,
         routes::rundown::go, routes::rundown::set_next,
         routes::rundown::hold, routes::rundown::set_fade_time,
@@ -435,6 +449,10 @@ pub fn build_router(shared: SharedState) -> Router {
         .route(
             "/api/channels/{channel_uuid}/name",
             axum::routing::put(routes::channels::rename),
+        )
+        .route(
+            "/api/channels/{channel_uuid}/color",
+            axum::routing::put(routes::channels::set_color),
         )
         .route(
             "/api/channels/{channel_uuid}/move",
@@ -1299,6 +1317,27 @@ pub fn build_router(shared: SharedState) -> Router {
             axum::routing::put(routes::audio_mix::set_bus_delay),
         )
         .route(
+            "/api/audio-buses/{bus_uuid}/live",
+            axum::routing::put(routes::audio_mix::set_bus_live),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/pre-fader",
+            axum::routing::put(routes::audio_mix::set_bus_pre_fader),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/insert",
+            axum::routing::put(routes::audio_mix::set_bus_insert),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/insert/bypass",
+            axum::routing::put(routes::audio_mix::set_bus_insert_bypass),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/insert/window",
+            axum::routing::post(routes::audio_mix::open_bus_insert)
+                .delete(routes::audio_mix::close_bus_insert),
+        )
+        .route(
             "/api/audio-buses/{bus_uuid}/device",
             axum::routing::put(routes::audio_mix::set_bus_device),
         )
@@ -1341,6 +1380,54 @@ pub fn build_router(shared: SharedState) -> Router {
         .route(
             "/api/audio-sources/{source_uuid}/delay",
             axum::routing::put(routes::audio_mix::set_source_delay),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/low-cut",
+            axum::routing::put(routes::audio_mix::set_source_low_cut),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/gate",
+            axum::routing::put(routes::audio_mix::set_source_gate),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/eq",
+            axum::routing::put(routes::audio_mix::set_source_eq),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/de-esser",
+            axum::routing::put(routes::audio_mix::set_source_de_esser),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/leveler",
+            axum::routing::put(routes::audio_mix::set_source_leveler),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/compressor",
+            axum::routing::put(routes::audio_mix::set_source_compressor),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/speech-preset",
+            axum::routing::post(routes::audio_mix::apply_speech_preset),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/meters/reset",
+            axum::routing::post(routes::audio_mix::reset_source_meters),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/compressor",
+            axum::routing::put(routes::audio_mix::set_bus_compressor),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/limiter",
+            axum::routing::put(routes::audio_mix::set_bus_limiter),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/meters/reset",
+            axum::routing::post(routes::audio_mix::reset_bus_meters),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/loudness/reset",
+            axum::routing::post(routes::audio_mix::reset_bus_loudness),
         )
         .route(
             "/api/outputs/{output_uuid}/audio-bus",
@@ -1429,8 +1516,20 @@ pub fn build_router(shared: SharedState) -> Router {
             axum::routing::put(routes::rundown::set_play),
         )
         .route(
+            "/api/rundown/steps/{step_uuid}/plays/{deck_uuid}/until-next",
+            axum::routing::put(routes::rundown::set_until_next),
+        )
+        .route(
+            "/api/rundown/steps/{step_uuid}/plays/{deck_uuid}/timer",
+            axum::routing::put(routes::rundown::set_timer),
+        )
+        .route(
             "/api/rundown/steps/{step_uuid}/then",
             axum::routing::put(routes::rundown::set_then),
+        )
+        .route(
+            "/api/rundown/steps/{step_uuid}/at",
+            axum::routing::put(routes::rundown::set_at),
         )
         .route(
             "/api/rundown/steps/{step_uuid}/capture",
@@ -1786,6 +1885,20 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the window's notice that the API is off goes by (see the UI
+    /// runner's `finish_init`).
+    #[test]
+    fn a_port_in_use_leaves_the_api_off() {
+        let taken = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let started = start(
+            port,
+            mpsc::unbounded_channel().0,
+            Arc::new(RwLock::new(None)),
+        );
+        assert!(started.is_none(), "port {port} is taken");
+    }
 
     #[test]
     fn test_build_router_creates_valid_router() {

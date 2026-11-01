@@ -5,11 +5,11 @@
 # where Homebrew put it), this app carries what it needs: the FFmpeg
 # libraries Nida links, the `ffmpeg` program it runs for REC and STREAM, and
 # every library those load (bundle-macos-libs.py), and the shaders. It opens
-# on any Mac with Apple silicon and macOS 15.7.9 or later — Homebrew's
+# on any Mac with Apple silicon and macOS 15.8.1 or later — Homebrew's
 # libraries need the macOS they were built for, so build this on macOS 15
 # (as the release workflow does). Most of Homebrew's packages for macOS 15
 # need 15.0; tesseract's (FFmpeg's OCR filter, linked by ffmpeg-full) needs
-# 15.7.9, so that is the floor. Anything needing more stops the build.
+# 15.8.1 since its October 2026 bottle, so that is the floor. Anything needing more stops the build.
 #
 # The FFmpeg inside is Homebrew's `ffmpeg-full`, under GPL version 3 or later,
 # so the app as a whole is given away under the GPLv3; Nida's own source
@@ -18,7 +18,10 @@
 # not mix — so NDI works once the NDI runtime is installed (docs/23).
 #
 # Signed ad hoc, not by Apple: the first time, macOS needs Open Anyway in
-# System Settings → Privacy & Security.
+# System Settings → Privacy & Security. With NIDA_SIGN_IDENTITY set to a
+# code-signing certificate in the keychain (the mini's "Nida Local
+# Signing"), signed by it instead: every build signed alike, macOS keeps the
+# camera, microphone and screen permissions from one to the next.
 #
 # The GPL asks for the corresponding source to be offered beside the DMG:
 # Nida-<version>-third-party-source.tar.gz holds the exact source Homebrew built
@@ -27,9 +30,11 @@
 # (shaders-left-out.txt).
 #
 # Usage: scripts/ci/build-macos.sh [--skip-deps] [--binary PATH] [--out DIR]
-#          [--min-macos 15.7.9] [--no-sources]
+#          [--min-macos 15.8.1] [--no-sources]
 #   --binary      package a nida already built, instead of building one
 #   --no-sources  skip the source archive (a try-out, not for giving away)
+#   --label NAME  a try-out's name after the version — its bundle version
+#                 and the DMG's name (Nida-0.9.1-ppt-70d687d-macOS-arm64.dmg)
 # Produces in DIR (the project root by default): Nida-<version>-macOS-arm64.dmg,
 # its .sha256, and Nida-<version>-third-party-source.tar.gz
 set -euo pipefail
@@ -39,9 +44,10 @@ cd "$ROOT"
 
 SKIP_DEPS=false
 SOURCES=true
+LABEL=""
 BINARY=""
 OUT="$ROOT"
-MIN_MACOS="15.7.9"
+MIN_MACOS="15.8.1"
 BUNDLE_ID="lt.proconf.nida"
 FEATURES="--no-default-features --features screen-capture"
 while [ $# -gt 0 ]; do
@@ -51,6 +57,7 @@ while [ $# -gt 0 ]; do
     --out) shift; OUT="$1" ;;
     --min-macos) shift; MIN_MACOS="$1" ;;
     --no-sources) SOURCES=false ;;
+    --label) shift; LABEL="$1" ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
   shift
@@ -61,7 +68,8 @@ if [ "$(uname -m)" != "arm64" ]; then
   exit 1
 fi
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-echo "==> Nida $VERSION for macOS $MIN_MACOS and later"
+BUILD="$VERSION${LABEL:+-$LABEL}"
+echo "==> Nida $BUILD for macOS $MIN_MACOS and later"
 
 if [ "$SKIP_DEPS" = false ]; then
   brew install ffmpeg-full
@@ -135,7 +143,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>Nida</string>
   <key>CFBundleDisplayName</key><string>Nida</string>
   <key>CFBundleIdentifier</key><string>${BUNDLE_ID}</string>
-  <key>CFBundleVersion</key><string>${VERSION}</string>
+  <key>CFBundleVersion</key><string>${BUILD}</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
   <key>CFBundleExecutable</key><string>nida</string>
   <key>CFBundlePackageType</key><string>APPL</string>
@@ -147,6 +155,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSCameraReactionEffectGesturesEnabledDefault</key><false/>
   <key>NSMicrophoneUsageDescription</key><string>Nida mixes microphones and other sound inputs.</string>
   <key>NSAudioCaptureUsageDescription</key><string>Nida takes an app's sound, such as a Zoom or Teams call's, as an input to mix.</string>
+  <key>NSAppleEventsUsageDescription</key><string>Nida plays PowerPoint decks as inputs: it opens them in PowerPoint and moves the show on when you click.</string>
   <key>NSLocalNetworkUsageDescription</key><string>Nida finds and sends NDI video on the local network.</string>
   <key>NSBonjourServices</key>
   <array>
@@ -189,7 +198,7 @@ mkdir -p "$DMG_DIR"
 ditto "$APP" "$DMG_DIR/Nida.app"
 ln -s /Applications "$DMG_DIR/Applications"
 cat > "$DMG_DIR/Read me first.txt" <<TXT
-Nida $VERSION — for Macs with Apple silicon, macOS Sequoia $MIN_MACOS or later
+Nida $BUILD — for Macs with Apple silicon, macOS Sequoia $MIN_MACOS or later
 
 1. Drag Nida to Applications.
 2. Open it. The first time, macOS says it cannot check Nida for malicious
@@ -211,11 +220,11 @@ vMix and Resolume are trademarks of their owners; Nida is not affiliated
 with either.
 TXT
 
-DMG="$OUT/Nida-$VERSION-macOS-arm64.dmg"
+DMG="$OUT/Nida-$BUILD-macOS-arm64.dmg"
 rm -f "$DMG"
 # hdiutil is known to fail now and then with "Resource busy" on CI Macs.
 for attempt in 1 2 3; do
-  if hdiutil create -volname "Nida $VERSION" -srcfolder "$DMG_DIR" -ov -format UDZO "$DMG" >/dev/null; then
+  if hdiutil create -volname "Nida $BUILD" -srcfolder "$DMG_DIR" -ov -format UDZO "$DMG" >/dev/null; then
     break
   fi
   [ "$attempt" = 3 ] && exit 1
