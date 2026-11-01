@@ -2242,7 +2242,8 @@ impl VardaApp {
                 CommandResult::Ok
             }
             EngineCommand::SetAudioTempoRange { min, max } => {
-                self.audio_manager.set_tempo_range(crate::audio::TempoRange::new(min, max));
+                self.audio_manager
+                    .set_tempo_range(crate::audio::TempoRange::new(min, max));
                 CommandResult::Ok
             }
 

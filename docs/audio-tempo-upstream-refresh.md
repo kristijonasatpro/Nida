@@ -10,6 +10,7 @@ Fresh validation:
 
 - 102 existing audio and clock regressions pass, zero failed/ignored, in an isolated Windows harness importing the exact production audio and clock modules. It uses the unchanged production MIDI DeviceId alias (`u32`) as its only type-only shim. Tests cover rhythm/phase, sample rates, queue overload, worker/direct analysis equivalence, tempo range, silence, clock priority/manual control, live feeds, PCM gathering and asynchronous capture reopening/handoff. The harness does not emulate those implementations.
 - Audio implementation, analysis module and benchmark pass focused rustfmt. Proposal whitespace checks pass.
+- Compared rustfmt edits with PR-added/modified lines in every changed Rust file. Corrected the new tempo command's method-chain formatting; the remaining formatting findings in shared edited files concern inherited upstream lines.
 - A fresh full production-library check reports exactly the two existing Windows DeckLink E0425 errors for Unix clock_gettime/CLOCK_THREAD_CPUTIME_ID at `src/internal/decklink/mod.rs:362`. No DeckLink guard or test suppression is included.
 - This is not a full application, physical microphone, real-music accuracy, or native macOS/Linux qualification. Previous unrelated Linux suite/platform-lint failures still require separate assessment by fresh upstream CI. Other inherited whole-repository formatting findings are not hidden or reformatted wholesale.
 
