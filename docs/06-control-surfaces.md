@@ -184,7 +184,7 @@ Nida derives BPM and beat phase from multiple sources with automatic priority re
 |----------|--------|-----|
 | 1 (highest) | **MIDI Clock** | 24 PPQ timing ticks (0xF8) from any connected device. BPM computed from tick intervals, EMA-smoothed (α=0.3). Start (0xFA) resets beat phase; Stop (0xFC) triggers fallback. |
 | 2 | **OSC Clock** | `/varda/clock/bpm` and `/varda/clock/beat` messages from network controllers |
-| 3 | **Audio Detection** | Spectral flux onset detection from FFT analysis. 16-interval BPM history with outlier rejection. Range: 30–300 BPM. |
+| 3 | **Audio Detection** | Kick-band spectral flux with autocorrelation tempo estimation and beat-grid phase tracking. Expected range defaults to 70–240 BPM; adjustable in the BPM popover. |
 | Forced only | **Manual** | User-set BPM value. Beat phase computed from elapsed wall-clock time. Manual never wins Auto resolution. |
 
 **Stale timeout**: if the active source hasn't sent data in 2 seconds, Nida falls back to the next priority source automatically.

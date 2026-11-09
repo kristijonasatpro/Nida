@@ -606,6 +606,8 @@ pub struct BusTransitionSnapshot {
 /// Snapshot of the unified clock state for UI display.
 #[derive(Clone, Serialize)]
 pub struct ClockSnapshot {
+    /// Octave-folding range for the audio tempo detector.
+    pub audio_tempo_range: crate::audio::TempoRange,
     /// Current BPM from the resolved clock source.
     pub bpm: Option<f32>,
     /// Beat phase 0.0–1.0.
@@ -1603,6 +1605,7 @@ mod tests {
             timecode: TimecodeSnapshot::default(),
             arrangement: None,
             clock: ClockSnapshot {
+                audio_tempo_range: crate::audio::TempoRange::default(),
                 bpm: None,
                 beat_phase: 0.0,
                 source_label: "None".into(),
@@ -1711,6 +1714,7 @@ mod tests {
             timecode: TimecodeSnapshot::default(),
             arrangement: None,
             clock: ClockSnapshot {
+                audio_tempo_range: crate::audio::TempoRange::default(),
                 bpm: Some(120.0),
                 beat_phase: 0.0,
                 source_label: "Audio".into(),
