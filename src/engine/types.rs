@@ -390,6 +390,24 @@ pub struct OutputPacing {
     pub on_screen: OnScreenStats,
 }
 
+/// The engine's state as last published, for other threads (the API): a
+/// reader takes the pointer and lets go of the lock at once, then reads or
+/// serializes what it points to — the engine never waits on a reader that
+/// is slow with a big show (see `App::publish_state`).
+pub type PublishedState = std::sync::RwLock<Option<std::sync::Arc<EngineState>>>;
+
+/// The show's size as it is drawn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RenderSnapshot {
+    pub width: u32,
+    pub height: u32,
+    /// Following the largest screen an output is on (Auto).
+    pub auto: bool,
+    /// A smaller size every output with a size of its own still gets all it
+    /// shows from, when there is one (see `VardaApp::render_hint`).
+    pub hint: Option<crate::app::RenderHint>,
+}
+
 // Serialized DTO: the flags mirror independent engine toggles, not a state enum.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Serialize)]
@@ -423,6 +441,8 @@ pub struct EngineState {
     pub frame_count: u64,
     /// Target FPS (0 = uncapped)
     pub target_fps: u32,
+    /// The show's size, and a smaller one enough for every output.
+    pub render: RenderSnapshot,
     /// How evenly frames are started and shown.
     pub pacing: PacingSnapshot,
     /// Discovered NDI sources (names)
@@ -1600,6 +1620,12 @@ mod tests {
             fps: 60.0,
             frame_count: 0,
             target_fps: 60,
+            render: RenderSnapshot {
+                width: 1920,
+                height: 1080,
+                auto: false,
+                hint: None,
+            },
             pacing: crate::engine::PacingSnapshot::default(),
             ndi_sources: vec![],
             ndi_available: false,
@@ -1702,6 +1728,12 @@ mod tests {
             fps: 59.9,
             frame_count: 42,
             target_fps: 60,
+            render: RenderSnapshot {
+                width: 1920,
+                height: 1080,
+                auto: false,
+                hint: None,
+            },
             pacing: crate::engine::PacingSnapshot::default(),
             ndi_sources: vec![],
             ndi_available: false,

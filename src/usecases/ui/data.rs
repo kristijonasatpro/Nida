@@ -749,6 +749,9 @@ pub struct UIData {
     pub render_height: u32,
     /// Whether the render resolution follows the output screens.
     pub render_auto: bool,
+    /// A smaller size for the show that every output still gets all it
+    /// shows from (see `VardaApp::render_hint`).
+    pub render_hint: Option<crate::app::RenderHint>,
     /// GPU's maximum 2D texture dimension — the only bound on custom render
     /// resolution (Varda imposes no artificial cap).
     pub max_render_dimension: u32,

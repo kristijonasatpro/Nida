@@ -50,6 +50,9 @@ pub struct ClipAudioShared {
     /// Whether anyone can hear this clip. Set by the mixer's owner every
     /// frame; the decode thread idles while it is false.
     wanted: AtomicBool,
+    /// The clip is gone: silent for good, whatever its thread — let go of,
+    /// still ending — puts in (see `ClipAudio`'s drop).
+    retired: AtomicBool,
 }
 
 #[derive(Default)]
@@ -72,7 +75,7 @@ impl ClipAudioShared {
             return;
         };
         let q = &mut *guard;
-        if !q.playing {
+        if !q.playing || self.retired.load(Ordering::Acquire) {
             return;
         }
         let before = q.frames.len();
@@ -93,6 +96,30 @@ impl ClipAudioShared {
             q.reader.reset();
             q.correction = 0.0;
         }
+    }
+
+    /// Silent for good: the clip is gone.
+    fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.silence();
+    }
+
+    /// Hand the mixer `frames`, starting at clip time `now`, to play — unless
+    /// the clip is gone, asked under the queue's lock: once retired (and
+    /// silenced, under it) nothing plays again. Whether they were handed.
+    fn publish(&self, frames: VecDeque<Frame>, now: f64) -> bool {
+        let Ok(mut q) = self.queue.lock() else {
+            return false;
+        };
+        if self.retired.load(Ordering::Acquire) {
+            return false;
+        }
+        q.frames = frames;
+        q.front_pts = now;
+        q.reader.reset();
+        q.correction = 0.0;
+        q.playing = true;
+        true
     }
 }
 
@@ -140,12 +167,13 @@ impl ClipAudio {
 }
 
 impl Drop for ClipAudio {
+    /// Stops the thread and silences the clip for good — not waiting for
+    /// the thread, which ends on its own: waited for, a soundtrack stuck
+    /// reading its file held up whoever let the clip go (the show's thread).
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        self.shared.silence();
+        self.shared.retire();
+        self.thread.take();
     }
 }
 
@@ -179,7 +207,7 @@ fn follow_picture(
         let video_now = snap.position_now();
 
         if !synced {
-            if let Err(e) = prime(&mut dec, shared, video_now, &snapshot) {
+            if let Err(e) = prime(&mut dec, shared, video_now, &snapshot, stop) {
                 log::warn!("Clip audio: {e}");
             }
             synced = true;
@@ -225,12 +253,16 @@ fn prime(
     shared: &ClipAudioShared,
     target: f64,
     snapshot: &dyn Fn() -> Option<PlaybackSnapshot>,
+    stop: &AtomicBool,
 ) -> Result<()> {
     dec.seek(target)?;
     let mut frames: VecDeque<Frame> = VecDeque::new();
     let mut start: Option<f64> = None;
     let mut chunk = Vec::new();
     loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
         chunk.clear();
         let pts = dec.decode_more(&mut chunk)?;
         if chunk.is_empty() {
@@ -258,13 +290,7 @@ fn prime(
             frames.push_front([0.0; 2]);
         }
     }
-    if let Ok(mut q) = shared.queue.lock() {
-        q.frames = frames;
-        q.front_pts = now;
-        q.reader.reset();
-        q.correction = 0.0;
-        q.playing = true;
-    }
+    shared.publish(frames, now);
     Ok(())
 }
 
@@ -423,5 +449,27 @@ impl ClipDecoder {
             out.push([l, r]);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A clip let go of is silent for good: its thread, still ending,
+    /// handing the mixer a queue it primed cannot make it heard again.
+    #[test]
+    fn a_retired_clip_stays_silent() {
+        let shared = ClipAudioShared::default();
+        let sound = || VecDeque::from(vec![[0.5_f32, 0.5]; 4800]);
+        assert!(shared.publish(sound(), 0.0), "heard while the clip is there");
+        let mut out = vec![[0.0_f32; 2]; 256];
+        shared.pull(&mut out);
+        assert!(out.iter().any(|f| f[0] != 0.0));
+        shared.retire();
+        assert!(!shared.publish(sound(), 0.0), "not handed once retired");
+        let mut out = vec![[0.0_f32; 2]; 256];
+        shared.pull(&mut out);
+        assert!(out.iter().all(|f| f[0] == 0.0), "silent for good");
     }
 }

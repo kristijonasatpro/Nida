@@ -731,6 +731,11 @@ pub(super) fn render_resolution_popover(ui: &mut egui::Ui, data: &UIData, action
     let current_w = data.render_width;
     let current_h = data.render_height;
 
+    if let Some(hint) = &data.render_hint {
+        render_hint(ui, hint, actions);
+        ui.separator();
+    }
+
     if ui
         .radio(data.render_auto, "Auto — match the output screens")
         .on_hover_text(
@@ -836,6 +841,49 @@ pub(super) fn render_resolution_popover(ui: &mut egui::Ui, data: &UIData, action
             .weak()
             .small(),
     );
+}
+
+/// A smaller size that is enough for every output, said and offered.
+fn render_hint(ui: &mut egui::Ui, hint: &crate::app::RenderHint, actions: &mut UIActions) {
+    let (w, h) = hint.size;
+    ui.label(
+        egui::RichText::new(format!("⬇ {w}×{h} is enough"))
+            .strong()
+            .color(egui::Color32::from_rgb(230, 170, 60)),
+    );
+    ui.label(
+        egui::RichText::new(format!(
+            "No screen, feed or recording with a size of its own shows more than \
+             {w}×{h} of the picture: at that size it is as sharp on them, with \
+             {}% of the pixels to draw.",
+            hint.pixels_pct
+        ))
+        .small(),
+    );
+    ui.label(
+        egui::RichText::new(
+            "A layer zoomed in shows less of its picture, and effects set in \
+             pixels — blur, pixelate — keep their pixels: check those after.",
+        )
+        .small()
+        .weak(),
+    );
+    if !hint.following.is_empty() {
+        ui.label(
+            egui::RichText::new(format!(
+                "{} follow the show's size: they would be {w}×{h} too, with less detail.",
+                hint.following.join(", ")
+            ))
+            .small()
+            .weak(),
+        );
+    }
+    if ui.button(format!("Use {w}×{h}")).clicked() {
+        actions.commands.push(EngineCommand::SetRenderResolution {
+            width: w,
+            height: h,
+        });
+    }
 }
 
 /// Render the target FPS popover (shown when clicking FPS target in the top bar).

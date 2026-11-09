@@ -57,20 +57,40 @@ pub fn pdf_in(folder: &Path, deck: &Path) -> Option<PathBuf> {
         return None;
     }
     let path = std::fs::canonicalize(deck).unwrap_or_else(|_| deck.to_path_buf());
-    let time = meta
-        .modified()
-        .ok()
+    Some(pdf_named(folder, &path, meta.len(), meta.modified().ok()))
+}
+
+/// The PDF in `folder` of the deck really at `path`, of `len` bytes, last
+/// changed at `modified`.
+fn pdf_named(
+    folder: &Path,
+    path: &Path,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+) -> PathBuf {
+    let time = modified
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos());
     let name = format!(
         "{:016x}",
         fnv1a(&[
             path.to_string_lossy().as_bytes(),
-            &meta.len().to_le_bytes(),
+            &len.to_le_bytes(),
             &time.to_le_bytes(),
         ])
     );
-    Some(folder.join(format!("{name}.pdf")))
+    folder.join(format!("{name}.pdf"))
+}
+
+/// [`saved_for`] as last found, for a show thread: from what
+/// [`crate::file_facts`] knows of the deck and its PDF, never asking the
+/// disk. None too while either is not yet looked at.
+#[must_use]
+pub fn saved_known(deck: &Path) -> Option<(PathBuf, crate::file_facts::Found)> {
+    let found = crate::file_facts::file(deck)??;
+    let pdf = pdf_named(&folder()?, &found.real, found.len, found.modified);
+    let saved = crate::file_facts::file(&pdf)??;
+    Some((pdf, saved))
 }
 
 /// The deck's PDF, when PowerPoint has saved it for the file as it is now.

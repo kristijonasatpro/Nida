@@ -106,6 +106,14 @@ pub struct AudioPreFaderBody {
     pub pre_fader: bool,
 }
 
+/// A bus's echo removal: the bus the room's speakers play, or null for off.
+#[derive(Deserialize, ToSchema)]
+pub struct AudioEchoRoomBody {
+    /// The room's bus, by UUID; null or left out, off.
+    #[serde(default)]
+    pub room: Option<String>,
+}
+
 /// Where a source's Audio Auto looks for it being on air.
 #[derive(Deserialize, ToSchema)]
 pub struct AudioFollowBody {
@@ -413,6 +421,15 @@ pub async fn set_bus_pre_fader(
     Json(b): Json<AudioPreFaderBody>,
 ) -> impl IntoResponse {
     dispatch(&s, EngineCommand::SetAudioBusPreFader { uuid, pre_fader: b.pre_fader }).await
+}
+
+#[utoipa::path(put, path = "/api/audio-buses/{bus_uuid}/echo-room", params(("bus_uuid" = String, Path, description = "Audio bus UUID")), request_body = AudioEchoRoomBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "The bus itself as its room"), (status = 404, description = "No such bus")), tag = "Audio Mixer")]
+pub async fn set_bus_echo_room(
+    State(s): State<SharedState>,
+    Path(uuid): Path<String>,
+    Json(b): Json<AudioEchoRoomBody>,
+) -> impl IntoResponse {
+    dispatch(&s, EngineCommand::SetAudioBusEchoRoom { uuid, room: b.room }).await
 }
 
 #[utoipa::path(put, path = "/api/audio-sources/{source_uuid}/follow", params(("source_uuid" = String, Path, description = "Source UUID (the deck's, for a clip)")), request_body = AudioFollowBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such source or video bus")), tag = "Audio Mixer")]

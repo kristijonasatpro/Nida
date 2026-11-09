@@ -90,7 +90,7 @@ async fn handle_ws(socket: WebSocket, state: SharedState) {
         return;
     };
 
-    let mut last_json = serde_json::to_value(&initial).unwrap_or_default();
+    let mut last_json = serde_json::to_value(&*initial).unwrap_or_default();
     if sink
         .send(Message::Text(last_json.to_string().into()))
         .await
@@ -125,7 +125,7 @@ async fn handle_ws(socket: WebSocket, state: SharedState) {
                 _ = interval.tick() => {
                     // Compute delta
                     if let Some(current) = state.engine_state.read().ok().and_then(|g| g.clone()) {
-                        let current_json = serde_json::to_value(&current).unwrap_or_default();
+                        let current_json = serde_json::to_value(&*current).unwrap_or_default();
                         let patch = json_patch::diff(&last_json, &current_json);
                         if !patch.0.is_empty() {
                             let patch_str = serde_json::to_string(&patch).unwrap_or_default();

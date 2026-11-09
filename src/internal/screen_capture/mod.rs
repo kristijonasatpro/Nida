@@ -81,6 +81,10 @@ struct ActiveCapture {
     config: Arc<Mutex<CaptureConfig>>,
     stop_flag: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
+    /// Which of its threads is the one running now: moved on when it is
+    /// replaced, so a thread replaced, still ending, puts no frame in (see
+    /// [`retire`]). Each thread has a `connected` of its own.
+    current: Arc<std::sync::atomic::AtomicU64>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// Frames put in its texture: none yet, and its texture shows nothing.
     uploaded: u64,
@@ -99,7 +103,16 @@ pub struct ScreenCaptureManager {
     next_id: CaptureId,
     permission: PermissionState,
     disabled: bool,
+    /// Capture threads let go of and still ending — closing their session,
+    /// which macOS may never finish (see [`retire`]).
+    retiring: Vec<std::thread::JoinHandle<()>>,
 }
+
+/// Capture threads still ending past which it is said, at each such many
+/// more: macOS not letting go of them. Captures still start — a talk's
+/// window refused would leave its screen black — each such thread left
+/// behind costing a thread and its session.
+const RETIRING_SAID_PAST: usize = 8;
 
 impl Default for ScreenCaptureManager {
     fn default() -> Self {
@@ -115,6 +128,7 @@ impl ScreenCaptureManager {
             next_id: 0,
             permission: platform::permission_state(),
             disabled: false,
+            retiring: Vec::new(),
         };
         mgr.scan_targets();
         mgr
@@ -128,6 +142,7 @@ impl ScreenCaptureManager {
             next_id: 0,
             permission: PermissionState::NotRequired,
             disabled: true,
+            retiring: Vec::new(),
         }
     }
 
@@ -141,6 +156,7 @@ impl ScreenCaptureManager {
             next_id: 0,
             permission: PermissionState::NotRequired,
             disabled: false,
+            retiring: Vec::new(),
         }
     }
 
@@ -272,6 +288,22 @@ impl ScreenCaptureManager {
         self.start_session(target, session, config, device)
     }
 
+    /// Keep `thread`, let go of and still ending, clearing those that have
+    /// ended; saying so when macOS has not let go of many.
+    fn keep_retiring(&mut self, thread: Option<std::thread::JoinHandle<()>>) {
+        self.retiring.retain(|thread| !thread.is_finished());
+        let Some(thread) = thread else {
+            return;
+        };
+        self.retiring.push(thread);
+        let ending = self.retiring.len();
+        if ending >= RETIRING_SAID_PAST && ending.is_multiple_of(RETIRING_SAID_PAST) {
+            log::warn!(
+                "macOS has not let go of {ending} screen captures: their threads are still ending"
+            );
+        }
+    }
+
     /// The session already capturing `target` — the same window, not only
     /// one of its app and title — with one more holder.
     fn share(&mut self, target: &CaptureTargetInfo) -> Option<(CaptureId, u32, u32)> {
@@ -383,17 +415,15 @@ impl ScreenCaptureManager {
         &mut self,
         id: CaptureId,
         target: &CaptureTargetInfo,
-        mut session: Box<dyn ScreenCaptureBackend>,
+        session: Box<dyn ScreenCaptureBackend>,
         config: CaptureConfig,
     ) -> Result<(CaptureId, u32, u32), CaptureError> {
+        let mut session = session;
         let backend_size = session.resolution();
         let Some(active) = self.active.get_mut(&id) else {
             return Err(CaptureError::Backend(format!("capture {id} is gone")));
         };
-        active.stop_flag.store(true, Ordering::Relaxed);
-        if let Some(thread) = active.thread.take() {
-            let _ = thread.join();
-        }
+        let retired = retire(active);
         if let Ok(mut guard) = active.config.lock() {
             *guard = config;
         }
@@ -403,10 +433,14 @@ impl ScreenCaptureManager {
         }
         active.fresh = 0;
         let stop_flag = Arc::new(AtomicBool::new(false));
+        // Its own: the one replaced, still ending, says nothing of this one.
+        active.connected = Arc::new(AtomicBool::new(false));
         let frame_tx = Arc::clone(&active.frame_data);
         let config_rx = Arc::clone(&active.config);
         let stop_rx = Arc::clone(&stop_flag);
         let connected_tx = Arc::clone(&active.connected);
+        let current = Arc::clone(&active.current);
+        let mine = current.load(Ordering::SeqCst);
         let spawned = std::thread::Builder::new()
             .name(format!("screen-capture-{id}"))
             .spawn(move || {
@@ -416,7 +450,7 @@ impl ScreenCaptureManager {
                     &frame_tx,
                     &config_rx,
                     &stop_rx,
-                    &connected_tx,
+                    (&connected_tx, &current, mine),
                 );
             });
         let thread = match spawned {
@@ -424,6 +458,7 @@ impl ScreenCaptureManager {
             Err(e) => {
                 // Its thread stopped and none to follow: gone, not shared.
                 self.active.remove(&id);
+                self.keep_retiring(retired);
                 return Err(CaptureError::Backend(format!(
                     "failed to spawn capture thread: {e}"
                 )));
@@ -440,7 +475,9 @@ impl ScreenCaptureManager {
             target.width,
             target.height
         );
-        Ok((id, active.width, active.height))
+        let opened = (id, active.width, active.height);
+        self.keep_retiring(retired);
+        Ok(opened)
     }
 
     /// Open a synthetic capture. Always available — used by tests, benches, and
@@ -471,10 +508,11 @@ impl ScreenCaptureManager {
     fn start_session(
         &mut self,
         target: &CaptureTargetInfo,
-        mut session: Box<dyn ScreenCaptureBackend>,
+        session: Box<dyn ScreenCaptureBackend>,
         config: CaptureConfig,
         device: &wgpu::Device,
     ) -> Result<(CaptureId, u32, u32), CaptureError> {
+        let mut session = session;
         let (width, height) = {
             let (w, h) = session.resolution();
             (w.max(1), h.max(1))
@@ -508,11 +546,13 @@ impl ScreenCaptureManager {
         let config = Arc::new(Mutex::new(config));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicBool::new(false));
+        let current = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let frame_tx = Arc::clone(&frame_data);
         let config_rx = Arc::clone(&config);
         let stop_rx = Arc::clone(&stop_flag);
         let connected_tx = Arc::clone(&connected);
+        let current_rx = Arc::clone(&current);
 
         let thread = std::thread::Builder::new()
             .name(format!("screen-capture-{id}"))
@@ -523,7 +563,7 @@ impl ScreenCaptureManager {
                     &frame_tx,
                     &config_rx,
                     &stop_rx,
-                    &connected_tx,
+                    (&connected_tx, &current_rx, 0),
                 );
             })
             .map_err(|e| CaptureError::Backend(format!("failed to spawn capture thread: {e}")))?;
@@ -552,6 +592,7 @@ impl ScreenCaptureManager {
                 config,
                 stop_flag,
                 connected,
+                current,
                 thread: Some(thread),
                 uploaded: 0,
                 fresh: 0,
@@ -601,10 +642,7 @@ impl ScreenCaptureManager {
         let Some(mut removed) = self.active.remove(&id) else {
             return;
         };
-        removed.stop_flag.store(true, Ordering::Relaxed);
-        if let Some(t) = removed.thread.take() {
-            let _ = t.join();
-        }
+        self.keep_retiring(retire(&mut removed));
     }
 
     /// Reconcile the live sessions against the decks that actually hold them.
@@ -639,10 +677,7 @@ impl ScreenCaptureManager {
                 "Screen capture {id} ('{}') outlived its last deck — stopping it",
                 removed.label
             );
-            removed.stop_flag.store(true, Ordering::Relaxed);
-            if let Some(t) = removed.thread.take() {
-                let _ = t.join();
-            }
+            self.keep_retiring(retire(&mut removed));
         }
         for (id, active) in &mut self.active {
             if let Some(&count) = holders.get(id) {
@@ -745,6 +780,7 @@ impl ScreenCaptureManager {
         needed: &HashSet<CaptureId>,
         show_at: f64,
     ) {
+        self.retiring.retain(|thread| !thread.is_finished());
         for (id, active) in &mut self.active {
             if needed.contains(id) {
                 Self::upload_frame(*id, active, context, show_at);
@@ -767,6 +803,7 @@ impl ScreenCaptureManager {
     /// Upload frames for every active capture, for the show frame due at
     /// `show_at`.
     pub fn update(&mut self, context: &GpuContext, show_at: f64) {
+        self.retiring.retain(|thread| !thread.is_finished());
         for (id, active) in &mut self.active {
             Self::upload_frame(*id, active, context, show_at);
         }
@@ -905,8 +942,10 @@ fn capture_loop(
     frame_data: &Mutex<FramePicker<CaptureFrame>>,
     config: &Mutex<CaptureConfig>,
     stop: &AtomicBool,
-    connected: &AtomicBool,
+    (connected, current, mine): (&AtomicBool, &std::sync::atomic::AtomicU64, u64),
 ) {
+    // Still the capture's thread, not one replaced still ending.
+    let still_mine = || current.load(Ordering::SeqCst) == mine;
     let self_paced = session.is_self_paced();
     let mut applied = config.lock().ok().map(|c| c.clone()).unwrap_or_default();
     let mut interval = poll_interval(applied.frame_interval(), self_paced);
@@ -936,9 +975,17 @@ fn capture_loop(
             connected.store(true, Ordering::SeqCst);
             // Frames let go give their surfaces back to the capture here,
             // the picker no longer held: the show's frame waits for it.
+            // Asked under the picker's lock: once replaced (the count moved
+            // on, then the picker emptied, under it) nothing more goes in.
             let let_go = frame_data
                 .lock()
-                .map(|mut picker| picker.push(frame_time(&frame), frame))
+                .map(|mut picker| {
+                    if still_mine() {
+                        picker.push(frame_time(&frame), frame)
+                    } else {
+                        vec![frame]
+                    }
+                })
                 .unwrap_or_default();
             drop(let_go);
             if !self_paced {
@@ -957,6 +1004,17 @@ fn capture_loop(
     log::debug!("Screen capture {id} thread stopped");
 }
 
+/// Stop the capture's thread and let it end on its own: it puts nothing
+/// more in and closes its session — macOS stopping the capture, which can
+/// take a while with the window server busy — on its own thread. Waited
+/// for here, it held the show's thread up as a talk's window was let go.
+fn retire(active: &mut ActiveCapture) -> Option<std::thread::JoinHandle<()>> {
+    active.stop_flag.store(true, Ordering::Relaxed);
+    active.current.fetch_add(1, Ordering::SeqCst);
+    // Not waited for: it ends once it sees the stop.
+    active.thread.take()
+}
+
 #[cfg(test)]
 mod tests {
     use super::backend::{
@@ -964,6 +1022,10 @@ mod tests {
         ScreenCaptureBackend, TargetIdentity,
     };
     use super::{poll_interval, ScreenCaptureManager, SELF_PACED_MAX_POLL, SELF_PACED_MIN_POLL};
+    use super::{capture_loop, CaptureFrame, FramePicker, PICKER_FRAMES};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     // ── Capture-thread pacing ───────────────────────────────────────
@@ -1337,6 +1399,195 @@ mod tests {
             mgr.release(id);
         }
         assert!(!mgr.is_active(id));
+    }
+
+    /// A session that takes a second to close, as macOS's capture can with
+    /// the window server busy.
+    struct SlowToClose(MockBackend);
+
+    impl ScreenCaptureBackend for SlowToClose {
+        fn label(&self) -> &str {
+            self.0.label()
+        }
+        fn resolution(&self) -> (u32, u32) {
+            self.0.resolution()
+        }
+        fn next_frame(&mut self) -> Option<CaptureFrame> {
+            self.0.next_frame()
+        }
+        fn set_config(&mut self, config: &CaptureConfig) -> Result<(), CaptureError> {
+            self.0.set_config(config)
+        }
+    }
+
+    impl Drop for SlowToClose {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    /// Letting a capture go — released, replaced, or outliving its decks —
+    /// never waits for its session to close: that closes on its own thread.
+    #[test]
+    fn letting_a_capture_go_never_waits_for_its_session_to_close() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        let mut mgr = ScreenCaptureManager::enabled_for_tests();
+        let target = mock_targets().remove(0);
+        let config = CaptureConfig::default();
+        let slow = |t: &CaptureTargetInfo| -> Box<dyn ScreenCaptureBackend> {
+            Box::new(SlowToClose(MockBackend::new(
+                t.label.clone(),
+                t.width,
+                t.height,
+                CaptureConfig::default(),
+            )))
+        };
+        let quick = |what: &str, started: std::time::Instant| {
+            assert!(
+                started.elapsed() < Duration::from_millis(300),
+                "{what} waited for the session to close: {:?}",
+                started.elapsed()
+            );
+        };
+        // Released.
+        let (id, _, _) = mgr.adopt(&target, slow(&target), config.clone(), &gpu.device).unwrap();
+        let started = std::time::Instant::now();
+        mgr.release(id);
+        quick("release", started);
+        assert!(!mgr.is_active(id));
+        // Replaced: the window at another size.
+        let (id, _, _) = mgr.adopt(&target, slow(&target), config.clone(), &gpu.device).unwrap();
+        let mut resized = target.clone();
+        resized.width /= 2;
+        let started = std::time::Instant::now();
+        let (again, _, _) = mgr.adopt(&resized, slow(&resized), config.clone(), &gpu.device).unwrap();
+        quick("replacing", started);
+        assert_eq!(again, id);
+        // Outliving its last deck.
+        let started = std::time::Instant::now();
+        mgr.reconcile_holders(&HashMap::new());
+        quick("reconciling", started);
+        assert!(!mgr.is_active(id));
+    }
+
+    /// A session macOS does not let go of until the test says.
+    struct HeldOnClose(MockBackend, Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+    impl ScreenCaptureBackend for HeldOnClose {
+        fn label(&self) -> &str {
+            self.0.label()
+        }
+        fn resolution(&self) -> (u32, u32) {
+            self.0.resolution()
+        }
+        fn next_frame(&mut self) -> Option<CaptureFrame> {
+            self.0.next_frame()
+        }
+        fn set_config(&mut self, config: &CaptureConfig) -> Result<(), CaptureError> {
+            self.0.set_config(config)
+        }
+    }
+
+    impl Drop for HeldOnClose {
+        fn drop(&mut self) {
+            let (held, let_go) = &*self.1;
+            let mut held = held.lock().unwrap();
+            while *held {
+                held = let_go.wait(held).unwrap();
+            }
+        }
+    }
+
+    /// Lets held sessions go when dropped.
+    struct LetGo(Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+    impl Drop for LetGo {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+            self.0 .1.notify_all();
+        }
+    }
+
+    /// Captures macOS does not let go of still let new ones start — a
+    /// talk's window refused would show black — and are kept until they
+    /// end, then cleared.
+    #[test]
+    fn captures_still_ending_never_stop_new_ones() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        let mut mgr = ScreenCaptureManager::enabled_for_tests();
+        let target = mock_targets().remove(0);
+        let config = CaptureConfig::default();
+        let held = Arc::new((Mutex::new(true), std::sync::Condvar::new()));
+        // Let go however the test ends, before the manager is dropped (it
+        // waits for its captures as Nida quits).
+        let _let_go = LetGo(Arc::clone(&held));
+        let session = |t: &CaptureTargetInfo| -> Box<dyn ScreenCaptureBackend> {
+            Box::new(HeldOnClose(
+                MockBackend::new(t.label.clone(), t.width, t.height, CaptureConfig::default()),
+                Arc::clone(&held),
+            ))
+        };
+        let many = super::RETIRING_SAID_PAST + 2;
+        for _ in 0..many {
+            let started = std::time::Instant::now();
+            let (id, _, _) = mgr.adopt(&target, session(&target), config.clone(), &gpu.device).unwrap();
+            mgr.release(id);
+            assert!(started.elapsed() < Duration::from_millis(300), "never waited");
+        }
+        assert_eq!(mgr.retiring.len(), many, "kept while still ending");
+        // macOS lets go: cleared.
+        *held.0.lock().unwrap() = false;
+        held.1.notify_all();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !mgr.retiring.is_empty() {
+            assert!(std::time::Instant::now() < until, "the ending captures ended");
+            // As the show's frame does, needing none.
+            mgr.update_selective(&gpu, &std::collections::HashSet::new(), f64::MAX);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A capture's thread replaced, still ending, puts no frame in: the one
+    /// now running is the capture. (Each thread says it is connected on a
+    /// flag of its own.)
+    #[test]
+    fn a_replaced_capture_thread_puts_nothing_in() {
+        let frames = Arc::new(Mutex::new(FramePicker::keeping(PICKER_FRAMES)));
+        let config = Arc::new(Mutex::new(CaptureConfig::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let connected = Arc::new(AtomicBool::new(false));
+        let current = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let running = {
+            let (frames, config, stop, connected, current) = (
+                Arc::clone(&frames),
+                Arc::clone(&config),
+                Arc::clone(&stop),
+                Arc::clone(&connected),
+                Arc::clone(&current),
+            );
+            std::thread::spawn(move || {
+                let mut session = MockBackend::new("Old".to_string(), 32, 18, CaptureConfig::default());
+                capture_loop(&mut session, 7, &frames, &config, &stop, (&connected, &current, 0));
+            })
+        };
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while frames.lock().unwrap().waiting() == 0 {
+            assert!(std::time::Instant::now() < until, "frames came");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(connected.load(Ordering::SeqCst));
+        // Replaced, as `replace_session` does: the count moved on, the
+        // picker emptied.
+        current.fetch_add(1, Ordering::SeqCst);
+        frames.lock().unwrap().discard_waiting();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(frames.lock().unwrap().waiting(), 0, "the old thread put nothing in");
+        stop.store(true, Ordering::Relaxed);
+        running.join().unwrap();
     }
 
     #[test]

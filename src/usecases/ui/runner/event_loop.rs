@@ -372,6 +372,8 @@ impl ApplicationHandler for UIRunner {
         if let Some(kept) = self.night_shift.give_back_now() {
             log::info!("Quit: {kept:?}");
         }
+        // The process ends as this returns: the last lines into the log.
+        crate::app::log_file::drain(std::time::Duration::from_secs(1));
     }
 }
 

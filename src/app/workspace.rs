@@ -483,18 +483,37 @@ impl VardaApp {
                         prefs.outputs.iter().map(|c| c.uuid.clone()).collect();
                     self.close_outputs_not_in(&listed);
                     for (index, output_config) in prefs.outputs.iter().enumerate() {
+                        // One written twice in the stage is opened once.
+                        if prefs.outputs[..index]
+                            .iter()
+                            .any(|earlier| earlier.uuid == output_config.uuid)
+                        {
+                            continue;
+                        }
                         // A screen already open — a show opened while running,
-                        // made from this one — stays as it is, not opened twice;
-                        // and one written twice in the stage is opened once.
-                        if self
+                        // made from this one — stays as it is, not opened
+                        // twice; but its LED screens are the show's, in the
+                        // pixels of the show's size (the size changed since,
+                        // they were rescaled to it, and the show opens at its
+                        // own again).
+                        if let Some(open) = self
                             .output
                             .outputs
-                            .iter()
-                            .any(|o| o.uuid() == output_config.uuid)
-                            || prefs.outputs[..index]
-                                .iter()
-                                .any(|earlier| earlier.uuid == output_config.uuid)
+                            .iter_mut()
+                            .find(|o| o.uuid() == output_config.uuid)
                         {
+                            open.set_led(output_config.led.clone());
+                            continue;
+                        }
+                        // One still opening, likewise: it opens as it was
+                        // asked, with the show's LED screens (Codex).
+                        if let Some(pending) = self
+                            .output
+                            .pending_output_creates
+                            .iter_mut()
+                            .find(|c| c.uuid == output_config.uuid)
+                        {
+                            pending.led.clone_from(&output_config.led);
                             continue;
                         }
                         // Migrate legacy target_display field to new target config
@@ -791,6 +810,7 @@ impl VardaApp {
             outgoing.into_iter().map(|h| h.minus(&still_held)).collect();
 
         self.mixer = result.mixer;
+        self.show_generation += 1;
         for h in releasing {
             self.release_held_resources(h);
         }
@@ -1863,6 +1883,109 @@ mod tests {
             surfaces.iter().any(|s| s.name == "Test Surface"),
             "surface should survive roundtrip"
         );
+    }
+
+    /// A show opened again while its outputs stay open — at its own size,
+    /// changed since — gives them its LED screens as saved, at that size: not
+    /// the ones they kept, rescaled to the size it was changed to (Codex).
+    #[test]
+    fn a_show_opened_again_gives_its_open_outputs_its_led_screens() {
+        use crate::engine::value::led::{LedFit, LedLayout};
+        use crate::engine::{CommandResult, EngineCommand};
+        use crate::renderer::context::OutputTarget;
+
+        let tmp = TempDir::new().unwrap();
+        let Some(mut app) = headless_app_in(tmp.path()) else {
+            return;
+        };
+        app.set_render_resolution(3840, 2160);
+        assert!(matches!(
+            app.execute_command(EngineCommand::CreateHeadlessOutput {
+                target: OutputTarget::SyphonServer {
+                    server_name: "Wall".into(),
+                },
+            }),
+            CommandResult::Ok
+        ));
+        let output = app.build_engine_state().outputs.windows[0].uuid.clone();
+        let mut layout = LedLayout::single([1920, 1080]);
+        layout.screens[0].fit = LedFit::Part {
+            x: 0,
+            y: 736,
+            width: 3840,
+            height: 688,
+        };
+        assert!(matches!(
+            app.cmd_set_output_led(&output, Some(layout)),
+            CommandResult::Ok
+        ));
+        let saved = app.output.outputs[0].led().cloned().expect("its layout");
+        app.save_workspace(&UILayoutState::default()).expect("saved");
+        app.set_render_resolution(1920, 1080);
+        assert_ne!(app.output.outputs[0].led(), Some(&saved), "rescaled to 1080p");
+        let _ = app.load_workspace();
+        assert_eq!((app.render_width, app.render_height), (3840, 2160), "the show's size");
+        assert_eq!(app.output.outputs.len(), 1, "the output kept open");
+        assert_eq!(app.output.outputs[0].led(), Some(&saved), "its screens as saved");
+    }
+
+    /// The same for an output still opening — the show opened, its output
+    /// asked for and not yet open: it opens with the show's LED screens, not
+    /// the ones rescaled to the size the show was changed to (Codex).
+    #[test]
+    fn a_show_opened_again_gives_its_outputs_still_opening_its_led_screens() {
+        use crate::engine::value::led::{LedFit, LedLayout};
+        use crate::engine::{CommandResult, EngineCommand};
+        use crate::renderer::context::OutputTarget;
+
+        let tmp = TempDir::new().unwrap();
+        // A show saved at 4K with an LED output.
+        {
+            let Some(mut app) = headless_app_in(tmp.path()) else {
+                return;
+            };
+            app.set_render_resolution(3840, 2160);
+            assert!(matches!(
+                app.execute_command(EngineCommand::CreateHeadlessOutput {
+                    target: OutputTarget::SyphonServer {
+                        server_name: "Wall".into(),
+                    },
+                }),
+                CommandResult::Ok
+            ));
+            let output = app.build_engine_state().outputs.windows[0].uuid.clone();
+            let mut layout = LedLayout::single([1920, 1080]);
+            layout.screens[0].fit = LedFit::Part {
+                x: 0,
+                y: 736,
+                width: 3840,
+                height: 688,
+            };
+            assert!(matches!(
+                app.cmd_set_output_led(&output, Some(layout)),
+                CommandResult::Ok
+            ));
+            app.save_workspace(&UILayoutState::default()).expect("saved");
+        }
+        let Some(mut app) = headless_app_in(tmp.path()) else {
+            return;
+        };
+        let _ = app.load_workspace();
+        let pending = |app: &crate::app::VardaApp| -> Vec<Option<LedLayout>> {
+            app.output
+                .pending_output_creates
+                .iter()
+                .map(|c| c.led.clone())
+                .collect()
+        };
+        let saved = pending(&app);
+        assert_eq!(saved.len(), 1, "its output asked for, not yet open");
+        assert!(saved[0].is_some());
+        app.set_render_resolution(1920, 1080);
+        assert_ne!(pending(&app), saved, "rescaled to 1080p");
+        let _ = app.load_workspace();
+        assert_eq!((app.render_width, app.render_height), (3840, 2160), "the show's size");
+        assert_eq!(pending(&app), saved, "asked for once, with its screens as saved");
     }
 
     #[test]

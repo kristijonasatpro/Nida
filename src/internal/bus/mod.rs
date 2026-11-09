@@ -978,6 +978,22 @@ impl BusBank {
         self.buses.iter()
     }
 
+    /// Each bus's picture size on a `master`, by its id: its region of the
+    /// master as an output samples it — no larger than the master (see
+    /// [`BusCanvas::uv`]).
+    pub fn picture_sizes(&self, master: (u32, u32)) -> std::collections::HashMap<String, (u32, u32)> {
+        self.buses
+            .iter()
+            .map(|bus| {
+                let size = (
+                    bus.canvas.width.min(master.0).max(1),
+                    bus.canvas.height.min(master.1).max(1),
+                );
+                (bus.uuid().to_string(), size)
+            })
+            .collect()
+    }
+
     /// Keep every bus on the same part of the picture across a master resize
     /// (see [`BusCanvas::rescaled`]).
     pub fn rescale_canvases(&mut self, from: (u32, u32), to: (u32, u32)) {

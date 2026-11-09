@@ -55,7 +55,8 @@ vMix and Resolume are trademarks of their owners. Nida is not affiliated with or
   - the call's sound comes straight from the app;
   - the guest's camera and slides come in as window inputs;
   - Nida's programme goes back to the call as a camera — through the free NDI Virtual Input, OBS's Virtual Camera or a USB capture device;
-  - a bus made for the call (a mix-minus: everything but the call) keeps it from hearing itself.
+  - a bus made for the call (a mix-minus: everything but the call) keeps it from hearing itself;
+  - with the guest on the room's speakers, that bus can take the room's echo out of each microphone (WebRTC's echo canceller, on Apple silicon): a voice comes out much cleaner than steady music or noise.
 
 ### Running the show
 

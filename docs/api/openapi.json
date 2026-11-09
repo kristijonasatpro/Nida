@@ -646,6 +646,53 @@
         }
       }
     },
+    "/api/audio-buses/{bus_uuid}/echo-room": {
+      "put": {
+        "tags": [
+          "Audio Mixer"
+        ],
+        "operationId": "set_bus_echo_room",
+        "parameters": [
+          {
+            "name": "bus_uuid",
+            "in": "path",
+            "description": "Audio bus UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AudioEchoRoomBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The bus itself as its room"
+          },
+          "404": {
+            "description": "No such bus"
+          }
+        }
+      }
+    },
     "/api/audio-buses/{bus_uuid}/gain": {
       "put": {
         "tags": [
@@ -3918,6 +3965,37 @@
           "content": {
             "application/json": {
               "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/compositor": {
+      "put": {
+        "tags": [
+          "System"
+        ],
+        "summary": "How the compositor draws: for comparing its ways on one show, GPU use\nwith each, without a restart. The picture is the same either way.",
+        "operationId": "set_compositor",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompositorBody"
+              }
             }
           },
           "required": true
@@ -14847,6 +14925,19 @@
           }
         }
       },
+      "AudioEchoRoomBody": {
+        "type": "object",
+        "description": "A bus's echo removal: the bus the room's speakers play, or null for off.",
+        "properties": {
+          "room": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The room's bus, by UUID; null or left out, off."
+          }
+        }
+      },
       "AudioFollowBody": {
         "type": "object",
         "description": "Where a source's Audio Auto looks for it being on air.",
@@ -15725,6 +15816,25 @@
               "type": "string"
             },
             "description": "UUIDs of the surfaces to combine."
+          }
+        }
+      },
+      "CompositorBody": {
+        "type": "object",
+        "properties": {
+          "direct_layers": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Draw a layer that is only its live source placed — a camera, a\nscreen, another input (a tap), cropped, moved or scaled — straight\nonto its input from that source, rather than into a frame of its own\nfirst (on by default). One left out stays as it is."
+          },
+          "merge_layer_passes": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Draw an input's Normal, Add and Screen layers in one pass (on by\ndefault)."
           }
         }
       },
@@ -20339,6 +20449,10 @@
             "type": "number",
             "format": "float",
             "description": "Seconds since Record was pressed."
+          },
+          "starting": {
+            "type": "boolean",
+            "description": "Its encoder still starting: Record pressed, nothing written yet."
           }
         }
       },

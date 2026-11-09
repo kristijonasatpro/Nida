@@ -208,6 +208,28 @@ fn same_either_way(ctx: &GpuContext, decks: Vec<Deck>, set: impl FnOnce(&mut Cha
     shares
 }
 
+/// A background whose thumbnail the control window shows is drawn whole
+/// under a picture-in-picture: drawn round it only, the thumbnail was blank
+/// where the picture covers it (Codex).
+#[test]
+fn a_background_whose_thumbnail_shows_is_drawn_whole() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let pip = framed(&ctx, solid(&ctx, [0.1, 0.2, 0.9, 1.0]), |_, t| {
+        t.set_float("scale", 0.55);
+    });
+    let background = checker(&ctx, 40.0);
+    let mut mixer = mixer(&ctx);
+    mixer.previewed_decks = vec![background.uuid().to_string()];
+    let ch = mixer.channel_mut(0).unwrap();
+    ch.add_deck(background);
+    ch.add_deck(pip);
+    render(&ctx, &mut mixer);
+    let share = mixer.channels()[0].decks[0].deck.drawn_share();
+    assert!(share >= 1.0, "drawn whole for its thumbnail: {share}");
+}
+
 #[test]
 fn a_background_behind_a_picture_in_picture_is_drawn_round_it_only() {
     let Some(ctx) = headless_gpu() else {
@@ -432,6 +454,36 @@ fn a_layer_covered_by_two_pictures_together_is_not_drawn() {
     render(&ctx, &mut mixer);
     let whole = bits(&ctx, &mixer.channels()[0]);
     assert!(hidden == whole, "{}", differences(&hidden, &whole));
+}
+
+/// The same with the pattern's thumbnail on screen: covered altogether, it
+/// is still not drawn each frame — only now and then for its thumbnail, as
+/// any covered deck is (Codex).
+#[test]
+fn a_layer_covered_by_two_pictures_together_with_its_thumbnail_shown_is_not_drawn() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let left = framed(&ctx, solid(&ctx, [1.0, 0.0, 0.0, 1.0]), |_, t| {
+        t.set_float("scale", 1.2);
+        t.set_float("pos_x", -0.3);
+    });
+    let right = framed(&ctx, solid(&ctx, [0.0, 0.0, 1.0, 1.0]), |_, t| {
+        t.set_float("scale", 1.2);
+        t.set_float("pos_x", 0.3);
+    });
+    let pattern = checker(&ctx, 40.0);
+    let mut mixer = mixer(&ctx);
+    mixer.previewed_decks = vec![pattern.uuid().to_string()];
+    let ch = mixer.channel_mut(0).unwrap();
+    ch.add_deck(pattern);
+    ch.add_deck(left);
+    ch.add_deck(right);
+    // Its first frame drawn for its thumbnail, then left.
+    render(&ctx, &mut mixer);
+    render(&ctx, &mut mixer);
+    assert_eq!(mixer.channels()[0].active_deck_count, 2, "the pattern is not rendered");
+    assert_eq!(mixer.channels()[0].composited_deck_count, 2, "nor composited");
 }
 
 /// An opaque picture fitted with bars at its sides covers only between the

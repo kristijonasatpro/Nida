@@ -105,7 +105,8 @@ fn look(status: &crate::record::RecordStatus, bright: bool) -> (Option<egui::Col
 /// Whether NOT RECORDING blinks behind the take buttons: asked for, and
 /// not recording.
 pub(super) fn warns_not_recording(data: &UIData) -> bool {
-    data.record.options.warn_when_off && !data.record.status.recording
+    let status = &data.record.status;
+    data.record.options.warn_when_off && (!status.recording || status.starting)
 }
 
 /// How long one blink of NOT RECORDING takes, on and off.
@@ -338,7 +339,7 @@ fn render_header(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
             let name = std::path::Path::new(file)
                 .file_name()
                 .map_or_else(|| file.clone(), |n| n.to_string_lossy().into_owned());
-            let verb = if status.recording { "Writing" } else { "Last" };
+            let verb = if status.file.is_some() { "Writing" } else { "Last" };
             ui.label(egui::RichText::new(format!("{verb}: {name}")).small())
                 .on_hover_text(file);
             if ui.small_button("Show in Finder").clicked() {
@@ -806,6 +807,21 @@ fn render_start_stop(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) 
 
 #[cfg(test)]
 mod tests {
+    /// NOT RECORDING blinks while Record was pressed but the encoder is still
+    /// starting — nothing is being written yet — and stops once it is.
+    #[test]
+    fn not_recording_blinks_until_the_encoder_has_started() {
+        let mut data = crate::usecases::ui::UIData::test_fixture();
+        data.record.options.warn_when_off = true;
+        data.record.status = crate::record::RecordStatus::idle(None);
+        assert!(super::warns_not_recording(&data), "idle");
+        data.record.status.recording = true;
+        data.record.status.starting = true;
+        assert!(super::warns_not_recording(&data), "starting");
+        data.record.status.starting = false;
+        assert!(!super::warns_not_recording(&data), "recording");
+    }
+
     /// A recording rate that does not divide the show's leaves frames out
     /// unevenly, and says so; an even share, or the show's own, does not.
     #[test]
@@ -956,6 +972,7 @@ mod tests {
             fps: 0,
             file_fps: 0,
             last_file: None,
+            starting: false,
             audio_bus: None,
         }
     }

@@ -121,6 +121,11 @@ rsync -a --exclude-from=<(grep -v -E '^(#|$)' scripts/ci/shaders-left-out.txt) \
   shaders/ "$APP/Contents/Resources/shaders/"
 cp LICENSE "$APP/Contents/Resources/licenses/LICENSE-Nida-MIT"
 cp "$FFMPEG_FULL/COPYING.GPLv3" "$APP/Contents/Resources/licenses/COPYING-GPLv3"
+# WebRTC's echo canceller, linked into nida (vendor/webrtc-aec3): its
+# licences, its patent grant, and which source it was built from.
+mkdir -p "$APP/Contents/Resources/licenses/webrtc-aec3"
+cp vendor/webrtc-aec3/licenses/*.txt vendor/webrtc-aec3/README.md \
+  "$APP/Contents/Resources/licenses/webrtc-aec3/"
 
 # The icon, at every size macOS asks for.
 ICONSET="$STAGE/nida.iconset"

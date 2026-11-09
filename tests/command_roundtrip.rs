@@ -26,8 +26,7 @@ fn send_cmd(app: &mut VardaApp, cmd: EngineCommand) -> CommandResult {
     let tx = app.command_sender();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     tx.send((cmd, Some(reply_tx))).unwrap();
-    app.process_commands();
-    reply_rx.blocking_recv().unwrap()
+    varda::testing::reply_of(app, reply_rx)
 }
 
 /// The UUID a creating command reports (see ui-engine-boundary.md WS1).
@@ -2229,5 +2228,10 @@ fn dropped_files_load_in_the_order_they_were_dropped() {
         })
         .collect();
     assert_eq!(order, [0, 1, 2, 3, 4]);
+    // The loader counts a file done just after it sends it: a moment later.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pending.load(std::sync::atomic::Ordering::Relaxed) != 0 && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     assert_eq!(pending.load(std::sync::atomic::Ordering::Relaxed), 0);
 }

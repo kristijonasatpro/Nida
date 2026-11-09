@@ -870,6 +870,7 @@ mod tests {
             meter_db: [-96.0, -96.0],
             signal_db: [-96.0, -96.0],
             refused: None,
+            echo: Vec::new(),
             send_settings: std::collections::BTreeMap::default(),
             sent_before: Vec::new(),
         });

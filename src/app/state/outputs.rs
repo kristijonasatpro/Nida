@@ -1358,6 +1358,75 @@ impl VardaApp {
     }
 }
 
+/// An encoder — ffmpeg, and the media engine's session for an encoder in
+/// Nida — being started on a thread of its own for the recording or the
+/// stream, with what goes with it once there. Started on the show's thread,
+/// the media engine's session alone held it up 80 ms (the first REC after a
+/// launch, measured 2026-11-04), and every time a stream started again after
+/// the network went; with the media engine stuck, for as long as it was.
+pub(crate) struct EncoderStart<T = crate::renderer::FfmpegSubprocess> {
+    made: std::sync::mpsc::Receiver<anyhow::Result<T>>,
+    /// The audio tap the encoder reads, kept to be let go should it fail.
+    pub(crate) passthrough: Option<crate::renderer::context::AudioPassthrough>,
+    /// The rate frames reach it at.
+    pub(crate) fps: u32,
+    /// Started again after it stopped, not by the operator.
+    pub(crate) again: bool,
+    /// Wait for the start, made or failed (commands over the bus).
+    pub(crate) replies: Vec<crate::app::Reply>,
+}
+
+impl<T: Send + 'static> EncoderStart<T> {
+    /// Start `make` on a thread named `name`. Should no thread start, the
+    /// error and the audio tap are handed back.
+    pub(crate) fn begin(
+        name: String,
+        make: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+        passthrough: Option<crate::renderer::context::AudioPassthrough>,
+        fps: u32,
+        again: bool,
+    ) -> Result<Self, (String, Option<crate::renderer::context::AudioPassthrough>)> {
+        let (done, outcome) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name(name).spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(make))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("starting the encoder crashed")));
+            // No one waiting (stopped meanwhile): dropped here, off the show.
+            let _ = done.send(result);
+        });
+        match spawned {
+            Ok(_) => Ok(Self {
+                made: outcome,
+                passthrough,
+                fps,
+                again,
+                replies: Vec::new(),
+            }),
+            Err(e) => Err((
+                format!("No thread to start the encoder on: {e}"),
+                passthrough,
+            )),
+        }
+    }
+
+    /// What came of it, once it has: `None` while it is still starting.
+    pub(crate) fn made(&self) -> Option<anyhow::Result<T>> {
+        match self.made.try_recv() {
+            Ok(result) => Some(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Some(Err(anyhow::anyhow!("the encoder's thread ended")))
+            }
+        }
+    }
+
+    /// Answer whoever waits for it.
+    pub(crate) fn answer(&mut self, result: &CommandResult) {
+        for reply in self.replies.drain(..) {
+            let _ = reply.send(result.clone());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     thread_local! {
@@ -1676,3 +1745,47 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod encoder_start_tests {
+    use super::EncoderStart;
+    use std::time::{Duration, Instant};
+
+    /// The encoder is made on a thread of its own: starting it never waits
+    /// for it, and what came of it is there once it is.
+    #[test]
+    fn an_encoder_starts_on_a_thread_of_its_own() {
+        let (go, held) = std::sync::mpsc::channel::<()>();
+        // Let go after a second whatever happens: one made in place would
+        // otherwise wait for it for ever, and the test with it.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            drop(go);
+        });
+        let started = Instant::now();
+        let start = EncoderStart::<crate::renderer::FfmpegSubprocess>::begin(
+            "encoder-start-test".into(),
+            move || {
+                let _ = held.recv();
+                Err(anyhow::anyhow!("not made"))
+            },
+            None,
+            30,
+            false,
+        )
+        .unwrap_or_else(|_| panic!("a thread"));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "not waited for"
+        );
+        assert!(start.made().is_none(), "still starting");
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(made) = start.made() {
+                assert!(made.is_err());
+                break;
+            }
+            assert!(Instant::now() < until, "what came of it came");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}

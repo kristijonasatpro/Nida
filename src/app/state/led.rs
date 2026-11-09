@@ -122,6 +122,37 @@ impl super::super::VardaApp {
         CommandResult::OkWithId { uuid: bus }
     }
 
+    /// The show's size changed from `from` to `to`, each bus's picture from
+    /// its size in `buses_were` to that in `buses_now`: every LED screen
+    /// showing a part of a picture keeps showing the same part of it — an
+    /// output's, and one still opening (see [`LedLayout::rescale_parts`]).
+    pub(crate) fn rescale_led_parts(
+        &mut self,
+        from: (u32, u32),
+        to: (u32, u32),
+        buses_were: &std::collections::HashMap<String, (u32, u32)>,
+        buses_now: &std::collections::HashMap<String, (u32, u32)>,
+    ) {
+        let sizes = |source: &OutputSource| match source {
+            OutputSource::Master => Some((from, to)),
+            OutputSource::BusProgram(bus) => Some((*buses_were.get(bus)?, *buses_now.get(bus)?)),
+            _ => None,
+        };
+        for output in &mut self.output.outputs {
+            let Some(mut layout) = output.led().cloned() else {
+                continue;
+            };
+            if layout.rescale_parts(sizes) {
+                output.set_led(Some(layout));
+            }
+        }
+        for config in &mut self.output.pending_output_creates {
+            if let Some(layout) = &mut config.led {
+                layout.rescale_parts(sizes);
+            }
+        }
+    }
+
     /// `layout` with ids given to new screens, or why it cannot be shown.
     fn checked_led(&self, mut layout: LedLayout) -> Result<LedLayout, CommandResult> {
         let invalid = |message: String| CommandResult::Err {
@@ -244,6 +275,94 @@ mod tests {
             CommandResult::Ok
         ));
         assert!(app.output.pending_output_creates[0].led.is_none());
+    }
+
+    /// The show's size changes (Settings, Auto): a screen showing part of
+    /// Main or of a bus still shows the same part — of an output still
+    /// opening too — and comes back where it was at the old size.
+    #[test]
+    fn led_parts_follow_the_shows_size() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        app.set_render_resolution(3840, 2160);
+        let bus = app.production_buses.iter().next().expect("a bus").uuid().to_string();
+        let canvas = app.production_buses.get(&bus).expect("its bus").canvas();
+        let part = |x, y, width, height| LedFit::Part {
+            x,
+            y,
+            width,
+            height,
+        };
+        let mut layout = LedLayout::single([1920, 1080]);
+        layout.screens[0].fit = part(0, 736, 3840, 688);
+        layout.screens.push(LedScreen {
+            fit: part(0, 0, canvas.width / 2, canvas.height),
+            ..cube(OutputSource::BusProgram(bus.clone()))
+        });
+        let at = layout.clone();
+        created(app.cmd_create_led_output(None, layout));
+        let parts = |app: &crate::app::VardaApp| -> Vec<LedFit> {
+            app.output.pending_output_creates[0]
+                .led
+                .as_ref()
+                .expect("its layout")
+                .screens
+                .iter()
+                .map(|s| s.fit)
+                .collect()
+        };
+        app.set_render_resolution(1920, 1080);
+        let now = app.production_buses.get(&bus).expect("its bus").canvas();
+        assert_eq!(
+            parts(&app),
+            vec![part(0, 368, 1920, 344), part(0, 0, now.width / 2, now.height)],
+            "the same parts of the smaller pictures"
+        );
+        app.set_render_resolution(3840, 2160);
+        assert_eq!(
+            parts(&app),
+            at.screens.iter().map(|s| s.fit).collect::<Vec<_>>(),
+            "back where they were"
+        );
+    }
+
+    /// A bus larger than the show shows only the show's size of it (its
+    /// canvas is clamped to the master as it is drawn): the show growing
+    /// grows what it shows, and a part of it grows with that — not with its
+    /// canvas, which the grown show no longer clamps (Codex).
+    #[test]
+    fn a_part_of_a_bus_larger_than_the_show_follows_what_it_shows() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        app.set_render_resolution(1920, 1080);
+        let bus = app.production_buses.iter().next().expect("a bus").uuid().to_string();
+        app.production_buses
+            .get_mut(&bus)
+            .expect("its bus")
+            .set_canvas(crate::bus::BusCanvas::new(3840, 2160));
+        let mut layout = LedLayout::single([1920, 1080]);
+        layout.screens[0].source = OutputSource::BusProgram(bus.clone());
+        layout.screens[0].fit = LedFit::Part {
+            x: 0,
+            y: 0,
+            width: 960,
+            height: 1080,
+        };
+        created(app.cmd_create_led_output(None, layout));
+        app.set_render_resolution(3840, 2160);
+        let fit = app.output.pending_output_creates[0].led.as_ref().expect("its layout").screens[0].fit;
+        assert_eq!(
+            fit,
+            LedFit::Part {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 2160
+            },
+            "still the left half of what the bus shows"
+        );
     }
 
     #[test]

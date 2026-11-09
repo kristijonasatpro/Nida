@@ -4,12 +4,12 @@
 //! For windowed operation this runs alongside `UIRunner`.
 //! For headless operation this is the primary consumer.
 
-use crate::engine::{CommandEnvelope, EngineState};
+use crate::engine::CommandEnvelope;
 use crate::usecases::api::routes;
 use crate::usecases::api::SharedState;
 
 use axum::Router;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tower_http::cors::{Any, CorsLayer};
 use utoipa::OpenApi;
@@ -26,6 +26,7 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::system::set_resolution, routes::system::set_resolution_auto,
         routes::system::set_domemaster_resolution,
         routes::system::set_target_fps, routes::system::start_perf_profile,
+        routes::system::set_compositor,
         routes::system::set_clock_preference,
         routes::system::set_manual_bpm, routes::system::save_workspace,
         routes::system::load_workspace,
@@ -217,7 +218,7 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::audio_mix::rename_bus, routes::audio_mix::set_bus_gain,
         routes::audio_mix::set_bus_mute, routes::audio_mix::set_bus_delay,
         routes::audio_mix::set_bus_live, routes::audio_mix::set_bus_insert,
-        routes::audio_mix::set_bus_pre_fader,
+        routes::audio_mix::set_bus_pre_fader, routes::audio_mix::set_bus_echo_room,
         routes::audio_mix::set_bus_insert_bypass, routes::audio_mix::open_bus_insert,
         routes::audio_mix::close_bus_insert,
         routes::audio_mix::set_bus_device, routes::audio_mix::create_input,
@@ -1325,6 +1326,10 @@ pub fn build_router(shared: SharedState) -> Router {
             axum::routing::put(routes::audio_mix::set_bus_pre_fader),
         )
         .route(
+            "/api/audio-buses/{bus_uuid}/echo-room",
+            axum::routing::put(routes::audio_mix::set_bus_echo_room),
+        )
+        .route(
             "/api/audio-buses/{bus_uuid}/insert",
             axum::routing::put(routes::audio_mix::set_bus_insert),
         )
@@ -1683,6 +1688,10 @@ pub fn build_router(shared: SharedState) -> Router {
             axum::routing::post(routes::system::start_perf_profile),
         )
         .route(
+            "/api/compositor",
+            axum::routing::put(routes::system::set_compositor),
+        )
+        .route(
             "/api/clock/preference",
             axum::routing::put(routes::system::set_clock_preference),
         )
@@ -1815,7 +1824,7 @@ impl ApiServerHandle {
 pub fn start(
     port: u16,
     command_tx: mpsc::UnboundedSender<CommandEnvelope>,
-    engine_state: Arc<RwLock<Option<EngineState>>>,
+    engine_state: Arc<crate::engine::types::PublishedState>,
 ) -> Option<ApiServerHandle> {
     let shared = SharedState {
         command_tx,
@@ -1885,6 +1894,7 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::RwLock;
 
     /// What the window's notice that the API is off goes by (see the UI
     /// runner's `finish_init`).

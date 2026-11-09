@@ -40,7 +40,17 @@ pub(super) fn render_controls(
     actions: &mut UIActions,
 ) {
     ui.separator();
-    ui.strong("Text");
+    // "Updating…" comes and goes with each redraw while typing: on the
+    // heading's row, so the fields below never jump.
+    ui.horizontal(|ui| {
+        ui.strong("Text");
+        if text.error.is_none() && text.pending {
+            ui.weak("Updating…");
+        }
+    });
+    if let Some(error) = &text.error {
+        ui.colored_label(WARN, error);
+    }
     lines(ui, deck, text, actions);
     shown(ui, deck, text, actions);
     // Where it comes on: Main, and buses — over what each shows.
@@ -337,6 +347,67 @@ mod tests {
     use crate::usecases::ui::UIData;
     use egui_kittest::kittest::Queryable;
 
+    #[test]
+    fn text_render_failure_is_visible_without_changing_settings() {
+        let data = UIData::test_fixture();
+        let (ch, dk) = data.selected_deck.unwrap();
+        let deck = data.channels[ch].decks[dk].clone();
+        let text = TextSnapshot {
+            settings: TextSettings::default(),
+            pending: false,
+            error: Some("Text could not be drawn; previous picture retained".into()),
+        };
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 900.0))
+            .build_ui_state(
+                move |ui, sent: &mut Vec<EngineCommand>| {
+                    let mut actions = UIActions::new();
+                    render_controls(ui, &data, &deck, &text, &mut actions);
+                    sent.extend(actions.commands);
+                },
+                Vec::new(),
+            );
+        h.run_steps(3);
+        assert!(h
+            .query_by_label("Text could not be drawn; previous picture retained")
+            .is_some());
+        assert!(h.state().is_empty());
+    }
+
+    /// "Updating…" shows while each typed letter is drawn: the field being
+    /// typed in stays where it is.
+    #[test]
+    fn updating_does_not_move_the_text_field() {
+        let data = UIData::test_fixture();
+        let (ch, dk) = data.selected_deck.unwrap();
+        let deck = data.channels[ch].decks[dk].clone();
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 900.0))
+            .build_ui_state(
+                move |ui, text: &mut TextSnapshot| {
+                    let mut actions = UIActions::new();
+                    render_controls(ui, &data, &deck, text, &mut actions);
+                },
+                TextSnapshot {
+                    settings: TextSettings::default(),
+                    pending: false,
+                    error: None,
+                },
+            );
+        let field = |h: &egui_kittest::Harness<'_, TextSnapshot>| {
+            h.query_all_by_role(egui::accesskit::Role::MultilineTextInput)
+                .next()
+                .expect("the text field")
+                .rect()
+        };
+        h.run_steps(3);
+        let idle = field(&h);
+        h.state_mut().pending = true;
+        h.run_steps(3);
+        assert!(h.query_by_label("Updating…").is_some());
+        assert_eq!(field(&h), idle);
+    }
+
     /// Typing, then an undo (the engine's text changed elsewhere): the
     /// field gives way, and the next letter goes on the undone text — the
     /// undone typing is not sent back.
@@ -365,6 +436,8 @@ mod tests {
                 },
                 State {
                     text: TextSnapshot {
+                        pending: false,
+                        error: None,
                         settings: TextSettings {
                             text: "Salė A".into(),
                             ..TextSettings::default()
@@ -407,6 +480,8 @@ mod tests {
         let (ch, dk) = data.selected_deck.expect("fixture selects a deck");
         let deck = data.channels[ch].decks[dk].clone();
         let text = TextSnapshot {
+            pending: false,
+            error: None,
             settings: TextSettings::default(),
         };
         let ui_data = UIData::test_fixture();

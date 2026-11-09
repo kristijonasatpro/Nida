@@ -407,6 +407,9 @@ pub struct RecordStatus {
     pub file_fps: u32,
     /// The last finished recording, for "Show in Finder".
     pub last_file: Option<String>,
+    /// Its encoder still starting: Record pressed, nothing written yet.
+    #[serde(default)]
+    pub starting: bool,
     /// The audio-mixer bus the running recording carries, as chosen when it
     /// started; none idle, or carrying silence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -427,6 +430,7 @@ impl RecordStatus {
             fps: 0,
             file_fps: 0,
             last_file,
+            starting: false,
             audio_bus: None,
         }
     }
@@ -459,6 +463,40 @@ pub const LOW_SPACE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// A new file's path: `Nida 2026-09-26 14-05-09.mp4` in `folder`, with
 /// ` (2)`, ` (3)` … when a take continues in more files or the name is taken.
+/// [`file_path`], passing over the paths in `given` too — handed already to
+/// an encoder starting, or one stopped before it started, that may yet make
+/// its file — and putting the one chosen there. It looks at the disk: not
+/// for the show's thread.
+pub fn file_path_unused<S: std::hash::BuildHasher>(
+    folder: &Path,
+    stamp: &str,
+    part: usize,
+    extension: &str,
+    given: &std::sync::Mutex<std::collections::HashSet<PathBuf, S>>,
+) -> PathBuf {
+    let base = if part > 1 {
+        format!("Nida {stamp} ({part})")
+    } else {
+        format!("Nida {stamp}")
+    };
+    let held = || {
+        given
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let mut path = folder.join(format!("{base}.{extension}"));
+    let mut n = 2;
+    loop {
+        // The disk looked at with nothing held: a disk that keeps it waiting
+        // keeps no other start waiting.
+        if !held().contains(&path) && !path.exists() && held().insert(path.clone()) {
+            return path;
+        }
+        path = folder.join(format!("{base} {n}.{extension}"));
+        n += 1;
+    }
+}
+
 pub fn file_path(folder: &Path, stamp: &str, part: usize, extension: &str) -> PathBuf {
     let base = if part > 1 {
         format!("Nida {stamp} ({part})")
@@ -692,6 +730,32 @@ fn available_on(path: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A file handed to one encoder is never handed to another, though
+    /// neither has made it yet: one stopped before it started may still.
+    #[test]
+    fn a_file_is_never_handed_out_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let given = std::sync::Mutex::new(std::collections::HashSet::new());
+        let first = file_path_unused(dir.path(), "2026-11-04 15-30-00", 1, "mp4", &given);
+        let second = file_path_unused(dir.path(), "2026-11-04 15-30-00", 1, "mp4", &given);
+        assert_ne!(first, second);
+        assert!(
+            second
+                .to_string_lossy()
+                .ends_with("Nida 2026-11-04 15-30-00 2.mp4"),
+            "{second:?}"
+        );
+        // One on the disk is passed over too.
+        std::fs::write(dir.path().join("Nida 2026-11-04 15-30-01.mp4"), b"x").unwrap();
+        let third = file_path_unused(dir.path(), "2026-11-04 15-30-01", 1, "mp4", &given);
+        assert!(
+            third
+                .to_string_lossy()
+                .ends_with("Nida 2026-11-04 15-30-01 2.mp4"),
+            "{third:?}"
+        );
+    }
     /// A picture encoded in Nida is copied into the file as it comes, HEVC
     /// tagged as Apple's players take it, MP4 in one-second pieces.
     #[test]

@@ -26,6 +26,13 @@ pub(crate) struct Framing<'a> {
     /// The deck's own frame, as its render scale makes it: the picture
     /// drawn at this size, then shown at the master's, as the deck is.
     pub size: (u32, u32),
+    /// The source's own size.
+    pub source_size: (u32, u32),
+    /// The deck draws it into its frame through the placed pass too (its
+    /// crop or Transform folded in, see `Deck::fold`): else through the
+    /// blit, which scales a source not at the frame's size its own way —
+    /// bicubic up, box filtered down (`scaled_sample.wgsl`).
+    pub folded: bool,
 }
 
 /// The effects the pass drawing a deck's source does too (see
@@ -448,14 +455,7 @@ impl Deck {
         let time = self.render_time;
         self.frame_count += 1;
 
-        // Derive per-deck FPS from wall-clock render interval (for UI display only)
-        let now = Instant::now();
-        let wall_dt = (now - self.last_frame_time).as_secs_f32();
-        self.last_frame_time = now;
-        if wall_dt > 0.0 && wall_dt < 1.0 {
-            let instant_fps = 1.0 / wall_dt;
-            self.fps_smoothed = 0.1 * instant_fps + 0.9 * self.fps_smoothed;
-        }
+        self.count_frame_shown();
 
         // Accumulate generator phase times using the fixed dt
         accumulate_phase_times(
@@ -1293,7 +1293,22 @@ impl Deck {
             },
             source: self.external_source_view.as_ref(),
             size: (self.texture.width(), self.texture.height()),
+            source_size: (*source_width, *source_height),
+            folded: !drawn.is_empty(),
         })
+    }
+
+    /// A new picture of the deck shown: its rate (`fps`, for the UI) from
+    /// the time since the last — drawn into its frame, or straight onto its
+    /// input from its source (see `Channel::direct_layers`).
+    pub(crate) fn count_frame_shown(&mut self) {
+        let now = Instant::now();
+        let wall_dt = (now - self.last_frame_time).as_secs_f32();
+        self.last_frame_time = now;
+        if wall_dt > 0.0 && wall_dt < 1.0 {
+            let instant_fps = 1.0 / wall_dt;
+            self.fps_smoothed = 0.1 * instant_fps + 0.9 * self.fps_smoothed;
+        }
     }
 
     /// Upload analyzer texture data into preprocessor slots.

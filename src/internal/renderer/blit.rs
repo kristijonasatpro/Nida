@@ -743,6 +743,20 @@ impl BlitPipeline {
         render_pass.set_bind_group(0, bind_group, &[]);
         super::region::draw_within(render_pass, within);
     }
+
+    /// [`Self::render_at_slot_within`] in a pass other draws share, on a
+    /// target of `size`: a draw everywhere resets the scissor first.
+    pub fn render_at_slot_within_shared<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        bind_group: &'a wgpu::BindGroup,
+        within: Option<&[super::region::Pixels]>,
+        size: (u32, u32),
+    ) {
+        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_bind_group(0, bind_group, &[]);
+        super::region::draw_within_shared(render_pass, within, size.0, size.1);
+    }
 }
 
 // === Composite blend pipeline ===

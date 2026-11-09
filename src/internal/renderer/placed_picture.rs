@@ -118,8 +118,12 @@ struct Params {
     cropped: f32,
     bordered: f32,
     over_black: f32,
+    /// Drawn onto a composite (see [`PlacedOnto`]): the layer's opacity, and
+    /// 0 for its colour straight, 1 premultiplied.
+    opacity: f32,
+    onto: u32,
     /// To the 16 bytes a uniform block is a multiple of.
-    _pad: [f32; 3],
+    _pad: f32,
 }
 
 pub struct PlacedPicturePipeline {
@@ -131,95 +135,13 @@ pub struct PlacedPicturePipeline {
 
 impl PlacedPicturePipeline {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Placed Picture Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Placed Picture Pipeline Layout"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let vertex = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Placed Picture Vertex Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/fullscreen.wgsl").into()),
-        });
-        let fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Placed Picture Fragment Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/placed_picture.wgsl").into()),
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Placed Picture Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &vertex,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &fragment,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Placed Picture Sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let params = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Placed Picture Params"),
-            size: std::mem::size_of::<Params>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let layout = bind_layout(device);
+        let pipeline = pipeline(device, &layout, format, "fs_main", wgpu::BlendState::REPLACE);
         Self {
             pipeline,
             layout,
-            sampler,
-            params,
+            sampler: sampler(device),
+            params: params_buffer(device),
         }
     }
 
@@ -238,64 +160,8 @@ impl PlacedPicturePipeline {
         frame: (u32, u32),
         within: Option<&[Pixels]>,
     ) -> u64 {
-        let none = Border {
-            color: [0.0; 4],
-            width: 0.0,
-            radius: 0.0,
-            circle: 0.0,
-            strength: 1.0,
-        };
-        let (crop_mode, crop, border, feather, cropped) = match &placed.crop {
-            None => (0, [0.0, 1.0, 0.0, 1.0], none, 0.0, 1.0),
-            Some(c) => (
-                if c.border.is_some() { 2 } else { 1 },
-                [c.left, c.right, c.bottom, c.top],
-                c.border.unwrap_or(none),
-                c.feather,
-                c.strength,
-            ),
-        };
-        #[allow(clippy::cast_precision_loss)]
-        let size = [frame.0.max(1) as f32, frame.1.max(1) as f32];
-        let params = Params {
-            uv_scale: placed.uv_scale,
-            uv_offset: placed.uv_offset,
-            pos: placed.pos,
-            scale: placed.scale.map(|s| s.max(1e-4)),
-            frame: size,
-            premultiplied: u32::from(placed.premultiplied),
-            crop_mode,
-            crop,
-            // Linear, as the crop effect's own colour reaches its shader
-            // (see `ParamValue::write_bytes`).
-            border_color: {
-                let [r, g, b, a] = border.color;
-                let linear = crate::params::srgb_to_linear;
-                [linear(r), linear(g), linear(b), a]
-            },
-            feather,
-            border_width: border.width,
-            border_radius: border.radius,
-            circle: border.circle,
-            flip: placed.flip.map(|on| if on { 1.0 } else { 0.0 }),
-            cropped,
-            bordered: border.strength,
-            over_black: placed.over_black,
-            _pad: [0.0; 3],
-        };
-        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
-
-        let [x0, y0, x1, y1] = placed.bounds([1.0 / size[0], 1.0 / size[1]]);
-        let picture = super::region::Area { x0, y0, x1, y1 }.outer_pixels(frame.0, frame.1, 0);
-        let parts: Vec<Pixels> = match (picture, within) {
-            (None, _) => Vec::new(),
-            (Some(picture), None) => vec![picture],
-            (Some(picture), Some(parts)) => parts
-                .iter()
-                .map(|part| part.intersect(&picture))
-                .filter(|part| !part.is_empty())
-                .collect(),
-        };
+        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params_of(placed, frame)));
+        let parts = parts_of(placed, frame, within);
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Placed Picture Bind Group"),
@@ -342,6 +208,303 @@ impl PlacedPicturePipeline {
         }
         cmd_buffers.push(encoder.finish());
         parts.iter().map(Pixels::count).sum()
+    }
+}
+
+/// The bind group layout every placed draw takes: a sampler, the source and
+/// its params.
+fn bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Placed Picture Bind Group Layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+/// The placed picture's pipeline into `format`: the fragment shader's
+/// `entry` through `blend`.
+fn pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+    entry: &str,
+    blend: wgpu::BlendState,
+) -> wgpu::RenderPipeline {
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Placed Picture Pipeline Layout"),
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
+    });
+    let vertex = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Placed Picture Vertex Shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/fullscreen.wgsl").into()),
+    });
+    let fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Placed Picture Fragment Shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/placed_picture.wgsl").into()),
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Placed Picture Pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &vertex,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &fragment,
+            entry_point: Some(entry),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn sampler(device: &wgpu::Device) -> wgpu::Sampler {
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("Placed Picture Sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    })
+}
+
+fn params_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Placed Picture Params"),
+        size: std::mem::size_of::<Params>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// The shader's params for `placed` drawn in a frame of `frame` pixels,
+/// drawn into it (opacity 1, straight).
+fn params_of(placed: &Placed, frame: (u32, u32)) -> Params {
+    let none = Border {
+        color: [0.0; 4],
+        width: 0.0,
+        radius: 0.0,
+        circle: 0.0,
+        strength: 1.0,
+    };
+    let (crop_mode, crop, border, feather, cropped) = match &placed.crop {
+        None => (0, [0.0, 1.0, 0.0, 1.0], none, 0.0, 1.0),
+        Some(c) => (
+            if c.border.is_some() { 2 } else { 1 },
+            [c.left, c.right, c.bottom, c.top],
+            c.border.unwrap_or(none),
+            c.feather,
+            c.strength,
+        ),
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let size = [frame.0.max(1) as f32, frame.1.max(1) as f32];
+    Params {
+        uv_scale: placed.uv_scale,
+        uv_offset: placed.uv_offset,
+        pos: placed.pos,
+        scale: placed.scale.map(|s| s.max(1e-4)),
+        frame: size,
+        premultiplied: u32::from(placed.premultiplied),
+        crop_mode,
+        crop,
+        // Linear, as the crop effect's own colour reaches its shader
+        // (see `ParamValue::write_bytes`).
+        border_color: {
+            let [r, g, b, a] = border.color;
+            let linear = crate::params::srgb_to_linear;
+            [linear(r), linear(g), linear(b), a]
+        },
+        feather,
+        border_width: border.width,
+        border_radius: border.radius,
+        circle: border.circle,
+        flip: placed.flip.map(|on| if on { 1.0 } else { 0.0 }),
+        cropped,
+        bordered: border.strength,
+        over_black: placed.over_black,
+        opacity: 1.0,
+        onto: 0,
+        _pad: 0.0,
+    }
+}
+
+/// The pixels of a `frame` the picture can reach, within `within` (the
+/// parts of the frame that show) when given.
+fn parts_of(placed: &Placed, frame: (u32, u32), within: Option<&[Pixels]>) -> Vec<Pixels> {
+    #[allow(clippy::cast_precision_loss)]
+    let pixel = [1.0 / frame.0.max(1) as f32, 1.0 / frame.1.max(1) as f32];
+    let [x0, y0, x1, y1] = placed.bounds(pixel);
+    let picture = super::region::Area { x0, y0, x1, y1 }.outer_pixels(frame.0, frame.1, 0);
+    match (picture, within) {
+        (None, _) => Vec::new(),
+        (Some(picture), None) => vec![picture],
+        (Some(picture), Some(parts)) => parts
+            .iter()
+            .map(|part| part.intersect(&picture))
+            .filter(|part| !part.is_empty())
+            .collect(),
+    }
+}
+
+/// How a layer drawn straight onto a composite blends there, as the
+/// composite's own pipelines blend a layer's picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Onto {
+    Normal,
+    Add,
+    Screen,
+}
+
+/// Layers drawn straight onto their channel's composite from their live
+/// source — a camera, a screen, another channel's picture — instead of into
+/// a frame of their own that the composite then reads: at 4K that frame is
+/// ~130 MB written and ~130 MB read again each frame (Max5's wall show:
+/// three taps of a background and two cameras placed on it, a third of the
+/// GPU). The picture comes out as the frame would have held it, but for that
+/// frame's half-float rounding.
+pub struct PlacedOnto {
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    /// Normal, Add, Screen — the blend states of the composite's own
+    /// pipelines (see `Channel::new`).
+    pipelines: [wgpu::RenderPipeline; 3],
+    /// A params buffer for each layer drawn in a frame.
+    params: Vec<wgpu::Buffer>,
+}
+
+/// One layer to draw onto a composite (see [`PlacedOnto::prepare`]).
+pub struct OntoDraw {
+    pipeline: usize,
+    bind_group: wgpu::BindGroup,
+    /// The composite's pixels it can reach.
+    pub parts: Vec<Pixels>,
+}
+
+impl PlacedOnto {
+    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let layout = bind_layout(device);
+        let pipelines = [
+            wgpu::BlendState::ALPHA_BLENDING,
+            super::blit::ADD_BLENDING,
+            super::blit::SCREEN_BLENDING,
+        ]
+        .map(|blend| pipeline(device, &layout, format, "fs_onto", blend));
+        Self {
+            layout,
+            sampler: sampler(device),
+            pipelines,
+            params: Vec::new(),
+        }
+    }
+
+    /// Room for `count` layers drawn in one frame.
+    pub fn ensure_slots(&mut self, device: &wgpu::Device, count: usize) {
+        while self.params.len() < count {
+            self.params.push(params_buffer(device));
+        }
+    }
+
+    /// `placed` from `source`, at `opacity`, blended `onto` a composite of
+    /// `frame` pixels — only where `within` (the parts of it the layer
+    /// shows in) meets the picture. Its params go in `slot`, one a layer
+    /// (see [`Self::ensure_slots`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        slot: usize,
+        placed: &Placed,
+        source: &wgpu::TextureView,
+        frame: (u32, u32),
+        within: Option<&[Pixels]>,
+        opacity: f32,
+        onto: Onto,
+    ) -> OntoDraw {
+        let params = Params {
+            opacity,
+            onto: u32::from(onto != Onto::Normal),
+            ..params_of(placed, frame)
+        };
+        queue.write_buffer(&self.params[slot], 0, bytemuck::bytes_of(&params));
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Placed Onto Bind Group"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(source),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.params[slot].as_entire_binding(),
+                },
+            ],
+        });
+        OntoDraw {
+            pipeline: match onto {
+                Onto::Normal => 0,
+                Onto::Add => 1,
+                Onto::Screen => 2,
+            },
+            bind_group,
+            parts: parts_of(placed, frame, within),
+        }
+    }
+
+    /// Draw `draw` in `pass`, onto the composite it was prepared for.
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, draw: &OntoDraw) {
+        if draw.parts.is_empty() {
+            return;
+        }
+        pass.set_pipeline(&self.pipelines[draw.pipeline]);
+        pass.set_bind_group(0, &draw.bind_group, &[]);
+        draw_within(pass, Some(&draw.parts));
     }
 }
 

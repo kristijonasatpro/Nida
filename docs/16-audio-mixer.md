@@ -233,6 +233,11 @@ rename is not undone by Undo — rename it back. Each bus strip has its fader, m
   each source reaches this bus at its send's level, before its fader, so
   riding a fader for the room leaves this mix as it is (see
   [Sends and monitor mixes](#sends-and-monitor-mixes) below).
+- **Remove the echo of** — for a call's bus, with the room on speakers:
+  pick the bus the room's speakers play, and the microphones sent here
+  arrive with what that bus plays taken out, so the guest does not hear
+  themselves come back (see [Zoom and Teams calls](24-calls.md#the-call-must-not-hear-itself)).
+  Not on a live bus.
 - **Effect** — an Audio Unit plug-in first in the bus's processing (see
   [Plug-ins](#plug-ins-audio-units) below).
 - **Delay** 0–300 ms, to hold the sound back until the picture catches up —
@@ -433,6 +438,7 @@ DELETE /api/audio-buses/{bus}/insert/window          (closes it)
 PUT  /api/audio-sources/{deck-or-input}/gain         {"gain_db": -6}
 PUT  /api/audio-sources/{deck-or-input}/sends/{bus}  {"on": true}   or any of {"on", "gain_db": -6, "mode": "inherit" | "pre" | "post"} (a level never turns a send on)
 PUT  /api/audio-buses/{bus}/pre-fader                {"pre_fader": true}
+PUT  /api/audio-buses/{bus}/echo-room                {"room": "<the room's bus>"}   (null: off)
 PUT  /api/audio-sources/{deck}/auto                  {"auto": true}
 PUT  /api/audio-sources/{deck}/follow                {"bus_uuid": "main"}   (a bus, "main", or null for anywhere)
 PUT  /api/audio-sources/{deck-or-input}/balance      {"balance": -0.5}

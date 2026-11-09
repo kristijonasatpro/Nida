@@ -517,6 +517,7 @@ impl UIData {
             render_width: 1920,
             render_height: 1080,
             render_auto: false,
+            render_hint: None,
             max_render_dimension: 16384,
             target_fps: 60,
             frames_in_flight: 1,

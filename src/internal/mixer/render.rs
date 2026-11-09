@@ -648,6 +648,9 @@ impl Mixer {
         for (idx, channel) in self.channels.iter_mut().enumerate() {
             channel.shown_alone.clone_from(&shown_alone);
             channel.draw_visible_parts = self.draw_visible_parts;
+            channel.direct_layers = self.direct_layers;
+            channel.merge_layer_passes = self.merge_layer_passes;
+            channel.previewed.clone_from(&self.previewed_decks);
             channel.draw_every_deck = merging[idx];
         }
 

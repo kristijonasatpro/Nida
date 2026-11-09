@@ -1,6 +1,6 @@
 [package]
 name = "varda"
-version = "0.9.7"
+version = "0.9.8"
 edition = "2021"
 authors = ["Varda Contributors"]
 description = "Linux, MacOS, and Windows VJ software"
@@ -343,6 +343,10 @@ harness = false
 
 [[bench]]
 name = "shader_params"
+harness = false
+
+[[bench]]
+name = "shader_compilation"
 harness = false
 
 [[bench]]

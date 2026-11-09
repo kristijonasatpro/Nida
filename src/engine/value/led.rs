@@ -203,6 +203,55 @@ impl LedLayout {
         }
     }
 
+    /// Its screens' parts of pictures moved with the pictures' sizes: `sizes`
+    /// gives a source's picture size before and after (the show's size
+    /// changed — Auto, Settings), `None` for one that kept its size. A part is
+    /// in its picture's pixels, so a wall showing the left half of a 4K bus
+    /// showed its left quarter at 1080p, and black past it. Rounded as bus
+    /// canvases are. Whether any part moved.
+    pub fn rescale_parts(
+        &mut self,
+        sizes: impl Fn(&OutputSource) -> Option<((u32, u32), (u32, u32))>,
+    ) -> bool {
+        // To the nearest pixel, halves away from zero (a part may start
+        // left of or above its picture).
+        let scale = |v: i64, from: u32, to: u32| {
+            let (from, to) = (i64::from(from.max(1)), i64::from(to));
+            let n = v * to;
+            let r = (n.abs() + from / 2) / from;
+            if n < 0 {
+                -r
+            } else {
+                r
+            }
+        };
+        let mut moved = false;
+        for screen in &mut self.screens {
+            let LedFit::Part {
+                x,
+                y,
+                width,
+                height,
+            } = screen.fit
+            else {
+                continue;
+            };
+            let Some((from, to)) = sizes(&screen.source).filter(|(from, to)| from != to) else {
+                continue;
+            };
+            let at = |v: i64| i32::try_from(v).unwrap_or(if v < 0 { i32::MIN } else { i32::MAX });
+            let size = |v: i64| u32::try_from(v.max(1)).map_or(MAX_LED_PIXELS, |v| v.min(MAX_LED_PIXELS));
+            screen.fit = LedFit::Part {
+                x: at(scale(i64::from(x), from.0, to.0)),
+                y: at(scale(i64::from(y), from.1, to.1)),
+                width: size(scale(i64::from(width), from.0, to.0)),
+                height: size(scale(i64::from(height), from.1, to.1)),
+            };
+            moved = true;
+        }
+        moved
+    }
+
     /// What is wrong with the layout, if anything, in words for the operator.
     pub fn problem(&self) -> Option<String> {
         let in_range = |v: u32| (1..=MAX_LED_PIXELS).contains(&v);
@@ -510,5 +559,51 @@ mod tests {
         });
         assert_eq!(layout.screens[0].uuid, "id1");
         assert_eq!(layout.screens[1].name, "Screen 2");
+    }
+
+    /// The show's size changed: parts move with their pictures — Main's and
+    /// each bus's by its own sizes — and a 4K → 1080p → 4K round trip
+    /// comes back where it was. Fitted screens and unchanged pictures stay.
+    #[test]
+    fn parts_follow_their_pictures_size() {
+        let part = |x, y, width, height| LedFit::Part {
+            x,
+            y,
+            width,
+            height,
+        };
+        let mut layout = LedLayout {
+            feed: HD,
+            screens: vec![
+                screen([1920, 688], [0, 0], part(0, 736, 3840, 1376)),
+                screen([300, 300], [0, 700], part(-100, 20, 600, 600)),
+                LedScreen {
+                    fit: part(10, 10, 100, 100),
+                    ..LedScreen::new("B", [100, 100], [500, 700], OutputSource::BusProgram("b1".into()))
+                },
+                screen([400, 300], [800, 700], LedFit::Fit),
+            ],
+            test_card: false,
+        };
+        let at = layout.clone();
+        let down = |source: &OutputSource| match source {
+            OutputSource::Master => Some(((3840, 2160), (1920, 1080))),
+            _ => None,
+        };
+        assert!(layout.rescale_parts(down));
+        assert_eq!(layout.screens[0].fit, part(0, 368, 1920, 688));
+        assert_eq!(layout.screens[1].fit, part(-50, 10, 300, 300));
+        assert_eq!(layout.screens[2].fit, at.screens[2].fit, "its bus kept its size");
+        assert_eq!(layout.screens[3].fit, LedFit::Fit);
+        let up = |source: &OutputSource| match source {
+            OutputSource::Master => Some(((1920, 1080), (3840, 2160))),
+            OutputSource::BusProgram(_) => Some(((1000, 500), (2000, 1000))),
+            _ => None,
+        };
+        assert!(layout.rescale_parts(up));
+        assert_eq!(layout.screens[0].fit, at.screens[0].fit, "back where it was");
+        assert_eq!(layout.screens[1].fit, at.screens[1].fit);
+        assert_eq!(layout.screens[2].fit, part(20, 20, 200, 200), "by its bus's own sizes");
+        assert!(!layout.rescale_parts(|_| None), "nothing changed size");
     }
 }

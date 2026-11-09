@@ -1,22 +1,21 @@
 //! System monitor — lightweight CPU & RAM usage sampling.
 //!
-//! Samples are taken at a configurable interval (default 1s) to avoid
-//! the cost of querying sysinfo every frame. The latest values are
-//! exposed via simple getters for the snapshot pipeline.
+//! Samples are taken once a second on a thread of their own: asking the
+//! system — its processors, its memory, the GPU's I/O Registry entries and
+//! every one of their clients — waits on it, and the show's thread, which
+//! asked every second, must not. The latest values are exposed via simple
+//! getters for the snapshot pipeline.
 
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::System;
 
 /// How often to re-sample CPU/RAM (default: 1 second).
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Lightweight system resource monitor.
-///
-/// Call `update()` every frame — it only actually re-samples when
-/// `SAMPLE_INTERVAL` has elapsed since the last sample.
-pub struct SystemMonitor {
-    sys: System,
-    last_sample: Instant,
+/// What one look at the system found.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Sample {
     /// CPU usage as a percentage (0–100), averaged across all cores.
     cpu_usage: f32,
     /// Total physical RAM in bytes.
@@ -29,12 +28,64 @@ pub struct SystemMonitor {
     /// Nida's own share of the GPU (0–100), as Activity Monitor reads it:
     /// its GPU time gone by since the last look, over the time gone by.
     nida_gpu: Option<f32>,
-    /// Nida's GPU time so far (nanoseconds) by client counter, and when it
-    /// was read.
-    nida_gpu_time: Option<(GpuTimes, Instant)>,
     /// Nida's own memory, in bytes (its physical footprint, as Activity
     /// Monitor's Memory column).
     nida_ram: Option<u64>,
+}
+
+/// The sampling thread's own: the system as last refreshed, and Nida's GPU
+/// time at the last look.
+struct Sampler {
+    sys: System,
+    /// Nida's GPU time so far (nanoseconds) by client counter, and when it
+    /// was read.
+    nida_gpu_time: Option<(GpuTimes, Instant)>,
+}
+
+impl Sampler {
+    fn new() -> Self {
+        Self {
+            sys: System::new(),
+            nida_gpu_time: None,
+        }
+    }
+
+    /// Look at the system now.
+    fn sample(&mut self) -> Sample {
+        self.sys.refresh_cpu_usage();
+        self.sys.refresh_memory();
+        let now = Instant::now();
+        let mut nida_gpu = None;
+        if let Some(times) = own_gpu_time() {
+            if let Some((before, at)) = &self.nida_gpu_time {
+                let spent = gpu_time_spent(before, &times) as f64;
+                let gone = now.duration_since(*at).as_nanos().max(1) as f64;
+                nida_gpu = Some(((spent / gone) * 100.0).clamp(0.0, 100.0) as f32);
+            }
+            self.nida_gpu_time = Some((times, now));
+        }
+        Sample {
+            cpu_usage: SystemMonitor::avg_cpu(&self.sys),
+            ram_total: self.sys.total_memory(),
+            ram_used: self.sys.used_memory(),
+            gpu_busy: gpu_busy_now(),
+            nida_gpu,
+            nida_ram: own_footprint(),
+        }
+    }
+}
+
+/// Lightweight system resource monitor.
+///
+/// Call `update()` every frame — it takes the thread's latest sample, if
+/// it can without waiting, and never asks the system itself.
+pub struct SystemMonitor {
+    /// The latest sample taken in.
+    latest: Sample,
+    /// Where the thread puts each sample.
+    shared: Arc<Mutex<Sample>>,
+    /// Dropped with the monitor: the thread then ends.
+    _stop: mpsc::Sender<()>,
 }
 
 impl Default for SystemMonitor {
@@ -45,87 +96,77 @@ impl Default for SystemMonitor {
 
 impl SystemMonitor {
     pub fn new() -> Self {
-        let mut sys = System::new();
-        // Initial refresh to populate baseline
-        sys.refresh_cpu_usage();
-        sys.refresh_memory();
-
-        let cpu_usage = Self::avg_cpu(&sys);
-        let ram_total = sys.total_memory();
-        let ram_used = sys.used_memory();
-
+        let shared = Arc::new(Mutex::new(Sample::default()));
+        let (stop, stopped) = mpsc::channel::<()>();
+        let into = Arc::clone(&shared);
+        let started = std::thread::Builder::new()
+            .name("system-monitor".into())
+            .spawn(move || {
+                let mut sampler = Sampler::new();
+                loop {
+                    let sample = sampler.sample();
+                    if let Ok(mut shared) = into.lock() {
+                        *shared = sample;
+                    }
+                    match stopped.recv_timeout(SAMPLE_INTERVAL) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        _ => break,
+                    }
+                }
+            });
+        if let Err(e) = started {
+            log::warn!("CPU, memory and GPU use are not watched: their thread did not start ({e})");
+        }
         Self {
-            sys,
-            last_sample: Instant::now(),
-            cpu_usage,
-            ram_total,
-            ram_used,
-            gpu_busy: gpu_busy_now(),
-            nida_gpu: None,
-            nida_gpu_time: own_gpu_time().map(|t| (t, Instant::now())),
-            nida_ram: own_footprint(),
+            latest: Sample::default(),
+            shared,
+            _stop: stop,
         }
     }
 
-    /// Call every frame. Only re-samples when the interval has elapsed.
+    /// Call every frame: takes the latest sample, never waiting for it.
     pub fn update(&mut self) {
-        if self.last_sample.elapsed() >= SAMPLE_INTERVAL {
-            self.sys.refresh_cpu_usage();
-            self.sys.refresh_memory();
-            self.cpu_usage = Self::avg_cpu(&self.sys);
-            self.ram_total = self.sys.total_memory();
-            self.ram_used = self.sys.used_memory();
-            self.gpu_busy = gpu_busy_now();
-            let now = Instant::now();
-            if let Some(times) = own_gpu_time() {
-                if let Some((before, at)) = &self.nida_gpu_time {
-                    let spent = gpu_time_spent(before, &times) as f64;
-                    let gone = now.duration_since(*at).as_nanos().max(1) as f64;
-                    self.nida_gpu = Some(((spent / gone) * 100.0).clamp(0.0, 100.0) as f32);
-                }
-                self.nida_gpu_time = Some((times, now));
-            }
-            self.nida_ram = own_footprint();
-            self.last_sample = now;
+        if let Ok(shared) = self.shared.try_lock() {
+            self.latest = *shared;
         }
     }
 
     /// CPU usage % (0–100), averaged across all cores.
     pub fn cpu_usage(&self) -> f32 {
-        self.cpu_usage
+        self.latest.cpu_usage
     }
 
     /// The GPU's busy share (0–100) as the OS reports it; `None` where it
     /// does not.
     pub fn gpu_busy(&self) -> Option<f32> {
-        self.gpu_busy
+        self.latest.gpu_busy
     }
 
     /// Nida's own share of the GPU (0–100), as Activity Monitor reads it;
     /// `None` where the OS does not say.
     pub fn nida_gpu(&self) -> Option<f32> {
-        self.nida_gpu
+        self.latest.nida_gpu
     }
 
     /// Nida's own memory in bytes (its footprint); `None` where unknown.
     pub fn nida_ram(&self) -> Option<u64> {
-        self.nida_ram
+        self.latest.nida_ram
     }
 
     /// Total physical RAM in bytes.
     pub fn ram_total(&self) -> u64 {
-        self.ram_total
+        self.latest.ram_total
     }
 
     /// Used physical RAM in bytes.
     pub fn ram_used(&self) -> u64 {
-        self.ram_used
+        self.latest.ram_used
     }
 
     /// RAM usage as a percentage (0–100).
     pub fn ram_usage_pct(&self) -> f32 {
-        if self.ram_total > 0 {
-            (self.ram_used as f64 / self.ram_total as f64 * 100.0) as f32
+        if self.latest.ram_total > 0 {
+            (self.latest.ram_used as f64 / self.latest.ram_total as f64 * 100.0) as f32
         } else {
             0.0
         }
@@ -475,7 +516,13 @@ mod tests {
 
     #[test]
     fn system_monitor_initial_values() {
-        let mon = SystemMonitor::new();
+        let mut mon = SystemMonitor::new();
+        // The first sample comes from the monitor's thread.
+        let until = Instant::now() + Duration::from_secs(10);
+        while mon.ram_total() == 0 && Instant::now() < until {
+            mon.update();
+            std::thread::sleep(Duration::from_millis(10));
+        }
         // CPU usage should be between 0 and 100
         assert!(mon.cpu_usage() >= 0.0);
         assert!(mon.cpu_usage() <= 100.0);
@@ -486,6 +533,27 @@ mod tests {
         // Percentage should be in range
         assert!(mon.ram_usage_pct() >= 0.0);
         assert!(mon.ram_usage_pct() <= 100.0);
+    }
+
+    /// The frame's update takes what the thread found if it can, and goes
+    /// on at once if it cannot: it never waits on the system, nor on the
+    /// thread.
+    #[test]
+    fn update_never_waits_on_the_sampling_thread() {
+        let mut mon = SystemMonitor::new();
+        let shared = Arc::clone(&mon.shared);
+        let held = shared.lock().unwrap();
+        let updating = std::thread::spawn(move || {
+            mon.update();
+            mon
+        });
+        let until = Instant::now() + Duration::from_secs(2);
+        while !updating.is_finished() {
+            assert!(Instant::now() < until, "update waited for the sample");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(held);
+        updating.join().unwrap();
     }
 
     #[test]

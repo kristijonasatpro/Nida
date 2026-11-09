@@ -53,6 +53,9 @@ pub struct UIRunner {
     /// The channels whose picture — the channel's, or a layer's of it — the
     /// windows drew last frame (see `visible_tiles`).
     visible_tiles: Vec<usize>,
+    /// The decks whose thumbnails the windows drew last frame, by UUID (see
+    /// `previewed_decks`).
+    previewed_decks: Vec<String>,
     /// The channels the UI showed big or under the pointer last frame, by
     /// UUID (see `UISession::shown_full`): drawn at the show's rate.
     shown_full: Vec<String>,
@@ -131,6 +134,11 @@ pub struct UIRunner {
     /// What was done to it, to tell the show.
     screen_rate_kept: Option<crate::screen_rate::Kept>,
     night_shift: crate::night_shift::NightShift,
+    /// Night Shift as the show last asked: outputs on screens, and keeping
+    /// it off for them wanted (see `keep_night_shift`).
+    night_shift_asked: Option<(bool, bool)>,
+    /// What was done to Night Shift, to tell the show.
+    night_shift_kept: Option<crate::night_shift::Kept>,
     /// Shows opened lately, for the Show menu.
     recent_shows: std::sync::Arc<Vec<std::path::PathBuf>>,
     /// The show folder the window is named after (see `show_changed`).
@@ -275,6 +283,7 @@ impl UIRunner {
             preview_encoder: None,
             textures_drawn: std::collections::HashSet::new(),
             visible_tiles: Vec::new(),
+            previewed_decks: Vec::new(),
             shown_full: Vec::new(),
             hold_notes: Vec::new(),
             long_hold_reported: None,
@@ -306,6 +315,8 @@ impl UIRunner {
             screen_rate_asked: None,
             screen_rate_kept: None,
             night_shift: crate::night_shift::NightShift::default(),
+            night_shift_asked: None,
+            night_shift_kept: None,
             recent_shows: std::sync::Arc::default(),
             named_after: std::path::PathBuf::new(),
             // A test's runner never reads or writes this computer's Recent
@@ -717,6 +728,20 @@ fn visible_tiles(
     seen
 }
 
+/// The decks, by UUID, whose thumbnails were among the textures `drawn`.
+fn previewed_decks(
+    drawn: &std::collections::HashSet<egui::TextureId>,
+    deck_textures: &std::collections::HashMap<String, egui::TextureId>,
+) -> Vec<String> {
+    let mut seen: Vec<String> = deck_textures
+        .iter()
+        .filter(|(_, texture)| drawn.contains(texture))
+        .map(|(uuid, _)| uuid.clone())
+        .collect();
+    seen.sort_unstable();
+    seen
+}
+
 /// The share of its pixels a window on `monitor` is drawn at: on a scaled
 /// display mode — a 4K panel set to look like 2560×1440 is drawn at
 /// 5120×2880 and scaled down by macOS — the panel's own pixels, no more
@@ -1034,6 +1059,7 @@ impl UIRunner {
         // And the tiles shown: an off-air input is drawn for its tile only
         // while it is seen.
         varda.set_tile_channels(self.visible_tiles.clone());
+        varda.set_previewed_decks(self.previewed_decks.clone());
         varda.set_ui_selected_deck(self.layout.selected_deck);
 
         // GPU render (mixer compositing)
@@ -1095,6 +1121,7 @@ impl UIRunner {
             return;
         };
         self.keep_screen_rate();
+        self.keep_night_shift();
         let Some(window) = self.window else { return };
         self.stall_for_test();
 
@@ -1319,6 +1346,19 @@ impl UIRunner {
         }
     }
 
+    /// Night Shift off while an output is on a screen, or given back (see
+    /// `night_shift`), asked of macOS without the show held: every few
+    /// seconds it asked macOS's display service with the show waiting on
+    /// the control window. Told to the show next time.
+    fn keep_night_shift(&mut self) {
+        let Some((outputs, on)) = self.night_shift_asked.take() else {
+            return;
+        };
+        if let Some(kept) = self.night_shift.keep(outputs, on) {
+            self.night_shift_kept = Some(kept);
+        }
+    }
+
     /// The Main and Preview monitors' next frames (see `monitor_frames`):
     /// say what the window shows — the cued input, the sizes drawn — and
     /// step each to the frame after the one it showed.
@@ -1451,11 +1491,10 @@ impl UIRunner {
                 varda.note_screen_rate(&kept);
             }
             // Night Shift off while an output is on a screen (see
-            // `night_shift`).
-            if let Some(kept) = self
-                .night_shift
-                .keep(varda.outputs_on_screens(), varda.night_shift_off())
-            {
+            // `night_shift`): asked of macOS after the show is let go (see
+            // `keep_night_shift`), what was done told here the time after.
+            self.night_shift_asked = Some((varda.outputs_on_screens(), varda.night_shift_off()));
+            if let Some(kept) = self.night_shift_kept.take() {
                 varda.note_night_shift(kept);
             }
             #[cfg(feature = "html")]
@@ -2077,6 +2116,8 @@ impl UIRunner {
                 varda.mixer_ref().channels(),
             );
             varda.set_tile_channels(self.visible_tiles.clone());
+            self.previewed_decks = previewed_decks(&self.textures_drawn, &self.deck_preview_textures);
+            varda.set_previewed_decks(self.previewed_decks.clone());
             varda.set_ui_selected_deck(self.layout.selected_deck);
             self.selection_anchor = self.layout.anchor(&super::state::ChannelOrder::of(
                 varda.mixer_ref().channels(),

@@ -102,6 +102,38 @@ const NATIVE_STUCK_MS: u64 = 3000;
 /// their own, and the app goes on.
 const NATIVE_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Hand `pieces` to a thread named `name` that winds them down with
+/// `wind_down` — joins, waits — so the caller waits for none of it. Handed
+/// over only once the thread runs: should none start, `let_go` lets them
+/// go without waiting either (dropped as they are, some would wait).
+fn wind_down_elsewhere<T: Send + 'static>(
+    name: String,
+    pieces: T,
+    wind_down: impl FnOnce(T) + Send + 'static,
+    let_go: impl FnOnce(T),
+) {
+    let (hand, handed) = mpsc::channel::<T>();
+    let spawned = std::thread::Builder::new().name(name).spawn(move || {
+        if let Ok(pieces) = handed.recv() {
+            wind_down(pieces);
+        }
+    });
+    match spawned {
+        Ok(_) => {
+            let _ = hand.send(pieces);
+        }
+        Err(e) => {
+            log::warn!("No thread to wind an output down ({e}): its pieces end on their own");
+            let_go(pieces);
+        }
+    }
+}
+
+/// How long a stop waits for ffmpeg, killed, to be gone: long enough for a
+/// process that ends at once — the port it listened on free again for one
+/// started after it — and no longer.
+const REAP_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Join `threads` on a thread of its own, waiting up to `wait`: whether they
 /// all ended in time. Those that did not are left to end on their own.
 fn join_within(threads: Vec<std::thread::JoinHandle<()>>, wait: std::time::Duration) -> bool {
@@ -942,7 +974,8 @@ fn write_stream_player(dir: &str, kind: &str, manifest_filename: &str, low_laten
 /// This prevents the render thread from blocking when ffmpeg's stdin pipe is full
 /// (e.g. SRT listener waiting for a client connection).
 pub struct FfmpegSubprocess {
-    child: Child,
+    /// The ffmpeg process; taken by `stop`, which waits for it elsewhere.
+    child: Option<Child>,
     /// Channel sender for frames, with when each was drawn → writer thread
     frame_tx: Option<mpsc::SyncSender<(std::time::Instant, Vec<u8>)>>,
     /// Writer thread handle
@@ -2091,6 +2124,13 @@ impl AudioPipe {
             .is_none_or(std::thread::JoinHandle::is_finished)
     }
 
+    /// Tell the writer to stop and let it end on its own, waiting for
+    /// nothing: for when no thread is to be had to wait for it.
+    fn let_go(&mut self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        self.writer_thread.take();
+    }
+
     /// Tear down the writer thread. Idempotent. Setting `shutting_down` unblocks
     /// a pending accept-poll (~20ms) or `recv_timeout` drain (~100ms).
     fn stop(&mut self) {
@@ -2328,7 +2368,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, path.to_string())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -2441,7 +2481,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, url.to_string())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -2560,7 +2600,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, name.to_string())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -2670,7 +2710,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, label.clone())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -2908,7 +2948,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, label.clone())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: Some(fanout),
             native,
@@ -3089,7 +3129,7 @@ impl FfmpegSubprocess {
         };
         let audio = finalize_audio(prepared, label.clone())?;
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -3120,7 +3160,9 @@ impl FfmpegSubprocess {
     /// Kill ffmpeg abruptly, as a crash would — for tests of what survives.
     #[doc(hidden)]
     pub fn kill_process(&mut self) {
-        let _ = self.child.kill();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
     }
 
     /// The stream's destinations, when this is the stream's encoder.
@@ -3134,7 +3176,10 @@ impl FfmpegSubprocess {
         !self.stopped
             && !self.write_failed.load(Ordering::SeqCst)
             && !self.native.as_ref().is_some_and(|n| n.shared.stuck())
-            && matches!(self.child.try_wait(), Ok(None))
+            && self
+                .child
+                .as_mut()
+                .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
     }
 
     /// Whether this stream's video rate changes while live — to follow the
@@ -3270,7 +3315,7 @@ impl FfmpegSubprocess {
         let audio = finalize_audio(prepared, name.to_string())?;
 
         Ok(Self {
-            child,
+            child: Some(child),
             stderr_tail,
             fanout: None,
             rate_plan: None,
@@ -3397,7 +3442,11 @@ impl FfmpegSubprocess {
             return false;
         }
         // Check if ffmpeg already exited (non-blocking)
-        if let Some(status) = self.child.try_wait().ok().flatten() {
+        if let Some(status) = self
+            .child
+            .as_mut()
+            .and_then(|child| child.try_wait().ok().flatten())
+        {
             if !status.success() {
                 self.drain_stderr();
                 log::error!(
@@ -3465,25 +3514,19 @@ impl FfmpegSubprocess {
         if self.graceful_shutdown {
             // --- Recording path: finalize on a background thread ---
             // Move all owned resources out of `self` so the thread owns them.
-            let mut audio = self.audio.take();
+            let audio = self.audio.take();
             let writer_thread = self.writer_thread.take();
-            let mut child = std::mem::replace(
-                &mut self.child,
-                // Placeholder — never used again (stopped == true).
-                Command::new("true")
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .expect("failed to spawn placeholder"),
-            );
+            let Some(child) = self.child.take() else {
+                return;
+            };
             let label = self.label.clone();
             let counters = self.counters.clone();
             let stderr = self.stderr_tail.clone();
 
-            std::thread::Builder::new()
-                .name(format!("ffmpeg-finalize-{label}"))
-                .spawn(move || {
+            wind_down_elsewhere(
+                format!("ffmpeg-finalize-{label}"),
+                (audio, writer_thread, child),
+                move |(mut audio, writer_thread, mut child)| {
                     const FINALIZE_TIMEOUT: std::time::Duration =
                         std::time::Duration::from_secs(30);
 
@@ -3558,70 +3601,104 @@ impl FfmpegSubprocess {
                         ),
                         duration.as_secs_f32()
                     );
-                })
-                .expect("failed to spawn ffmpeg finalize thread");
+                },
+                // The writers told to stop and left to: ffmpeg, its inputs
+                // ended, finishes the file by itself.
+                |(mut audio, _writer, _child)| {
+                    if let Some(audio) = audio.as_mut() {
+                        audio.let_go();
+                    }
+                },
+            );
         } else {
-            // --- Streaming path: kill immediately (inline, fast) ---
+            // --- Streaming path: killed now, the rest on a thread ---
 
             // 3. Kill ffmpeg BEFORE joining the writer thread. The writer
             //    thread may be blocked on stdin.write_all() (e.g. SRT listener
             //    with a full pipe buffer). Killing the child breaks the pipe,
             //    which unblocks the write and lets the thread exit.
-            let _ = self.child.kill();
-
-            // 3b. Tear down the audio side-channel (socket + writer thread).
-            //     Done after the kill so a writer blocked on a full socket sees
-            //     a broken pipe.
-            if let Some(audio) = self.audio.as_mut() {
-                audio.stop();
-            }
-
-            // 4. Now safe to join — the writer thread will see a broken pipe
-            //    or a closed channel and exit promptly. An encoder in Nida
-            //    ends its session there, and the thread writing what it made
-            //    ends after it — waited for only so long, off this thread:
-            //    an engine that has stopped may never let it end.
-            if let Some(native) = self.native.as_mut() {
-                let threads: Vec<_> = self
-                    .writer_thread
-                    .take()
-                    .into_iter()
-                    .chain(native.output.take())
-                    .collect();
-                if !join_within(threads, NATIVE_STOP_WAIT) {
-                    log::warn!(
-                        "The stream's encoder in Nida did not end within {} s; left to end on its own",
-                        NATIVE_STOP_WAIT.as_secs()
-                    );
+            let mut child = self.child.take();
+            if let Some(process) = child.as_mut() {
+                let _ = process.kill();
+                // Gone at once, as a killed process is: reaped here, so a
+                // stream started right after it finds its port free.
+                let until = std::time::Instant::now() + REAP_WAIT;
+                while std::time::Instant::now() < until {
+                    if !matches!(process.try_wait(), Ok(None)) {
+                        child = None;
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
-            } else if let Some(handle) = self.writer_thread.take() {
-                let _ = handle.join();
             }
-
-            // 5. Reap the child process
-            let _ = self.child.wait();
-
-            // 6. The encoder is gone, so its destinations have seen the last
-            //    of the stream: let each finish sending and hang up.
-            if let Some(mut fanout) = self.fanout.take() {
-                fanout.stop();
-            }
-
-            let frames = self.counters.written.load(Ordering::Relaxed);
-            let padded = self.counters.padded.load(Ordering::Relaxed);
-            let left_out = self.counters.left_out.load(Ordering::Relaxed);
-            self.drain_stderr();
-            log::info!(
-                "ffmpeg finished: {} ({} frames{}, {:.1}s)",
-                self.label,
-                frames,
-                Self::timeline_summary(
-                    padded,
-                    left_out,
-                    self.counters.skipped.load(Ordering::Relaxed),
-                    self.counters.held.load(Ordering::Relaxed),
-                ),
-                duration.as_secs_f32()
+            // What waits — the writers, ffmpeg's end, the destinations —
+            // waits on a thread of its own. A stream stops on the show's
+            // thread (Stop, or started afresh after the network went), and
+            // waiting there for an encoder in Nida to end its session held
+            // the show up for as long as two seconds.
+            let audio = self.audio.take();
+            let writer_thread = self.writer_thread.take();
+            let native_output = self.native.as_mut().map(|native| native.output.take());
+            let fanout = self.fanout.take();
+            let label = self.label.clone();
+            let counters = self.counters.clone();
+            let stderr = self.stderr_tail.clone();
+            wind_down_elsewhere(
+                format!("ffmpeg-stop-{label}"),
+                (audio, writer_thread, native_output, child, fanout),
+                move |(mut audio, writer_thread, native_output, child, fanout)| {
+                    // 3b. Tear down the audio side-channel (socket + writer
+                    //     thread). Done after the kill so a writer blocked on
+                    //     a full socket sees a broken pipe.
+                    if let Some(audio) = audio.as_mut() {
+                        audio.stop();
+                    }
+                    // 4. Now safe to join — the writer thread will see a
+                    //    broken pipe or a closed channel and exit promptly.
+                    //    An encoder in Nida ends its session there, and the
+                    //    thread writing what it made ends after it — waited
+                    //    for only so long: an engine that has stopped may
+                    //    never let it end.
+                    if let Some(output) = native_output {
+                        let threads: Vec<_> = writer_thread.into_iter().chain(output).collect();
+                        if !join_within(threads, NATIVE_STOP_WAIT) {
+                            log::warn!(
+                                "The stream's encoder in Nida did not end within {} s; left to end on its own",
+                                NATIVE_STOP_WAIT.as_secs()
+                            );
+                        }
+                    } else if let Some(handle) = writer_thread {
+                        let _ = handle.join();
+                    }
+                    // 5. Reap the child process
+                    if let Some(mut child) = child {
+                        let _ = child.wait();
+                    }
+                    // 6. The encoder is gone, so its destinations have seen
+                    //    the last of the stream: let each finish sending and
+                    //    hang up.
+                    if let Some(mut fanout) = fanout {
+                        fanout.stop();
+                    }
+                    stderr.log(&label);
+                    log::info!(
+                        "ffmpeg finished: {} ({} frames{}, {:.1}s)",
+                        label,
+                        counters.written.load(Ordering::Relaxed),
+                        Self::timeline_summary(
+                            counters.padded.load(Ordering::Relaxed),
+                            counters.left_out.load(Ordering::Relaxed),
+                            counters.skipped.load(Ordering::Relaxed),
+                            counters.held.load(Ordering::Relaxed),
+                        ),
+                        duration.as_secs_f32()
+                    );
+                },
+                |(mut audio, ..)| {
+                    if let Some(audio) = audio.as_mut() {
+                        audio.let_go();
+                    }
+                },
             );
         }
     }
@@ -4617,6 +4694,52 @@ mod tests {
 
         // Stop cleanly
         sub.stop();
+    }
+
+    /// Stopping a stream — on the show's thread: Stop, or started afresh
+    /// after the network went — does not wait for its writers to end: a
+    /// writer that takes its time is waited for elsewhere.
+    #[test]
+    fn a_stream_stops_without_waiting_for_its_writers() {
+        if !ffmpeg_available() {
+            eprintln!("Skipping test: ffmpeg not available");
+            return;
+        }
+        let mut sub = FfmpegSubprocess::spawn_srt(
+            "srt://127.0.0.1:19877",
+            &crate::renderer::context::SrtCodec::H264,
+            PresentationRequest::default(),
+            64,
+            64,
+            30,
+            None,
+        )
+        .expect("failed to spawn SRT");
+        let (ended, ending) = mpsc::channel();
+        sub.writer_thread = Some(std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let _ = ended.send(());
+        }));
+        #[cfg(unix)]
+        let pid = sub.child.as_ref().map(Child::id).expect("ffmpeg running");
+        let start = std::time::Instant::now();
+        sub.stop();
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "stop waited for the writer: {:?}",
+            start.elapsed()
+        );
+        // ffmpeg itself gone already — reaped, not a zombie — so a stream
+        // started right after finds its port free.
+        #[cfg(unix)]
+        {
+            let pid = libc::pid_t::try_from(pid).unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "ffmpeg still there");
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
+        ending
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the writer ended on its own");
     }
 
     /// Each dropped frame counts its own slot, at the pace the show runs

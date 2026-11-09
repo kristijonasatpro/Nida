@@ -23,8 +23,7 @@ fn send_cmd(app: &mut VardaApp, cmd: EngineCommand) -> CommandResult {
     let tx = app.command_sender();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     tx.send((cmd, Some(reply_tx))).unwrap();
-    app.process_commands();
-    reply_rx.blocking_recv().unwrap()
+    varda::testing::reply_of(app, reply_rx)
 }
 
 #[allow(clippy::needless_pass_by_value)] // Takes the reply straight from `send_cmd`.
@@ -483,4 +482,61 @@ fn the_status_gives_the_files_own_rate() {
     let status = app.record_status();
     ok(send_cmd(&mut app, EngineCommand::StopRecording));
     assert_eq!(status.file_fps, 30, "{status:?}");
+}
+
+/// Starting a recording never waits for its encoder on the show's thread —
+/// ffmpeg and the media engine's session (80 ms for the first REC after a
+/// launch, measured) are started on a thread of their own and taken in on a
+/// later frame; the reply waits for them, and says Ok once the file is open.
+#[test]
+fn starting_a_recording_never_waits_for_its_encoder() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let Some(mut app) = app() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let options = RecordOptions {
+        folder: dir.path().join("takes"),
+        size: Some((640, 360)),
+        ..RecordOptions::default()
+    };
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::SetRecordOptions { options },
+    ));
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    app.command_sender()
+        .send((EngineCommand::StartRecording, Some(reply_tx)))
+        .unwrap();
+    app.process_commands();
+    assert!(
+        matches!(
+            reply_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "not answered in the frame it was asked in: its encoder starts elsewhere"
+    );
+    // Starting, said so — not the red of a recording under way.
+    let status = app.record_status();
+    assert!(
+        status.recording && status.starting && !status.is_healthy(),
+        "{status:?}"
+    );
+    // Asked again while it starts: both answered once it runs.
+    let (again_tx, again_rx) = tokio::sync::oneshot::channel();
+    app.command_sender()
+        .send((EngineCommand::StartRecording, Some(again_tx)))
+        .unwrap();
+    ok(varda::testing::reply_of(&mut app, reply_rx));
+    ok(varda::testing::reply_of(&mut app, again_rx));
+    // The file's size is looked up every two seconds, from when it opened.
+    let until = Instant::now() + Duration::from_secs(10);
+    while app.record_status().bytes == 0 && Instant::now() < until {
+        run(&mut app, 0.5);
+    }
+    let status = app.record_status();
+    assert!(status.recording && !status.starting && status.bytes > 0, "{status:?}");
+    ok(send_cmd(&mut app, EngineCommand::StopRecording));
 }

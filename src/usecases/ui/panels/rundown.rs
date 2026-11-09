@@ -2077,6 +2077,7 @@ mod tests {
             signal_db: [-96.0, -96.0],
             peak_db: [-96.0;2],
             refused: None,
+            echo: Vec::new(),
             send_settings: std::collections::BTreeMap::default(),
             sent_before: Vec::new(),
         };
@@ -2397,6 +2398,7 @@ mod tests {
             signal_db: [-96.0, -96.0],
             peak_db: [-96.0; 2],
             refused: None,
+            echo: Vec::new(),
             send_settings: std::collections::BTreeMap::default(),
             sent_before: Vec::new(),
         }];

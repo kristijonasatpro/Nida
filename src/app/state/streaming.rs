@@ -54,6 +54,9 @@ pub(crate) struct Streaming {
     /// Nida; kept over a restart of the encoder, which starts at the rate the
     /// upload carried rather than at the one that was too much for it.
     rate: Option<RateControl>,
+    /// The encoder being started on a thread of its own (see
+    /// `EncoderStart`), and the destinations as it was started with them.
+    starting: Option<(super::outputs::EncoderStart, Vec<StreamDestination>)>,
 }
 
 /// What a destination lost to a slow upload under the stream's earlier
@@ -429,7 +432,7 @@ impl super::super::VardaApp {
         self.streaming.drops.clear();
         // A new stream starts at the rate set.
         self.streaming.rate = None;
-        if let Err(message) = self.spawn_stream_encoder() {
+        if let Err(message) = self.spawn_stream_encoder(false) {
             self.release_stream_output();
             return CommandResult::Err {
                 code: ErrorCode::InternalError,
@@ -454,8 +457,41 @@ impl super::super::VardaApp {
         CommandResult::Ok
     }
 
+    /// Start the stream for a command over the bus: `reply` answered once
+    /// its encoder runs — or failed — rather than as it is asked for.
+    pub(crate) fn start_stream_for_command(&mut self, reply: Option<crate::app::Reply>) {
+        let result = self.cmd_start_stream();
+        match (&result, self.streaming.starting.as_mut()) {
+            (CommandResult::Ok, Some((start, _))) => start.replies.extend(reply),
+            _ => {
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
+            }
+        }
+    }
+
+    /// Answer whoever waits for the stream to start: Nida is quitting.
+    pub(crate) fn refuse_stream_start(&mut self) {
+        if let Some((start, _)) = self.streaming.starting.as_mut() {
+            start.answer(&CommandResult::Err {
+                code: ErrorCode::Unavailable,
+                message: "Nida is quitting".into(),
+            });
+        }
+    }
+
     /// Stop the encoder and give back its audio.
     fn release_stream_output(&mut self) {
+        if let Some((mut start, _)) = self.streaming.starting.take() {
+            start.answer(&CommandResult::Err {
+                code: ErrorCode::Unavailable,
+                message: "The stream was stopped before it started".into(),
+            });
+            if let Some(pass) = start.passthrough.take() {
+                pass.release(&mut self.audio_manager);
+            }
+        }
         for output in self.streaming.output.drain(..) {
             if let UnifiedOutput::Headless(mut h) = output {
                 if let Some(mut sub) = h.subprocess.take() {
@@ -495,13 +531,15 @@ impl super::super::VardaApp {
         }
     }
 
-    fn spawn_stream_encoder(&mut self) -> Result<(), String> {
+    /// (Re)start the stream's encoder, with a fresh audio tap — on a thread
+    /// of its own, taken in once there (see [`Self::take_started_stream`]).
+    /// `again`: after the last one stopped.
+    fn spawn_stream_encoder(&mut self, again: bool) -> Result<(), String> {
         let Self {
             streaming,
             audio_manager,
             audio_mix,
             session,
-            context,
             target_fps,
             ..
         } = self;
@@ -522,6 +560,7 @@ impl super::super::VardaApp {
             }
             old.stop();
         }
+        h.active = false;
         if let Some(stale) = h.audio_pcm.take() {
             stale.release(audio_manager);
         }
@@ -537,15 +576,69 @@ impl super::super::VardaApp {
         );
         // Frames go to the encoder as NV12 made on the GPU where they can.
         let fps = encoder_fps(*target_fps);
-        match crate::renderer::FfmpegSubprocess::spawn_stream_with(
-            &streaming.settings,
-            h.presentation_request,
-            (h.width, h.height),
+        let settings = streaming.settings.clone();
+        let destinations = settings.destinations.clone();
+        let (request, size) = (h.presentation_request, (h.width, h.height));
+        let nv12 = crate::renderer::nv12::nv12_fits(h.width, h.height);
+        let make = move || {
+            crate::renderer::FfmpegSubprocess::spawn_stream_with(
+                &settings,
+                request,
+                size,
+                fps,
+                audio_input,
+                nv12,
+            )
+        };
+        match super::outputs::EncoderStart::begin(
+            "stream-start".into(),
+            make,
+            passthrough,
             fps,
-            audio_input,
-            crate::renderer::nv12::nv12_fits(h.width, h.height),
+            again,
         ) {
+            Ok(start) => {
+                streaming.starting = Some((start, destinations));
+                Ok(())
+            }
+            Err((message, passthrough)) => {
+                if let Some(pass) = passthrough {
+                    pass.release(audio_manager);
+                }
+                Err(message)
+            }
+        }
+    }
+
+    /// The stream's encoder being started, taken in once there — or,
+    /// failing, said: the stream stops if it was its first start, else it is
+    /// tried again in a while. Whether one is still starting (the rest of
+    /// the frame's check then waits).
+    pub(crate) fn take_started_stream(&mut self) -> bool {
+        let Some((start, _)) = &self.streaming.starting else {
+            return false;
+        };
+        let Some(made) = start.made() else {
+            return true;
+        };
+        let Some((mut start, started_with)) = self.streaming.starting.take() else {
+            return false;
+        };
+        let Self {
+            streaming,
+            audio_manager,
+            context,
+            ..
+        } = self;
+        match made {
             Ok(sub) => {
+                let Some(UnifiedOutput::Headless(h)) = streaming.output.first_mut() else {
+                    if let Some(pass) = start.passthrough.take() {
+                        pass.release(audio_manager);
+                    }
+                    return false;
+                };
+                let fps = start.fps;
                 let options = &streaming.settings.options;
                 if sub.changes_rate_live() && options.adaptive {
                     let rate = streaming
@@ -561,29 +654,67 @@ impl super::super::VardaApp {
                         }
                     }
                 }
+                // A destination edited while it started: as edited.
+                if let Some(fanout) = sub.fanout() {
+                    for (index, (now, then)) in streaming
+                        .settings
+                        .destinations
+                        .iter()
+                        .zip(&started_with)
+                        .enumerate()
+                    {
+                        if now != then {
+                            fanout.set_destination(index, now);
+                        }
+                    }
+                }
                 if let Some(resolved) = sub.presentation().cloned() {
                     h.set_resolved_presentation(&context.device, resolved);
                 }
                 h.keep_nv12(&context.device, sub.takes_nv12());
                 h.subprocess = Some(Box::new(sub));
-                h.audio_pcm = passthrough.map(Box::new);
+                h.audio_pcm = start.passthrough.take().map(Box::new);
                 h.active = true;
                 h.started_at = Some(Instant::now());
                 streaming.fps = fps;
-                Ok(())
+                if start.again {
+                    log::info!("Stream encoder restarted");
+                    streaming.encoder_problem = None;
+                    // The old encoder's tally was banked as it went.
+                    streaming.drops.clear();
+                }
+                start.answer(&CommandResult::Ok);
             }
             Err(error) => {
-                if let Some(pass) = passthrough {
+                if let Some(pass) = start.passthrough.take() {
                     pass.release(audio_manager);
                 }
-                Err(error.to_string())
+                let message = error.to_string();
+                start.answer(&CommandResult::Err {
+                    code: ErrorCode::InternalError,
+                    message: message.clone(),
+                });
+                if start.again {
+                    self.streaming.encoder_problem =
+                        Some(format!("The encoder cannot start: {message}"));
+                    self.streaming.retry_at = Some(Instant::now() + ENCODER_RETRY * 2);
+                } else {
+                    log::warn!("The stream could not start: {message}");
+                    self.notify_error(format!("The stream could not start: {message}"));
+                    self.release_stream_output();
+                    self.streaming.started_at = None;
+                }
             }
         }
+        false
     }
 
     /// Once a frame: notice an encoder that stopped by itself and start it
     /// again after a pause, and watch whether it keeps up.
     pub(crate) fn poll_stream(&mut self) {
+        if self.take_started_stream() {
+            return;
+        }
         let Some(UnifiedOutput::Headless(h)) = self.streaming.output.first_mut() else {
             return;
         };
@@ -636,13 +767,10 @@ impl super::super::VardaApp {
                 }
                 self.streaming.retry_at = Some(now + ENCODER_RETRY);
             }
-            Some(at) if now >= at => match self.spawn_stream_encoder() {
+            Some(at) if now >= at => match self.spawn_stream_encoder(true) {
                 Ok(()) => {
-                    log::info!("Stream encoder restarted");
-                    self.streaming.encoder_problem = None;
+                    // Taken in once started (see `take_started_stream`).
                     self.streaming.retry_at = None;
-                    // The old encoder's tally was banked as it went.
-                    self.streaming.drops.clear();
                 }
                 Err(error) => {
                     self.streaming.encoder_problem =

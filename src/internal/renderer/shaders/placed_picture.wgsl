@@ -48,6 +48,13 @@ struct Params {
     // draws it — black where the source is clear or does not reach; 0: as
     // the source comes. Between, a Merge on its way from one to the other.
     over_black: f32,
+    // Drawn straight onto a channel's composite (`fs_onto`): the layer's
+    // opacity, and how its colour goes out — 0 straight, alpha weighted by
+    // the opacity (Normal's blend state weights the colour by it); 1
+    // premultiplied by both (Add, Screen) — as the composite's blit draws a
+    // layer's own picture (blit.wgsl, modes 0 and 2).
+    opacity: f32,
+    onto: u32,
 };
 
 @group(0) @binding(0) var samp: sampler;
@@ -69,11 +76,30 @@ fn edge(inside: f32, pixel: f32) -> f32 {
     return smoothstep(-params.feather, params.feather, inside);
 }
 
+// The layer's picture where it is drawn: its own pixels, as `fs_main`
+// writes them into its frame.
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return picture_at(in.uv);
+}
+
+// The layer's picture drawn straight onto its channel's composite, as the
+// composite's blit would draw it from its frame — no frame of its own
+// written and read back: a 4K one is ~130 MB through memory each way.
+@fragment
+fn fs_onto(in: VertexOutput) -> @location(0) vec4<f32> {
+    let c = picture_at(in.uv);
+    let a = c.a * params.opacity;
+    if (params.onto == 0u) {
+        return vec4<f32>(c.rgb, a);
+    }
+    return vec4<f32>(c.rgb * a, a);
+}
+
+fn picture_at(uv: vec2<f32>) -> vec4<f32> {
     // Back from this pixel to the picture point the transform shows here —
     // its mirror, flipped.
-    let placed = (in.uv - vec2<f32>(0.5) - params.pos) / params.scale + vec2<f32>(0.5);
+    let placed = (uv - vec2<f32>(0.5) - params.pos) / params.scale + vec2<f32>(0.5);
     let p = select(placed, vec2<f32>(1.0) - placed, params.flip > vec2<f32>(0.5));
     if (any(p < vec2<f32>(0.0)) || any(p > vec2<f32>(1.0))) {
         return vec4<f32>(0.0);

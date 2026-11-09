@@ -318,13 +318,14 @@ impl VardaApp {
         // `session_path` the file what plays it has (the one it was started
         // with, while it is on).
         let snap = |talk: &Talk, shown_path: &str, session_path: &str, kind: Option<TalkKind>| {
-            let file = std::fs::metadata(shown_path).ok().filter(std::fs::Metadata::is_file);
-            let missing = file.is_none();
-            let warnings = file
-                .map(|f| {
-                    self.talk_checks
-                        .warnings(shown_path, (f.len(), f.modified().ok()), aspect)
-                })
+            // As last found, never asked of the disk here: a talk's file on
+            // a stick pulled out would hold the show up (see `file_facts`).
+            // Not looked at yet, it is not said to be missing.
+            let found = crate::file_facts::file(std::path::Path::new(shown_path));
+            let missing = matches!(found, Some(None));
+            let warnings = found
+                .flatten()
+                .map(|f| self.talk_checks.warnings(shown_path, (f.len, f.modified), aspect))
                 .unwrap_or_default();
             let key = super::presentations::talk_key(deck.uuid(), &talk.id, session_path);
             let presentation = (kind == Some(TalkKind::PowerPoint))
@@ -375,7 +376,7 @@ impl VardaApp {
             };
             let pictures = kind == Some(TalkKind::PowerPoint)
                 && !missing
-                && crate::presentation::pictures::saved_for(std::path::Path::new(shown_path))
+                && crate::presentation::pictures::saved_known(std::path::Path::new(shown_path))
                     .is_some();
             TalkSnapshot {
                 id: talk.id.clone(),
@@ -499,9 +500,10 @@ pub(crate) fn next_pictures_of(deck: &Deck) -> Option<crate::deck::presenter::Ne
             .map(|t| t.path.clone())
     })?;
     let path = std::path::PathBuf::from(path);
-    let stamp = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| Some((m.len(), m.modified().ok()?)));
+    // As last found: asked every frame, never of the disk here.
+    let stamp = crate::file_facts::file(&path)
+        .flatten()
+        .and_then(|f| Some((f.len, f.modified?)));
     Some(crate::deck::presenter::NextSource {
         talk: talk_id.to_string(),
         path,

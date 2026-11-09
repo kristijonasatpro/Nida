@@ -40,8 +40,7 @@ fn app_in(workspace: &std::path::Path) -> Option<VardaApp> {
 fn send(app: &mut VardaApp, cmd: EngineCommand) -> CommandResult {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     app.command_sender().send((cmd, Some(reply_tx))).unwrap();
-    app.process_commands();
-    reply_rx.blocking_recv().unwrap()
+    varda::testing::reply_of(app, reply_rx)
 }
 
 fn id(result: CommandResult) -> String {

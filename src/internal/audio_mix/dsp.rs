@@ -1300,11 +1300,28 @@ impl Compressor {
     }
 
     pub fn process(&mut self, block: &mut [Frame]) {
+        self.run(block, None);
+    }
+
+    /// [`Self::process`], writing the gain it gave each frame into `gains`:
+    /// what a sound mixed with this one was turned down by (the echo
+    /// removal's reference of a room's bus, `core::RoomSound`).
+    pub fn process_tracked(&mut self, block: &mut [Frame], gains: &mut Vec<f32>) {
+        self.run(block, Some(gains));
+    }
+
+    fn run(&mut self, block: &mut [Frame], mut gains: Option<&mut Vec<f32>>) {
+        if let Some(gains) = gains.as_deref_mut() {
+            gains.clear();
+        }
         let c = self.config;
         let target_mix = if c.enabled { 1.0 } else { 0.0 };
         if target_mix == 0.0 && self.mix.rests_at(0.0) {
             self.envelope_db = 0.0;
             self.deepest_db = 0.0;
+            if let Some(gains) = gains {
+                gains.resize(block.len(), 1.0);
+            }
             return;
         }
         let attack = coefficient(f64::from(c.attack_ms) / 1000.0, 1.0 / RATE);
@@ -1329,6 +1346,9 @@ impl Compressor {
             let g = 1.0 + (compressed - 1.0) * mix;
             for sample in frame.iter_mut() {
                 *sample = (clean(*sample) * g) as f32;
+            }
+            if let Some(gains) = gains.as_deref_mut() {
+                gains.push(g as f32);
             }
         }
         self.deepest_db = -deepest;
@@ -1438,6 +1458,21 @@ impl Limiter {
     }
 
     pub fn process(&mut self, block: &mut [Frame]) {
+        self.run(block, None);
+    }
+
+    /// [`Self::process`], writing the gain it gave each frame going out into
+    /// `gains` (its last-moment clamp aside, which is rare): what a sound
+    /// mixed with this one, held back as long ([`LIMITER_LOOKAHEAD`]), was
+    /// turned down by.
+    pub fn process_tracked(&mut self, block: &mut [Frame], gains: &mut Vec<f32>) {
+        self.run(block, Some(gains));
+    }
+
+    fn run(&mut self, block: &mut [Frame], mut gains: Option<&mut Vec<f32>>) {
+        if let Some(gains) = gains.as_deref_mut() {
+            gains.clear();
+        }
         let c = self.config;
         let ceiling_to = f64::from(db_to_gain(c.ceiling_db));
         // Down within the look-ahead, so the gain is there before the peak.
@@ -1468,6 +1503,9 @@ impl Limiter {
                 // and never an over once fully on.
                 let limited = (x * self.gain).clamp(-ceiling, ceiling);
                 *sample = (x + (limited - x) * mix) as f32;
+            }
+            if let Some(gains) = gains.as_deref_mut() {
+                gains.push((1.0 + (self.gain - 1.0) * mix) as f32);
             }
         }
         self.deepest = deepest;

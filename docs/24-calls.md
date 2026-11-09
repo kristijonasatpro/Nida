@@ -83,6 +83,47 @@ call's own sound. That bus is what goes back to the call (above). The call's
 sound goes to Master (and the room, stream and recording buses) as usual.
 Otherwise the guest hears themselves back a moment late.
 
+### With the room on speakers: echo removal
+
+With the guest on the room's speakers rather than headphones, the room's
+microphones hear the guest too, and send them back to the call a moment late.
+The call app cannot help: its own echo cancelling needs to see its sound go to
+the speakers and come back, and here the sound goes through Nida. Nida takes
+the echo out itself, as a conference processor does:
+
+- In the CALL bus's ⚙, **Remove the echo of:** the bus the room's speakers
+  play (Master, or the room's own bus).
+- Every microphone sent to CALL then arrives there with what that bus plays
+  taken out: the call, clips, other apps' sound. A microphone is a sound
+  device's input: not an app's sound, and not the sound that comes with a
+  camera or capture card (often a laptop's video, played in the room too).
+  The microphones themselves are not taken out, even when the room hears
+  them on its speakers.
+- Each microphone gets a canceller of its own: WebRTC's, the one in Chrome
+  and most call apps. It learns the room in the first seconds the call
+  plays. Every microphone has one while a bus removes the echo, sent to
+  that bus or not, so one sent to it later is cleaned at once. Then it takes the echo out (25-40 dB once learnt, in our tests)
+  and ducks the speaker a little while both talk, as any call does. It
+  finds the delay itself, up to about half a second.
+- Only the CALL bus gets the cleaned microphones, mono, about 10 ms later.
+  The room, stream and recording get them as they are.
+- The ⚙ shows, per microphone, how much of the echo it takes out and how
+  far behind the echo comes. **Listening** means the call has not played
+  loud enough there yet.
+- Not on a live bus: its device mixes its own microphones. A call's bus
+  never needs to be live.
+- The room's bus may be live. Its compressor should then be off, and its
+  limiter only now and then catching a peak: a live bus processes its sound
+  inside its device, which the echo removal does not follow. The bus's ⚙
+  says so.
+- It is made for voices: a guest's voice is taken out 40-55 dB, steady
+  sound (music, hum, a video's background noise) only about 20 dB. It also
+  hears the room's two sides as one, so stereo music from a clip comes
+  through more than a voice, the same on both speakers, does.
+- The microphones and the speakers on different sound devices drift apart
+  slowly, which the canceller follows. For a long show, one device for both
+  (or one clock) is best.
+
 ## Before the show
 
 - Rehearse with the same Zoom or Teams version, on the same Mac: picture,

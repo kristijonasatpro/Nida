@@ -891,6 +891,7 @@ impl VardaApp {
         self.mixer.decks_shown_alone = self.decks_shown_alone();
         self.mixer.tile_previews = self.ui_tiles;
         self.mixer.tile_channels.clone_from(&self.tile_channels);
+        self.mixer.previewed_decks.clone_from(&self.previewed_decks);
         // The refresh is taken by the mixer: when the frame was drawn is kept
         // for the outputs first, or the recording timed every frame by when
         // its readback was started — a few milliseconds later each time, by

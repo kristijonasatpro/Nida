@@ -983,13 +983,15 @@ impl VideoDecodeHandle {
 }
 
 impl Drop for VideoDecodeHandle {
+    /// Stops the decode thread — not waiting for it, which ends on its own:
+    /// waited for, a decoder stuck reading its file (a disk gone to sleep,
+    /// a share gone) held up whoever let the clip go — the show's thread,
+    /// removing a layer or loading a show over it.
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::Release);
         // Send Stop to unblock recv_timeout
         let _ = self.cmd_tx.send(VideoCommand::Stop);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.thread.take();
     }
 }
 
@@ -2238,6 +2240,61 @@ impl VideoPlayer {
 
 #[cfg(test)]
 mod tests {
+    /// A player whose every frame takes a second: a decoder stuck reading
+    /// its file.
+    struct SlowPlayer {
+        playback: super::PlaybackState,
+        reading: std::sync::mpsc::Sender<()>,
+        frame: Vec<u8>,
+    }
+
+    impl super::FramePlayer for SlowPlayer {
+        fn playback(&mut self) -> &mut super::PlaybackState {
+            &mut self.playback
+        }
+        fn playback_state(&self) -> &super::PlaybackState {
+            &self.playback
+        }
+        fn next_frame(&mut self) -> anyhow::Result<Option<&[u8]>> {
+            let _ = self.reading.send(());
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            Ok(Some(&self.frame))
+        }
+        fn seek_and_reset(&mut self, _time_secs: f64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn width(&self) -> u32 {
+            2
+        }
+        fn height(&self) -> u32 {
+            2
+        }
+    }
+
+    /// Letting a clip go never waits for its decoder: one stuck reading its
+    /// file ends on its own.
+    #[test]
+    fn letting_a_clip_go_never_waits_for_its_decoder() {
+        let (reading, read) = std::sync::mpsc::channel();
+        let handle = super::VideoDecodeHandle::spawn_player(
+            SlowPlayer {
+                playback: super::PlaybackState::new(10.0, 30.0),
+                reading,
+                frame: vec![0; 16],
+            },
+            "slow-decode",
+        );
+        read.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the decoder is reading");
+        let started = std::time::Instant::now();
+        drop(handle);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(300),
+            "dropping waited for the decoder: {:?}",
+            started.elapsed()
+        );
+    }
+
     use super::*;
 
     /// Decode time must come out of the wait, not be added to it. Waiting a

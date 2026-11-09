@@ -988,6 +988,12 @@ pub(crate) fn build_engine_state(app: &VardaApp) -> EngineState {
         fps: app.frame_stats.fps_smoothed,
         frame_count: app.frame_stats.frame_count,
         target_fps: app.target_fps,
+        render: crate::engine::types::RenderSnapshot {
+            width: app.render_width,
+            height: app.render_height,
+            auto: app.render_auto(),
+            hint: app.render_hint(),
+        },
         pacing: build_pacing_snapshot(app),
         ndi_sources: app.external_io.ndi_manager.discovered_sources(),
         decklink_devices: crate::decklink::known_devices(),

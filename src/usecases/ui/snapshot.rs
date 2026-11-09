@@ -835,6 +835,7 @@ pub(crate) fn build_ui_data(
         render_width: app.render_width(),
         render_height: app.render_height(),
         render_auto: app.render_auto(),
+        render_hint: engine.render.hint.clone(),
         max_render_dimension: app.max_render_dimension(),
         target_fps: app.target_fps(),
         frames_in_flight: app.frames_in_flight(),
@@ -910,13 +911,15 @@ fn effect_snapshot_to_ui(snap: &EffectSnapshot) -> EffectInfo {
 /// Scan `.varda/luts/` for available LUT files (.cube, .3dl).
 fn list_available_luts(workspace: &crate::persistence::Workspace) -> Vec<String> {
     let dir = workspace.luts_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    // As last found: asked in every control-window frame, never of the disk
+    // here (see `file_facts`).
+    let Some(Some(names)) = crate::file_facts::folder(&dir) else {
         return vec![];
     };
-    let mut files: Vec<String> = entries
-        .filter_map(std::result::Result::ok)
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
+    let mut files: Vec<String> = names
+        .iter()
+        .cloned()
+        .filter_map(|name| {
             let is_lut = std::path::Path::new(&name).extension().is_some_and(|ext| {
                 ext.eq_ignore_ascii_case("cube") || ext.eq_ignore_ascii_case("3dl")
             });

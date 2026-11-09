@@ -298,6 +298,26 @@ impl VardaApp {
         done(self.audio_mix.edit_bus(uuid, edit))
     }
 
+    /// A bus's echo removal: its microphones cleaned of what `room` plays
+    /// (another bus there is), or not.
+    pub fn cmd_set_audio_echo_room(&mut self, uuid: &str, room: Option<String>) -> CommandResult {
+        if let Some(room) = &room {
+            if room == uuid {
+                return CommandResult::Err {
+                    code: ErrorCode::InvalidInput,
+                    message: "a bus cannot take its own sound out of its microphones: choose the bus the room's speakers play".into(),
+                };
+            }
+            if !self.audio_mix.has_bus(room) {
+                return CommandResult::Err {
+                    code: ErrorCode::NotFound,
+                    message: format!("no such bus: {room}"),
+                };
+            }
+        }
+        done(self.audio_mix.edit_bus(uuid, |b| b.echo_room = room))
+    }
+
     /// A bus's Audio Unit insert set (`component` codes) or taken out;
     /// named as this Mac lists it, else by its codes.
     pub fn cmd_set_audio_insert(&mut self, uuid: &str, component: Option<String>) -> CommandResult {
@@ -517,6 +537,42 @@ mod tests {
             sink.put_sound(&[0; 4], 2);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    /// A bus removes the echo of another bus there is, never its own.
+    #[test]
+    fn a_buses_echo_room_is_another_bus() {
+        use crate::engine::{CommandResult, EngineCommand, ErrorCode};
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let mut add = |name: &str| match app.execute_command(EngineCommand::AddAudioBus { name: name.into() }) {
+            CommandResult::OkWithId { uuid } => uuid,
+            other => panic!("expected a bus, got {other:?}"),
+        };
+        let room = add("Room");
+        let call = add("CALL");
+        let set = |app: &mut VardaApp, room: Option<&str>| {
+            app.execute_command(EngineCommand::SetAudioBusEchoRoom {
+                uuid: call.clone(),
+                room: room.map(str::to_string),
+            })
+        };
+        let echo_room = |app: &VardaApp| {
+            app.audio_mix
+                .config()
+                .buses
+                .iter()
+                .find(|b| b.uuid == call)
+                .and_then(|b| b.echo_room.clone())
+        };
+        assert!(matches!(set(&mut app, Some(&call)), CommandResult::Err { code: ErrorCode::InvalidInput, .. }));
+        assert!(matches!(set(&mut app, Some("nope")), CommandResult::Err { code: ErrorCode::NotFound, .. }));
+        assert_eq!(echo_room(&app), None);
+        assert!(matches!(set(&mut app, Some(&room)), CommandResult::Ok));
+        assert_eq!(echo_room(&app), Some(room.clone()));
+        assert!(matches!(set(&mut app, None), CommandResult::Ok));
+        assert_eq!(echo_room(&app), None);
     }
 
     /// A camera whose sound comes with its pictures has it in the mixer as

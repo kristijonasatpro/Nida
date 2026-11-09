@@ -282,6 +282,12 @@ impl Insert {
         }
     }
 
+    /// How many frames later the bus plays for it: its depth and the
+    /// effect's own delay (see [`Self::dry`]).
+    pub fn late_frames(&self) -> usize {
+        INSERT_DEPTH * BLOCK_FRAMES + self.status.effect_frames()
+    }
+
     /// The mixer jumped over `blocks` blocks (held up): what was handed
     /// over before is stale. Its time moves on as the mixer's did, and the
     /// blocks due from before come out as silence (processed ones from then

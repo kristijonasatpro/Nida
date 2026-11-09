@@ -332,7 +332,7 @@ impl VardaApp {
         .and_then(|()| crate::persistence::StagePrefs::default().save(target.stage_path()))
         .and_then(|()| empty.save(target.scene_path()))
         .with_context(|| format!("Cannot write {}", folder.display()))?;
-        self.enter_show(target);
+        self.another_show(target);
         let opened = self.load_workspace();
         if let Some(why) = opened.error_message() {
             log::warn!("New show opened in part: {why}");
@@ -404,7 +404,7 @@ impl VardaApp {
                 }
             }
         }
-        self.enter_show(workspace);
+        self.another_show(workspace);
         let loaded = self.load_workspace();
         log::info!("Opened show {}", folder.display());
         Ok(loaded)
@@ -413,7 +413,7 @@ impl VardaApp {
     /// Start in the show in `folder` rather than the one Nida was started
     /// with, before the show is loaded: the one open last time.
     pub fn start_in_show(&mut self, folder: &Path) {
-        self.enter_show(Workspace::new(folder.to_path_buf()));
+        self.another_show(Workspace::new(folder.to_path_buf()));
     }
 
     /// Make `workspace` the show's folder, its own shaders in the library
@@ -429,6 +429,14 @@ impl VardaApp {
             }
         }
         self.session.workspace = workspace;
+    }
+
+    /// Another show from now on, its mixer replaced or not: what was asked
+    /// of the one before is not put in this one (see `media_adds`). Not for
+    /// a Save As, which moves this show.
+    fn another_show(&mut self, workspace: Workspace) {
+        self.show_generation += 1;
+        self.enter_show(workspace);
     }
 
     /// The scene a new show starts with: two empty inputs, and Main as it is

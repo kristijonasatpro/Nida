@@ -28,9 +28,13 @@ pub async fn health() -> impl IntoResponse {
 /// which would indicate a bug in the snapshot's `Serialize` implementation.
 #[utoipa::path(get, path = "/api/state", responses((status = 200, description = "Full engine state"), (status = 503, description = "Engine not yet initialized")), tag = "System")]
 pub async fn get_state(State(state): State<SharedState>) -> impl IntoResponse {
-    match state.engine_state.read() {
-        Ok(guard) => match guard.as_ref() {
-            Some(engine_state) => Json(serde_json::to_value(engine_state).unwrap()).into_response(),
+    // The pointer only, under the lock: serialized after (see
+    // `PublishedState`).
+    match state.engine_state.read().map(|guard| guard.clone()) {
+        Ok(published) => match published {
+            Some(engine_state) => {
+                Json(serde_json::to_value(&*engine_state).unwrap()).into_response()
+            }
             None => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Engine not yet initialized",
@@ -148,6 +152,38 @@ pub async fn set_target_fps(
 ) -> impl IntoResponse {
     match state
         .send_command(EngineCommand::SetTargetFps { fps: b.fps })
+        .await
+    {
+        Ok(r) => command_response(r),
+        Err(m) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct CompositorBody {
+    /// Draw a layer that is only its live source placed — a camera, a
+    /// screen, another input (a tap), cropped, moved or scaled — straight
+    /// onto its input from that source, rather than into a frame of its own
+    /// first (on by default). One left out stays as it is.
+    #[serde(default)]
+    pub direct_layers: Option<bool>,
+    /// Draw an input's Normal, Add and Screen layers in one pass (on by
+    /// default).
+    #[serde(default)]
+    pub merge_layer_passes: Option<bool>,
+}
+/// How the compositor draws: for comparing its ways on one show, GPU use
+/// with each, without a restart. The picture is the same either way.
+#[utoipa::path(put, path = "/api/compositor", request_body = CompositorBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "System")]
+pub async fn set_compositor(
+    State(state): State<SharedState>,
+    Json(b): Json<CompositorBody>,
+) -> impl IntoResponse {
+    match state
+        .send_command(EngineCommand::SetCompositor {
+            direct_layers: b.direct_layers,
+            merge_layer_passes: b.merge_layer_passes,
+        })
         .await
     {
         Ok(r) => command_response(r),

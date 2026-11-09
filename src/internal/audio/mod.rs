@@ -1238,6 +1238,16 @@ impl AudioManager {
         fresh
     }
 
+    /// Whether capture `id` is being opened now.
+    pub fn is_opening(&self, id: AudioSourceId) -> bool {
+        self.opening.contains_key(&id)
+    }
+
+    /// Whether capture `id` is open.
+    pub fn is_active(&self, id: AudioSourceId) -> bool {
+        self.active.contains_key(&id)
+    }
+
     /// How many captures have been taken afresh so far.
     pub fn landed(&self) -> u64 {
         self.landed

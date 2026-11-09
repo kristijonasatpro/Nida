@@ -18,7 +18,7 @@ mod tests {
         let state = make_test_state();
         let (cmd_tx, mut cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
-        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(state)));
+        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state))));
 
         // Spawn a background task that processes commands
         tokio::spawn(async move {
@@ -56,7 +56,7 @@ mod tests {
         });
         let shared = SharedState {
             command_tx: cmd_tx,
-            engine_state: std::sync::Arc::new(std::sync::RwLock::new(Some(state))),
+            engine_state: std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state)))),
         };
         (crate::usecases::api::runner::build_router(shared), sent)
     }
@@ -65,7 +65,7 @@ mod tests {
         let state = make_test_state();
         let shared = SharedState {
             command_tx: tokio::sync::mpsc::unbounded_channel().0,
-            engine_state: std::sync::Arc::new(std::sync::RwLock::new(Some(state))),
+            engine_state: std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state)))),
         };
         crate::usecases::api::runner::build_router(shared)
     }
@@ -228,7 +228,7 @@ mod tests {
         };
         let shared = SharedState {
             command_tx: tokio::sync::mpsc::unbounded_channel().0,
-            engine_state: std::sync::Arc::new(std::sync::RwLock::new(Some(state))),
+            engine_state: std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state)))),
         };
         let app = crate::usecases::api::runner::build_router(shared);
 
@@ -3380,7 +3380,7 @@ mod tests {
         let state = make_test_state();
         let (cmd_tx, mut cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
-        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(state)));
+        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state))));
         tokio::spawn(async move {
             while let Some((_cmd, reply_tx)) = cmd_rx.recv().await {
                 if let Some(tx) = reply_tx {
@@ -3402,7 +3402,7 @@ mod tests {
         let state = make_test_state();
         let (cmd_tx, mut cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
-        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(state)));
+        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state))));
         tokio::spawn(async move {
             while let Some((_cmd, reply_tx)) = cmd_rx.recv().await {
                 if let Some(tx) = reply_tx {
@@ -3424,7 +3424,7 @@ mod tests {
         let state = make_test_state();
         let (cmd_tx, mut cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
-        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(state)));
+        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state))));
         tokio::spawn(async move {
             while let Some((_cmd, reply_tx)) = cmd_rx.recv().await {
                 if let Some(tx) = reply_tx {
@@ -3445,7 +3445,7 @@ mod tests {
         let state = make_test_state();
         let (cmd_tx, mut cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
-        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(state)));
+        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state))));
         tokio::spawn(async move {
             while let Some((_cmd, reply_tx)) = cmd_rx.recv().await {
                 if let Some(tx) = reply_tx {
@@ -3520,7 +3520,7 @@ mod tests {
         let state = make_test_state();
         let (cmd_tx, cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
-        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(state)));
+        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state))));
         // Drop receiver immediately so sends fail
         drop(cmd_rx);
         let shared = SharedState {
@@ -3789,7 +3789,7 @@ mod tests {
         let state = make_test_state();
         let (cmd_tx, mut cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
-        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(state)));
+        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state))));
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
         tokio::spawn(async move {
@@ -4130,6 +4130,22 @@ mod tests {
             &sent.lock().unwrap()[..],
             [C::SetAudioBusPreFader { uuid, pre_fader: true }] if uuid == "bus1"
         ));
+        for (body, room) in [
+            (serde_json::json!({"room": "room1"}), Some("room1")),
+            (serde_json::json!({"room": null}), None),
+            (serde_json::json!({}), None),
+        ] {
+            let (app, sent) = router_recording_commands();
+            let (status, _) = put_json(app, "/api/audio-buses/bus1/echo-room", body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(
+                matches!(
+                    &sent.lock().unwrap()[..],
+                    [C::SetAudioBusEchoRoom { uuid, room: r }] if uuid == "bus1" && r.as_deref() == room
+                ),
+                "{body}"
+            );
+        }
     }
 
     #[tokio::test]

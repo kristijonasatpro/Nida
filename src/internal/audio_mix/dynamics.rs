@@ -225,6 +225,22 @@ impl BusChain {
         self.post = held(self.post, block_peak(block));
     }
 
+    /// [`Self::process_pre`], the compressor's gain on each frame into
+    /// `gains`.
+    pub fn process_pre_tracked(&mut self, block: &mut [Frame], gains: &mut Vec<f32>) {
+        self.pre = held(self.pre, block_peak(block));
+        self.compressor.process_tracked(block, gains);
+    }
+
+    /// [`Self::process_post`], the limiter's gain on each frame going out
+    /// into `gains` (each [`super::dsp::LIMITER_LOOKAHEAD`] frames behind
+    /// the frame that came in).
+    pub fn process_post_tracked(&mut self, block: &mut [Frame], gains: &mut Vec<f32>) {
+        self.limiter.process_tracked(block, gains);
+        self.loudness.measure(block);
+        self.post = held(self.post, block_peak(block));
+    }
+
     /// Start the loudness readings again.
     pub fn reset_loudness(&mut self) {
         self.loudness.reset();

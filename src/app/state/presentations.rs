@@ -43,13 +43,7 @@ pub(crate) struct Presentations {
     /// The decks PowerPoint is saving as slide pictures (see
     /// `make_slide_pictures`).
     making: std::collections::HashSet<std::path::PathBuf>,
-    /// Each slide pictures' PDF's pages, once counted — and the file's size
-    /// and time then: counted again once the file is another.
-    pdf_pages: std::collections::HashMap<std::path::PathBuf, (Option<PdfStamp>, u32)>,
 }
-
-/// A PDF file's size and time: another once it is written again.
-type PdfStamp = (u64, std::time::SystemTime);
 
 /// How a presenter view's show stood when it was last told.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,7 +72,6 @@ impl Presentations {
             spots: std::collections::HashMap::new(),
             title_bar: crate::presentation::manager::title_bar_points(),
             making: std::collections::HashSet::new(),
-            pdf_pages: std::collections::HashMap::new(),
         }
     }
 
@@ -299,7 +292,7 @@ impl VardaApp {
                 let next = match (pdf, powerpoint) {
                     (Some(source), _) => (Some(source), show.as_ref().and_then(|s| s.next_slide)),
                     (None, Some((talk_id, path))) => {
-                        self.slide_pictures_next(&talk_id, &path, show.as_ref())
+                        Self::slide_pictures_next(&talk_id, &path, show.as_ref())
                     }
                     (None, None) => (None, None),
                 };
@@ -1243,26 +1236,17 @@ impl VardaApp {
     /// `path`) and their page as `show` stands, once its slides are saved as
     /// pictures; none till then.
     fn slide_pictures_next(
-        &mut self,
         talk: &str,
         path: &Path,
         show: Option<&PresentationSnapshot>,
     ) -> (Option<crate::deck::presenter::NextSource>, Option<u32>) {
-        let Some(pdf) = crate::presentation::pictures::saved_for(path) else {
+        // As last found, and its pages counted by a thread of their own:
+        // asked every frame, never of the disk here (see `file_facts`).
+        let Some((pdf, saved)) = crate::presentation::pictures::saved_known(path) else {
             return (None, None);
         };
-        let stamp = std::fs::metadata(&pdf)
-            .ok()
-            .and_then(|m| Some((m.len(), m.modified().ok()?)));
-        let pages = match self.presentations.pdf_pages.get(&pdf) {
-            Some((counted, n)) if *counted == stamp => Some(*n),
-            _ => crate::presentation::pdf::PdfPages::open(&pdf)
-                .ok()
-                .map(|doc| doc.pages())
-                .inspect(|n| {
-                    self.presentations.pdf_pages.insert(pdf.clone(), (stamp, *n));
-                }),
-        };
+        let stamp = saved.modified.map(|at| (saved.len, at));
+        let pages = crate::file_facts::facts().pdf_pages(&pdf, &saved).flatten();
         let page = show.zip(pages).and_then(|(s, pages)| {
             crate::presentation::pictures::page_of_next(
                 pages,

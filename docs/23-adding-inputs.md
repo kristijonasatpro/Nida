@@ -400,7 +400,10 @@ Over the API: `{"source": {"kind": "text", "settings": {"text":
 `{"SetTextSettings": {"deck_uuid": …, "settings": {…}}}` to `POST
 /api/command` (the whole settings: `text`, `visible`, `fade_secs`, `look`,
 and `targets` — the bus UUIDs it shows on). A deck's `text` in `GET
-/api/state` has them.
+/api/state` has them. Its `pending` flag says a current drawing is still
+being prepared for the input or a bus. If a drawing fails, `error` explains
+that any previous picture is retained; the same message appears in Input
+Settings. A successful redraw clears the error.
 
 ## Lower thirds
 

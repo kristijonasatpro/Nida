@@ -625,12 +625,27 @@ pub fn render_ui(ui: &mut egui::Ui, data: &UIData) -> UIActions {
                 } else {
                     format!("📐 {}×{}", data.render_width, data.render_height)
                 };
+                // A smaller size would do for every output: said here, so it
+                // is seen without opening the menu.
+                let (res_text, res_hover) = match &data.render_hint {
+                    Some(hint) => (
+                        egui::RichText::new(format!("{res_label} ⬇"))
+                            .monospace()
+                            .color(egui::Color32::from_rgb(230, 170, 60)),
+                        format!(
+                            "{}×{} is enough for every screen, feed and recording with a \
+                             size of its own — click for more",
+                            hint.size.0, hint.size.1
+                        ),
+                    ),
+                    None => (
+                        egui::RichText::new(&res_label).monospace(),
+                        "Click to change render resolution".to_string(),
+                    ),
+                };
                 let res_response = ui
-                    .add(
-                        egui::Label::new(egui::RichText::new(&res_label).monospace())
-                            .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text("Click to change render resolution");
+                    .add(egui::Label::new(res_text).sense(egui::Sense::click()))
+                    .on_hover_text(res_hover);
                 status_popover(&res_response, |ui| {
                     render_resolution_popover(ui, data, &mut actions);
                 });

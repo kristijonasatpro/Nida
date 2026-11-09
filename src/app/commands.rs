@@ -31,7 +31,7 @@ fn wire(result: anyhow::Result<()>) -> CommandResult {
 }
 
 /// Map an id-returning engine call (creation) onto the wire result.
-fn wire_id(result: anyhow::Result<String>) -> CommandResult {
+pub(super) fn wire_id(result: anyhow::Result<String>) -> CommandResult {
     match result {
         Ok(uuid) => CommandResult::OkWithId { uuid },
         Err(e) => CommandResult::Err {
@@ -719,6 +719,9 @@ impl VardaApp {
             }
             EngineCommand::SetAudioBusPreFader { uuid, pre_fader } => {
                 self.cmd_edit_audio_bus(&uuid, |b| b.pre_fader = pre_fader)
+            }
+            EngineCommand::SetAudioBusEchoRoom { uuid, room } => {
+                self.cmd_set_audio_echo_room(&uuid, room)
             }
             EngineCommand::SetAudioSendSettings {
                 uuid,
@@ -2360,6 +2363,20 @@ impl VardaApp {
                 CommandResult::Ok
             }
 
+            EngineCommand::SetCompositor {
+                direct_layers,
+                merge_layer_passes,
+            } => {
+                let mixer = &mut self.mixer;
+                mixer.direct_layers = direct_layers.unwrap_or(mixer.direct_layers);
+                mixer.merge_layer_passes = merge_layer_passes.unwrap_or(mixer.merge_layer_passes);
+                log::info!(
+                    "Compositor: layers drawn from their sources {}, blend-unit layers in one pass {}",
+                    mixer.direct_layers,
+                    mixer.merge_layer_passes
+                );
+                CommandResult::Ok
+            }
             EngineCommand::SetTargetFps { fps } => {
                 self.set_target_fps(fps);
                 self.blackmagic_follow_show_rate();
@@ -2555,6 +2572,7 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::SetAudioBusDelay { .. }
             | C::SetAudioBusLive { .. }
             | C::SetAudioBusPreFader { .. }
+            | C::SetAudioBusEchoRoom { .. }
             | C::SetAudioSendSettings { .. }
             | C::SetAudioBusInsert { .. }
             | C::SetAudioBusInsertBypass { .. }
@@ -2748,6 +2766,7 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::SetRenderResolution { .. }
             | C::SetRenderResolutionAuto { .. }
             | C::SetDomemasterResolution { .. }
+            | C::SetCompositor { .. }
             | C::SetTargetFps { .. }
             | C::SetFramesInFlight { .. }
             | C::SetFramePacing { .. }

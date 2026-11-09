@@ -14,8 +14,7 @@ fn send_cmd(app: &mut VardaApp, cmd: EngineCommand) -> CommandResult {
     let tx = app.command_sender();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     tx.send((cmd, Some(reply_tx))).unwrap();
-    app.process_commands();
-    reply_rx.blocking_recv().unwrap()
+    varda::testing::reply_of(app, reply_rx)
 }
 
 fn id(result: CommandResult) -> String {
@@ -397,6 +396,8 @@ fn a_layer_showing_a_lost_input_draws_nothing() {
 /// Another input shown small and to one side is drawn straight into its
 /// place — a quarter of the frame drawn, not all of it and then shrunk —
 /// and lands exactly where the transform puts it, the right way round.
+/// Into a frame of its own: drawn onto its input from the source, it draws
+/// no frame of its own (see `tests/direct_layers.rs`).
 #[test]
 fn an_input_moved_and_scaled_is_drawn_in_its_place_in_one_pass() {
     let Some(gpu) = common::headless_gpu() else {
@@ -415,6 +416,13 @@ fn an_input_moved_and_scaled_is_drawn_in_its_place_in_one_pass() {
     .save(&picture)
     .unwrap();
     let mut app = VardaApp::new(gpu, &varda::testing::headless_config()).unwrap();
+    send_cmd(
+        &mut app,
+        EngineCommand::SetCompositor {
+            direct_layers: Some(false),
+            merge_layer_passes: None,
+        },
+    );
     send_cmd(
         &mut app,
         EngineCommand::SetMixMode {
@@ -577,20 +585,30 @@ fn frame_pixels(gpu: &varda::renderer::context::GpuContext, texture: &wgpu::Text
     out
 }
 
+/// How a picture-in-picture is drawn onto its input: into a frame of its
+/// own, or straight from its source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drawn {
+    IntoItsFrame,
+    FromSource,
+}
+
 /// A picture-in-picture with a white border and rounded corners — the crop
 /// then the transform — drawn in one pass looks as it did drawn whole,
 /// cropped and shrunk: the same over the whole frame but for the odd pixel
 /// on an anti-aliased edge.
 #[test]
 fn a_bordered_rounded_picture_in_picture_drawn_in_one_pass_looks_the_same() {
-    drawn_in_one_pass_looks_the_same(false, false, false);
+    drawn_in_one_pass_looks_the_same(false, false, false, Drawn::IntoItsFrame);
+    drawn_in_one_pass_looks_the_same(false, false, false, Drawn::FromSource);
 }
 
 /// The same, ringed in a circle — a thick coloured ring, whose colour both
 /// ways must take alike.
 #[test]
 fn a_circled_picture_in_picture_drawn_in_one_pass_looks_the_same() {
-    drawn_in_one_pass_looks_the_same(true, false, false);
+    drawn_in_one_pass_looks_the_same(true, false, false, Drawn::IntoItsFrame);
+    drawn_in_one_pass_looks_the_same(true, false, false, Drawn::FromSource);
 }
 
 /// Flipped both ways, with a crop off to one side: the transform mirrors the
@@ -598,7 +616,8 @@ fn a_circled_picture_in_picture_drawn_in_one_pass_looks_the_same() {
 /// as in two, and a point of it shows the corner mirrored there.
 #[test]
 fn a_flipped_picture_in_picture_drawn_in_one_pass_looks_the_same() {
-    drawn_in_one_pass_looks_the_same(false, true, false);
+    drawn_in_one_pass_looks_the_same(false, true, false, Drawn::IntoItsFrame);
+    drawn_in_one_pass_looks_the_same(false, true, false, Drawn::FromSource);
 }
 
 /// A layer not keeping its input's transparency, the input clear in a
@@ -607,16 +626,20 @@ fn a_flipped_picture_in_picture_drawn_in_one_pass_looks_the_same() {
 /// under it, the same both ways.
 #[test]
 fn a_picture_in_picture_flattened_over_black_drawn_in_one_pass_looks_the_same() {
-    drawn_in_one_pass_looks_the_same(false, false, true);
+    drawn_in_one_pass_looks_the_same(false, false, true, Drawn::IntoItsFrame);
+    drawn_in_one_pass_looks_the_same(false, false, true, Drawn::FromSource);
 }
 
 /// Two copies of one picture-in-picture, the first drawn in one pass and the
 /// second the old way — its crop modulated, at no depth, so the pass drawing
 /// the picture leaves it to the passes after: whole, then cropped, then
 /// shrunk. Flattened: the picture clear in its top right quarter, neither
-/// layer keeping its transparency.
-fn drawn_in_one_pass_looks_the_same(circle: bool, flip: bool, flattened: bool) {
+/// layer keeping its transparency. `drawn`: the first drawn in that one pass
+/// into a frame of its own, or straight onto its input from the source (see
+/// `tests/direct_layers.rs`).
+fn drawn_in_one_pass_looks_the_same(circle: bool, flip: bool, flattened: bool, drawn: Drawn) {
     use varda::params::ParamValue::{Bool, Color, Float};
+    let direct = drawn == Drawn::FromSource;
     // White, or orange: 0.9, 0.5, 0.1 in sRGB is about 0.79, 0.21, 0.01 in
     // the linear light the composite holds.
     let (ring, width, linear) = if circle {
@@ -639,6 +662,13 @@ fn drawn_in_one_pass_looks_the_same(circle: bool, flip: bool, flattened: bool) {
     .save(&picture)
     .unwrap();
     let mut app = VardaApp::new(gpu, &varda::testing::headless_config()).unwrap();
+    send_cmd(
+        &mut app,
+        EngineCommand::SetCompositor {
+            direct_layers: Some(direct),
+            merge_layer_passes: None,
+        },
+    );
     send_cmd(
         &mut app,
         EngineCommand::SetMixMode {
@@ -791,7 +821,12 @@ fn drawn_in_one_pass_looks_the_same(circle: bool, flip: bool, flattened: bool) {
             .drawn_share()
     };
     let (one_pass, old_way) = (deck(1, &layers[0]), deck(2, &layers[1]));
-    assert!(one_pass < 0.2, "drawn in its place: {one_pass}");
+    if direct {
+        assert_eq!(mixer.channels()[1].drawn_onto, 1, "drawn onto its input");
+    } else {
+        assert!(one_pass < 0.2, "drawn in its place: {one_pass}");
+    }
+    assert_eq!(mixer.channels()[2].drawn_onto, 0, "the old way: a frame of its own");
     assert!(old_way > 0.99, "drawn whole: {old_way}");
 
     let a = frame_pixels(app.gpu_context(), &mixer.channels()[1].composite_texture);

@@ -10,6 +10,7 @@ pub mod clicker;
 pub mod clock;
 pub mod deck;
 pub mod decklink;
+pub mod file_facts;
 pub mod frame_picker;
 pub mod host_clock;
 pub mod depth;

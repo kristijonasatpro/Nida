@@ -346,7 +346,7 @@ impl Rest {
             reader: RateReader::default(),
             // Emptied again at the first callback: what the mix sent while
             // the stream was built is as late.
-            drift: DriftControl::starting_empty(depth),
+            drift: DriftControl::starting_empty(depth).without_landing(),
             block: vec![[0.0; 2]; LIVE_MOST_CALL],
         }
     }

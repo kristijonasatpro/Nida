@@ -90,6 +90,8 @@ curl -X POST http://localhost:8080/api/command -H "Content-Type: application/jso
 
 `GET /api/state` shows what it has made. Screens and LED walls have routes too (`/api/outputs`).
 
+`.render` in `GET /api/state` is the show's size: `{"width": 3840, "height": 2160, "auto": false, "hint": …}`. `hint` is `null`, or a smaller size every screen, LED feed and recording with a size of its own still gets all it shows from, as the control window's ⬇ offers it: `{"size": [1920, 1080], "pixels_pct": 25, "following": ["Recordings"]}` (`following`: what follows the show's size and would be that size too). Set it with `PUT /api/resolution`.
+
 It can use only what the Mac running Nida has: pictures and clips are files on that Mac, and cameras, capture cards, NDI sources and calls need the device, the runtime and macOS's permission there. The spec also lists the web-page and depth-sensor routes, which the DMG has no engine for: a web page is refused with a message saying so (show the page with Desktop Capture instead).
 
 We tried it on a headless Nida. An agent made three named inputs (a camera's stand-in, slides and a logo overlay), switched on Main mode with Merge, and added a bus for the stage screen, a stream destination, HEVC recording and a rundown step. It saved the show, and the show opened again with all of it.
@@ -589,6 +591,7 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `PUT` | `/api/audio-buses/{bus_uuid}/compressor` | A bus's compressor, before its fader. |
 | `PUT` | `/api/audio-buses/{bus_uuid}/delay` |  |
 | `PUT` | `/api/audio-buses/{bus_uuid}/device` |  |
+| `PUT` | `/api/audio-buses/{bus_uuid}/echo-room` |  |
 | `PUT` | `/api/audio-buses/{bus_uuid}/gain` |  |
 | `PUT` | `/api/audio-buses/{bus_uuid}/insert` |  |
 | `PUT` | `/api/audio-buses/{bus_uuid}/insert/bypass` |  |
@@ -1059,6 +1062,7 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | `PUT` | `/api/clock/manual-bpm` |  |
 | `PUT` | `/api/clock/preference` |  |
 | `POST` | `/api/command` | Applies any `EngineCommand` sent as JSON, and answers as every route does |
+| `PUT` | `/api/compositor` | How the compositor draws: for comparing its ways on one show, GPU use |
 | `PUT` | `/api/domemaster/resolution` |  |
 | `GET` | `/api/health` |  |
 | `POST` | `/api/perf-profile` |  |

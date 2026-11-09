@@ -23,8 +23,9 @@ async fn dispatch(state: &SharedState, cmd: EngineCommand) -> axum::response::Re
 
 #[utoipa::path(get, path = "/api/stream", responses((status = 200, body = crate::streaming::StreamSnapshot), (status = 503, description = "Engine not yet initialized")), tag = "Stream")]
 pub async fn get_stream(State(state): State<SharedState>) -> impl IntoResponse {
-    match state.engine_state.read() {
-        Ok(guard) => match guard.as_ref() {
+    // The pointer only, under the lock (see `PublishedState`).
+    match state.engine_state.read().map(|guard| guard.clone()) {
+        Ok(published) => match published {
             Some(engine_state) => Json(engine_state.stream.clone()).into_response(),
             None => (
                 StatusCode::SERVICE_UNAVAILABLE,

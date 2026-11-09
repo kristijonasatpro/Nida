@@ -368,7 +368,15 @@ fn render_processing_settings(
         }
         Settings::Bus(uuid) => {
             if let Some(bus) = data.audio_mix.buses.iter().find(|b| b.config.uuid == *uuid) {
-                bus_processing(ui, uuid, bus, actions);
+                // The buses removing its echo, by name.
+                let cleaned: Vec<&str> = data
+                    .audio_mix
+                    .buses
+                    .iter()
+                    .filter(|b| b.config.echo_room.as_deref() == Some(uuid.as_str()) && !b.config.live)
+                    .map(|b| b.config.name.as_str())
+                    .collect();
+                bus_processing(ui, uuid, bus, &cleaned, actions);
             }
         }
         Settings::Headphones => {}
@@ -627,6 +635,7 @@ fn bus_processing(
     ui: &mut egui::Ui,
     uuid: &str,
     bus: &crate::audio_mix::AudioBusSnapshot,
+    echo_for: &[&str],
     actions: &mut UIActions,
 ) {
     let snapshot = &bus.dynamics;
@@ -637,6 +646,17 @@ fn bus_processing(
             .weak(),
     );
     ui.separator();
+    if bus.config.live && !echo_for.is_empty() {
+        ui.label(
+            egui::RichText::new(format!(
+                "⚠ Live, and {} removes its echo: with this compressor on, or the limiter \
+                 working often, the echo comes out less well",
+                echo_for.join(", ")
+            ))
+            .small()
+            .color(egui::Color32::from_rgb(230, 170, 60)),
+        );
+    }
     let mut compressor = bus.config.compressor;
     if compressor_controls(ui, &mut compressor) {
         actions.commands.push(EngineCommand::SetAudioBusCompressor {
@@ -1209,6 +1229,7 @@ fn bus_settings(
             pre_fader,
         });
     }
+    echo_setting(ui, bus, data, actions);
     insert_setting(ui, bus, data, actions);
     ui.horizontal(|ui| {
         ui.label("Delay:");
@@ -1245,6 +1266,94 @@ fn bus_settings(
                 uuid: cfg.uuid.clone(),
             });
         }
+    }
+}
+
+/// A bus's echo removal, for a call's: its microphones without what the
+/// room's speakers play. Then how each microphone sent to it is doing.
+fn echo_setting(ui: &mut egui::Ui, bus: &AudioBusSnapshot, data: &UIData, actions: &mut UIActions) {
+    let cfg = &bus.config;
+    let mix = &data.audio_mix;
+    let room = cfg
+        .echo_room
+        .as_deref()
+        .and_then(|r| mix.buses.iter().find(|b| b.config.uuid == r));
+    ui.horizontal(|ui| {
+        ui.label("Remove the echo of:");
+        ui.add_enabled_ui(!cfg.live, |ui| {
+            egui::ComboBox::from_id_salt(format!("bus_echo_{}", cfg.uuid))
+                .selected_text(room.map_or("Off", |b| b.config.name.as_str()))
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(room.is_none(), "Off").clicked() && cfg.echo_room.is_some() {
+                        actions.commands.push(EngineCommand::SetAudioBusEchoRoom {
+                            uuid: cfg.uuid.clone(),
+                            room: None,
+                        });
+                    }
+                    for other in mix.buses.iter().filter(|b| b.config.uuid != cfg.uuid) {
+                        let current = cfg.echo_room.as_deref() == Some(other.config.uuid.as_str());
+                        if ui.selectable_label(current, &other.config.name).clicked() && !current {
+                            actions.commands.push(EngineCommand::SetAudioBusEchoRoom {
+                                uuid: cfg.uuid.clone(),
+                                room: Some(other.config.uuid.clone()),
+                            });
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "For a call's bus, with the room on speakers: the microphones sent here \
+                     arrive with what the chosen bus plays taken out (the call, clips, other \
+                     apps; not the microphones), so the guest does not hear themselves come \
+                     back. Choose the bus the room's speakers play. Every other bus gets the \
+                     microphones as they are.\n\nA voice is taken out best (40-55 dB). Steady \
+                     sound (music, hum, a video's background) much less, about 20 dB, and \
+                     stereo music less than mono.",
+                );
+        })
+        .response
+        .on_disabled_hover_text("Not on a live bus: its device mixes its microphones itself");
+    });
+    let Some(room) = room.filter(|_| !cfg.live) else {
+        return;
+    };
+    if room.config.live && room.config.compressor.enabled {
+        ui.label(
+            egui::RichText::new(format!(
+                "⚠ {} plays live with its compressor on: the echo comes out less well",
+                room.config.name
+            ))
+            .small()
+            .color(egui::Color32::from_rgb(230, 170, 60)),
+        )
+        .on_hover_text(
+            "A live bus compresses and limits inside its device, its microphones there sooner \
+             than the mix hears them: the echo removal follows the mix's compressor and limiter, \
+             not the device's. A limiter that only now and then catches a peak does little harm.",
+        );
+    }
+    let mics: Vec<_> = mix
+        .sources
+        .iter()
+        .filter(|s| s.sends.contains(&cfg.uuid))
+        .filter_map(|s| Some((s, s.echo.iter().find(|e| e.room == room.config.uuid)?)))
+        .collect();
+    if mics.is_empty() {
+        ui.label(
+            egui::RichText::new("No microphone sent here yet")
+                .small()
+                .weak(),
+        );
+    }
+    for (source, echo) in mics {
+        let how = match (echo.removed_db, echo.delay_ms) {
+            (Some(db), Some(ms)) if db >= 1.0 => {
+                format!("{}: {db:.0} dB of the echo out, {ms} ms behind", source.name)
+            }
+            _ => format!("{}: listening for {}", source.name, room.config.name),
+        };
+        ui.label(egui::RichText::new(how).small().weak());
     }
 }
 
@@ -3111,6 +3220,7 @@ mod tests {
                 live_frames: None,
                 insert: None,
                 pre_fader: false,
+                echo_room: None,
             },
             device_ok: None,
             device_note: None,
@@ -3143,6 +3253,7 @@ mod tests {
             meter_db: [-96.0, -96.0],
             signal_db: [-96.0, -96.0],
             refused: None,
+            echo: Vec::new(),
             send_settings: std::collections::BTreeMap::default(),
             sent_before: Vec::new(),
         }

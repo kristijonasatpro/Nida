@@ -47,6 +47,12 @@ pub(crate) struct Recording {
     /// The current file's size and the free space, looked up away from the
     /// engine while the take runs.
     disk: Option<crate::record::DiskWatch>,
+    /// The encoder for the next file being started on a thread of its own
+    /// — the file chosen there too (see `EncoderStart`).
+    starting: Option<super::outputs::EncoderStart<(crate::renderer::FfmpegSubprocess, PathBuf)>>,
+    /// Every file handed to an encoder this run: none is handed twice — one
+    /// stopped before it started may yet make its file.
+    given: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
 }
 
 impl super::super::VardaApp {
@@ -112,8 +118,12 @@ impl super::super::VardaApp {
             .map(|(_, secs)| secs)
             .sum();
         let behind = recent > BEHIND_WINDOW.as_secs_f64() / 100.0;
+        let starting = self.recording.starting.is_some();
         let problem = self.recording.problem.clone().or_else(|| {
-            if free_bytes.is_some_and(|b| b < crate::record::LOW_SPACE_BYTES) {
+            if starting {
+                // Not recording yet: its encoder still starting.
+                Some("Starting the recording…".into())
+            } else if free_bytes.is_some_and(|b| b < crate::record::LOW_SPACE_BYTES) {
                 Some("The disk is nearly full".into())
             } else if behind {
                 Some("The encoder cannot keep up — frames are left out or repeated".into())
@@ -141,6 +151,7 @@ impl super::super::VardaApp {
             fps,
             file_fps: self.recording.settings.options.fps.unwrap_or(fps).max(1),
             last_file,
+            starting,
             audio_bus: match self.recording.output.first() {
                 Some(UnifiedOutput::Headless(h)) => h.audio_bus.clone(),
                 _ => None,
@@ -204,7 +215,7 @@ impl super::super::VardaApp {
         self.recording.retry_at = None;
         self.recording.dropped_before = 0;
         self.recording.disk = Some(crate::record::DiskWatch::start(options.folder.clone()));
-        if let Err(message) = self.spawn_record_encoder() {
+        if let Err(message) = self.spawn_record_encoder(false) {
             self.release_record_output();
             return CommandResult::Err {
                 code: ErrorCode::InternalError,
@@ -215,11 +226,38 @@ impl super::super::VardaApp {
         CommandResult::Ok
     }
 
+    /// Start recording for a command over the bus: `reply` answered once
+    /// its encoder runs — or failed — rather than as it is asked for.
+    pub(crate) fn start_recording_for_command(&mut self, reply: Option<crate::app::Reply>) {
+        let result = self.cmd_start_recording();
+        match (&result, self.recording.starting.as_mut()) {
+            (CommandResult::Ok, Some(start)) => start.replies.extend(reply),
+            _ => {
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
+            }
+        }
+    }
+
+    /// Answer whoever waits for the recording to start: Nida is quitting.
+    pub(crate) fn refuse_record_start(&mut self) {
+        if let Some(start) = self.recording.starting.as_mut() {
+            start.answer(&CommandResult::Err {
+                code: ErrorCode::Unavailable,
+                message: "Nida is quitting".into(),
+            });
+        }
+    }
+
     /// Stop recording. The file is finished on a background thread.
     pub fn cmd_stop_recording(&mut self) -> CommandResult {
         if self.record_running() {
             self.release_record_output();
-            self.recording.last_file = self.recording.files.last().cloned();
+            // A take stopped before its first file opened keeps the last.
+            if let Some(file) = self.recording.files.last() {
+                self.recording.last_file = Some(file.clone());
+            }
             log::info!("Recording stopped");
         }
         self.recording.started_at = None;
@@ -230,6 +268,15 @@ impl super::super::VardaApp {
 
     fn release_record_output(&mut self) {
         self.recording.disk = None;
+        if let Some(mut start) = self.recording.starting.take() {
+            start.answer(&CommandResult::Err {
+                code: ErrorCode::Unavailable,
+                message: "The recording was stopped before it started".into(),
+            });
+            if let Some(pass) = start.passthrough.take() {
+                pass.release(&mut self.audio_manager);
+            }
+        }
         for output in self.recording.output.drain(..) {
             if let UnifiedOutput::Headless(mut h) = output {
                 if let Some(mut sub) = h.subprocess.take() {
@@ -242,14 +289,15 @@ impl super::super::VardaApp {
         }
     }
 
-    /// Start the encoder on the take's next file, with a fresh audio tap.
-    fn spawn_record_encoder(&mut self) -> Result<(), String> {
+    /// Start the encoder on the take's next file, with a fresh audio tap —
+    /// on a thread of its own, taken in once there (see
+    /// [`Self::take_started_record`]). `again`: after the last one stopped.
+    fn spawn_record_encoder(&mut self, again: bool) -> Result<(), String> {
         let Self {
             recording,
             audio_manager,
             audio_mix,
             session,
-            context,
             target_fps,
             ..
         } = self;
@@ -260,15 +308,15 @@ impl super::super::VardaApp {
             recording.dropped_before += old.frames_dropped();
             old.stop();
         }
+        h.active = false;
         if let Some(stale) = h.audio_pcm.take() {
             stale.release(audio_manager);
         }
-        let options = &recording.settings.options;
-        let path = crate::record::file_path(
-            &options.folder,
-            &recording.stamp,
+        let options = recording.settings.options.clone();
+        let (stamp, part, given) = (
+            recording.stamp.clone(),
             recording.files.len() + 1,
-            options.format.extension(),
+            std::sync::Arc::clone(&recording.given),
         );
         let (audio_input, passthrough) = resolve_output_audio(
             audio_manager,
@@ -282,18 +330,78 @@ impl super::super::VardaApp {
         );
         // Frames go to the encoder as NV12 made on the GPU where they can.
         let fps = encoder_fps(*target_fps);
-        match crate::renderer::FfmpegSubprocess::spawn_record_with(
-            options,
-            (h.width, h.height),
+        let size = (h.width, h.height);
+        let nv12 = crate::renderer::nv12::nv12_fits(h.width, h.height);
+        // The file chosen there as well: choosing it looks at the disk.
+        let make = move || {
+            let file = crate::record::file_path_unused(
+                &options.folder,
+                &stamp,
+                part,
+                options.format.extension(),
+                &given,
+            );
+            crate::renderer::FfmpegSubprocess::spawn_record_with(
+                &options,
+                size,
+                fps,
+                audio_input,
+                &file,
+                nv12,
+            )
+            .map(|sub| (sub, file))
+        };
+        match super::outputs::EncoderStart::begin(
+            "record-start".into(),
+            make,
+            passthrough,
             fps,
-            audio_input,
-            &path,
-            crate::renderer::nv12::nv12_fits(h.width, h.height),
+            again,
         ) {
-            Ok(sub) => {
+            Ok(start) => {
+                recording.starting = Some(start);
+                Ok(())
+            }
+            Err((message, passthrough)) => {
+                if let Some(pass) = passthrough {
+                    pass.release(audio_manager);
+                }
+                Err(message)
+            }
+        }
+    }
+
+    /// The encoder being started for the next file, taken in once there —
+    /// or, failing, said: the take stops if it was its first, else it is
+    /// tried again in a while. Whether one is still starting (the rest of
+    /// the frame's check then waits).
+    pub(crate) fn take_started_record(&mut self) -> bool {
+        let Some(start) = &self.recording.starting else {
+            return false;
+        };
+        let Some(made) = start.made() else {
+            return true;
+        };
+        let Some(mut start) = self.recording.starting.take() else {
+            return false;
+        };
+        let Self {
+            recording,
+            audio_manager,
+            context,
+            ..
+        } = self;
+        match made {
+            Ok((sub, path)) => {
+                let Some(UnifiedOutput::Headless(h)) = recording.output.first_mut() else {
+                    if let Some(pass) = start.passthrough.take() {
+                        pass.release(audio_manager);
+                    }
+                    return false;
+                };
                 h.keep_nv12(&context.device, sub.takes_nv12());
                 h.subprocess = Some(Box::new(sub));
-                h.audio_pcm = passthrough.map(Box::new);
+                h.audio_pcm = start.passthrough.take().map(Box::new);
                 h.active = true;
                 h.started_at = Some(Instant::now());
                 if let Some(disk) = &recording.disk {
@@ -303,16 +411,33 @@ impl super::super::VardaApp {
                 recording.dropped_seen = 0;
                 recording.dropped_secs_seen = 0.0;
                 recording.drops.clear();
-                recording.fps = fps;
-                Ok(())
+                recording.fps = start.fps;
+                if start.again {
+                    log::info!("Recording continues in a new file");
+                }
+                start.answer(&CommandResult::Ok);
             }
             Err(error) => {
-                if let Some(pass) = passthrough {
+                if let Some(pass) = start.passthrough.take() {
                     pass.release(audio_manager);
                 }
-                Err(error.to_string())
+                let message = error.to_string();
+                start.answer(&CommandResult::Err {
+                    code: ErrorCode::InternalError,
+                    message: message.clone(),
+                });
+                if start.again {
+                    self.recording.problem = Some(format!("Cannot record: {message}"));
+                    self.recording.retry_at = Some(Instant::now() + ENCODER_RETRY * 3);
+                } else {
+                    log::warn!("Recording could not start: {message}");
+                    self.notify_error(format!("Recording could not start: {message}"));
+                    self.release_record_output();
+                    self.recording.started_at = None;
+                }
             }
         }
+        false
     }
 
     /// Kill the recording's encoder as a crash would — for tests.
@@ -328,6 +453,9 @@ impl super::super::VardaApp {
     /// Once a frame: continue in a new file when the encoder stopped by
     /// itself, and watch whether it keeps up.
     pub(crate) fn poll_recording(&mut self) {
+        if self.take_started_record() {
+            return;
+        }
         let Some(UnifiedOutput::Headless(h)) = self.recording.output.first_mut() else {
             return;
         };
@@ -369,11 +497,11 @@ impl super::super::VardaApp {
                 h.active = false;
                 self.recording.retry_at = Some(now + ENCODER_RETRY);
             }
-            Some(at) if now >= at => match self.spawn_record_encoder() {
+            Some(at) if now >= at => match self.spawn_record_encoder(true) {
                 Ok(()) => {
-                    log::info!("Recording continues in a new file");
-                    self.recording.retry_at = None;
+                    // Taken in once started (see `take_started_record`).
                     // The problem stays shown: the take is now in two files.
+                    self.recording.retry_at = None;
                 }
                 Err(error) => {
                     self.recording.problem = Some(format!("Cannot record: {error}"));

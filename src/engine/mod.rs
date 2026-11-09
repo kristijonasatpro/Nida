@@ -1836,6 +1836,18 @@ pub enum EngineCommand {
         resolution: crate::engine::value::dome::DomemasterResolution,
     },
 
+    /// How the compositor draws, to compare its ways on one show without
+    /// a restart: a layer that is only its live source placed drawn
+    /// straight onto its channel from that source (`direct_layers`, on by
+    /// default), and a channel's blend-unit layers in one pass
+    /// (`merge_layer_passes`, on). One left out stays as it is.
+    SetCompositor {
+        #[serde(default)]
+        direct_layers: Option<bool>,
+        #[serde(default)]
+        merge_layer_passes: Option<bool>,
+    },
+
     // ── Frame pacing ─────────────────────────────────────────
     SetTargetFps {
         fps: u32,
@@ -2210,6 +2222,10 @@ pub enum EngineCommand {
     /// An audio bus as a monitor mix: sources reach it before their faders
     /// (unless a send says otherwise).
     SetAudioBusPreFader { uuid: String, pre_fader: bool },
+    /// Echo removal on an audio bus, for a call's: its microphones arrive
+    /// with what `room` plays (the bus the room's speakers play, by UUID)
+    /// taken out; `None` is off.
+    SetAudioBusEchoRoom { uuid: String, room: Option<String> },
     /// Send a source to an audio bus, or stop.
     SetAudioSend {
         uuid: String,

@@ -310,6 +310,16 @@ pub struct Mixer {
     /// (see [`crate::renderer::region`]). On by default; off draws every
     /// deck whole, as before, for comparing the two.
     pub draw_visible_parts: bool,
+    /// Draw a layer that is only its live source placed straight onto its
+    /// channel from that source (see `Channel::direct_layers`); off for
+    /// comparing (`SetCompositor`).
+    pub direct_layers: bool,
+    /// Draw a channel's blend-unit layers in one pass (see
+    /// `Channel::merge_layer_passes`); off for comparing.
+    pub merge_layer_passes: bool,
+    /// Decks whose thumbnails the control window drew last frame, by UUID
+    /// (see `Channel::previewed`).
+    pub previewed_decks: Vec<String>,
     /// The order channels render in this frame, set by `prepare_taps`: a
     /// channel shown in another renders before it, so the other shows this
     /// frame's picture. Channel order everywhere else is unchanged.
@@ -457,6 +467,9 @@ impl Mixer {
             tile_channels: Vec::new(),
             drawn_on: std::collections::HashMap::new(),
             draw_visible_parts: true,
+            direct_layers: true,
+            merge_layer_passes: true,
+            previewed_decks: Vec::new(),
             render_order: Vec::new(),
             tap_shows: Vec::new(),
             tap_loops: std::collections::HashSet::new(),

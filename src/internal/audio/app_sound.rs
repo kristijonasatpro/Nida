@@ -10,8 +10,11 @@
 //! like any input (`audio_mix::device::open_input`); being private, only this
 //! process sees it. macOS asks once whether Nida may record other apps' sound.
 //!
-//! The app is muted on the Mac's own speakers while Nida takes its sound, so a
-//! room does not hear a call twice: it is heard through Nida's buses.
+//! The app is muted on the Mac's own speakers while Nida takes its sound and
+//! sends it to a bus, so a room does not hear a call twice: it is heard
+//! through Nida's buses. Its strip sending it to no bus, the app keeps its
+//! speakers, its sound still metered: taken and sent nowhere, Safari was
+//! silent while Nida ran (Max5, 2026-11-08).
 
 /// An app making sound, or that has, which can be taken as an input.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
@@ -167,11 +170,12 @@ mod mac {
         kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioProcessPropertyBundleID,
         kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyPID,
         kAudioStreamPropertyVirtualFormat, kAudioSubDeviceUIDKey,
-        kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, AudioHardwareCreateAggregateDevice,
-        AudioHardwareCreateProcessTap, AudioHardwareDestroyAggregateDevice,
-        AudioHardwareDestroyProcessTap, AudioObjectGetPropertyData,
-        AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
-        CATapDescription, CATapMuteBehavior,
+        kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, kAudioTapPropertyDescription,
+        AudioHardwareCreateAggregateDevice, AudioHardwareCreateProcessTap,
+        AudioHardwareDestroyAggregateDevice, AudioHardwareDestroyProcessTap,
+        AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
+        AudioObjectPropertyAddress, AudioObjectSetPropertyData, CATapDescription,
+        CATapMuteBehavior,
     };
     use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType};
     use objc2_foundation::{NSArray, NSBundle, NSNumber, NSString};
@@ -448,18 +452,30 @@ mod mac {
         process: AudioObjectID,
         aggregate: AudioObjectID,
         device: String,
+        /// What the tap was made from: changed and given again to mute the
+        /// app or not (see [`Self::set_muted`]).
+        description: Retained<CATapDescription>,
+    }
+
+    /// Muted on the Mac's own speakers while tapped, or not at all.
+    fn behaviour(muted: bool) -> CATapMuteBehavior {
+        if muted {
+            CATapMuteBehavior::MutedWhenTapped
+        } else {
+            CATapMuteBehavior::Unmuted
+        }
     }
 
     impl Tap {
-        /// Tap the processes `processes` of the app `bundle_id`, muted on the
-        /// Mac's own speakers while tapped.
+        /// Tap the processes `processes` of the app `bundle_id` — `muted` on
+        /// the Mac's own speakers while tapped, or not.
         ///
         /// # Errors
         ///
         /// When there is nothing to tap, no output without inputs to clock
         /// it, Core Audio refuses the tap or its device, or the device holds
         /// more than the tap's sound.
-        pub fn create(bundle_id: &str, processes: &[AudioObjectID]) -> Result<Self> {
+        pub fn create(bundle_id: &str, processes: &[AudioObjectID], muted: bool) -> Result<Self> {
             if processes.is_empty() {
                 bail!("{bundle_id} is not running");
             }
@@ -477,7 +493,7 @@ mod mac {
                 unsafe {
                     description.setName(&NSString::from_str(&format!("Nida: {bundle_id}")));
                     description.setPrivate(true);
-                    description.setMuteBehavior(CATapMuteBehavior::MutedWhenTapped);
+                    description.setMuteBehavior(behaviour(muted));
                 }
                 let mut tap: AudioObjectID = 0;
                 // SAFETY: the description is valid; `tap` receives its object.
@@ -494,6 +510,7 @@ mod mac {
                             process: tap,
                             aggregate,
                             device,
+                            description: description.clone(),
                         })
                     } else {
                         // SAFETY: the device made just above.
@@ -512,6 +529,36 @@ mod mac {
         /// The name of the device the tap is read through: this tap's alone.
         pub fn device(&self) -> &str {
             &self.device
+        }
+
+        /// Mute the app on the Mac's own speakers while tapped, or give them
+        /// back — the tap and its sound go on.
+        ///
+        /// # Errors
+        ///
+        /// When Core Audio refuses the changed description.
+        pub fn set_muted(&mut self, muted: bool) -> Result<()> {
+            // SAFETY: a plain setter on the description this tap was made from.
+            unsafe { self.description.setMuteBehavior(behaviour(muted)) };
+            let at = address(kAudioTapPropertyDescription, kAudioObjectPropertyScopeGlobal);
+            let description: *const CATapDescription = Retained::as_ptr(&self.description);
+            let size = u32::try_from(std::mem::size_of::<*const CATapDescription>())?;
+            // SAFETY: the tap this value made; the property takes a pointer to
+            // its description, which `description` is, `size` bytes of it.
+            let status = unsafe {
+                AudioObjectSetPropertyData(
+                    self.process,
+                    NonNull::from(&at),
+                    0,
+                    std::ptr::null(),
+                    size,
+                    NonNull::from(&description).cast(),
+                )
+            };
+            if status != 0 {
+                bail!("the tap's mute could not be changed (status {status})");
+            }
+            Ok(())
         }
     }
 
@@ -618,12 +665,19 @@ mod other {
         /// # Errors
         ///
         /// Always: only macOS taps an app's sound.
-        pub fn create(_bundle_id: &str, _processes: &[u32]) -> Result<Self> {
+        pub fn create(_bundle_id: &str, _processes: &[u32], _muted: bool) -> Result<Self> {
             bail!("an app's sound can be taken only on macOS")
         }
 
         pub fn device(&self) -> &str {
             ""
+        }
+
+        /// # Errors
+        ///
+        /// Never: there is no tap here.
+        pub fn set_muted(&mut self, _muted: bool) -> Result<()> {
+            Ok(())
         }
     }
 }
