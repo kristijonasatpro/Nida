@@ -202,7 +202,7 @@ mod tests {
 #[derive(Debug, Clone)]
 pub(crate) struct AnalyzerInput {
     /// RGBA pixel data, downscaled from the deck's source frame.
-    pub frame: Vec<u8>,
+    pub frame: std::sync::Arc<Vec<u8>>,
     /// Width of the downscaled frame in pixels.
     pub width: u32,
     /// Height of the downscaled frame in pixels.
@@ -219,6 +219,9 @@ pub(crate) struct AnalyzerInput {
 /// The engine handles threading, lifecycle, and snapshot delivery — implementors
 /// only need to define the analysis logic.
 pub(crate) trait Analyzer: Send + 'static {
+    /// Requested long edge of display-encoded RGBA8 input. None means no
+    /// pixels are needed; analysis still receives an empty frame and dimensions.
+    fn frame_size(&self) -> Option<u32>;
     /// Unique type identifier (e.g. `"face_detect"`, `"brightness"`).
     ///
     /// Must be stable across sessions for serialization.

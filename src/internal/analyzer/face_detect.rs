@@ -763,6 +763,10 @@ impl FaceDetectAnalyzer {
 }
 
 impl Analyzer for FaceDetectAnalyzer {
+    // Keep 1080p detail: the mesh stage crops faces from this picture.
+    fn frame_size(&self) -> Option<u32> {
+        Some(1920)
+    }
     fn analyzer_type(&self) -> &'static str {
         "face_detect"
     }
@@ -1247,7 +1251,7 @@ mod tests {
     fn preprocess_produces_correct_shape() {
         let mut analyzer = FaceDetectAnalyzer::new();
         let input = AnalyzerInput {
-            frame: vec![128u8; 64 * 64 * 4],
+            frame: std::sync::Arc::new(vec![128u8; 64 * 64 * 4]),
             width: 64,
             height: 64,
             timestamp: Instant::now(),
@@ -1359,7 +1363,7 @@ mod tests {
     fn preprocess_face_crop_correct_shape() {
         let mut analyzer = FaceDetectAnalyzer::new();
         let input = AnalyzerInput {
-            frame: vec![128u8; 64 * 64 * 4],
+            frame: std::sync::Arc::new(vec![128u8; 64 * 64 * 4]),
             width: 64,
             height: 64,
             timestamp: Instant::now(),
