@@ -16,6 +16,7 @@ use crate::renderer::blit::BlitPipeline;
 use crate::renderer::GpuContext;
 
 use super::lower_third::{Params, Placer};
+use super::Stand;
 
 /// What a drawing is of: whatever changes it.
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +143,10 @@ pub struct Text {
     /// How far shown (0 hidden, 1 shown) when `since`, and toward which.
     fade_from: f32,
     since: Instant,
+    /// Which drawing its own is: another number each time one is put — a
+    /// same-size one is written into the texture it has (see
+    /// `Text::still`).
+    put_serial: u64,
 }
 
 impl Text {
@@ -172,6 +177,7 @@ impl Text {
             completed: Vec::new(),
             fade_from: shown,
             since: Instant::now(),
+            put_serial: super::next_drawing(),
         })
     }
 
@@ -270,6 +276,37 @@ impl Text {
         self.shown(Instant::now()) > 0.0 && !self.faces.is_empty()
     }
 
+    /// Hidden, and faded out: its frame is clear, and stays so until
+    /// `set_settings` shows it — so its channel need not be drawn (see
+    /// `Channel::blank`).
+    pub fn is_off(&self) -> bool {
+        !self.settings.visible && self.shown(Instant::now()) <= 0.0
+    }
+
+    /// What its frame shows while it stands still; none while it fades.
+    /// Hidden, or with no drawing: clear. Shown: its drawing as placed —
+    /// exactly what `render` draws, which then is the same every frame, so
+    /// its deck keeps the frame it has (see `Deck::still_frame`).
+    pub(super) fn still(&self) -> Option<Stand> {
+        let now = Instant::now();
+        let secs = self.settings.fade_secs;
+        // Within its fade time: taken for fading, though it may be where
+        // it was — a frame drawn later than this is as far on or further.
+        if secs > 0.0 && (now - self.since).as_secs_f32() < secs {
+            return None;
+        }
+        let shown = self.shown(now);
+        let Some(face) = self.main_face().filter(|_| shown > 0.0) else {
+            return Some(Stand::Clear);
+        };
+        let (scale, offset) = self.placement(face);
+        let placed = [shown, scale[0], scale[1], offset[0], offset[1]];
+        Some(Stand::Drawing {
+            serial: self.put_serial,
+            placed: bytemuck::bytes_of(&placed).to_vec(),
+        })
+    }
+
     /// Each frame: the drawings asked for if they changed, and taken when
     /// back.
     pub fn tick(&mut self) {
@@ -299,6 +336,8 @@ impl Text {
         if !frames.contains(&frame) {
             return;
         }
+        // Whatever comes of it, what it shows may be another picture.
+        self.put_serial = super::next_drawing();
         self.completed.retain(|(done, _)| done.frame != frame);
         let error = drawing.as_ref().err().map(|()| {
             format!(
@@ -1327,5 +1366,84 @@ mod tests {
             ink_middle(TextAlign::Right),
         );
         assert!(l < 0.4 && (c - 0.5).abs() < 0.05 && r > 0.6, "{l} {c} {r}");
+    }
+
+    /// Off (`is_off`) is hidden and faded out: at once with no fade time, or
+    /// once the fade has run. Never while it fades out, nor while shown —
+    /// even from nothing, at the start of a fade in.
+    #[test]
+    fn off_is_hidden_and_faded_out() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            return;
+        };
+        let mut text = Text::new(&gpu, TextSettings::default(), (640, 360)).expect("text");
+        let now = Instant::now();
+        // A fade begun an hour from now stands where it begins; one begun
+        // ten seconds ago is done.
+        let begins = now + std::time::Duration::from_secs(3600);
+        let done = now
+            .checked_sub(std::time::Duration::from_secs(10))
+            .expect("the machine up ten seconds");
+        assert!(!text.is_off(), "shown");
+        text.settings.visible = false;
+        text.settings.fade_secs = 0.0;
+        assert!(text.is_off(), "hidden, with no fade time");
+        text.settings.fade_secs = 5.0;
+        text.fade_from = 1.0;
+        text.since = begins;
+        assert!(!text.is_off(), "fading out");
+        text.since = done;
+        assert!(text.is_off(), "faded out");
+        text.settings.visible = true;
+        text.fade_from = 0.0;
+        text.since = begins;
+        assert!(!text.is_off(), "coming in from nothing");
+    }
+
+    /// What stands still (`still`): clear with no drawing, or hidden and
+    /// faded out; none within its fade time; shown, its drawing as placed —
+    /// the same from frame to frame, another when it is drawn again (though
+    /// into the texture it has) or put elsewhere.
+    #[test]
+    fn a_text_standing_still_is_its_drawing_as_placed() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            return;
+        };
+        let mut text = Text::new(&gpu, TextSettings::default(), (640, 360)).expect("text");
+        let now = Instant::now();
+        // A fade begun an hour from now stands where it begins; one begun
+        // ten seconds ago is done.
+        let begins = now + std::time::Duration::from_secs(3600);
+        let done = now
+            .checked_sub(std::time::Duration::from_secs(10))
+            .expect("the machine up ten seconds");
+        text.since = done;
+        assert_eq!(text.still(), Some(Stand::Clear), "shown, with no drawing");
+        let spec = text.wanted().remove(0);
+        let red = image::RgbaImage::from_pixel(8, 4, image::Rgba([255, 0, 0, 255]));
+        text.put(spec.clone(), Ok(Some(red)));
+        let stands = text.still();
+        assert!(matches!(stands, Some(Stand::Drawing { .. })), "{stands:?}");
+        assert_eq!(text.still(), stands, "the same from frame to frame");
+        // As big as the one before: written into the texture it has.
+        let green = image::RgbaImage::from_pixel(8, 4, image::Rgba([0, 255, 0, 255]));
+        text.put(spec, Ok(Some(green)));
+        let redrawn = text.still();
+        assert!(matches!(redrawn, Some(Stand::Drawing { .. })), "{redrawn:?}");
+        assert_ne!(redrawn, stands, "drawn again, where it was");
+        text.settings.look.anchor = crate::engine::value::timer::Anchor::TopLeft;
+        let placed = text.still();
+        assert!(matches!(placed, Some(Stand::Drawing { .. })), "{placed:?}");
+        assert_ne!(placed, redrawn, "put elsewhere");
+        text.since = begins;
+        assert_eq!(text.still(), None, "within its fade time");
+        text.settings.visible = false;
+        text.fade_from = 1.0;
+        assert_eq!(text.still(), None, "fading out");
+        text.since = done;
+        assert_eq!(text.still(), Some(Stand::Clear), "hidden and faded out");
+        text.settings.fade_secs = 0.0;
+        text.since = begins;
+        assert_eq!(text.still(), Some(Stand::Clear), "hidden, with no fade time");
     }
 }

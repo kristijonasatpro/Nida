@@ -178,6 +178,16 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                                 s.identity,
                                 crate::screen_capture::backend::TargetIdentity::Display { .. }
                             ),
+                            target_uuid: match &s.identity {
+                                crate::screen_capture::backend::TargetIdentity::Display {
+                                    uuid,
+                                    ..
+                                } => uuid.clone(),
+                                crate::screen_capture::backend::TargetIdentity::Window {
+                                    ..
+                                } => None,
+                            },
+                            kept_by_name: app.screen_capture_manager().goes_by_name(&s.identity),
                             // Normalized so the UI slider and the MIDI router
                             // speak the same units on the same path.
                             rate_norm: ((s.config.rate - MIN_CAPTURE_RATE)
@@ -310,7 +320,7 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                         render_cost_us: slot.render_cost_us,
                         gpu_render_cost_us: slot.gpu_render_cost_us,
                         fps: slot.deck.fps(),
-                        still: slot.deck.still_frame(mixer.modulation()).is_some(),
+                        still: slot.deck.is_still(mixer.modulation()),
                         source_asleep: !slot.source_demand.wants_frames(),
                         running_analyzers: slot
                             .deck
@@ -713,6 +723,7 @@ pub(crate) fn build_screen_capture_snapshot(
                 width: t.width,
                 height: t.height,
                 is_varda: t.is_varda,
+                uuid: t.uuid.clone(),
             })
             .collect(),
         permission: mgr.permission_state().as_str().to_string(),

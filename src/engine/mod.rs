@@ -365,6 +365,13 @@ pub enum EngineCommand {
         deck_uuid: String,
         source: crate::scene::TapSourceConfig,
     },
+    /// Point an existing screen capture deck at another screen or window —
+    /// or at its own, picked again: a display so picked is kept by its own
+    /// identity, not the number it is listed under.
+    SetScreenCaptureTarget {
+        deck_uuid: String,
+        target: crate::scene::CaptureTargetConfig,
+    },
     RemoveDeck {
         deck_uuid: String,
     },
@@ -710,7 +717,8 @@ pub enum EngineCommand {
         talk_id: String,
         to: usize,
     },
-    /// One talk taken out of the running order; the talk on stays on.
+    /// One talk taken out of the running order; the talk on stays on, till
+    /// another is started or it is stopped (`StopTalk`).
     RemoveTalk {
         deck_uuid: String,
         talk_id: String,
@@ -728,6 +736,16 @@ pub enum EngineCommand {
         #[serde(default)]
         deck_uuid: Option<String>,
         to: crate::engine::value::slides::TalkRef,
+    },
+    /// End the talk on, and one being started: nothing on, PowerPoint's
+    /// show of it ended and the deck Nida opened closed, nothing opened
+    /// ahead until a talk is started again. The talk stays in the running
+    /// order, where it was left: `"previous"` starts it again, and what came
+    /// after it comes next. Without a `deck_uuid`, the Slides input on air,
+    /// else the one started last, else the first.
+    StopTalk {
+        #[serde(default)]
+        deck_uuid: Option<String>,
     },
     /// The talk Start next takes, picked by hand; `null` for the talk
     /// after the one on.
@@ -1839,13 +1857,36 @@ pub enum EngineCommand {
     /// How the compositor draws, to compare its ways on one show without
     /// a restart: a layer that is only its live source placed drawn
     /// straight onto its channel from that source (`direct_layers`, on by
-    /// default), and a channel's blend-unit layers in one pass
-    /// (`merge_layer_passes`, on). One left out stays as it is.
+    /// default), a channel's blend-unit layers in one pass
+    /// (`merge_layer_passes`, on), a slow layer on Auto drawn less often
+    /// while frames run late (`slow_layers_less_often`, on), a channel
+    /// nothing of which shows left undrawn (`skip_blank_channels`, on), a
+    /// lower third or a text standing still kept as it is drawn
+    /// (`keep_still_text`, on), Main's blend-unit layers in one pass
+    /// (`merge_main_passes`, on), Main that is one input, whole, given
+    /// out as that input's picture (`pass_main_through`, on), a clip's
+    /// frame kept while the clip gives no new one (`keep_still_clips`, on),
+    /// and an input's picture kept while nothing it is made of changes
+    /// (`keep_still_inputs`, on). One left out stays as it is.
     SetCompositor {
         #[serde(default)]
         direct_layers: Option<bool>,
         #[serde(default)]
         merge_layer_passes: Option<bool>,
+        #[serde(default)]
+        slow_layers_less_often: Option<bool>,
+        #[serde(default)]
+        skip_blank_channels: Option<bool>,
+        #[serde(default)]
+        keep_still_text: Option<bool>,
+        #[serde(default)]
+        merge_main_passes: Option<bool>,
+        #[serde(default)]
+        pass_main_through: Option<bool>,
+        #[serde(default)]
+        keep_still_clips: Option<bool>,
+        #[serde(default)]
+        keep_still_inputs: Option<bool>,
     },
 
     // ── Frame pacing ─────────────────────────────────────────

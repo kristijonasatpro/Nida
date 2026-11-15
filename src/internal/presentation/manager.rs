@@ -101,30 +101,90 @@ pub enum Job {
     /// Have PowerPoint save the deck at `path` as a PDF at `out` — its
     /// slides as pictures, for the presenter view's next slide (see
     /// `super::pictures`): opened for it when PowerPoint does not have it,
-    /// and closed again then. Never while a show of PowerPoint's runs: the
-    /// question it may ask (Grant Access) holds the show till answered.
+    /// and closed again then. With a show of PowerPoint's running, only a
+    /// deck an input keeps open, and only into a folder PowerPoint has
+    /// saved into before (see [`Worker::save_pdf`]).
     SavePdf { path: PathBuf, out: PathBuf },
 }
 
-impl Job {
-    /// Whether it plays a show: the saves of slide pictures waiting are
-    /// dropped for it (see [`Worker::take`]).
-    fn plays_a_show(&self) -> bool {
-        matches!(
-            self,
-            Self::Open { show: true, .. } | Self::SetShow { show: true, .. } | Self::Restart { .. }
-        )
+/// Why a save of slide pictures was not made beside a running show:
+/// PowerPoint has not saved into their folder yet.
+/// A copy of the slide pictures saved at `pdf` put beside the deck at
+/// `deck` ([`super::pictures::put_beside`]), by a thread of their own, one
+/// for all the copies: the first time Nida writes into a folder macOS keeps
+/// (Downloads, Desktop, Documents) macOS may ask the user, and holds the
+/// thread that writes till answered — never the one that steps PowerPoint's
+/// shows. In the order they were saved, so the pictures saved last are the
+/// ones left beside a deck saved twice. Not copied — the folder not to be
+/// written, the user saying no — the pictures work as they are, from Nida's
+/// own folder: said once a folder.
+fn copy_beside(pdf: &Path, deck: &Path) {
+    type Copy = (PathBuf, PathBuf);
+    static QUEUE: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Copy>>> =
+        std::sync::OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Copy>();
+        let spawned = std::thread::Builder::new()
+            .name("slide-pictures-beside".into())
+            .spawn(move || {
+                for (pdf, deck) in rx {
+                    copy_one_beside(&pdf, &deck);
+                }
+            });
+        match spawned {
+            Ok(_) => Some(tx),
+            Err(e) => {
+                log::warn!("Slide pictures are not copied beside their decks: no thread for it: {e}");
+                None
+            }
+        }
+    });
+    if let Some(queue) = queue {
+        let _ = queue.send((pdf.to_path_buf(), deck.to_path_buf()));
     }
 }
 
-/// Why a save of slide pictures was refused: a show of PowerPoint's runs.
-const SHOW_RUNNING: &str = "a PowerPoint show is running: slide pictures are made with none \
-     running — PowerPoint may ask for access first, and holds its show till that is answered";
+/// One copy of [`copy_beside`]'s, on its thread.
+fn copy_one_beside(pdf: &Path, deck: &Path) {
+    match super::pictures::put_beside(pdf, deck) {
+        Ok(Some(to)) => log::info!("Slide pictures copied beside their deck: {}", to.display()),
+        Ok(None) => {}
+        Err(why) => {
+            let folder = deck.parent().unwrap_or(deck);
+            if super::pictures::said_first(folder) {
+                log::warn!(
+                    "Slide pictures are not copied beside the decks in {}: {why} — they \
+                     work as they are, from Nida's own folder",
+                    folder.display()
+                );
+            }
+        }
+    }
+}
 
-/// Why the saves of slide pictures waiting were dropped (see
-/// [`Worker::take`]).
-const SAVES_DROPPED: &str =
-    "not made: a PowerPoint talk was started first — make them again with none on";
+const SHOW_RUNNING: &str = "a PowerPoint show is running, and PowerPoint has not saved into \
+     Nida's folder before: the first time it may ask for access, and holds its show till that \
+     is answered — make them once with no show running";
+
+/// Why not beside a running show: PowerPoint does not have the deck open.
+const NOT_OPEN: &str = "a PowerPoint show is running, and this deck is not open in PowerPoint: \
+     nothing is opened beside a show — made once it is open, or with no show running";
+
+/// With a show of PowerPoint's running, PowerPoint is left this long after
+/// one save of slide pictures before the next: while it saves it takes no
+/// step.
+const SAVES_APART: Duration = Duration::from_secs(3);
+
+/// Why not now: a show is on its way up.
+const SHOW_STARTING: &str = "a PowerPoint show is on its way up: made once it runs";
+
+/// Whether a save of slide pictures answered `why` was only not made now —
+/// a show of PowerPoint's in its way — and may be asked again later as it
+/// is.
+#[must_use]
+pub fn not_now(why: &str) -> bool {
+    [SHOW_RUNNING, NOT_OPEN, SHOW_STARTING].contains(&why)
+}
 
 /// How a deck's show stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,10 +325,9 @@ pub fn title_bar_points() -> u32 {
 /// screen's own pixels (a Retina screen's 960 × 540 points are 1920 × 1080
 /// pixels), no more than the picture needs.
 ///
-/// The capture's `scale_to` bounds the whole window and the crop is taken
-/// from that (see `screen_capture::platform::macos::output_size`): the bound
-/// is the picture's size grown by what the crop takes away, so the slide
-/// comes out at most `pixels`.
+/// The capture's `scale_to` bounds what the crop keeps (see
+/// `screen_capture::resample::Geometry::resolve`): the slide, which comes
+/// out at most `pixels`.
 #[must_use]
 pub fn capture_config(
     target: &CaptureTargetInfo,
@@ -286,17 +345,14 @@ pub fn capture_config(
         w: 1.0,
         h: kept,
     };
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let bound = (
-        pixels.0.max(1),
-        (pixels.1.max(1) as f32 / kept).ceil() as u32,
-    );
     CaptureConfig {
         rate: SHOW_CAPTURE_RATE,
         crop,
         show_cursor: false,
         exclude_varda: false,
-        scale_to: Some(bound),
+        scale_to: Some((pixels.0.max(1), pixels.1.max(1))),
+        // The slide fitted within its picture, whatever shows it.
+        drawn: crate::screen_capture::backend::Drawn::default(),
     }
 }
 
@@ -466,6 +522,11 @@ pub struct Worker<R: Runner, F: WindowFinder> {
     /// Decks Nida was opening for inputs since gone: closed once PowerPoint
     /// has them, given up on after a while.
     orphans: Vec<(PathBuf, Instant)>,
+    /// When PowerPoint last ended a save of slide pictures.
+    last_save: Option<Instant>,
+    /// Slide pictures waiting are not saved till then: a show running,
+    /// PowerPoint rests from its last save ([`Self::save_next`]).
+    saves_held: Option<Instant>,
 }
 
 impl<R: Runner, F: WindowFinder> Worker<R, F> {
@@ -478,6 +539,8 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
             events,
             sessions: HashMap::new(),
             orphans: Vec::new(),
+            last_save: None,
+            saves_held: None,
         }
     }
 
@@ -526,15 +589,9 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
             }
             Job::Close { deck } => self.close(&deck),
             Job::SavePdf { path, out } => {
-                let result = self.save_pdf(&path, &out);
-                match &result {
-                    Ok(()) => log::info!("PowerPoint saved {} as slide pictures", path.display()),
-                    Err(why) => log::warn!(
-                        "PowerPoint did not save {} as slide pictures: {why}",
-                        path.display()
-                    ),
-                }
-                self.send(Event::SavedPdf { path, out, result });
+                let began = Instant::now();
+                let beside = self.beside_a_show();
+                self.save_and_say(path, out, beside, began, now);
             }
             Job::Window { deck } => {
                 if let Some(session) = self.sessions.get_mut(&deck) {
@@ -546,21 +603,67 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
         }
     }
 
+    /// The deck at `path` saved as a PDF at `out` ([`Self::save_pdf`]) —
+    /// `beside` a show of PowerPoint's or not, as [`Self::beside_a_show`]
+    /// just found, asked at `began` — and what came of it said to the
+    /// engine.
+    fn save_and_say(
+        &mut self,
+        path: PathBuf,
+        out: PathBuf,
+        beside: Result<bool, String>,
+        began: Instant,
+        now: Instant,
+    ) {
+        let result = beside.and_then(|with_show| self.save_pdf(&path, &out, with_show, began, now));
+        match &result {
+            Ok(()) => log::info!("PowerPoint saved {} as slide pictures", path.display()),
+            Err(why) if not_now(why) => log::info!(
+                "PowerPoint was not asked to save {} as slide pictures now: {why}",
+                path.display()
+            ),
+            Err(why) => log::warn!(
+                "PowerPoint did not save {} as slide pictures: {why}",
+                path.display()
+            ),
+        }
+        self.send(Event::SavedPdf { path, out, result });
+    }
+
     /// [`Job::SavePdf`]: the deck at `path` saved as a PDF at `out`, opened
     /// for it and closed again when PowerPoint did not have it. Written
     /// under another name first, and put at `out` once it opens: a save cut
     /// short leaves nothing that looks made.
-    fn save_pdf(&mut self, path: &Path, out: &Path) -> Result<(), String> {
-        // A talk on, or on its way up.
-        if self.sessions.values().any(|s| s.show.is_some() || s.wants_show) {
-            return Err(SHOW_RUNNING.into());
-        }
-        // A show started in PowerPoint itself, of any deck: Nida's sessions
-        // do not know it. Asked before anything is opened.
-        match self.ppt.slide_shows() {
-            Ok(0) => {}
-            Ok(_) | Err(ScriptError::Showing) => return Err(SHOW_RUNNING.into()),
-            Err(e) => return Err(e.to_string()),
+    ///
+    /// With a show of PowerPoint's running — a talk on, or one started in
+    /// PowerPoint itself — PowerPoint saves all the same, its show staying
+    /// as it is (tried, 16.114: 0.3 to 1.8 s, in which it answers nothing
+    /// else). Two things could hold the show longer, so neither is done
+    /// then: the question PowerPoint asks the first time it saves into a
+    /// folder (Grant Access) — only a folder it has saved into before is
+    /// saved into; and opening or closing a deck — only a deck an input
+    /// keeps open is saved, and left open.
+    ///
+    /// `with_show`: whether such a show runs, as whoever asks found it the
+    /// moment before ([`Self::beside_a_show`]) — PowerPoint is asked once:
+    /// the rest between two saves ([`Self::save_next`]) and the way it is
+    /// saved go by the one answer. A show started since is not saved
+    /// beside: the save meant for no show leaves PowerPoint alone with one
+    /// running, and the deck is asked again later.
+    ///
+    /// `began`: when PowerPoint was first asked for this save — for its
+    /// shows, before the save itself. When the save ended is counted from
+    /// there, on the clock `now` is of.
+    fn save_pdf(
+        &mut self,
+        path: &Path,
+        out: &Path,
+        with_show: bool,
+        began: Instant,
+        now: Instant,
+    ) -> Result<(), String> {
+        if with_show {
+            self.may_save_beside_a_show(path, out)?;
         }
         if let Some(dir) = out.parent() {
             std::fs::create_dir_all(dir)
@@ -569,49 +672,134 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
         let part = super::pictures::part_of(out);
         // A save cut short before, finished by PowerPoint since or not.
         let _ = std::fs::remove_file(&part);
-        let opened = self.ppt.open(path, OPEN_WAIT).map_err(|e| e.to_string())?;
-        let saved = self.ppt.save_pdf(path, &part).map_err(|e| match e {
+        // Beside a show nothing is opened: the deck is an input's.
+        let opened_for_it = if with_show {
+            false
+        } else {
+            self.ppt.open(path, OPEN_WAIT).map_err(|e| e.to_string())?.by_nida
+        };
+        let saved = self.ppt.save_pdf(path, &part, with_show).map_err(|e| match e {
+            // Not waited for as long beside a show.
+            ScriptError::TimedOut if with_show => "PowerPoint did not finish beside its show: \
+                a large deck — or, if it asks for access to the folder, click Grant Access \
+                there. Make the pictures again with no show running"
+                .to_string(),
             ScriptError::TimedOut => "PowerPoint did not finish: if it asks for access to the \
                 folder, click Grant Access there, then make the pictures again"
                 .to_string(),
-            ScriptError::Showing => SHOW_RUNNING.to_string(),
+            // A show started since it was asked.
+            ScriptError::Showing => SHOW_STARTING.to_string(),
+            // Closed since: by hand.
+            ScriptError::NotOpen | ScriptError::NotRunning if with_show => NOT_OPEN.to_string(),
             e => e.to_string(),
         });
+        // PowerPoint was asked, and has ended — by the clock `now` is of,
+        // all that went before the save (its shows asked for, a deck opened
+        // for it) counted in:
+        // beside a show the next waits from here.
+        self.last_save = Some(now + began.elapsed());
         // Opened for this alone: closed again. A deck an input keeps open,
         // or the user had open, stays.
-        if opened.by_nida && !self.sessions.values().any(|s| s.path == path) {
+        if opened_for_it && !self.sessions.values().any(|s| s.path == path) {
             let _ = self.ppt.close(path);
         }
         let put = saved.and_then(|()| super::pictures::put_in_place(&part, out));
         if put.is_err() {
             let _ = std::fs::remove_file(&part);
+        } else {
+            copy_beside(out, path);
         }
         put
     }
 
+    /// Whether a show of PowerPoint's is running: a talk on, or on its way
+    /// up; else one started in PowerPoint itself, of any deck — Nida's
+    /// sessions do not know it, PowerPoint is asked.
+    fn beside_a_show(&self) -> Result<bool, String> {
+        if self.sessions.values().any(|s| s.show.is_some() || s.wants_show) {
+            return Ok(true);
+        }
+        match self.ppt.slide_shows() {
+            Ok(shows) => Ok(shows > 0),
+            Err(ScriptError::Showing) => Ok(true),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Whether the deck at `path` may be saved at `out` with a show of
+    /// PowerPoint's running (see [`Self::save_pdf`]).
+    fn may_save_beside_a_show(&self, path: &Path, out: &Path) -> Result<(), String> {
+        // A show on its way up is left to come up first.
+        if self.sessions.values().any(|s| s.wants_show && s.show.is_none()) {
+            return Err(SHOW_STARTING.into());
+        }
+        if !out.parent().is_some_and(super::pictures::given) {
+            return Err(SHOW_RUNNING.into());
+        }
+        if !self
+            .sessions
+            .values()
+            .any(|s| s.path == path && s.opened.is_some())
+        {
+            return Err(NOT_OPEN.into());
+        }
+        Ok(())
+    }
+
     /// A job from the engine. A save of slide pictures waits till nothing
     /// else is asked ([`Self::run`]): a show never waits behind saves asked
-    /// before it — and one played drops the saves waiting, each answered so.
+    /// before it. Each is judged at its turn ([`Self::save_pdf`]), as
+    /// PowerPoint stands then.
     fn take(&mut self, job: Job, saves: &mut VecDeque<(PathBuf, PathBuf)>, now: Instant) {
         match job {
             Job::SavePdf { path, out } => saves.push_back((path, out)),
-            job => {
-                if job.plays_a_show() {
-                    for (path, out) in saves.drain(..) {
-                        log::info!(
-                            "Slide pictures of {} dropped: a show was played first",
-                            path.display()
-                        );
-                        self.send(Event::SavedPdf {
-                            path,
-                            out,
-                            result: Err(SAVES_DROPPED.into()),
-                        });
-                    }
-                }
-                self.handle(job, now);
-            }
+            job => self.handle(job, now),
         }
+    }
+
+    /// The turn of the slide pictures waiting, nothing else asked: the
+    /// first is saved. With a show of PowerPoint's running, not till
+    /// [`SAVES_APART`] after its last save ended — those asked before the
+    /// show, or several at once, too: PowerPoint takes no step while it
+    /// saves, so its saves never follow one another beside a show.
+    fn save_next(&mut self, saves: &mut VecDeque<(PathBuf, PathBuf)>, now: Instant) {
+        if self.saves_held.is_some_and(|till| now < till) {
+            return;
+        }
+        self.saves_held = None;
+        if saves.is_empty() {
+            return;
+        }
+        // PowerPoint is asked for its shows once: whether it rests first
+        // and how it is saved go by the one answer — a show started in
+        // between is not saved beside with no rest. The time it takes to
+        // answer is the save's too.
+        let began = Instant::now();
+        let beside = self.beside_a_show();
+        let resting = self
+            .last_save
+            .map(|at| at + SAVES_APART)
+            .filter(|till| now < *till);
+        // Held till then, the show ended meanwhile or not: asked again
+        // then, not at every look.
+        if resting.is_some() && matches!(beside, Ok(true)) {
+            self.saves_held = resting;
+            return;
+        }
+        if let Some((path, out)) = saves.pop_front() {
+            self.save_and_say(path, out, beside, began, now);
+        }
+    }
+
+    /// How long the worker waits for a job: no time with slide pictures
+    /// `waiting` — unless they are held, then till they are not.
+    fn save_wait(&self, waiting: bool, now: Instant) -> Duration {
+        if !waiting {
+            return POLL;
+        }
+        self.saves_held.map_or(Duration::ZERO, |till| {
+            till.saturating_duration_since(now).min(POLL)
+        })
     }
 
     /// The file of a deck whose show is running.
@@ -1314,13 +1502,11 @@ impl<R: Runner, F: WindowFinder> Worker<R, F> {
         // Saves of slide pictures, waiting till nothing else is asked.
         let mut saves = VecDeque::new();
         loop {
-            let wait = if saves.is_empty() { POLL } else { Duration::ZERO };
+            let wait = self.save_wait(!saves.is_empty(), Instant::now());
             match jobs.recv_timeout(wait) {
                 Ok(job) => self.take(job, &mut saves, Instant::now()),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some((path, out)) = saves.pop_front() {
-                        self.handle(Job::SavePdf { path, out }, Instant::now());
-                    }
+                    self.save_next(&mut saves, Instant::now());
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.shut_down();
@@ -1443,6 +1629,34 @@ impl PresentationManager {
         self.views
             .values()
             .any(|v| v.wants_show || v.show.is_some() || v.status == Status::Showing)
+    }
+
+    /// Whether a show of PowerPoint's is asked for and not up yet, as last
+    /// heard.
+    #[must_use]
+    pub fn any_starting(&self) -> bool {
+        self.views.values().any(|v| v.wants_show && v.show.is_none())
+    }
+
+    /// Whether an input has the deck at `path` open in PowerPoint, as last
+    /// heard: its show running, or ready to start.
+    #[must_use]
+    pub fn holds_open(&self, path: &Path) -> bool {
+        self.views.values().any(|v| {
+            v.path == path
+                && (v.show.is_some()
+                    || matches!(
+                        v.status,
+                        Status::Ready | Status::Showing | Status::NoWindow(_)
+                    ))
+        })
+    }
+
+    /// Whether the deck at `path` is the one a show is asked of, as last
+    /// heard.
+    #[must_use]
+    pub fn shows(&self, path: &Path) -> bool {
+        self.views.values().any(|v| v.path == path && v.wants_show)
     }
 
     fn send(&self, job: Job) {
@@ -1787,54 +2001,116 @@ mod tests {
             .collect()
     }
 
-    /// A deck PowerPoint does not have is opened to be saved as slide
-    /// pictures, and closed again; one an input keeps open stays open. With
-    /// a show running nothing is asked of PowerPoint: the question it may
-    /// ask first (Grant Access) would hold the show.
+    fn save_job(path: impl Into<PathBuf>, out: &Path) -> Job {
+        Job::SavePdf {
+            path: path.into(),
+            out: out.to_path_buf(),
+        }
+    }
+
+    /// The slide pictures PowerPoint saved are copied beside their deck
+    /// too — by a thread of their own, so waited for here — under the
+    /// deck's file name.
     #[test]
-    fn a_deck_is_saved_as_slide_pictures_only_with_no_show_running() {
+    fn slide_pictures_saved_are_copied_beside_their_deck() {
         let dir = tempfile::tempdir().unwrap();
         let deck = dir.path().join("talk.pptx");
         std::fs::write(&deck, b"deck").unwrap();
         let out = dir.path().join("pictures").join("talk.pdf");
-        let now = Instant::now();
-
-        // Not open: opened for it, saved, closed again.
         let ppt = FakePowerPoint::with_slides(4);
         let (mut w, rx) = worker(&ppt, 1.0);
-        w.handle(
-            Job::SavePdf {
-                path: deck.clone(),
-                out: out.clone(),
-            },
-            now,
-        );
+        w.handle(save_job(&deck, &out), Instant::now());
+        assert_eq!(saved(&drain(&rx)), vec![Ok(())]);
+        let copy = dir.path().join("Slide pictures").join("talk.pptx.pdf");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let made = std::fs::read(&out).unwrap();
+        while std::fs::read(&copy).ok().as_ref() != Some(&made) {
+            assert!(Instant::now() < deadline, "never copied whole beside the deck");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A deck PowerPoint does not have is opened to be saved as slide
+    /// pictures, and closed again; one an input keeps open stays open. With
+    /// a show running PowerPoint saves too — but only into a folder it has
+    /// saved into before (the question it asks the first time, Grant
+    /// Access, would hold the show), and only a deck an input keeps open
+    /// (nothing is opened or closed beside a show).
+    #[test]
+    fn a_deck_is_saved_beside_a_show_only_when_nothing_could_hold_the_show() {
+        use super::super::pictures;
+        let dir = tempfile::tempdir().unwrap();
+        let deck = dir.path().join("talk.pptx");
+        std::fs::write(&deck, b"deck").unwrap();
+        let folder = dir.path().join("pictures");
+        let out = folder.join("talk.pdf");
+        let now = Instant::now();
+
+        // Not open, no show: opened for it, saved, closed again — the
+        // folder saved into for the first time.
+        assert!(!pictures::given(&folder));
+        let ppt = FakePowerPoint::with_slides(4);
+        let (mut w, rx) = worker(&ppt, 1.0);
+        w.handle(save_job(&deck, &out), now);
         assert_eq!(saved(&drain(&rx)), vec![Ok(())]);
         assert!(out.is_file(), "the PDF");
         assert_eq!(ppt.opened_files(), vec![deck.clone()]);
         assert!(ppt.closed(), "closed again");
+        assert!(pictures::given(&folder), "saved into now");
 
-        // A show running: refused, nothing asked.
+        // A show running, the folder never saved into: not now, nothing
+        // asked — nor with what a save cut short left there.
         let ppt = FakePowerPoint::with_slides(4);
         let (mut w, rx) = worker(&ppt, 1.0);
         w.handle(open_job("d1", None), now);
         w.tick(now);
         assert!(ppt.showing());
         drain(&rx);
-        let out = dir.path().join("pictures").join("other.pdf");
-        w.handle(
-            Job::SavePdf {
-                path: "/Talks/talk.pptx".into(),
-                out: out.clone(),
-            },
-            now,
-        );
-        let results = saved(&drain(&rx));
-        assert!(matches!(&results[..], [Err(why)] if why.contains("show is running")), "{results:?}");
-        assert!(!out.exists());
+        let never = dir.path().join("never");
+        let other = never.join("other.pdf");
+        for left_over in [false, true] {
+            if left_over {
+                std::fs::create_dir_all(&never).unwrap();
+                std::fs::write(never.join("cut.saving.pdf"), b"part").unwrap();
+            }
+            w.handle(save_job("/Talks/talk.pptx", &other), now);
+            let results = saved(&drain(&rx));
+            assert!(
+                matches!(&results[..], [Err(why)] if why.contains("has not saved into") && not_now(why)),
+                "{results:?}"
+            );
+        }
+        assert!(!other.exists());
+        assert_eq!(ppt.pdfs_saved(), 0, "nothing asked");
         assert!(ppt.showing(), "its show untouched");
 
-        // Kept open by an input, its show ended: saved, and left open.
+        // Saved into before: the deck the input keeps open is saved, its
+        // show running on — nothing opened, nothing closed.
+        let opened = ppt.opened_files();
+        let other = folder.join("other.pdf");
+        w.handle(save_job("/Talks/talk.pptx", &other), now);
+        assert_eq!(saved(&drain(&rx)), vec![Ok(())]);
+        assert!(other.is_file(), "the PDF");
+        assert_eq!(ppt.pdfs_saved(), 1);
+        assert!(ppt.showing(), "its show untouched");
+        assert!(ppt.open() && !ppt.closed(), "left open");
+        assert_eq!(ppt.opened_files(), opened, "nothing opened");
+
+        // A deck no input keeps open: not beside the show, and never opened.
+        let third = folder.join("third.pdf");
+        w.handle(save_job(&deck, &third), now);
+        let results = saved(&drain(&rx));
+        assert!(
+            matches!(&results[..], [Err(why)] if why.contains("not open in PowerPoint") && not_now(why)),
+            "{results:?}"
+        );
+        assert!(!third.exists());
+        assert_eq!(ppt.opened_files(), opened, "never opened");
+        assert_eq!(ppt.pdfs_saved(), 1);
+        assert!(ppt.showing());
+
+        // Kept open by an input, its show ended: saved as with no show —
+        // into a folder never saved into too — and left open.
         w.handle(
             Job::SetShow {
                 deck: "d1".into(),
@@ -1845,61 +2121,78 @@ mod tests {
         );
         w.tick(now);
         drain(&rx);
-        w.handle(
-            Job::SavePdf {
-                path: "/Talks/talk.pptx".into(),
-                out: out.clone(),
-            },
-            now,
-        );
+        let ended = never.join("ended.pdf");
+        w.handle(save_job("/Talks/talk.pptx", &ended), now);
         assert_eq!(saved(&drain(&rx)), vec![Ok(())]);
+        assert!(ended.is_file());
         assert!(ppt.open(), "left open");
         assert!(!ppt.closed());
 
         // Another deck's show started in PowerPoint itself, by hand: Nida
-        // knows of no show, PowerPoint does. Refused, the deck never opened.
+        // knows of no show, PowerPoint does. A deck not open is not made,
+        // and never opened.
         let decks = crate::presentation::fake::FakeDecks::with_slides(4);
         decks.play_by_hand("other.pptx");
         let (tx, rx) = mpsc::channel();
         let mut w = Worker::new(decks.clone(), decks.windows(), 1.0, tx);
-        let out = dir.path().join("pictures").join("by-hand.pdf");
+        let by_hand = folder.join("by-hand.pdf");
+        w.handle(save_job(&deck, &by_hand), now);
+        let results = saved(&drain(&rx));
+        assert!(
+            matches!(&results[..], [Err(why)] if why.contains("not open in PowerPoint")),
+            "{results:?}"
+        );
+        assert!(!by_hand.exists());
+        assert_eq!(decks.log(), vec!["show other.pptx by hand"], "the deck never opened");
+        // One an input keeps open ahead is: the show by hand plays on.
         w.handle(
-            Job::SavePdf {
+            Job::Open {
+                deck: "next".into(),
                 path: deck.clone(),
-                out: out.clone(),
+                slide: None,
+                pixels: (1920, 1080),
+                spot: None,
+                show: false,
             },
             now,
         );
-        let results = saved(&drain(&rx));
-        assert!(matches!(&results[..], [Err(why)] if why.contains("show is running")), "{results:?}");
-        assert!(!out.exists());
-        assert_eq!(decks.log(), vec!["show other.pptx by hand"], "the deck never opened");
+        w.tick(now);
+        drain(&rx);
+        w.handle(save_job(&deck, &by_hand), now);
+        assert_eq!(saved(&drain(&rx)), vec![Ok(())]);
+        assert!(by_hand.is_file());
+        assert_eq!(
+            decks.log(),
+            vec!["show other.pptx by hand", "open talk.pptx", "save pdf talk.pptx"]
+        );
+        assert!(
+            decks.decks().iter().any(|(name, showing, _)| name == "other.pptx" && *showing),
+            "the show by hand plays on"
+        );
 
         // Saved cut short: nothing that looks made, nothing left over.
         let ppt = FakePowerPoint::with_slides(4);
         ppt.save_broken_pdfs();
         let (mut w, rx) = worker(&ppt, 1.0);
-        let out = dir.path().join("pictures").join("cut.pdf");
-        w.handle(
-            Job::SavePdf {
-                path: deck.clone(),
-                out: out.clone(),
-            },
-            now,
-        );
+        let cut = folder.join("cut.pdf");
+        w.handle(save_job(&deck, &cut), now);
         let results = saved(&drain(&rx));
-        assert!(matches!(&results[..], [Err(why)] if why.contains("does not open")), "{results:?}");
-        assert!(!out.exists(), "no PDF that looks made");
-        assert!(!super::super::pictures::part_of(&out).exists(), "nothing left over");
+        assert!(
+            matches!(&results[..], [Err(why)] if why.contains("does not open") && !not_now(why)),
+            "{results:?}"
+        );
+        assert!(!cut.exists(), "no PDF that looks made");
+        assert!(!pictures::part_of(&cut).exists(), "nothing left over");
     }
 
     /// A talk on its way up — PowerPoint still opening its deck, no show yet
-    /// for PowerPoint to tell — counts as on: no slide pictures made.
+    /// for PowerPoint to tell — is left to come up: no slide pictures made
+    /// meanwhile, into a folder saved into before either.
     #[test]
-    fn a_talk_on_its_way_up_counts_as_on_for_slide_pictures() {
+    fn a_talk_on_its_way_up_is_left_to_come_up_before_slide_pictures() {
         let dir = tempfile::tempdir().unwrap();
-        let deck = dir.path().join("talk.pptx");
-        std::fs::write(&deck, b"deck").unwrap();
+        std::fs::write(dir.path().join("made.pdf"), b"made before").unwrap();
+        assert!(super::super::pictures::given(dir.path()));
         let out = dir.path().join("talk.pdf");
         let now = Instant::now();
         let ppt = FakePowerPoint::with_slides(4);
@@ -1908,36 +2201,30 @@ mod tests {
         w.handle(open_job("d1", None), now);
         assert!(!ppt.showing(), "not up yet");
         drain(&rx);
-        w.handle(
-            Job::SavePdf {
-                path: deck,
-                out: out.clone(),
-            },
-            now,
-        );
+        w.handle(save_job("/Talks/talk.pptx", &out), now);
         let results = saved(&drain(&rx));
-        assert!(matches!(&results[..], [Err(why)] if why.contains("show is running")), "{results:?}");
+        assert!(
+            matches!(&results[..], [Err(why)] if why.contains("on its way up") && not_now(why)),
+            "{results:?}"
+        );
         assert!(!out.exists());
+        assert_eq!(ppt.pdfs_saved(), 0, "nothing asked");
     }
 
-    /// Saves of slide pictures wait for every other job, and a show played
-    /// drops those waiting, each answered: a talk never waits behind them.
+    /// Saves of slide pictures wait for every other job — a talk never
+    /// waits behind them — and are kept when a talk is played: each is
+    /// judged at its turn, as PowerPoint stands then.
     #[test]
-    fn a_talk_played_drops_the_slide_pictures_waiting() {
+    fn slide_pictures_waiting_are_kept_when_a_talk_is_played() {
         let dir = tempfile::tempdir().unwrap();
-        let deck = dir.path().join("talk.pptx");
-        std::fs::write(&deck, b"deck").unwrap();
-        let out = |n: u32| dir.path().join(format!("{n}.pdf"));
+        let folder = dir.path().join("pictures");
+        let out = |n: u32| folder.join(format!("{n}.pdf"));
         let now = Instant::now();
         let ppt = FakePowerPoint::with_slides(4);
         let (mut w, rx) = worker(&ppt, 1.0);
         let mut saves = VecDeque::new();
         for n in 1..=2 {
-            let job = Job::SavePdf {
-                path: deck.clone(),
-                out: out(n),
-            };
-            w.take(job, &mut saves, now);
+            w.take(save_job("/Talks/talk.pptx", &out(n)), &mut saves, now);
         }
         assert_eq!(saves.len(), 2, "kept, not made yet");
         assert!(saved(&drain(&rx)).is_empty());
@@ -1946,18 +2233,107 @@ mod tests {
         w.take(Job::Window { deck: "d0".into() }, &mut saves, now);
         assert_eq!(saves.len(), 2);
 
-        // A talk played: the saves dropped, each answered; its show plays.
+        // A talk played: its show plays first, the saves still waiting,
+        // none answered.
         w.take(open_job("d1", None), &mut saves, now);
         w.tick(now);
-        assert!(saves.is_empty());
-        let results = saved(&drain(&rx));
-        assert!(
-            matches!(&results[..], [Err(a), Err(b)] if a.contains("talk was started") && a == b),
-            "{results:?}"
-        );
-        assert!(!out(1).exists() && !out(2).exists());
         assert!(ppt.showing());
-        assert!(!ppt.opened_files().contains(&deck), "never opened for a save");
+        assert_eq!(saves.len(), 2, "kept");
+        assert!(saved(&drain(&rx)).is_empty());
+        assert_eq!(ppt.pdfs_saved(), 0);
+
+        // Each at its turn, as the worker's loop hands them on. The folder
+        // never saved into: not beside the show.
+        let (path, first) = saves.pop_front().unwrap();
+        w.handle(Job::SavePdf { path, out: first }, now);
+        let results = saved(&drain(&rx));
+        assert!(matches!(&results[..], [Err(why)] if not_now(why)), "{results:?}");
+        assert!(!out(1).exists());
+        // Saved into since: the talk's deck is saved beside its show.
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("made.pdf"), b"made before").unwrap();
+        let (path, second) = saves.pop_front().unwrap();
+        w.handle(Job::SavePdf { path, out: second }, now);
+        assert_eq!(saved(&drain(&rx)), vec![Ok(())]);
+        assert!(out(2).is_file());
+        assert!(ppt.showing(), "its show untouched");
+    }
+
+    /// Beside a show PowerPoint is left a while between two saves of slide
+    /// pictures — while it saves it takes no step — those asked before the
+    /// talk was played too. With no show they follow one another.
+    #[test]
+    fn beside_a_show_slide_pictures_waiting_are_saved_a_while_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("pictures");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("made.pdf"), b"made before").unwrap();
+        let out = |n: u32| folder.join(format!("{n}.pdf"));
+        let now = Instant::now();
+        let ppt = FakePowerPoint::with_slides(4);
+        let (mut w, rx) = worker(&ppt, 1.0);
+        let mut saves = VecDeque::new();
+        for n in 1..=4 {
+            w.take(save_job("/Talks/talk.pptx", &out(n)), &mut saves, now);
+        }
+        assert_eq!(w.save_wait(false, now), POLL);
+        assert_eq!(w.save_wait(true, now), Duration::ZERO, "nothing held");
+
+        // No show: one after the other — PowerPoint asked for its shows
+        // once a save, the rest and the save going by the one answer.
+        // PowerPoint slow to say what shows it runs, these two times.
+        ppt.shows_take(Duration::from_millis(300));
+        let counted = ppt.shows_counted();
+        w.save_next(&mut saves, now);
+        w.save_next(&mut saves, now);
+        ppt.shows_take(Duration::ZERO);
+        assert_eq!(ppt.shows_counted() - counted, 2, "asked once a save");
+        assert_eq!(saved(&drain(&rx)), vec![Ok(()), Ok(())]);
+        assert_eq!(saves.len(), 2);
+        assert_eq!(w.save_wait(true, now), Duration::ZERO, "nothing held");
+        // When the second ended, by the worker's clock: what follows is
+        // counted from there, however long the saves took — the time
+        // PowerPoint took to say what shows it runs counted in.
+        let ended = w.last_save.expect("a save ended");
+        assert!(
+            ended >= now + Duration::from_millis(300),
+            "ended {:?} after",
+            ended.duration_since(now)
+        );
+
+        // The talk played, its show up: the third — asked before the show —
+        // waits till PowerPoint has rested from the second.
+        w.take(open_job("d1", None), &mut saves, now);
+        w.tick(now);
+        assert!(ppt.showing());
+        drain(&rx);
+        for early in [100, 1500, 2900] {
+            let then = ended + Duration::from_millis(early);
+            w.save_next(&mut saves, then);
+            assert_eq!(saves.len(), 2, "held {early} ms after");
+            let wait = w.save_wait(true, then);
+            assert!(wait > Duration::ZERO && wait <= POLL, "{wait:?}");
+        }
+        assert!(saved(&drain(&rx)).is_empty());
+        assert_eq!(ppt.pdfs_saved(), 2);
+        let third = ended + SAVES_APART;
+        assert_eq!(w.save_wait(true, third), Duration::ZERO, "held no more");
+        w.save_next(&mut saves, third);
+        assert_eq!(saved(&drain(&rx)), vec![Ok(())]);
+        assert_eq!(ppt.pdfs_saved(), 3);
+        assert!(ppt.showing(), "its show untouched");
+
+        // And the fourth after the third.
+        let ended = w.last_save.expect("a save ended");
+        assert!(ended >= third);
+        w.save_next(&mut saves, ended + Duration::from_millis(2900));
+        assert_eq!(saves.len(), 1, "held");
+        assert!(saved(&drain(&rx)).is_empty());
+        w.save_next(&mut saves, ended + SAVES_APART);
+        assert_eq!(saved(&drain(&rx)), vec![Ok(())]);
+        assert!(saves.is_empty());
+        assert_eq!(ppt.pdfs_saved(), 4);
+        assert!(ppt.showing(), "its show untouched");
     }
 
     #[test]
@@ -2823,17 +3199,15 @@ mod tests {
         let four_three = fitted(narrower, Some(4.0 / 3.0), 32).expect("4:3");
         assert_eq!((four_three.width, four_three.height), (1256, 974));
         // The capture: the title bar cut off, the slide whole — the size it
-        // comes out at worked as the macOS capture does: the window's pixels
-        // bounded by `scale_to`, then the crop.
+        // comes out at worked as the macOS capture does: the part of the
+        // window's pixels the crop keeps, bounded by `scale_to`.
         let delivered = |target: &CaptureTargetInfo, scale: u32, config: &CaptureConfig| {
-            let native = (target.width * scale, target.height * scale);
-            let (w, h) = config.scale_to.map_or(native, |(bw, bh)| {
-                crate::screen_capture::resample::fit_within(native.0, native.1, bw, bh)
-            });
-            (
-                ((w as f32) * config.crop.w).round() as u32 & !1,
-                ((h as f32) * config.crop.h).round() as u32 & !1,
-            )
+            let fitted = crate::screen_capture::resample::Geometry::resolve(
+                target.width * scale,
+                target.height * scale,
+                config,
+            );
+            (fitted.out_w, fitted.out_h)
         };
         let target = window("PowerPoint Slide Show - [talk]", 1600, 932);
         let config = capture_config(&target, (1920, 1080), 32);
@@ -2847,7 +3221,7 @@ mod tests {
         let kept = window("PowerPoint Slide Show - [talk]", 1675, 974);
         assert_eq!(
             delivered(&kept, 1, &capture_config(&kept, (1920, 1080), 32)),
-            (1674, 942)
+            (1675, 942)
         );
         // A Retina screen's 960 × 540 points under the title bar: the
         // picture's 1920 × 1080.

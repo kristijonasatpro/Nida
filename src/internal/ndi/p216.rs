@@ -428,6 +428,141 @@ mod tests {
         assert_eq!(bytes, [0x00, 0x10, 0x00, 0xeb, 0x00, 0x80, 0x00, 0x80]);
     }
 
+    /// A row of pixels in linear light, as the blit leaves them for this
+    /// pass: the texture, kept with its view.
+    fn linear_row(
+        context: &crate::renderer::context::GpuContext,
+        row: &[[f32; 3]],
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let width = row.len() as u32;
+        let size = wgpu::Extent3d {
+            width,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
+        let texture = context.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("P216 Linear Row"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut pixels = Vec::with_capacity(row.len() * 8);
+        for [r, g, b] in row {
+            for channel in [*r, *g, *b, 1.0] {
+                pixels.extend_from_slice(&half::f16::from_f32(channel).to_bits().to_le_bytes());
+            }
+        }
+        context.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 8),
+                rows_per_image: Some(1),
+            },
+            size,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    }
+
+    /// A one-row frame's ten-bit codes: its luma, a code for each pixel, then
+    /// U and V for each pair of pixels.
+    fn codes(bytes: &[u8]) -> Vec<i32> {
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|code| i32::from(u16::from_le_bytes(*code) >> 6))
+            .collect()
+    }
+
+    /// The sRGB curve, as the windows and the eight-bit outputs are encoded.
+    fn srgb(linear: f32) -> f32 {
+        if linear <= 0.003_130_8 {
+            linear * 12.92
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        }
+    }
+
+    /// As a half float holds it: what the pass reads.
+    fn held(value: f32) -> f32 {
+        half::f16::from_f32(value).to_f32()
+    }
+
+    /// Ten-bit NDI carries the program's own values: grays come out where
+    /// the sRGB curve puts them, as on every other output — not where
+    /// Rec.709's camera curve does, darker in the dark parts (a receiver
+    /// showed the program's 22 of 255 as 8).
+    #[test]
+    fn gpu_encodes_grays_with_the_srgb_curve_as_the_other_outputs_do() {
+        let Ok(context) = crate::renderer::context::GpuContext::new_headless() else {
+            return;
+        };
+        // Both sides of the curve's knee, the dark parts above all. Each
+        // level twice: a pair of one gray has no colour.
+        let levels = [0.001_f32, 0.002, 0.005, 0.02, 0.1, 0.42, 0.8];
+        let row: Vec<[f32; 3]> = levels.iter().flat_map(|&level| [[level; 3]; 2]).collect();
+        let (_texture, view) = linear_row(&context, &row);
+        let mut converter = P216Converter::new(&context.device, row.len() as u32, 1).unwrap();
+        let codes = codes(&encode_once(&context, &mut converter, &view, false));
+        assert_eq!(codes.len(), row.len() * 2);
+
+        for (pair, level) in levels.iter().enumerate() {
+            let want = (64.0 + 876.0 * srgb(held(*level))).round() as i32;
+            for luma in &codes[pair * 2..pair * 2 + 2] {
+                assert!(
+                    (luma - want).abs() <= 1,
+                    "linear {level}: luma {luma}, the sRGB curve gives {want}"
+                );
+            }
+            assert_eq!(
+                codes[row.len() + pair * 2..row.len() + pair * 2 + 2],
+                [512, 512],
+                "linear {level}: a gray has no colour"
+            );
+        }
+    }
+
+    /// A colour's parts are each encoded by that curve before they are made
+    /// luma and colour difference: a dark red, where the two curves part most.
+    #[test]
+    fn gpu_encodes_a_colour_with_the_srgb_curve() {
+        let Ok(context) = crate::renderer::context::GpuContext::new_headless() else {
+            return;
+        };
+        let (_texture, view) = linear_row(&context, &[[0.05, 0.0, 0.0]; 2]);
+        let mut converter = P216Converter::new(&context.device, 2, 1).unwrap();
+        let codes = codes(&encode_once(&context, &mut converter, &view, false));
+
+        let red = srgb(held(0.05));
+        let luma = 0.2126 * red;
+        let want = [
+            64.0 + 876.0 * luma,
+            64.0 + 876.0 * luma,
+            512.0 - 896.0 * luma / 1.8556,
+            512.0 + 896.0 * (red - luma) / 1.5748,
+        ]
+        .map(|code: f32| code.round() as i32);
+        assert_eq!(codes.len(), 4);
+        for (code, want) in codes.iter().zip(want) {
+            assert!(
+                (code - want).abs() <= 1,
+                "a dark red is {codes:?}: {code} where the sRGB curve gives {want}"
+            );
+        }
+    }
+
     #[test]
     fn gpu_dither_is_stable_and_within_one_ten_bit_lsb() {
         const WIDTH: u32 = 32;

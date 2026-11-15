@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::manager::WindowFinder;
 use super::powerpoint::{Runner, ScriptError, POWERPOINT_ID};
@@ -62,6 +62,12 @@ struct FakeState {
     video_reads: u32,
     /// Its PDFs saved cut short: no PDF that opens.
     broken_pdfs: bool,
+    /// PDFs it saved, whole or cut short.
+    pdfs_saved: u32,
+    /// Times it was asked how many slide shows it runs.
+    shows_counted: u32,
+    /// How long it takes to say how many slide shows it runs.
+    shows_take: Duration,
 }
 
 impl FakePowerPoint {
@@ -121,6 +127,23 @@ impl FakePowerPoint {
     /// mid-save: files that do not open as PDFs.
     pub fn save_broken_pdfs(&self) {
         self.state().broken_pdfs = true;
+    }
+
+    /// How many PDFs it saved, whole or cut short.
+    #[must_use]
+    pub fn pdfs_saved(&self) -> u32 {
+        self.state().pdfs_saved
+    }
+
+    /// How many times it was asked how many slide shows it runs.
+    #[must_use]
+    pub fn shows_counted(&self) -> u32 {
+        self.state().shows_counted
+    }
+
+    /// It takes `time` to say how many slide shows it runs, from now on.
+    pub fn shows_take(&self, time: Duration) {
+        self.state().shows_take = time;
     }
 
     /// The deck's show started in PowerPoint itself, by hand: Nida was not
@@ -351,6 +374,21 @@ fn save_pdf(out: &Path, slides: u32) -> Result<String, ScriptError> {
     Ok("saved".into())
 }
 
+/// Whether a script that saves a PDF asks for PowerPoint's slide shows
+/// first and leaves it with one running (see `scripts::save_pdf`): one
+/// meant to be made beside a show does not, and PowerPoint saves.
+fn saves_with_no_show_only(script: &str) -> bool {
+    script.contains("then return \"showing\"")
+}
+
+/// A PDF cut short at `out`, as when PowerPoint is stopped mid-save:
+/// `saved`, and no PDF that opens.
+fn save_broken_pdf(out: &Path) -> Result<String, ScriptError> {
+    std::fs::write(out, b"%PDF-1.4\n1 0 obj << /Type")
+        .map_err(|e| ScriptError::Failed(format!("saving a PDF: {e}")))?;
+    Ok("saved".into())
+}
+
 /// Whether `script` only counts PowerPoint's slide shows (see
 /// `scripts::slide_shows`).
 fn counts_slide_shows(script: &str) -> bool {
@@ -370,6 +408,8 @@ impl Runner for FakePowerPoint {
             return Err(ScriptError::NotAllowed);
         }
         if counts_slide_shows(script) {
+            s.shows_counted += 1;
+            std::thread::sleep(s.shows_take);
             if !s.running {
                 return Ok("notrunning".into());
             }
@@ -438,13 +478,12 @@ impl Runner for FakePowerPoint {
                 return Ok("closed".into());
             }
             if let Some(out) = pdf_out(script) {
-                if s.showing {
+                if s.showing && saves_with_no_show_only(script) {
                     return Ok("showing".into());
                 }
+                s.pdfs_saved += 1;
                 if s.broken_pdfs {
-                    std::fs::write(&out, b"%PDF-1.4\n1 0 obj << /Type")
-                        .map_err(|e| ScriptError::Failed(format!("saving a PDF: {e}")))?;
-                    return Ok("saved".into());
+                    return save_broken_pdf(&out);
                 }
                 return save_pdf(&out, s.slides);
             }
@@ -509,6 +548,7 @@ pub fn window_numbered(title: &str, width: u32, height: u32, number: u64) -> Cap
         width,
         height,
         is_varda: false,
+        uuid: None,
     }
 }
 
@@ -554,6 +594,8 @@ pub struct FakeDecks {
     state: Arc<Mutex<DecksState>>,
 }
 
+/// One switch for each thing a test turns on or off.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 struct DecksState {
     running: bool,
@@ -566,6 +608,27 @@ struct DecksState {
     log: Vec<String>,
     hidden: bool,
     unhidden: u32,
+    /// Its PDFs saved cut short: no PDF that opens.
+    broken_pdfs: bool,
+    /// Its saves of PDFs held: they do not end till let go.
+    pdf_held: bool,
+    /// When each PDF was asked.
+    pdf_saves_at: Vec<Instant>,
+}
+
+/// The stand-in's saves of PDFs held ([`FakeDecks::hold_pdf_saves`]): let
+/// go when this is dropped — by a test's failure unwinding it too.
+pub struct PdfSavesHeld {
+    state: Arc<Mutex<DecksState>>,
+}
+
+impl Drop for PdfSavesHeld {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pdf_held = false;
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -598,6 +661,31 @@ impl FakeDecks {
     #[must_use]
     pub fn log(&self) -> Vec<String> {
         self.state().log.clone()
+    }
+
+    /// Its PDFs saved cut short (`broken`) from now on, as when PowerPoint
+    /// is stopped mid-save — files that do not open as PDFs — or whole
+    /// again.
+    pub fn save_broken_pdfs(&self, broken: bool) {
+        self.state().broken_pdfs = broken;
+    }
+
+    /// Its saves of PDFs held from now on — whoever asked waits, as for
+    /// PowerPoint mid-save, which takes no step meanwhile — till what this
+    /// gives is dropped. A test keeps it after its app: let go before the
+    /// app goes, should the test fail meanwhile.
+    #[must_use = "its saves are let go when this is dropped"]
+    pub fn hold_pdf_saves(&self) -> PdfSavesHeld {
+        self.state().pdf_held = true;
+        PdfSavesHeld {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    /// When each PDF was asked, in order.
+    #[must_use]
+    pub fn pdf_saves_at(&self) -> Vec<Instant> {
+        self.state().pdf_saves_at.clone()
     }
 
     /// The deck `file` open, its show started in PowerPoint itself, by
@@ -733,11 +821,23 @@ impl Runner for FakeDecks {
             log.push(format!("end {file}"));
         }
         if let Some(out) = pdf_out(script) {
-            if shows > 0 {
+            if shows > 0 && saves_with_no_show_only(script) {
                 return Ok("showing".into());
             }
             let slides = deck.slides;
             s.log.push(format!("save pdf {file}"));
+            s.pdf_saves_at.push(Instant::now());
+            let broken = s.broken_pdfs;
+            // What was done can be read meanwhile.
+            drop(s);
+            // Held, till the test lets go — or ends: what holds them lets
+            // go when dropped.
+            while self.state().pdf_held {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if broken {
+                return save_broken_pdf(&out);
+            }
             return save_pdf(&out, slides);
         }
         let closed = script.contains("close thePres saving no");

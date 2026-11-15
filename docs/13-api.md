@@ -216,7 +216,7 @@ curl -X POST http://localhost:8080/api/channels/<ch_uuid>/decks/html \
 
 ### Capture a display or window as a deck
 
-Targets are addressed by name, never by platform handle, and are matched against the last enumeration. Scan first if you are not sure what is available. See [Screen & Window Capture](09-streaming-and-io.md#screen--window-capture).
+Targets are addressed by name, never by platform handle, and are matched against the last enumeration. Scan first if you are not sure what is available. A display's name ("Display 1") is only its place in the list now; the scan also gives each display a `uuid` that stays its own, and a `"kind": "display"` target sent with that `uuid` beside the `name` captures that screen whatever its number. See [Screen & Window Capture](09-streaming-and-io.md#screen--window-capture).
 
 ```sh
 curl -X POST http://localhost:8080/api/devices/screen/scan
@@ -230,7 +230,16 @@ curl -X POST http://localhost:8080/api/channels/<ch_uuid>/decks/screen \
 curl -X PUT http://localhost:8080/api/params \
   -H "Content-Type: application/json" \
   -d '{"path": "deck/<deck_uuid>/capture/rate", "value": 0.5}'
+
+# Point a capture deck at another screen or window; its settings stay
+curl -X PUT http://localhost:8080/api/decks/<deck_uuid>/screen/target \
+  -H "Content-Type: application/json" \
+  -d '{"target": {"kind": "display", "name": "Display 2"}}'
 ```
+
+A display in a show saved before 0.9.9 is kept by its number alone (`screen_capture.kept_by_name` in the deck's state): it shows whichever screen has that number now. Pointing it at a screen — the one it shows already included — keeps that screen itself from then on.
+
+Decks of one screen or window share one capture, and with it one rate, crop and cursor (`capture/rate`, `capture/crop_*`, `capture/cursor`, `capture/exclude_varda`): set on any of them, they are every one's. A deck added of a screen another deck captures already — or pointed at it — takes the settings that capture runs with; `rate`, `crop`, `show_cursor` and `exclude_varda` sent with it are those of a capture opened new.
 
 ### Feed Nida's own output back in
 
@@ -926,6 +935,7 @@ ordinals and sequence step indices — see [/spec/api-addressing.md].
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/channels/{channel_uuid}/decks/screen` |  |
+| `PUT` | `/api/decks/{deck_uuid}/screen/target` | Point a screen capture layer at another screen or window, or at its own |
 | `POST` | `/api/devices/screen/permission` | Trigger the platform screen-recording permission request. |
 | `POST` | `/api/devices/screen/scan` |  |
 | `GET` | `/api/library/screen` | Displays and windows found by the last capture scan. |

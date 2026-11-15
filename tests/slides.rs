@@ -245,6 +245,139 @@ fn step(app: &mut VardaApp, to: Go) {
     ));
 }
 
+/// End the talk on: End talk.
+fn stop(app: &mut VardaApp) {
+    ok(send_cmd(app, EngineCommand::StopTalk { deck_uuid: None }));
+}
+
+/// The Slides input as the show at `workspace` has it saved.
+fn saved_slides(workspace: &Path) -> serde_json::Value {
+    let saved = std::fs::read_to_string(workspace.join(".varda/scene.json")).unwrap();
+    let scene: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    let source = scene["channels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|ch| ch["decks"].as_array().into_iter().flatten())
+        .map(|d| d["source"].clone())
+        .find(|source| source["type"] == "Slides");
+    source.expect("the Slides input saved")
+}
+
+/// One test at a time has Nida's folder of slide pictures: it is the
+/// process's.
+static PICTURES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Nida's folder of slide pictures in `dir`, this test's alone till the
+/// guard goes; with a PDF in it — PowerPoint has saved into it before —
+/// when `given`.
+fn pictures_in(
+    dir: &Path,
+    given: bool,
+) -> (std::sync::MutexGuard<'static, ()>, std::path::PathBuf) {
+    let guard = PICTURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let folder = dir.join("Slide pictures");
+    varda::presentation::pictures::use_folder(&folder);
+    if given {
+        std::fs::create_dir_all(&folder).unwrap();
+        write_pdf(&folder.join("made before.pdf"), 1);
+    }
+    (guard, folder)
+}
+
+/// A stand-in deck last changed a minute ago: not one still being written.
+fn write_settled_deck(path: &Path) -> String {
+    let deck = write_deck(path);
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+        .unwrap();
+    deck
+}
+
+/// The decks PowerPoint's stand-in was asked to save as PDFs, in order:
+/// `save pdf a.pptx`.
+fn pdf_saves(ppt: &FakeDecks) -> Vec<String> {
+    ppt.log()
+        .into_iter()
+        .filter(|l| l.starts_with("save pdf "))
+        .collect()
+}
+
+/// The notices given of slide pictures.
+fn said_of_pictures(app: &VardaApp) -> Vec<String> {
+    app.notices()
+        .into_iter()
+        .filter(|n| n.starts_with("Slide pictures of "))
+        .collect()
+}
+
+/// Frames until the stand-in was asked to save `saves` PDFs — half a
+/// minute at most: when it was asked each (by its own clock), and the most
+/// slide pictures the Slides input had in the making at a time meanwhile.
+fn until_saved(app: &mut VardaApp, ppt: &FakeDecks, saves: usize) -> (Vec<Instant>, usize) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut most = 0;
+    loop {
+        app.render_mixer_frame();
+        most = most.max(slides(app).map_or(0, |(_, _, s)| s.making_pictures));
+        let at = ppt.pdf_saves_at();
+        if at.len() >= saves {
+            return (at, most);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{saves} PDFs were never asked: {:?}",
+            ppt.log()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// `times` looks for slide pictures to make: a frame each, more than the
+/// half second between two looks after the one before — so every one of
+/// them looks, however long a frame takes. The PDFs the stand-in was asked
+/// for by the end, and the most slide pictures the Slides input had in the
+/// making at a time.
+fn looks(app: &mut VardaApp, ppt: &FakeDecks, times: usize) -> (usize, usize) {
+    let mut most = 0;
+    for _ in 0..times {
+        std::thread::sleep(Duration::from_millis(600));
+        app.render_mixer_frame();
+        most = most.max(slides(app).map_or(0, |(_, _, s)| s.making_pictures));
+    }
+    (ppt.pdf_saves_at().len(), most)
+}
+
+/// The Slides input `layer` told to make its slide pictures by themselves,
+/// or to leave them to Make; the rest of its `settings` as they are.
+fn make_by_themselves(
+    app: &mut VardaApp,
+    layer: &str,
+    settings: &varda::engine::value::slides::SlidesSettings,
+    make_pictures: bool,
+) {
+    ok(send_cmd(
+        app,
+        EngineCommand::SetSlidesSettings {
+            deck_uuid: layer.to_string(),
+            settings: varda::engine::value::slides::SlidesSettings {
+                make_pictures,
+                ..settings.clone()
+            },
+        },
+    ));
+}
+
+/// Whether PowerPoint's stand-in was asked to open no deck and play no
+/// show from line `from` of its log on.
+fn left_alone_since(ppt: &FakeDecks, from: usize) -> bool {
+    !ppt.log()[from..]
+        .iter()
+        .any(|l| l.starts_with("open ") || l.starts_with("show "))
+}
+
 #[test]
 fn talks_are_started_in_order_and_the_clicker_steps_the_talk_on() {
     let dir = tempfile::tempdir().unwrap();
@@ -515,6 +648,174 @@ fn powerpoint_talks_are_opened_ahead_and_their_shows_end_as_they_go_off() {
         app.render_mixer_frame();
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[test]
+fn a_powerpoint_talk_ended_by_hand_is_off_and_powerpoint_left_alone_until_one_is_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let one = write_deck(&dir.path().join("one.pptx"));
+    let two = write_deck(&dir.path().join("two.pptx"));
+    let three = write_deck(&dir.path().join("three.pptx"));
+    let ppt = FakeDecks::with_slides(5);
+    let Some(mut app) = app_in(&dir.path().join("show"), Some(&ppt)) else {
+        return;
+    };
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::AddTalks {
+            deck_uuid: None,
+            paths: vec![one, two, three],
+            at: None,
+        },
+    ));
+    until(&mut app, |s| s.talks[0].state == TalkState::Ready);
+    // Nothing on: nothing to end — the talk opened ahead stays so.
+    stop(&mut app);
+    frames_for(&mut app, 0.3);
+    assert_eq!(slides(&app).unwrap().2.talks[0].state, TalkState::Ready);
+    assert_eq!(ppt.decks(), vec![("one.pptx".into(), false, 0)]);
+
+    // The second talk on, at its third slide, white over it; the first and
+    // the third open either side of it.
+    start(&mut app, TalkRef::Next);
+    until(&mut app, |s| {
+        s.live == Some(0) && s.talks[1].state == TalkState::Ready
+    });
+    start(&mut app, TalkRef::Next);
+    until(&mut app, |s| {
+        s.live == Some(1)
+            && s.talks[0].state == TalkState::Ready
+            && s.talks[2].state == TalkState::Ready
+    });
+    let slide_of_two =
+        |s: &SlidesSnapshot| s.talks[1].presentation.as_ref().and_then(|p| p.slide);
+    step(&mut app, Go::Next);
+    until(&mut app, |s| slide_of_two(s) == Some(2));
+    step(&mut app, Go::Next);
+    until(&mut app, |s| slide_of_two(s) == Some(3));
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::TogglePresentationScreen {
+            deck_uuid: None,
+            screen: Screen::White,
+        },
+    ));
+    until(&mut app, |s| s.screen == Screen::White);
+
+    // Ended: nothing on, its show ended, and every deck Nida opened closed.
+    stop(&mut app);
+    let s = until(&mut app, |s| s.on.is_none() && ppt.decks().is_empty());
+    assert_eq!((s.live, s.starting), (None, None));
+    assert!(s.talk_secs.is_none());
+    assert_eq!(s.screen, Screen::Slide, "white went with the talk");
+    assert!(
+        s.talks.iter().all(|t| t.state == TalkState::Waiting),
+        "{s:#?}"
+    );
+    assert_eq!(
+        (s.next, s.previous),
+        (Some(2), Some(1)),
+        "the third comes next; the one ended is the one before"
+    );
+    let log = ppt.log();
+    for line in ["end two.pptx", "close one.pptx", "close two.pptx", "close three.pptx"] {
+        assert!(log.iter().any(|l| l == line), "{line}: {log:?}");
+    }
+
+    // Left so: nothing of PowerPoint's is opened or played again.
+    let asked = ppt.log().len();
+    frames_for(&mut app, 2.5);
+    assert!(left_alone_since(&ppt, asked), "{:?}", ppt.log());
+    assert!(ppt.decks().is_empty());
+    let now = slides(&app).unwrap().2;
+    assert!(
+        now.talks.iter().all(|t| t.presentation.is_none()),
+        "none asked of PowerPoint: {now:#?}"
+    );
+
+    // Previous talk: the one ended, played again at its slide — and with a
+    // talk on, those either side of it are opened ahead again.
+    start(&mut app, TalkRef::Previous);
+    let s = until(&mut app, |s| {
+        s.live == Some(1)
+            && slide_of_two(s) == Some(3)
+            && s.talks[0].state == TalkState::Ready
+            && s.talks[2].state == TalkState::Ready
+    });
+    assert_eq!(
+        (s.next, s.previous),
+        (Some(2), Some(0)),
+        "the one before it is as it was"
+    );
+}
+
+#[test]
+fn a_talk_on_taken_out_of_the_list_is_ended_by_hand_and_powerpoint_does_not_come_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let deck = write_deck(&dir.path().join("andromeda.pptx"));
+    let ppt = FakeDecks::with_slides(5);
+    let Some(mut app) = app_in(&dir.path().join("show"), Some(&ppt)) else {
+        return;
+    };
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::AddTalks {
+            deck_uuid: None,
+            paths: vec![deck],
+            at: None,
+        },
+    ));
+    let (_, layer, s) = slides(&app).unwrap();
+    until(&mut app, |s| s.talks[0].state == TalkState::Ready);
+    start(&mut app, TalkRef::Next);
+    until(&mut app, |s| s.live == Some(0));
+    let playing = |ppt: &FakeDecks| {
+        ppt.decks()
+            .iter()
+            .any(|(file, showing, _)| file == "andromeda.pptx" && *showing)
+    };
+    assert!(playing(&ppt), "{:?}", ppt.decks());
+
+    // Taken out of the list: still on, its show still played.
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::RemoveTalk {
+            deck_uuid: layer.clone(),
+            talk_id: s.talks[0].id.clone(),
+        },
+    ));
+    let s = until(&mut app, |s| s.talks.is_empty());
+    assert!(s.on.is_some(), "on, though not in the list");
+    frames_for(&mut app, 0.3);
+    assert!(playing(&ppt), "{:?}", ppt.decks());
+
+    // Ended by hand: off, its deck closed, and not opened again.
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::StopTalk {
+            deck_uuid: Some(layer),
+        },
+    ));
+    let s = until(&mut app, |s| s.on.is_none() && ppt.decks().is_empty());
+    assert_eq!((s.next, s.previous), (None, None));
+    let asked = ppt.log().len();
+    frames_for(&mut app, 2.5);
+    assert!(left_alone_since(&ppt, asked), "{:?}", ppt.log());
+
+    // Its removal undone: in the list again, not on — until it is started.
+    send_cmd(&mut app, EngineCommand::Undo);
+    let s = until(&mut app, |s| s.talks.len() == 1);
+    assert!(s.on.is_none(), "{s:#?}");
+    assert_eq!((s.live, s.next), (None, Some(0)));
+    // Not opened ahead: nothing is asked of PowerPoint for it (asked, it
+    // would be told here at once, whenever PowerPoint got to it).
+    frames_for(&mut app, 0.1);
+    let now = slides(&app).unwrap().2;
+    assert!(now.talks[0].presentation.is_none(), "{now:#?}");
+    frames_for(&mut app, 1.5);
+    assert!(left_alone_since(&ppt, asked), "{:?}", ppt.log());
+    start(&mut app, TalkRef::Next);
+    until(&mut app, |s| s.live == Some(0) && playing(&ppt));
 }
 
 #[test]
@@ -848,6 +1149,299 @@ fn a_talk_on_out_of_the_list_is_kept_with_the_show_and_a_missing_one_is_not_forg
 }
 
 #[test]
+fn a_talk_ended_by_hand_stays_in_the_list_and_is_not_on_when_the_show_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = write_pdf(&dir.path().join("results.pdf"), 3);
+    let blue = write_picture(&dir.path().join("blue.png"), [0, 0, 255]);
+    let green = write_picture(&dir.path().join("green.png"), [0, 255, 0]);
+    let workspace = dir.path().join("show");
+    {
+        let Some(mut app) = app_in(&workspace, None) else {
+            return;
+        };
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::AddTalks {
+                deck_uuid: None,
+                paths: vec![pdf, blue, green],
+                at: None,
+            },
+        ));
+        let (channel, layer, s) = slides(&app).unwrap();
+        let ids: Vec<String> = s.talks.iter().map(|t| t.id.clone()).collect();
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::TakeToMain {
+                source: MainSource::Channel(channel),
+                fade: false,
+            },
+        ));
+        start(&mut app, TalkRef::Next);
+        until(&mut app, |s| s.live == Some(0));
+        step(&mut app, Go::Next);
+        until(&mut app, |s| s.talks[0].position == Some(2));
+        until_main_is(&mut app, page_colour(2));
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::TogglePresentationScreen {
+                deck_uuid: None,
+                screen: Screen::White,
+            },
+        ));
+        until_main_is(&mut app, [255, 255, 255]);
+
+        // Ended: the input shows nothing, white gone with the talk; the
+        // talk after it comes next, and it is the one before.
+        stop(&mut app);
+        until_main_is(&mut app, [0, 0, 0]);
+        let s = slides(&app).unwrap().2;
+        assert_eq!((s.live, s.starting), (None, None));
+        assert!(s.on.is_none() && s.talk_secs.is_none(), "{s:#?}");
+        assert_eq!(s.screen, Screen::Slide);
+        assert_eq!(s.talks[0].state, TalkState::Waiting);
+        assert_eq!((s.next, s.previous), (Some(1), Some(0)));
+
+        // The list changed with nothing on: the talk after the one ended
+        // still comes next.
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::MoveTalk {
+                deck_uuid: layer.clone(),
+                talk_id: ids[2].clone(),
+                to: 0,
+            },
+        ));
+        let s = until(&mut app, |s| s.talks[0].id == ids[2]);
+        assert_eq!(
+            (s.next, s.previous),
+            (Some(2), Some(1)),
+            "the blue picture next, the PDF the one before"
+        );
+        // Undone: the list as it was, and still nothing on.
+        send_cmd(&mut app, EngineCommand::Undo);
+        let s = until(&mut app, |s| s.talks[0].id == ids[0]);
+        assert_eq!((s.live, s.next, s.previous), (None, Some(1), Some(0)));
+
+        // One being started, ended before it is on: it comes next itself,
+        // and what was being opened for it is let go.
+        start(&mut app, TalkRef::Id(ids[2].clone()));
+        stop(&mut app);
+        let s = until(&mut app, |s| s.starting.is_none());
+        assert_eq!((s.live, s.next, s.previous), (None, Some(2), Some(0)));
+        frames_for(&mut app, 0.5);
+        let s = slides(&app).unwrap().2;
+        assert_eq!((s.live, s.starting), (None, None));
+        // Moved meanwhile, it still comes next itself.
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::MoveTalk {
+                deck_uuid: layer.clone(),
+                talk_id: ids[2].clone(),
+                to: 0,
+            },
+        ));
+        let s = until(&mut app, |s| s.talks[0].id == ids[2]);
+        assert_eq!(
+            (s.next, s.previous),
+            (Some(0), Some(1)),
+            "the green picture next, the first now; the PDF the one before"
+        );
+        send_cmd(&mut app, EngineCommand::Undo);
+        let s = until(&mut app, |s| s.talks[0].id == ids[0]);
+        assert_eq!((s.live, s.next, s.previous), (None, Some(2), Some(0)));
+
+        // Started after a stop: the talk ended is the one before it.
+        start(&mut app, TalkRef::Next);
+        let s = until(&mut app, |s| s.live == Some(2));
+        assert_eq!((s.next, s.previous), (None, Some(0)));
+        until_main_is(&mut app, [0, 255, 0]);
+        // The last talk ended: the first comes next again.
+        stop(&mut app);
+        until_main_is(&mut app, [0, 0, 0]);
+        let s = slides(&app).unwrap().2;
+        assert_eq!((s.live, s.next, s.previous), (None, Some(0), Some(2)));
+        // The first moved to the end meanwhile, after the talk ended: it
+        // comes next.
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::MoveTalk {
+                deck_uuid: layer.clone(),
+                talk_id: ids[0].clone(),
+                to: 2,
+            },
+        ));
+        let s = until(&mut app, |s| s.talks[2].id == ids[0]);
+        assert_eq!(
+            (s.next, s.previous),
+            (Some(2), Some(1)),
+            "the PDF next, at the end now; the green picture the one before"
+        );
+        send_cmd(&mut app, EngineCommand::Undo);
+        let s = until(&mut app, |s| s.talks[0].id == ids[0]);
+        assert_eq!((s.live, s.next, s.previous), (None, Some(0), Some(2)));
+        // A talk added after the one ended, the last: that one comes next.
+        let red = write_picture(&dir.path().join("red.png"), [255, 0, 0]);
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::AddTalks {
+                deck_uuid: None,
+                paths: vec![red.clone()],
+                at: None,
+            },
+        ));
+        let s = until(&mut app, |s| s.talks.len() == 4);
+        assert_eq!(
+            (s.next, s.previous),
+            (Some(3), Some(2)),
+            "the red picture next, after the green one ended"
+        );
+        send_cmd(&mut app, EngineCommand::Undo);
+        let s = until(&mut app, |s| s.talks.len() == 3);
+        assert_eq!((s.live, s.next, s.previous), (None, Some(0), Some(2)));
+        // One added before them all: after the last, the first again —
+        // the one added.
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::AddTalks {
+                deck_uuid: None,
+                paths: vec![red],
+                at: Some(0),
+            },
+        ));
+        let s = until(&mut app, |s| s.talks.len() == 4);
+        assert_eq!(s.talks[1].id, ids[0]);
+        assert_eq!(
+            (s.next, s.previous),
+            (Some(0), Some(3)),
+            "the red picture next, the first; the green one the one before"
+        );
+        send_cmd(&mut app, EngineCommand::Undo);
+        let s = until(&mut app, |s| s.talks.len() == 3);
+        assert_eq!((s.live, s.next, s.previous), (None, Some(0), Some(2)));
+        // Previous talk starts the one ended: the one before it is as it
+        // was.
+        start(&mut app, TalkRef::Previous);
+        let s = until(&mut app, |s| s.live == Some(2));
+        assert_eq!(s.previous, Some(0));
+
+        // A talk ended, then taken out of the list: what came after it
+        // comes next — and, put back, it is counted from again.
+        start(&mut app, TalkRef::Id(ids[1].clone()));
+        until(&mut app, |s| s.live == Some(1));
+        stop(&mut app);
+        let s = until(&mut app, |s| s.on.is_none());
+        assert_eq!((s.next, s.previous), (Some(2), Some(1)));
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::RemoveTalk {
+                deck_uuid: layer,
+                talk_id: ids[1].clone(),
+            },
+        ));
+        let s = until(&mut app, |s| s.talks.len() == 2);
+        assert_eq!(s.next, Some(1), "the green picture, the second now");
+        send_cmd(&mut app, EngineCommand::Undo);
+        let s = until(&mut app, |s| s.talks.len() == 3);
+        assert_eq!((s.live, s.next, s.previous), (None, Some(2), Some(1)));
+
+        // The PDF again: at the page it was left on when ended.
+        start(&mut app, TalkRef::Id(ids[0].clone()));
+        let s = until(&mut app, |s| s.live == Some(0));
+        assert_eq!(s.talks[0].position, Some(2));
+        until_main_is(&mut app, page_colour(2));
+        stop(&mut app);
+        until(&mut app, |s| s.on.is_none());
+        app.save_workspace(&UILayoutState::default()).unwrap();
+        app.flush_saves();
+    }
+    // Saved with no talk on, each where it was left.
+    let source = saved_slides(&workspace);
+    assert!(source["live"].is_null(), "{source}");
+    assert_eq!(source["talks"][0]["slide"], 2, "{source}");
+
+    // Opened again: nothing on.
+    let Some(mut app) = app_in(&workspace, None) else {
+        return;
+    };
+    let _ = app.load_workspace();
+    frames_for(&mut app, 0.5);
+    let s = slides(&app).unwrap().2;
+    assert!(s.on.is_none(), "{s:#?}");
+    assert_eq!((s.live, s.starting), (None, None));
+}
+
+#[test]
+fn a_talk_a_show_opens_with_ended_as_it_starts_is_not_on_at_the_next_opening() {
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = write_pdf(&dir.path().join("results.pdf"), 3);
+    let blue = write_picture(&dir.path().join("blue.png"), [0, 0, 255]);
+    let green = write_picture(&dir.path().join("green.png"), [0, 255, 0]);
+    let workspace = dir.path().join("show");
+    {
+        let Some(mut app) = app_in(&workspace, None) else {
+            return;
+        };
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::AddTalks {
+                deck_uuid: None,
+                paths: vec![blue, pdf, green],
+                at: None,
+            },
+        ));
+        let (_, layer, s) = slides(&app).unwrap();
+        start(&mut app, TalkRef::Id(s.talks[1].id.clone()));
+        until(&mut app, |s| s.live == Some(1));
+        // Taken out of the list while on — it was the second — and saved so.
+        let all = talks_of(&s);
+        ok(send_cmd(
+            &mut app,
+            EngineCommand::SetSlidesTalks {
+                deck_uuid: layer,
+                talks: vec![all[0].clone(), all[2].clone()],
+            },
+        ));
+        until(&mut app, |s| s.talks.len() == 2);
+        app.render_mixer_frame();
+        app.save_workspace(&UILayoutState::default()).unwrap();
+        app.flush_saves();
+    }
+    let source = saved_slides(&workspace);
+    assert!(source["live"].is_string(), "{source}");
+    assert_eq!(source["live"], source["live_talk"]["id"], "{source}");
+
+    // Opened again, the show starts it — ended before it is on: what came
+    // after it in the list comes next, and nothing comes on.
+    {
+        let Some(mut app) = app_in(&workspace, None) else {
+            return;
+        };
+        let _ = app.load_workspace();
+        stop(&mut app);
+        frames_for(&mut app, 0.5);
+        let s = slides(&app).unwrap().2;
+        assert!(s.on.is_none(), "{s:#?}");
+        assert_eq!((s.starting, s.next), (None, Some(1)));
+        app.save_workspace(&UILayoutState::default()).unwrap();
+        app.flush_saves();
+    }
+    // Saved so: the show remembers no talk on.
+    let source = saved_slides(&workspace);
+    assert!(
+        source["live"].is_null() && source["live_talk"].is_null(),
+        "{source}"
+    );
+    let Some(mut app) = app_in(&workspace, None) else {
+        return;
+    };
+    let _ = app.load_workspace();
+    frames_for(&mut app, 0.5);
+    let s = slides(&app).unwrap().2;
+    assert!(s.on.is_none(), "{s:#?}");
+    assert_eq!(s.talks.len(), 2);
+}
+
+#[test]
 fn a_powerpoint_talk_given_another_file_plays_on_until_started_again() {
     let dir = tempfile::tempdir().unwrap();
     let one = write_deck(&dir.path().join("one.pptx"));
@@ -1165,6 +1759,7 @@ fn the_manuals_examples_are_commands_nida_takes() {
             if matches!(
                 parsed,
                 Ok(EngineCommand::StartTalk { .. }
+                    | EngineCommand::StopTalk { .. }
                     | EngineCommand::AddTalks { .. }
                     | EngineCommand::SetNextTalk { .. }
                     | EngineCommand::EditTalk { .. }
@@ -1181,7 +1776,7 @@ fn the_manuals_examples_are_commands_nida_takes() {
             assert!(source.is_ok(), "{line}: {source:?}");
         }
     }
-    assert_eq!(slides, 11, "the manual shows the Slides commands");
+    assert_eq!(slides, 12, "the manual shows the Slides commands");
 }
 
 #[test]
@@ -1881,13 +2476,14 @@ fn a_page_resized_whose_new_capture_sends_nothing_is_captured_again() {
     until(&mut app, |_| captures_after(&web.log()) >= 2);
 }
 
-/// PowerPoint talks' slides saved as pictures — asked with no PowerPoint
-/// show running, refused with one — give the presenter view the next
-/// slide's picture as the talk steps: the page of PowerPoint's next slide.
+/// PowerPoint talks' slides saved as pictures give the presenter view the
+/// next slide's picture as the talk steps: the page of PowerPoint's next
+/// slide. Asked with a PowerPoint show running, they are made beside it —
+/// but refused while PowerPoint has never saved into Nida's folder.
 #[test]
 fn a_powerpoint_talks_slide_pictures_give_the_presenter_view_its_next_slide() {
     let dir = tempfile::tempdir().unwrap();
-    varda::presentation::pictures::use_folder(&dir.path().join("Slide pictures"));
+    let (_pictures, folder) = pictures_in(dir.path(), false);
     let deck = write_deck(&dir.path().join("keynote.pptx"));
     let ppt = FakeDecks::with_slides(5);
     let Some(mut app) = app_in(&dir.path().join("show"), Some(&ppt)) else {
@@ -1950,24 +2546,630 @@ fn a_powerpoint_talks_slide_pictures_give_the_presenter_view_its_next_slide() {
     write_pdf(&pdf, 3);
     next_shown(&mut app, None);
     // And stays so once the new PDF is drawn from.
-    let until = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < until {
+    let end = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < end {
         app.render_mixer_frame();
         let now = presenter(&app).and_then(|(p, _)| p.next_picture());
         assert_eq!(now, None, "a page of the PDF as counted before");
         std::thread::sleep(Duration::from_millis(5));
     }
-    // Its show running: asked again, refused — nothing asked of PowerPoint.
+    // Its show running, its pictures there: asked again, nothing to make.
+    let saves = |ppt: &FakeDecks| pdf_saves(ppt).len();
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::MakeSlidePictures {
+            deck_uuid: Some(layer.clone()),
+        },
+    ));
+    assert_eq!(saves(&ppt), 1);
+    // Their PDF gone, and no other in the folder — for all Nida knows
+    // PowerPoint never saved into it, and may ask for access to it, holding
+    // its show: refused, nothing asked of PowerPoint.
+    std::fs::remove_file(&pdf).unwrap();
     let refused = send_cmd(
         &mut app,
         EngineCommand::MakeSlidePictures {
-            deck_uuid: Some(layer),
+            deck_uuid: Some(layer.clone()),
         },
     );
     assert!(
         matches!(&refused, CommandResult::Err { message, .. } if message.contains("talk is on")),
         "{refused:?}"
     );
+    frames_for(&mut app, 0.5);
+    assert_eq!(saves(&ppt), 1);
+    assert!(said_of_pictures(&app).is_empty(), "{:?}", app.notices());
+    // Another talk's pictures there — PowerPoint has saved into the folder:
+    // made beside the show, the deck open for it, and the show plays on.
+    write_pdf(&folder.join("another talk.pdf"), 2);
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::MakeSlidePictures {
+            deck_uuid: Some(layer.clone()),
+        },
+    ));
+    let beside = until(&mut app, |s| s.making_pictures == 0 && pdf.is_file());
+    assert_eq!(saves(&ppt), 2, "{:?}", ppt.log());
+    assert_eq!(beside.live, Some(0));
+    assert!(
+        ppt.decks()
+            .iter()
+            .any(|(file, showing, slide)| file == "keynote.pptx" && *showing && *slide == 2),
+        "{:?}",
+        ppt.decks()
+    );
+    assert!(said_of_pictures(&app).is_empty(), "{:?}", app.notices());
+    // The talk ended by hand: no show of PowerPoint's left, the pictures —
+    // their PDF gone — are made again.
+    stop(&mut app);
+    until(&mut app, |s| s.on.is_none());
+    std::fs::remove_file(&pdf).unwrap();
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::MakeSlidePictures {
+            deck_uuid: Some(layer),
+        },
+    ));
+    until(&mut app, |s| s.making_pictures == 0 && pdf.is_file());
+    assert_eq!(saves(&ppt), 3, "{:?}", ppt.log());
+}
+
+/// Slide pictures are made by themselves as PowerPoint talks are added —
+/// once PowerPoint has saved into Nida's folder for them (Make, pressed a
+/// first time): never before, when it may ask for access to it.
+#[test]
+fn slide_pictures_are_made_by_themselves_once_make_was_pressed_a_first_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_pictures, _) = pictures_in(dir.path(), false);
+    let first = write_settled_deck(&dir.path().join("first.pptx"));
+    let second = write_settled_deck(&dir.path().join("second.pptx"));
+    let third = write_settled_deck(&dir.path().join("third.pptx"));
+    let ppt = FakeDecks::with_slides(5);
+    let Some(mut app) = app_in(&dir.path().join("show"), Some(&ppt)) else {
+        return;
+    };
+    app.set_slide_pictures_by_themselves(true);
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::AddTalks {
+            deck_uuid: None,
+            paths: vec![first, second],
+            at: None,
+        },
+    ));
+    let (_, layer, _) = slides(&app).expect("a Slides input");
+    until(&mut app, |s| s.talks[0].state != TalkState::Failed);
+    // Never saved into: nothing is asked of PowerPoint by itself.
+    frames_for(&mut app, 2.5);
+    assert!(pdf_saves(&ppt).is_empty(), "{:?}", ppt.log());
+    let before = slides(&app).expect("a Slides input").2;
+    assert!(!before.pictures_given && before.settings.make_pictures);
+    // Make, a first time: both made.
+    ok(send_cmd(&mut app, EngineCommand::MakeSlidePictures {
+            deck_uuid: Some(layer.clone()),
+        }));
+    until(&mut app, |s| {
+        s.talks.iter().all(|t| t.pictures) && s.making_pictures == 0
+    });
+    assert_eq!(pdf_saves(&ppt).len(), 2, "{:?}", ppt.log());
+    // A talk added from then on: made with nothing pressed, once.
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::AddTalks {
+            deck_uuid: None,
+            paths: vec![third],
+            at: None,
+        },
+    ));
+    let after = until(&mut app, |s| {
+        s.talks.len() == 3 && s.talks.iter().all(|t| t.pictures) && s.making_pictures == 0
+    });
+    assert!(after.pictures_given);
+    frames_for(&mut app, 2.0);
+    assert_eq!(
+        pdf_saves(&ppt),
+        ["save pdf first.pptx", "save pdf second.pptx", "save pdf third.pptx"]
+    );
+    assert!(said_of_pictures(&app).is_empty(), "{:?}", app.notices());
+}
+
+/// With a PowerPoint talk on, slide pictures are made by themselves only of
+/// the decks PowerPoint has open for the input — the talk on's first, then
+/// the next talk's, a moment apart — and nothing is opened for the others,
+/// nor said of them: they are made once the talk is ended. Make says which
+/// it cannot make meanwhile.
+#[test]
+fn beside_a_talk_on_slide_pictures_are_made_of_the_decks_open_one_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_pictures, _) = pictures_in(dir.path(), true);
+    // The talk on's file comes last by name: it is made first all the same.
+    let on = write_settled_deck(&dir.path().join("z-on.pptx"));
+    let next = write_settled_deck(&dir.path().join("a-next.pptx"));
+    let far = write_settled_deck(&dir.path().join("m-far.pptx"));
+    let farther = write_settled_deck(&dir.path().join("n-farther.pptx"));
+    let ppt = FakeDecks::with_slides(5);
+    let Some(mut app) = app_in(&dir.path().join("show"), Some(&ppt)) else {
+        return;
+    };
+    // A save takes its time, as PowerPoint's does: held here, till let go
+    // — kept after the app, so let go before the app goes should the test
+    // fail meanwhile.
+    let held = ppt.hold_pdf_saves();
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::AddTalks {
+            deck_uuid: None,
+            paths: vec![on, next, far, farther],
+            at: None,
+        },
+    ));
+    let (_, layer, _) = slides(&app).expect("a Slides input");
+    until(&mut app, |s| s.talks[0].state != TalkState::Failed);
+    start(&mut app, TalkRef::Next);
+    // The talk on, and the next talk's deck open too: either could be
+    // asked.
+    until(&mut app, |s| {
+        s.live == Some(0) && s.talks[1].state == TalkState::Ready
+    });
+    assert!(pdf_saves(&ppt).is_empty(), "{:?}", ppt.log());
+    app.set_slide_pictures_by_themselves(true);
+    until_saved(&mut app, &ppt, 1);
+    // One at a time: while PowerPoint saves the first — it takes no step
+    // meanwhile — the second is not asked, looked at four times.
+    let during = looks(&mut app, &ppt, 4);
+    let let_go = Instant::now();
+    drop(held);
+    assert_eq!(during, (1, 1), "asked, and in the making at a time");
+    let (at, most) = until_saved(&mut app, &ppt, 2);
+    assert_eq!(
+        pdf_saves(&ppt),
+        ["save pdf z-on.pptx", "save pdf a-next.pptx"]
+    );
+    assert_eq!(most, 1, "in the making at a time");
+    // And PowerPoint is left three seconds after the first ended.
+    let rested = at[1].duration_since(let_go);
+    assert!(rested >= Duration::from_millis(2900), "{rested:?} after");
+    // The others PowerPoint does not have open: not asked, not opened, and
+    // nothing said; the show plays on.
+    let beside = until(&mut app, |s| {
+        s.talks[0].pictures && s.talks[1].pictures && s.making_pictures == 0
+    });
+    frames_for(&mut app, 2.0);
+    assert_eq!(pdf_saves(&ppt).len(), 2, "{:?}", ppt.log());
+    assert!(
+        !ppt.log()
+            .iter()
+            .any(|l| l.ends_with("m-far.pptx") || l.ends_with("n-farther.pptx")),
+        "{:?}",
+        ppt.log()
+    );
+    assert_eq!(beside.live, Some(0));
+    assert!(!beside.talks[2].pictures && !beside.talks[3].pictures);
+    assert!(
+        ppt.decks().contains(&("z-on.pptx".to_string(), true, 1)),
+        "{:?}",
+        ppt.decks()
+    );
+    assert!(said_of_pictures(&app).is_empty(), "{:?}", app.notices());
+    // Make, the talk on: it says which it cannot make now, and why.
+    let refused = send_cmd(&mut app, EngineCommand::MakeSlidePictures {
+            deck_uuid: Some(layer.clone()),
+        });
+    assert!(
+        matches!(&refused, CommandResult::Err { message, .. }
+            if message.contains("m-far.pptx, n-farther.pptx")
+                && message.contains("nothing is opened beside a show")),
+        "{refused:?}"
+    );
+    frames_for(&mut app, 0.5);
+    assert_eq!(pdf_saves(&ppt).len(), 2, "{:?}", ppt.log());
+    // The talk ended: the rest are made.
+    stop(&mut app);
+    until(&mut app, |s| s.on.is_none());
+    until(&mut app, |s| {
+        s.talks.iter().all(|t| t.pictures) && s.making_pictures == 0
+    });
+    assert_eq!(pdf_saves(&ppt).len(), 4, "{:?}", ppt.log());
+    assert!(said_of_pictures(&app).is_empty(), "{:?}", app.notices());
+}
+
+/// A show started in PowerPoint itself, by hand: no input knows of it.
+/// Slide pictures asked by themselves are made of the deck an input keeps
+/// open; the others are left — nothing is opened beside that show — and
+/// nothing is said of them: they are asked again in a while.
+#[test]
+fn beside_a_show_started_by_hand_the_deck_open_is_made_and_nothing_said_of_the_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_pictures, _) = pictures_in(dir.path(), true);
+    let one = write_settled_deck(&dir.path().join("one.pptx"));
+    let two = write_settled_deck(&dir.path().join("two.pptx"));
+    let ppt = FakeDecks::with_slides(5);
+    let Some(mut app) = app_in(&dir.path().join("show"), Some(&ppt)) else {
+        return;
+    };
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::AddTalks {
+            deck_uuid: None,
+            paths: vec![one, two],
+            at: None,
+        },
+    ));
+    // The first talk is opened ahead; the second is not.
+    until(&mut app, |s| s.talks[0].state == TalkState::Ready);
+    ppt.play_by_hand("other.pptx");
+    assert!(pdf_saves(&ppt).is_empty(), "{:?}", ppt.log());
+    app.set_slide_pictures_by_themselves(true);
+    until_saved(&mut app, &ppt, 1);
+    let beside = until(&mut app, |s| s.talks[0].pictures && s.making_pictures == 0);
+    frames_for(&mut app, 2.0);
+    assert_eq!(pdf_saves(&ppt), ["save pdf one.pptx"]);
+    assert!(
+        !ppt.log().iter().any(|l| l.ends_with("two.pptx")),
+        "{:?}",
+        ppt.log()
+    );
+    assert!(!beside.talks[1].pictures);
+    assert!(
+        ppt.decks()
+            .iter()
+            .any(|(name, showing, _)| name == "other.pptx" && *showing),
+        "{:?}",
+        ppt.decks()
+    );
+    assert!(said_of_pictures(&app).is_empty(), "{:?}", app.notices());
+}
+
+/// Make of a deck whose file changed the moment before — what was last
+/// found of it still the old file — that fails is kept for the file as
+/// Make found it: once the change is found, it is not asked again by
+/// itself, nor said again.
+#[test]
+fn slide_pictures_make_could_not_make_are_not_asked_again_by_themselves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_pictures, _) = pictures_in(dir.path(), true);
+    let path = dir.path().join("talk.pptx");
+    let deck = write_settled_deck(&path);
+    let ppt = FakeDecks::with_slides(5);
+    let Some(mut app) = app_in(&dir.path().join("show"), Some(&ppt)) else {
+        return;
+    };
+    app.set_slide_pictures_by_themselves(true);
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::AddTalks {
+            deck_uuid: None,
+            paths: vec![deck],
+            at: None,
+        },
+    ));
+    let (_, layer, _) = slides(&app).expect("a Slides input");
+    until(&mut app, |s| s.talks[0].pictures && s.making_pictures == 0);
+    assert_eq!(pdf_saves(&ppt).len(), 1, "{:?}", ppt.log());
+    // Left to Make for now. Another file under its name, settled too; Make
+    // at once, and PowerPoint's save cut short.
+    app.set_slide_pictures_by_themselves(false);
+    let file = std::fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(std::time::SystemTime::now() - Duration::from_secs(30))
+        .unwrap();
+    drop(file);
+    ppt.save_broken_pdfs(true);
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::MakeSlidePictures {
+            deck_uuid: Some(layer.clone()),
+        },
+    ));
+    until_saved(&mut app, &ppt, 2);
+    until(&mut app, |s| s.making_pictures == 0);
+    assert_eq!(said_of_pictures(&app).len(), 1, "{:?}", app.notices());
+    // The file is found changed, its pictures not there.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while varda::presentation::pictures::missing_known(&path).is_none() {
+        app.render_mixer_frame();
+        assert!(Instant::now() < deadline, "the changed file was never found");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // By themselves again, looked at four times: it is left, as Make
+    // found it.
+    app.set_slide_pictures_by_themselves(true);
+    assert_eq!(looks(&mut app, &ppt, 4).0, 2, "not asked again by itself");
+    let said = said_of_pictures(&app);
+    assert!(
+        matches!(&said[..], [one] if one.starts_with("Slide pictures of talk.pptx: ")),
+        "{:?}",
+        app.notices()
+    );
+}
+
+/// A Slides input told not to make its slide pictures by themselves is
+/// left to Make; told to again, they are made.
+#[test]
+fn slide_pictures_are_not_made_by_themselves_for_an_input_told_not_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_pictures, _) = pictures_in(dir.path(), true);
+    let deck = write_settled_deck(&dir.path().join("talk.pptx"));
+    let ppt = FakeDecks::with_slides(5);
+    let Some(mut app) = app_in(&dir.path().join("show"), Some(&ppt)) else {
+        return;
+    };
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::AddTalks {
+            deck_uuid: None,
+            paths: vec![deck],
+            at: None,
+        },
+    ));
+    let (_, layer, added) = slides(&app).expect("a Slides input");
+    until(&mut app, |s| s.talks[0].state != TalkState::Failed);
+    let tell = |app: &mut VardaApp, make_pictures: bool| {
+        ok(send_cmd(
+            app,
+            EngineCommand::SetSlidesSettings {
+                deck_uuid: layer.clone(),
+                settings: varda::engine::value::slides::SlidesSettings {
+                    make_pictures,
+                    ..added.settings.clone()
+                },
+            },
+        ));
+    };
+    tell(&mut app, false);
+    app.set_slide_pictures_by_themselves(true);
+    frames_for(&mut app, 2.5);
+    assert!(pdf_saves(&ppt).is_empty(), "{:?}", ppt.log());
+    assert!(!slides(&app).expect("a Slides input").2.settings.make_pictures);
+    tell(&mut app, true);
+    until(&mut app, |s| s.talks[0].pictures && s.making_pictures == 0);
+    assert_eq!(pdf_saves(&ppt), ["save pdf talk.pptx"]);
+}
+
+/// Slide pictures PowerPoint could not make are said once and not asked
+/// again by themselves, the file as it is: Make asks again.
+#[test]
+fn slide_pictures_that_fail_are_said_once_and_asked_again_only_by_make() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_pictures, _) = pictures_in(dir.path(), true);
+    let deck = write_settled_deck(&dir.path().join("talk.pptx"));
+    let ppt = FakeDecks::with_slides(5);
+    ppt.save_broken_pdfs(true);
+    let Some(mut app) = app_in(&dir.path().join("show"), Some(&ppt)) else {
+        return;
+    };
+    app.set_slide_pictures_by_themselves(true);
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::AddTalks {
+            deck_uuid: None,
+            paths: vec![deck],
+            at: None,
+        },
+    ));
+    let (_, layer, added) = slides(&app).expect("a Slides input");
+    until_saved(&mut app, &ppt, 1);
+    // What came of it is said, however long that took — and then, looked
+    // at three times, it is not asked again by itself, nor said again.
+    until_said_of_pictures(&mut app);
+    assert_eq!(looks(&mut app, &ppt, 3).0, 1, "not asked again by itself");
+    let said = said_of_pictures(&app);
+    assert!(
+        matches!(&said[..], [one] if one.starts_with("Slide pictures of talk.pptx: ")),
+        "{:?}",
+        app.notices()
+    );
+    // PowerPoint whole again: still not by itself — Make asks.
+    ppt.save_broken_pdfs(false);
+    assert_eq!(looks(&mut app, &ppt, 2).0, 1, "not asked again by itself");
+    // Nor once its input was told to leave them to Make — looked at so —
+    // and then to make them again: what failed is not forgotten.
+    make_by_themselves(&mut app, &layer, &added.settings, false);
+    looks(&mut app, &ppt, 2);
+    make_by_themselves(&mut app, &layer, &added.settings, true);
+    assert_eq!(looks(&mut app, &ppt, 3).0, 1, "not asked again by itself");
+    ok(send_cmd(&mut app, EngineCommand::MakeSlidePictures {
+            deck_uuid: Some(layer.clone()),
+        }));
+    until(&mut app, |s| s.talks[0].pictures && s.making_pictures == 0);
+    assert_eq!(pdf_saves(&ppt).len(), 2, "{:?}", ppt.log());
+    assert_eq!(said_of_pictures(&app).len(), 1, "{:?}", app.notices());
+}
+
+/// Frames until something is said of slide pictures — half a minute at
+/// most.
+fn until_said_of_pictures(app: &mut VardaApp) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while said_of_pictures(app).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "nothing said of slide pictures: {:?}",
+            app.notices()
+        );
+        app.render_mixer_frame();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// A show in `dir` with one PowerPoint talk, `talk.pptx`, whose slide
+/// pictures failed by themselves — and that was said — PowerPoint's
+/// stand-in whole again since: the app, the stand-in, the Slides layer,
+/// the talk's id and its file. None where no app can be made.
+fn a_talk_whose_slide_pictures_failed(
+    dir: &Path,
+) -> Option<(VardaApp, FakeDecks, String, String, String)> {
+    let deck = write_settled_deck(&dir.join("talk.pptx"));
+    let ppt = FakeDecks::with_slides(5);
+    ppt.save_broken_pdfs(true);
+    let mut app = app_in(&dir.join("show"), Some(&ppt))?;
+    app.set_slide_pictures_by_themselves(true);
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::AddTalks {
+            deck_uuid: None,
+            paths: vec![deck.clone()],
+            at: None,
+        },
+    ));
+    let (_, layer, added) = slides(&app).expect("a Slides input");
+    until_saved(&mut app, &ppt, 1);
+    until_said_of_pictures(&mut app);
+    ppt.save_broken_pdfs(false);
+    let talk = added.talks[0].id.clone();
+    Some((app, ppt, layer, talk, deck))
+}
+
+/// A talk taken out of the list and put back at once — no look for slide
+/// pictures to make between the two — is asked anew: what failed is
+/// forgotten once no talk is of its deck.
+#[test]
+fn a_talk_taken_out_and_put_back_at_once_is_asked_anew_for_its_slide_pictures() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_pictures, _) = pictures_in(dir.path(), true);
+    let Some((mut app, ppt, layer, talk, deck)) = a_talk_whose_slide_pictures_failed(dir.path())
+    else {
+        return;
+    };
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::RemoveTalk {
+            deck_uuid: layer.clone(),
+            talk_id: talk,
+        },
+    ));
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::AddTalks {
+            deck_uuid: Some(layer),
+            paths: vec![deck],
+            at: None,
+        },
+    ));
+    until_saved(&mut app, &ppt, 2);
+    until(&mut app, |s| s.talks[0].pictures && s.making_pictures == 0);
+    assert_eq!(pdf_saves(&ppt).len(), 2, "{:?}", ppt.log());
+    assert_eq!(said_of_pictures(&app).len(), 1, "{:?}", app.notices());
+}
+
+/// So is a talk taken out of the list and brought back by undo at once.
+#[test]
+fn a_talk_taken_out_and_brought_back_by_undo_at_once_is_asked_anew_for_its_slide_pictures() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_pictures, _) = pictures_in(dir.path(), true);
+    let Some((mut app, ppt, layer, talk, _)) = a_talk_whose_slide_pictures_failed(dir.path())
+    else {
+        return;
+    };
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::RemoveTalk {
+            deck_uuid: layer,
+            talk_id: talk,
+        },
+    ));
+    ok(send_cmd(&mut app, EngineCommand::Undo));
+    until_saved(&mut app, &ppt, 2);
+    until(&mut app, |s| s.talks[0].pictures && s.making_pictures == 0);
+    assert_eq!(pdf_saves(&ppt).len(), 2, "{:?}", ppt.log());
+    assert_eq!(said_of_pictures(&app).len(), 1, "{:?}", app.notices());
+}
+
+/// So is a talk taken out of the list and put into a new Slides input at
+/// once.
+#[test]
+fn a_talk_put_into_a_new_slides_input_at_once_is_asked_anew_for_its_slide_pictures() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_pictures, _) = pictures_in(dir.path(), true);
+    let Some((mut app, ppt, layer, talk, deck)) = a_talk_whose_slide_pictures_failed(dir.path())
+    else {
+        return;
+    };
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::RemoveTalk {
+            deck_uuid: layer,
+            talk_id: talk,
+        },
+    ));
+    let CommandResult::OkWithId { uuid: channel } = send_cmd(&mut app, EngineCommand::AddChannel)
+    else {
+        panic!("no channel");
+    };
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::AddSlidesDeck {
+            channel_uuid: channel,
+            paths: vec![deck],
+            settings: None,
+        },
+    ));
+    until_saved(&mut app, &ppt, 2);
+    frames_for(&mut app, 2.0);
+    assert_eq!(pdf_saves(&ppt).len(), 2, "{:?}", ppt.log());
+    assert_eq!(said_of_pictures(&app).len(), 1, "{:?}", app.notices());
+}
+
+/// So is a talk taken out of the list and come back at once with its
+/// Slides input, copied before, pasted.
+#[test]
+fn a_talk_come_back_with_its_input_pasted_at_once_is_asked_anew_for_its_slide_pictures() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_pictures, _) = pictures_in(dir.path(), true);
+    let Some((mut app, ppt, layer, talk, _)) = a_talk_whose_slide_pictures_failed(dir.path())
+    else {
+        return;
+    };
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::Copy {
+            source: varda::engine::ClipboardSource::Deck(layer.clone()),
+            include_arrangement: false,
+        },
+    ));
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::RemoveTalk {
+            deck_uuid: layer.clone(),
+            talk_id: talk,
+        },
+    ));
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::Paste {
+            target: varda::engine::PasteTarget::AfterDeck(layer),
+        },
+    ));
+    until_saved(&mut app, &ppt, 2);
+    frames_for(&mut app, 2.0);
+    assert_eq!(pdf_saves(&ppt).len(), 2, "{:?}", ppt.log());
+    assert_eq!(said_of_pictures(&app).len(), 1, "{:?}", app.notices());
+}
+
+/// A deck's file just written — one still being copied, for all Nida
+/// knows — is left to settle before its slide pictures are made.
+#[test]
+fn a_deck_just_written_is_left_to_settle_before_its_slide_pictures_are_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_pictures, _) = pictures_in(dir.path(), true);
+    let ppt = FakeDecks::with_slides(5);
+    let Some(mut app) = app_in(&dir.path().join("show"), Some(&ppt)) else {
+        return;
+    };
+    app.set_slide_pictures_by_themselves(true);
+    let written = Instant::now();
+    let deck = write_deck(&dir.path().join("talk.pptx"));
+    ok(send_cmd(
+        &mut app,
+        EngineCommand::AddTalks {
+            deck_uuid: None,
+            paths: vec![deck],
+            at: None,
+        },
+    ));
+    let (at, _) = until_saved(&mut app, &ppt, 1);
+    let waited = at[0].duration_since(written);
+    assert!(waited >= Duration::from_millis(2800), "asked after {waited:?}");
+    until(&mut app, |s| s.talks[0].pictures && s.making_pictures == 0);
+    assert_eq!(pdf_saves(&ppt), ["save pdf talk.pptx"]);
 }
 
 /// The presenter view following the Slides input: its layer's presenter.

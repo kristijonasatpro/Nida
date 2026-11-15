@@ -102,9 +102,59 @@ impl PartialEq for LiveWant {
     }
 }
 
-/// What opens a device: `device::open`, or a stand-in for tests.
+/// What opens a device the usual way, from its ring: `device::open`, or a
+/// stand-in for tests.
 pub(super) type Opener =
     Box<dyn FnMut(&str, u16, Arc<OutputRing>) -> anyhow::Result<Box<dyn Playing>> + Send>;
+
+/// What opens a device live (see [`LiveWant`]): `device::open_live`, or a
+/// stand-in for tests.
+pub(super) type LiveOpener =
+    Box<dyn FnMut(&str, u16, &LiveWant) -> anyhow::Result<Box<dyn Playing>> + Send>;
+
+/// What opens the buses' devices, the usual way and live.
+pub(super) struct Openers {
+    pub usual: Opener,
+    pub live: LiveOpener,
+}
+
+impl Openers {
+    /// The system's devices.
+    pub fn system() -> Self {
+        Self {
+            usual: Box::new(|name, first_channel, ring| {
+                super::device::open(name, first_channel, ring).map(|d| Box::new(d) as Box<dyn Playing>)
+            }),
+            live: Box::new(|name, first_channel, live| {
+                super::device::open_live(
+                    name,
+                    first_channel,
+                    live.frames,
+                    super::live::LiveMics {
+                        frames: live.feed.clone(),
+                        counts: Arc::clone(&live.counts),
+                        gains: live.mics.iter().map(|(_, gain)| Arc::clone(gain)).collect(),
+                        control: Arc::clone(&live.control),
+                        rest: live.rest.clone(),
+                    },
+                    Arc::clone(&live.bus_gain),
+                )
+                .map(|d| Box::new(d) as Box<dyn Playing>)
+            }),
+        }
+    }
+
+    /// `open` the usual way and no device live, refused as the system
+    /// refuses a device it has not got — nothing asked of it, which with a
+    /// dozen devices and other tests asking takes seconds. For tests.
+    #[cfg(test)]
+    pub fn standing_in(open: Opener) -> Self {
+        Self {
+            usual: open,
+            live: Box::new(|name, _, _| anyhow::bail!("no sound device called '{name}'")),
+        }
+    }
+}
 
 /// A device a bus (or the monitor, by its key) wants to play on.
 #[derive(Clone)]
@@ -165,7 +215,7 @@ impl Outputs {
     /// # Panics
     ///
     /// Panics if the OS refuses to start the thread.
-    pub fn spawn(open: Opener) -> Self {
+    pub fn spawn(open: Openers) -> Self {
         let shared = Arc::new(Shared::default());
         let (wake, woken) = mpsc::channel();
         let thread = {
@@ -354,12 +404,12 @@ struct Hushed {
     resume: bool,
 }
 
-/// Whether `device`, hushed since `since`, has played silence long enough.
-fn silent_enough(device: &dyn Playing, since: Instant) -> bool {
-    since.elapsed() >= HUSH_MOST
+/// Whether `device`, hushed for `so_far`, has played silence long enough.
+fn silent_enough(device: &dyn Playing, so_far: Duration) -> bool {
+    so_far >= HUSH_MOST
         || match device.silent_frames() {
             Some((silent, call)) => silent >= HUSH_FRAMES + 2 * call,
-            None => since.elapsed() >= HUSH,
+            None => so_far >= HUSH,
         }
 }
 
@@ -389,7 +439,11 @@ fn close_why(now: Option<&Want>, was: &Want, failed: bool) -> Option<&'static st
 
 /// The device thread: keep open what is wanted, looking for a missing device
 /// every [`RETRY`]; drop what is not, or has failed.
-fn run(shared: &Shared, woken: &mpsc::Receiver<()>, mut open: Opener) {
+fn run(shared: &Shared, woken: &mpsc::Receiver<()>, open: Openers) {
+    let Openers {
+        usual: mut open,
+        live: mut open_live,
+    } = open;
     let mut devices: HashMap<String, (Want, Box<dyn Playing>, bool)> = HashMap::new();
     let mut tried: HashMap<String, Instant> = HashMap::new();
     // Why each device would not open, as last said (see `first_said`).
@@ -423,7 +477,7 @@ fn run(shared: &Shared, woken: &mpsc::Receiver<()>, mut open: Opener) {
         let mut replacing: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (key, h) in &hushing {
             if let Some((_, device, _)) = devices.get(key) {
-                let done = silent_enough(device.as_ref(), h.since);
+                let done = silent_enough(device.as_ref(), h.since.elapsed());
                 let all = ready.entry(h.device.clone()).or_insert(true);
                 *all &= done;
             }
@@ -577,7 +631,7 @@ fn run(shared: &Shared, woken: &mpsc::Receiver<()>, mut open: Opener) {
                 }
                 let quiet = others
                     .iter()
-                    .all(|key| hushing.get(*key).is_none_or(|h| silent_enough(devices[*key].1.as_ref(), h.since)));
+                    .all(|key| hushing.get(*key).is_none_or(|h| silent_enough(devices[*key].1.as_ref(), h.since.elapsed())));
                 if !quiet {
                     continue;
                 }
@@ -585,35 +639,23 @@ fn run(shared: &Shared, woken: &mpsc::Receiver<()>, mut open: Opener) {
             }
             tried.insert(want.key.clone(), Instant::now());
             let opened = match &want.live {
-                Some(live) => super::device::open_live(
-                    &want.device,
-                    want.first_channel,
-                    live.frames,
-                    super::live::LiveMics {
-                        frames: live.feed.clone(),
-                        counts: Arc::clone(&live.counts),
-                        gains: live.mics.iter().map(|(_, gain)| Arc::clone(gain)).collect(),
-                        control: Arc::clone(&live.control),
-                        rest: live.rest.clone(),
-                    },
-                    Arc::clone(&live.bus_gain),
-                )
-                .map(|d| (Box::new(d) as Box<dyn Playing>, true))
-                .or_else(|e| {
-                    // Played the usual way, from its ring, rather than not
-                    // at all; the mix told so (see `is_playing_live`), and
-                    // the bus shows why (see `notes`).
-                    log::warn!("Audio bus output '{}': {e}", want.device);
-                    let opened = open(&want.device, want.first_channel, Arc::clone(&want.ring))
-                        .map(|d| (d, false));
-                    if opened.is_ok() {
-                        refused.insert(
-                            want.key.clone(),
-                            format!("Live refused ({e}): played the usual way"),
-                        );
-                    }
-                    opened
-                }),
+                Some(live) => open_live(&want.device, want.first_channel, live)
+                    .map(|d| (d, true))
+                    .or_else(|e| {
+                        // Played the usual way, from its ring, rather than
+                        // not at all; the mix told so (see `is_playing_live`),
+                        // and the bus shows why (see `notes`).
+                        log::warn!("Audio bus output '{}': {e}", want.device);
+                        let opened = open(&want.device, want.first_channel, Arc::clone(&want.ring))
+                            .map(|d| (d, false));
+                        if opened.is_ok() {
+                            refused.insert(
+                                want.key.clone(),
+                                format!("Live refused ({e}): played the usual way"),
+                            );
+                        }
+                        opened
+                    }),
                 None => open(&want.device, want.first_channel, Arc::clone(&want.ring)).map(|d| (d, false)),
             };
             match opened {
@@ -772,7 +814,78 @@ mod tests {
         }
         fn unhush(&self) {
             self.0.store(false, std::sync::atomic::Ordering::Relaxed);
-            self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Counted after the flag is cleared, and released: a test that
+            // has read the count (`Acquire`) reads the flag as left here.
+            self.1.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// The passes of the device thread, as `Passes` counts them, in which
+    /// the streams a test watches were opened, or closed.
+    type InPasses = std::sync::Arc<std::sync::Mutex<Vec<u32>>>;
+
+    /// A fake stream that counts the device thread's passes: asked its
+    /// events once in each, after what that pass closes and opens. Kept
+    /// open on a device of its own, it tells a test whether another stream
+    /// was opened again in the pass that closed it — at once — or in a
+    /// later one, however fast or slowly the thread runs.
+    struct Passes(std::sync::Arc<std::sync::atomic::AtomicU32>);
+    impl super::Playing for Passes {
+        fn failed(&self) -> bool {
+            false
+        }
+        fn events(&self) -> Vec<super::super::live::LiveEvent> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Vec::new()
+        }
+    }
+
+    /// A fake stream that says when it is hushed and when it is let back —
+    /// and, with a `gate`, holds the device thread in its hush till the gate
+    /// opens, or the watchdog's time is up: what a test posts meanwhile (in
+    /// less than that) is what the thread finds when it next looks — and,
+    /// closed, in which pass (see `Passes`).
+    struct Watched {
+        hushed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        passes: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        closed_in: InPasses,
+    }
+    impl super::Playing for Watched {
+        fn failed(&self) -> bool {
+            false
+        }
+        fn hush(&self) {
+            self.hushed.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(gate) = &self.gate {
+                wait_for(WATCHDOG, || gate.load(std::sync::atomic::Ordering::Acquire));
+            }
+        }
+        fn unhush(&self) {
+            self.hushed.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    impl Drop for Watched {
+        fn drop(&mut self) {
+            if let Ok(mut closed_in) = self.closed_in.lock() {
+                closed_in.push(self.passes.load(std::sync::atomic::Ordering::Relaxed));
+            }
+        }
+    }
+
+    /// A fake stream that says when it is hushed, and of its silence always
+    /// the same: so many frames played in callbacks of such a size, or that
+    /// it cannot say (see `Playing::silent_frames`).
+    struct Played(std::sync::Arc<std::sync::atomic::AtomicBool>, Option<(u64, u64)>);
+    impl super::Playing for Played {
+        fn failed(&self) -> bool {
+            false
+        }
+        fn hush(&self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn silent_frames(&self) -> Option<(u64, u64)> {
+            self.1
         }
     }
 
@@ -790,6 +903,16 @@ mod tests {
         w
     }
 
+    /// The longest a test waits for the device thread: a watchdog, far
+    /// longer than anything here takes, so that a busy machine fails nothing.
+    const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Each device opened, told by the device thread as it opens it: when,
+    /// and whether the stream a test watches was silent then. What a test
+    /// asserts of an order or a silence it reads here, not by when it gets
+    /// to look itself.
+    type Opened = std::sync::Arc<std::sync::Mutex<Vec<(std::time::Instant, bool)>>>;
+
     /// Waits up to `most` for `done`.
     fn wait_for(most: std::time::Duration, done: impl Fn() -> bool) {
         let start = std::time::Instant::now();
@@ -799,33 +922,65 @@ mod tests {
     }
 
     /// Going live undone while its stream plays silence: it opens again as
-    /// wanted, not left silent.
+    /// wanted, not left silent — and at once, in the pass of the device
+    /// thread that closed it, not after the two seconds a missing device
+    /// waits.
     #[test]
     fn a_change_undone_while_silent_opens_again() {
         type Flags = std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>>>;
         let flags: Flags = std::sync::Arc::default();
-        let made = std::sync::Arc::clone(&flags);
-        let mut outputs = super::Outputs::spawn(Box::new(move |_, _, _| {
-            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            made.lock().unwrap().push(std::sync::Arc::clone(&flag));
-            Ok(Box::new(Hushable(flag, std::sync::Arc::default())))
-        }));
+        let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (opened_in, closed_in) = (InPasses::default(), InPasses::default());
+        let (made, held) = (std::sync::Arc::clone(&flags), std::sync::Arc::clone(&gate));
+        let (opens, closes) = (std::sync::Arc::clone(&opened_in), std::sync::Arc::clone(&closed_in));
+        let passes = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut outputs = super::Outputs::spawn(super::Openers::standing_in(Box::new(move |name, _, _| {
+            let stream: Box<dyn super::Playing> = if name == "Other" {
+                Box::new(Passes(std::sync::Arc::clone(&passes)))
+            } else {
+                let hushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                opens.lock().unwrap().push(passes.load(std::sync::atomic::Ordering::Relaxed));
+                // Told last: it is what the test waits for.
+                made.lock().unwrap().push(std::sync::Arc::clone(&hushed));
+                // Hushed, it holds the device thread till the undoing below
+                // is posted — the test given the watchdog's time to get
+                // there, no more: the thread's next look finds the change
+                // undone and the stream still silent.
+                Box::new(Watched {
+                    hushed,
+                    gate: Some(std::sync::Arc::clone(&held)),
+                    passes: std::sync::Arc::clone(&passes),
+                    closed_in: std::sync::Arc::clone(&closes),
+                })
+            };
+            Ok(stream)
+        })));
         let count = || flags.lock().unwrap().len();
         let usual = want("a");
-        outputs.want(vec![usual.clone()]);
-        wait_for(std::time::Duration::from_secs(1), || count() == 1);
+        // On a device of its own, never changed: it counts the passes.
+        let mut other = want("b");
+        other.device = "Other".into();
+        outputs.want(vec![usual.clone(), other.clone()]);
+        wait_for(WATCHDOG, || count() == 1);
         let mut live = live_want("a", 64);
         live.ring = std::sync::Arc::clone(&usual.ring);
-        outputs.want(vec![live]);
-        wait_for(std::time::Duration::from_secs(1), || {
-            flags.lock().unwrap()[0].load(std::sync::atomic::Ordering::Relaxed)
-        });
+        outputs.want(vec![live, other.clone()]);
+        let silent = || flags.lock().unwrap()[0].load(std::sync::atomic::Ordering::Acquire);
+        wait_for(WATCHDOG, silent);
+        assert!(silent(), "silent first");
         // Wanted exactly as it was: nothing to close it for but the silence.
-        outputs.want(vec![usual]);
-        wait_for(std::time::Duration::from_secs(1), || count() == 2);
-        assert_eq!(count(), 2, "opened again");
+        outputs.want(vec![usual, other]);
+        gate.store(true, std::sync::atomic::Ordering::Release);
+        wait_for(WATCHDOG, || count() == 2);
+        assert_eq!(count(), 2, "opened again, once");
         let last = std::sync::Arc::clone(flags.lock().unwrap().last().unwrap());
-        assert!(!last.load(std::sync::atomic::Ordering::Relaxed), "not left silent");
+        assert!(!last.load(std::sync::atomic::Ordering::Acquire), "not left silent");
+        let (opened_in, closed_in) = (opened_in.lock().unwrap().clone(), closed_in.lock().unwrap().clone());
+        assert_eq!(
+            opened_in.get(1),
+            closed_in.first(),
+            "opened again in the pass that closed it, not left for the retry"
+        );
     }
 
     /// Another stream on the same device goes silent too while one waits to
@@ -835,35 +990,48 @@ mod tests {
         let b_hushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let b_back = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (bh, bb) = (std::sync::Arc::clone(&b_hushed), std::sync::Arc::clone(&b_back));
-        let opens = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let counted = std::sync::Arc::clone(&opens);
-        let mut outputs = super::Outputs::spawn(Box::new(move |_, _, ring| {
-            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // b's stream is the one with its own ring marker below.
-            let is_b = std::sync::Arc::strong_count(&ring) > 0 && ring.frames.lock().unwrap().len() == 1;
-            Ok(Box::new(if is_b {
+        let opened: Opened = std::sync::Arc::default();
+        let order: std::sync::Arc<std::sync::Mutex<Vec<usize>>> = std::sync::Arc::default();
+        let (told, seen) = (std::sync::Arc::clone(&opened), std::sync::Arc::clone(&order));
+        let mut outputs = super::Outputs::spawn(super::Openers::standing_in(Box::new(move |_, _, ring| {
+            // Which stream: told by how many frames its ring was given below
+            // (a none, b one, c two).
+            let frames = ring.frames.lock().unwrap().len();
+            seen.lock().unwrap().push(frames);
+            // When, and whether b was silent then.
+            told.lock().unwrap().push((std::time::Instant::now(), bh.load(std::sync::atomic::Ordering::Relaxed)));
+            Ok(Box::new(if frames == 1 {
                 Hushable(std::sync::Arc::clone(&bh), std::sync::Arc::clone(&bb))
             } else {
                 Hushable(std::sync::Arc::default(), std::sync::Arc::default())
             }))
-        }));
+        })));
+        let count = || opened.lock().unwrap().len();
         let b = want("b");
         b.ring.frames.lock().unwrap().push_back([0.0; 2]);
         outputs.want(vec![want("a"), b.clone()]);
-        wait_for(std::time::Duration::from_secs(1), || opens.load(std::sync::atomic::Ordering::Relaxed) == 2);
+        wait_for(WATCHDOG, || count() == 2);
         let asked = std::time::Instant::now();
         // And c, new on the same device meanwhile: it waits for the silence.
-        outputs.want(vec![live_want("a", 64), b, want("c")]);
-        wait_for(std::time::Duration::from_secs(1), || b_hushed.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(b_hushed.load(std::sync::atomic::Ordering::Relaxed), "b silent too");
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 2, "c not opened during the silence");
-        wait_for(std::time::Duration::from_secs(2), || b_back.load(std::sync::atomic::Ordering::Relaxed) == 1);
-        assert!(asked.elapsed() >= super::HUSH, "after the silence");
-        assert_eq!(b_back.load(std::sync::atomic::Ordering::Relaxed), 1, "b back");
+        let c = want("c");
+        c.ring.frames.lock().unwrap().extend([[0.0; 2]; 2]);
+        outputs.want(vec![live_want("a", 64), b, c]);
+        wait_for(WATCHDOG, || count() == 4 && b_back.load(std::sync::atomic::Ordering::Acquire) == 1);
+        // The device thread stopped: what it did is all there, and stays so
+        // while it is read.
+        drop(outputs);
+        let opens = opened.lock().unwrap().clone();
+        assert_eq!(opens.len(), 4, "a opened again and c, b never closed");
+        assert_eq!(*order.lock().unwrap(), [0, 1, 0, 2], "a and b; then a again, and c only after it");
+        for &(at, b_silent) in &opens[2..] {
+            // The silence starts after it is asked for: counted from the
+            // asking, it is no shorter however slowly the test gets here.
+            let after = at.duration_since(asked);
+            assert!(after >= super::HUSH, "a again and c only after the silence: {after:?}");
+            assert!(b_silent, "b silent too, till both had opened");
+        }
+        assert_eq!(b_back.load(std::sync::atomic::Ordering::Acquire), 1, "b back");
         assert!(!b_hushed.load(std::sync::atomic::Ordering::Relaxed));
-        wait_for(std::time::Duration::from_secs(1), || opens.load(std::sync::atomic::Ordering::Relaxed) == 4);
-        assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 4, "a opened again and c, b never closed");
     }
 
     /// After its device's silence, a stream's replacement opens before a
@@ -872,21 +1040,21 @@ mod tests {
     fn a_replacement_opens_before_anything_new_on_its_device() {
         let order: std::sync::Arc<std::sync::Mutex<Vec<usize>>> = std::sync::Arc::default();
         let seen = std::sync::Arc::clone(&order);
-        let mut outputs = super::Outputs::spawn(Box::new(move |_, _, ring| {
+        let mut outputs = super::Outputs::spawn(super::Openers::standing_in(Box::new(move |_, _, ring| {
             // Which stream: told by how many frames its ring was given below.
             seen.lock().unwrap().push(ring.frames.lock().unwrap().len());
             Ok(Box::new(Hushable(std::sync::Arc::default(), std::sync::Arc::default())))
-        }));
+        })));
         let a = want("a");
         a.ring.frames.lock().unwrap().push_back([0.0; 2]);
         outputs.want(vec![a.clone()]);
-        wait_for(std::time::Duration::from_secs(1), || order.lock().unwrap().len() == 1);
+        wait_for(WATCHDOG, || order.lock().unwrap().len() == 1);
         let mut live = live_want("a", 64);
         live.ring = std::sync::Arc::clone(&a.ring);
         let c = want("c");
         c.ring.frames.lock().unwrap().extend([[0.0; 2]; 2]);
         outputs.want(vec![c, live]);
-        wait_for(std::time::Duration::from_secs(2), || order.lock().unwrap().len() == 3);
+        wait_for(WATCHDOG, || order.lock().unwrap().len() == 3);
         assert_eq!(*order.lock().unwrap(), [1, 1, 2], "a, a again, then c");
     }
 
@@ -898,30 +1066,122 @@ mod tests {
         let b_hushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let b_back = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let (bh, bb) = (std::sync::Arc::clone(&b_hushed), std::sync::Arc::clone(&b_back));
-        let opens = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let counted = std::sync::Arc::clone(&opens);
-        let mut outputs = super::Outputs::spawn(Box::new(move |_, _, _| {
-            let first = counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
+        let opened: Opened = std::sync::Arc::default();
+        let order: std::sync::Arc<std::sync::Mutex<Vec<usize>>> = std::sync::Arc::default();
+        let (told, seen) = (std::sync::Arc::clone(&opened), std::sync::Arc::clone(&order));
+        let mut outputs = super::Outputs::spawn(super::Openers::standing_in(Box::new(move |_, _, ring| {
+            // Which stream: c's ring is the one given a frame below.
+            seen.lock().unwrap().push(ring.frames.lock().unwrap().len());
+            // When, and whether b was silent then; the first to open is b.
+            let first = {
+                let mut list = told.lock().unwrap();
+                list.push((std::time::Instant::now(), bh.load(std::sync::atomic::Ordering::Relaxed)));
+                list.len() == 1
+            };
             Ok(Box::new(if first {
                 Hushable(std::sync::Arc::clone(&bh), std::sync::Arc::clone(&bb))
             } else {
                 Hushable(std::sync::Arc::default(), std::sync::Arc::default())
             }))
-        }));
+        })));
+        let count = || opened.lock().unwrap().len();
         let b = want("b");
         outputs.want(vec![b.clone()]);
-        wait_for(std::time::Duration::from_secs(1), || opens.load(std::sync::atomic::Ordering::Relaxed) == 1);
+        wait_for(WATCHDOG, || count() == 1);
         let asked = std::time::Instant::now();
         // And c, wanted after it on the same device: it waits too.
-        outputs.want(vec![b, live_want("a", 64), want("c")]);
-        wait_for(std::time::Duration::from_secs(1), || b_hushed.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(b_hushed.load(std::sync::atomic::Ordering::Relaxed), "b silent first");
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 1, "nothing opened during the silence");
-        wait_for(std::time::Duration::from_secs(2), || opens.load(std::sync::atomic::Ordering::Relaxed) == 3);
-        assert!(asked.elapsed() >= super::HUSH, "a and c opened after the silence: {:?}", asked.elapsed());
-        wait_for(std::time::Duration::from_secs(1), || b_back.load(std::sync::atomic::Ordering::Relaxed) == 1);
+        let c = want("c");
+        c.ring.frames.lock().unwrap().push_back([0.0; 2]);
+        outputs.want(vec![b, live_want("a", 64), c]);
+        wait_for(WATCHDOG, || count() == 3 && b_back.load(std::sync::atomic::Ordering::Acquire) == 1);
+        // The device thread stopped: what it did is all there, and stays so
+        // while it is read.
+        drop(outputs);
+        let opens = opened.lock().unwrap().clone();
+        assert_eq!(opens.len(), 3, "a and c opened");
+        assert_eq!(*order.lock().unwrap(), [0, 0, 1], "b; then a, and c only after it");
+        assert!(opens[1].1, "b silent first: so it was when the next opened");
+        for &(at, _) in &opens[1..] {
+            let after = at.duration_since(asked);
+            assert!(after >= super::HUSH, "a and c opened after the silence: {after:?}");
+        }
+        assert_eq!(b_back.load(std::sync::atomic::Ordering::Acquire), 1, "b let back");
         assert!(!b_hushed.load(std::sync::atomic::Ordering::Relaxed), "b back");
+    }
+
+    /// A live bus added beside another stream, then taken back while that
+    /// stream goes silent for it — taken off the device, or made a usual
+    /// bus: the stream is let back, and what is wanted next on the device
+    /// opens — neither kept waiting for a bus that is no longer to open
+    /// live.
+    #[test]
+    fn a_live_bus_taken_back_while_it_waits_lets_the_others_play() {
+        // Taken off: b, then c — the bus never opened.
+        taken_back_while_it_waits(false, &[0, 2]);
+        // Made a usual bus: b, the bus the usual way, then c.
+        taken_back_while_it_waits(true, &[0, 1, 2]);
+    }
+
+    /// `a_live_bus_taken_back_while_it_waits_lets_the_others_play`, one way
+    /// of taking the bus back: off the device, or — `usual` — wanted on it
+    /// the usual way instead. `opened` = the streams that must have opened,
+    /// in order, each told by the frames its ring was given (b none, the
+    /// bus one, c two).
+    fn taken_back_while_it_waits(usual: bool, opened: &[usize]) {
+        let b_hushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let order: std::sync::Arc<std::sync::Mutex<Vec<usize>>> = std::sync::Arc::default();
+        let (bh, held, seen) =
+            (std::sync::Arc::clone(&b_hushed), std::sync::Arc::clone(&gate), std::sync::Arc::clone(&order));
+        let mut outputs = super::Outputs::spawn(super::Openers::standing_in(Box::new(move |_, _, ring| {
+            // Which stream: told by how many frames its ring was given below
+            // (b none, a one, c two).
+            let frames = ring.frames.lock().unwrap().len();
+            let stream: Box<dyn super::Playing> = if frames == 0 {
+                // Hushed, b holds the device thread till the bus is taken
+                // back below — the test given the watchdog's time to get
+                // there, no more: the thread's next look finds the bus no
+                // longer to open live, and b still silent for it.
+                Box::new(Watched {
+                    hushed: std::sync::Arc::clone(&bh),
+                    gate: Some(std::sync::Arc::clone(&held)),
+                    passes: std::sync::Arc::default(),
+                    closed_in: InPasses::default(),
+                })
+            } else {
+                Box::new(Fake(None))
+            };
+            // Told last: it is what the test waits for.
+            seen.lock().unwrap().push(frames);
+            Ok(stream)
+        })));
+        let count = || order.lock().unwrap().len();
+        let b = want("b");
+        outputs.want(vec![b.clone()]);
+        wait_for(WATCHDOG, || count() == 1);
+        let a = live_want("a", 64);
+        a.ring.frames.lock().unwrap().push_back([0.0; 2]);
+        outputs.want(vec![b.clone(), a.clone()]);
+        let silent = || b_hushed.load(std::sync::atomic::Ordering::Acquire);
+        wait_for(WATCHDOG, silent);
+        assert!(silent(), "b silent first (usual: {usual})");
+        // The bus taken back — off the device, or left on it as a usual
+        // bus, its ring the same — and c new on the device.
+        let c = want("c");
+        c.ring.frames.lock().unwrap().extend([[0.0; 2]; 2]);
+        let mut then = vec![b];
+        if usual {
+            then.push(super::Want { live: None, ..a });
+        }
+        then.push(c);
+        outputs.want(then);
+        gate.store(true, std::sync::atomic::Ordering::Release);
+        wait_for(WATCHDOG, || count() == opened.len() && !silent());
+        // The device thread stopped: what it did is all there, and stays so
+        // while it is read.
+        drop(outputs);
+        assert_eq!(*order.lock().unwrap(), opened, "what opened, in order (usual: {usual})");
+        assert!(!silent(), "b let back (usual: {usual})");
     }
 
     /// Hushed first only for a live stream with a smaller buffer on the same
@@ -952,68 +1212,171 @@ mod tests {
         assert!(!super::hush_first(&usual, false, &elsewhere), "another device");
     }
 
+    /// Silent long enough: once a stream says it has played the device's
+    /// replay in silent frames and two callbacks more, however short the
+    /// time; by the time alone when it cannot say; and, whatever it says,
+    /// once the longest wait is over.
+    #[test]
+    fn silence_is_told_by_frames_played_and_by_the_clock_without_them() {
+        let played = |frames| Played(std::sync::Arc::default(), Some((frames, 512)));
+        let cannot_say = Played(std::sync::Arc::default(), None);
+        let enough = super::HUSH_FRAMES + 2 * 512;
+        let a_moment = std::time::Duration::from_millis(1);
+        assert!(
+            super::silent_enough(&played(enough), std::time::Duration::ZERO),
+            "played out: at once"
+        );
+        assert!(
+            !super::silent_enough(&played(enough - 1), super::HUSH),
+            "a frame short of two callbacks more: not by the time"
+        );
+        assert!(
+            !super::silent_enough(&cannot_say, super::HUSH.saturating_sub(a_moment)),
+            "cannot say: not before the time"
+        );
+        assert!(super::silent_enough(&cannot_say, super::HUSH), "cannot say: by the time");
+        assert!(
+            !super::silent_enough(&played(0), super::HUSH_MOST.saturating_sub(a_moment)),
+            "nothing played: not before the longest wait"
+        );
+        assert!(
+            super::silent_enough(&played(0), super::HUSH_MOST),
+            "nothing played: the longest wait is over"
+        );
+    }
+
     /// A stream on the usual way, wanted live on the same device (a smaller
-    /// buffer): it plays silence first — hushed at once, closed and opened
-    /// live only after the device's replay has nothing but silence to give.
+    /// buffer): it plays silence first — hushed, and closed and opened again
+    /// only after the device's replay has nothing but silence to give.
     #[test]
     fn a_stream_going_live_plays_silence_before_it_closes() {
-
-        let hushed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let opens = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let (flag, counted) = (std::sync::Arc::clone(&hushed), std::sync::Arc::clone(&opens));
-        let mut outputs = super::Outputs::spawn(Box::new(move |_, _, _| {
-            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let opened: Opened = std::sync::Arc::default();
+        let told = std::sync::Arc::clone(&opened);
+        let mut outputs = super::Outputs::spawn(super::Openers::standing_in(Box::new(move |_, _, _| {
+            // When, and whether the stream before this one had been hushed.
+            told.lock().unwrap().push((std::time::Instant::now(), flag.load(std::sync::atomic::Ordering::Relaxed)));
             Ok(Box::new(Hushable(std::sync::Arc::clone(&flag), std::sync::Arc::default())))
-        }));
-        let first = want("a");
-        outputs.want(vec![first.clone()]);
-        let start = std::time::Instant::now();
-        while opens.load(std::sync::atomic::Ordering::Relaxed) < 1 && start.elapsed() < std::time::Duration::from_secs(1) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        let _ = first;
-        let live = live_want("a", 64);
+        })));
+        let count = || opened.lock().unwrap().len();
+        outputs.want(vec![want("a")]);
+        wait_for(WATCHDOG, || count() == 1);
         let asked = std::time::Instant::now();
-        outputs.want(vec![live]);
-        while !hushed.load(std::sync::atomic::Ordering::Relaxed) && asked.elapsed() < std::time::Duration::from_secs(1) {
+        outputs.want(vec![live_want("a", 64)]);
+        wait_for(WATCHDOG, || count() == 2);
+        let opens = opened.lock().unwrap().clone();
+        assert_eq!(opens.len(), 2, "opened again");
+        let (at, was_hushed) = opens[1];
+        assert!(was_hushed, "hushed before it closed");
+        // The silence starts after it is asked for: counted from the asking,
+        // it is no shorter however slowly the test gets here.
+        let after = at.duration_since(asked);
+        assert!(after >= super::HUSH, "opened again only after the silence: {after:?}");
+    }
+
+    /// Waits (no longer than `WATCHDOG`) for the devices of `keys` to play.
+    fn wait_playing(outputs: &mut super::Outputs, keys: &[&str]) {
+        let start = std::time::Instant::now();
+        while !keys.iter().all(|key| outputs.is_playing(key)) && start.elapsed() < WATCHDOG {
             std::thread::sleep(std::time::Duration::from_millis(2));
+            outputs.changed();
         }
-        assert!(asked.elapsed() < std::time::Duration::from_millis(200), "hushed at once");
-        while opens.load(std::sync::atomic::Ordering::Relaxed) < 2 && asked.elapsed() < std::time::Duration::from_secs(2) {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        let reopened = asked.elapsed();
-        assert!(
-            reopened >= super::HUSH && reopened < std::time::Duration::from_millis(800),
-            "opened again after the silence: {reopened:?}"
+    }
+
+    /// A bus wanted live is opened by the live opener, as it is wanted, and
+    /// told as playing live; one wanted the usual way by the usual opener.
+    #[test]
+    fn a_live_want_is_opened_live_and_a_usual_one_the_usual_way() {
+        type Asked = std::sync::Arc<std::sync::Mutex<Vec<(String, u16, Option<u32>)>>>;
+        let asked: Asked = std::sync::Arc::default();
+        let (usual, live) = (std::sync::Arc::clone(&asked), std::sync::Arc::clone(&asked));
+        let mut outputs = super::Outputs::spawn(super::Openers {
+            usual: Box::new(move |name, first_channel, _| {
+                usual.lock().unwrap().push((name.to_string(), first_channel, None));
+                Ok(Box::new(Fake(None)))
+            }),
+            live: Box::new(move |name, first_channel, wanted| {
+                live.lock().unwrap().push((name.to_string(), first_channel, Some(wanted.frames)));
+                Ok(Box::new(Fake(None)))
+            }),
+        });
+        // On a device each: one opening live waits for no other's silence.
+        let mut other = want("b");
+        other.device = "Other".into();
+        outputs.want(vec![live_want("a", 64), other]);
+        wait_playing(&mut outputs, &["a", "b"]);
+        assert!(outputs.is_playing("a") && outputs.is_playing("b"), "both play");
+        assert!(outputs.is_playing_live("a"), "the one wanted live plays live");
+        assert!(!outputs.is_playing_live("b"), "the other does not");
+        assert_eq!((outputs.note("a"), outputs.note("b")), (None, None));
+        let mut asked = asked.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(
+            asked,
+            [("Other".to_string(), 2, None), ("Solo".to_string(), 2, Some(64))],
+            "each opened once, its own way"
+        );
+    }
+
+    /// The tests' stand-in opens no device live: a bus wanted live is refused
+    /// in the system's words for a device it has not got, and played the
+    /// usual way — the system's devices not asked.
+    #[test]
+    fn the_stand_in_refuses_live_and_plays_the_usual_way() {
+        let mut outputs =
+            super::Outputs::spawn(super::Openers::standing_in(Box::new(|_, _, _| Ok(Box::new(Fake(None))))));
+        outputs.want(vec![live_want("a", 64)]);
+        wait_playing(&mut outputs, &["a"]);
+        assert!(outputs.is_playing("a"), "plays");
+        assert!(!outputs.is_playing_live("a"), "not live");
+        assert_eq!(
+            outputs.note("a"),
+            Some("Live refused (no sound device called 'Solo'): played the usual way")
         );
     }
 
     /// A device closed to open as now wanted (another pair, Live or its
-    /// buffer switched) opens again at once, not after the two seconds a
-    /// missing device waits — even just after it opened.
+    /// buffer switched) opens again at once — in the pass of the device
+    /// thread that closed it — not after the two seconds a missing device
+    /// waits, even just after it opened.
     #[test]
     fn a_device_wanted_otherwise_opens_again_at_once() {
-        let opens = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let counted = std::sync::Arc::clone(&opens);
-        let mut outputs = super::Outputs::spawn(Box::new(move |_, _, _| {
-            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(Box::new(Fake(None)))
-        }));
-        let until = |n: u32| {
-            let end = std::time::Instant::now() + std::time::Duration::from_millis(1_500);
-            while opens.load(std::sync::atomic::Ordering::Relaxed) < n && std::time::Instant::now() < end {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            opens.load(std::sync::atomic::Ordering::Relaxed)
-        };
+        let (opened_in, closed_in) = (InPasses::default(), InPasses::default());
+        let (opens, closes) = (std::sync::Arc::clone(&opened_in), std::sync::Arc::clone(&closed_in));
+        let passes = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut outputs = super::Outputs::spawn(super::Openers::standing_in(Box::new(move |name, _, _| {
+            let stream: Box<dyn super::Playing> = if name == "Other" {
+                Box::new(Passes(std::sync::Arc::clone(&passes)))
+            } else {
+                opens.lock().unwrap().push(passes.load(std::sync::atomic::Ordering::Relaxed));
+                Box::new(Watched {
+                    hushed: std::sync::Arc::default(),
+                    gate: None,
+                    passes: std::sync::Arc::clone(&passes),
+                    closed_in: std::sync::Arc::clone(&closes),
+                })
+            };
+            Ok(stream)
+        })));
+        let count = || opened_in.lock().unwrap().len();
         let first = want("a");
-        outputs.want(vec![first.clone()]);
-        assert_eq!(until(1), 1, "opened");
+        // On a device of its own, never changed: it counts the passes.
+        let mut other = want("b");
+        other.device = "Other".into();
+        outputs.want(vec![first.clone(), other.clone()]);
+        wait_for(WATCHDOG, || count() == 1);
+        assert_eq!(count(), 1, "opened");
         let mut moved = first;
         moved.first_channel = 0;
-        outputs.want(vec![moved]);
-        assert_eq!(until(2), 2, "opened again within 1.5 s, not after the 2 s retry");
+        outputs.want(vec![moved, other]);
+        wait_for(WATCHDOG, || count() == 2);
+        let (opened_in, closed_in) = (opened_in.lock().unwrap().clone(), closed_in.lock().unwrap().clone());
+        assert_eq!(opened_in.len(), 2, "opened again");
+        assert_eq!(
+            opened_in.get(1),
+            closed_in.first(),
+            "opened again in the pass that closed it, not after the retry's two seconds"
+        );
     }
 
     /// A bus moved off a device that would not open to another device or

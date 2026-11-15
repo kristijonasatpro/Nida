@@ -404,6 +404,7 @@ pub(super) fn render_library_panel(ui: &mut egui::Ui, data: &UIData, actions: &m
                                 t,
                                 crate::scene::CaptureTargetConfig::Display {
                                     name: t.label.clone(),
+                                    uuid: t.uuid.clone(),
                                 },
                             );
                         }

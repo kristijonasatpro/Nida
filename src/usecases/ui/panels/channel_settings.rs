@@ -1665,6 +1665,8 @@ mod tests {
         layer.screen_capture = Some(crate::usecases::ui::ScreenCaptureUI {
             target_label: "com.microsoft.Powerpoint — talk".into(),
             is_display: false,
+            target_uuid: None,
+            kept_by_name: false,
             rate: 1.0,
             rate_fps: 60.0,
             crop: [0.0, 0.0, 1.0, 1.0],
@@ -1707,7 +1709,7 @@ mod tests {
             "in its column and on its capture"
         );
         assert!(harness
-            .query_by_label("Target not found — showing black. Reopen the target and rescan.")
+            .query_by_label("Target not found — showing black. Reopen it, or pick another below.")
             .is_none());
     }
 

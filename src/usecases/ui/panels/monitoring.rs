@@ -57,6 +57,62 @@ fn load_color(percent: f32) -> egui::Color32 {
     }
 }
 
+/// The GPU figure's colour: whether the show keeps up, not how busy the
+/// GPU is. macOS runs the GPU at a slower clock while there is time to
+/// spare, so a show well within the Mac's reach reads 70–80 % busy at a low
+/// clock: red there said "at the limit" of a Mac that was far from it. So:
+/// green while the frames come on time; with the GPU 80 % busy or more —
+/// busy enough that it may be what holds them — the worse of the frame
+/// rate's own colour ([`fps_color`]: a show running slow) and the late
+/// frames' ([`late_color`]: one that hitches now and then, which the frame
+/// rate, a mean, hides). Uncapped, the GPU is meant to be flat out: green.
+/// Not `measured` — no figure from the OS, the load estimated as a share of
+/// the frame's time — it is a share of a budget, coloured as one
+/// ([`load_color`]).
+pub(super) fn gpu_color(
+    busy: f32,
+    measured: bool,
+    fps: f32,
+    late: u32,
+    target: u32,
+) -> egui::Color32 {
+    if !measured {
+        return load_color(busy);
+    }
+    if target == 0 || busy < 80.0 {
+        return GOOD;
+    }
+    let (rate, hitches) = (fps_color(fps, target), late_color(late));
+    if rate == BAD || hitches == BAD {
+        BAD
+    } else if rate == WARN || hitches == WARN {
+        WARN
+    } else {
+        GOOD
+    }
+}
+
+/// The colour of `late` frames among the last five seconds' (those started
+/// more than half a frame late: `UIData::late_frames`): none green, some
+/// yellow, more than fifteen — three a second — red.
+fn late_color(late: u32) -> egui::Color32 {
+    match late {
+        0 => GOOD,
+        1..=15 => WARN,
+        _ => BAD,
+    }
+}
+
+/// What the GPU figure does not say, for its hover text and its popover.
+pub(super) const GPU_NOT_A_LIMIT: &str = "Not how close the Mac is to its limit: macOS runs the \
+     GPU slower while there is time to spare, so a busy GPU can still have plenty left. Green \
+     while the frames come on time; yellow or red when the frame rate is under its target or \
+     frames start late while the GPU is 80% busy or more — it may then be what holds them";
+
+/// The same for a load that is estimated (no figure from the OS).
+pub(super) const GPU_ESTIMATED: &str = "The layers' costs as a share of a frame's time, \
+     estimated: yellow from 50%, red from 80%";
+
 fn ram_gb(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
@@ -126,10 +182,15 @@ pub(super) fn render_monitoring_section(
             .add(
                 egui::Label::new(
                     // Nida's own share, as Activity Monitor shows it; coloured
-                    // by how busy the whole GPU is, which is what holds frames
-                    // up.
+                    // by whether the show keeps up (`gpu_color`).
                     egui::RichText::new(format!("🖥 {:.0}%", data.nida_gpu.unwrap_or(gpu)))
-                        .color(load_color(gpu))
+                        .color(gpu_color(
+                            gpu,
+                            data.gpu_utilization_measured,
+                            data.fps,
+                            data.late_frames,
+                            data.target_fps,
+                        ))
                         .monospace()
                         .small(),
                 )
@@ -138,9 +199,12 @@ pub(super) fn render_monitoring_section(
             .on_hover_text(match (data.gpu_utilization_measured, data.nida_gpu) {
                 (true, Some(nida)) => format!(
                     "Nida uses {nida:.0}% of the GPU, as Activity Monitor shows it; the whole GPU \
-                     is {gpu:.0}% busy — every app and the screens. Click for details"
+                     is {gpu:.0}% busy — every app and the screens. {GPU_NOT_A_LIMIT}. Click for \
+                     details"
                 ),
-                (true, None) => "How busy the GPU is, as macOS reports it — click for details".into(),
+                (true, None) => format!(
+                    "How busy the GPU is, as macOS reports it. {GPU_NOT_A_LIMIT}. Click for details"
+                ),
                 _ => "GPU load, estimated from the layers' costs — click for details".into(),
             });
         status_popover(&gpu_response, |ui| {
@@ -221,6 +285,28 @@ mod tests {
 
     /// Against its target, the frame rate reads "50/50 FPS" and green: a
     /// fixed 55 called a perfect 50 a warning and a perfect 30 bad.
+    /// A busy GPU is not a Mac at its limit: the GPU figure is green while
+    /// the frames come on time, however busy; behind, it takes the frame
+    /// rate's colour — but only with the GPU busy enough to be the cause.
+    #[test]
+    fn the_gpu_figure_is_coloured_by_whether_the_show_keeps_up() {
+        assert_eq!(gpu_color(82.0, true, 60.0, 0, 60), GOOD, "busy, on time");
+        assert_eq!(gpu_color(100.0, true, 59.0, 0, 60), GOOD, "flat out, on time");
+        assert_eq!(gpu_color(82.0, true, 54.0, 0, 60), WARN, "busy, a little behind");
+        assert_eq!(gpu_color(95.0, true, 41.0, 0, 60), BAD, "busy, well behind");
+        assert_eq!(gpu_color(79.0, true, 41.0, 40, 60), GOOD, "behind, the GPU not busy");
+        assert_eq!(gpu_color(100.0, true, 143.0, 0, 0), GOOD, "uncapped: meant to be flat out");
+        assert_eq!(gpu_color(100.0, true, 20.0, 40, 0), GOOD, "uncapped");
+        // A hitch now and then: the frame rate, a mean, still reads 59.
+        assert_eq!(gpu_color(82.0, true, 59.2, 5, 60), WARN, "busy, a hitch a second");
+        assert_eq!(gpu_color(82.0, true, 59.2, 15, 60), WARN, "busy, three a second");
+        assert_eq!(gpu_color(82.0, true, 58.5, 16, 60), BAD, "busy, more than three a second");
+        assert_eq!(gpu_color(82.0, true, 41.0, 3, 60), BAD, "the worse of the two");
+        // Estimated from the layers' costs: a share of the frame's time.
+        assert_eq!(gpu_color(60.0, false, 60.0, 0, 60), WARN, "estimated");
+        assert_eq!(gpu_color(95.0, false, 60.0, 0, 60), BAD, "estimated");
+    }
+
     #[test]
     fn the_frame_rate_is_judged_against_its_target() {
         assert_eq!(fps_text(50.0, 50), "50/50 FPS");

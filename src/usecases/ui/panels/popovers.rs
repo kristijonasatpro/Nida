@@ -241,18 +241,25 @@ pub(super) fn render_gpu_popover(ui: &mut egui::Ui, data: &UIData) {
 
         let util = data.gpu_utilization;
         ui.label(egui::RichText::new("Utilization").strong().small());
-        let util_color = if util < 50.0 {
-            egui::Color32::from_rgb(100, 220, 100)
-        } else if util < 80.0 {
-            egui::Color32::from_rgb(220, 200, 60)
-        } else {
-            egui::Color32::from_rgb(220, 60, 60)
-        };
+        // Coloured as the figure in the top bar is: by whether the show
+        // keeps up, not by how busy the GPU is.
+        let util_color = super::monitoring::gpu_color(
+            util,
+            data.gpu_utilization_measured,
+            data.fps,
+            data.late_frames,
+            data.target_fps,
+        );
         ui.label(
             egui::RichText::new(format!("{util:.0}%"))
                 .color(util_color)
                 .monospace(),
-        );
+        )
+        .on_hover_text(if data.gpu_utilization_measured {
+            super::monitoring::GPU_NOT_A_LIMIT
+        } else {
+            super::monitoring::GPU_ESTIMATED
+        });
         ui.end_row();
     });
 }

@@ -13,6 +13,16 @@ pub mod pptx;
 pub mod screens;
 pub mod web;
 
+/// The name of a PowerPoint input playing the file at `path`: the file's,
+/// without its extension.
+pub fn input_name(path: &std::path::Path) -> String {
+    let talk = path.file_stem().map_or_else(
+        || "PowerPoint".to_string(),
+        |s| s.to_string_lossy().into_owned(),
+    );
+    format!("📽 {talk}")
+}
+
 /// A PowerPoint input's deck file, kept with the show on its capture deck.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct PresentationConfig {

@@ -20,7 +20,7 @@ pub mod surface;
 
 use backend::{
     CaptureConfig, CaptureError, CaptureFrame, CapturePixelFormat, CaptureTargetInfo,
-    CaptureTargetKind, MockBackend, PermissionState, ScreenCaptureBackend, TargetIdentity,
+    CaptureTargetKind, Drawn, MockBackend, PermissionState, ScreenCaptureBackend, TargetIdentity,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,6 +68,9 @@ struct ActiveCapture {
     label: String,
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
+    /// The same texture read as it was coded, where captures are drawn so
+    /// (see [`ScreenCaptureManager::coded_view`]).
+    coded_view: Option<wgpu::TextureView>,
     width: u32,
     height: u32,
     format: CapturePixelFormat,
@@ -88,12 +91,70 @@ struct ActiveCapture {
     thread: Option<std::thread::JoinHandle<()>>,
     /// Frames put in its texture: none yet, and its texture shows nothing.
     uploaded: u64,
+    /// Which picture its texture holds (see `ScreenCaptureManager::picture`).
+    picture: u64,
     /// Of those, the ones from the capture running now — none yet after it
     /// replaced another, though the texture still shows that one's last.
     fresh: u64,
     /// When the last frame was put in its texture: macOS sends a capture's
     /// frames only as what it shows changes, so a still slide sends none.
     last_picture: Option<std::time::Instant>,
+    /// A presentation's (a PowerPoint show's window, on air or in a Slides
+    /// input), taken through `adopt`: never shared with an input's own
+    /// capture of the same window, whose cap and crop would undo the show's
+    /// (its cap is the picture its slide is shown at, its crop cuts the
+    /// title bar off).
+    presentation: bool,
+    /// When it was last given another size for how its picture is drawn
+    /// (see [`ScreenCaptureManager::size_as_drawn`]): not yet, when opened.
+    sized: Option<std::time::Instant>,
+    /// Since when its picture has been drawn smaller than it is sized for.
+    smaller_since: Option<std::time::Instant>,
+}
+
+/// The least between two sizes given a capture as its picture is drawn
+/// bigger: a zoom dragged up changes its stream twice a second — as often
+/// as a window resized does (`FOLLOW_EVERY` on macOS) — not at every frame.
+const SIZED_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a capture's picture is drawn smaller before the capture is made
+/// smaller: a zoom taken off and put back, or dragged down, changes its
+/// stream once.
+const SMALLER_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Opens the platform's capture of a target: [`platform::open`], but in
+/// tests, whose managers open a mock of it or nothing and never ask macOS
+/// for a screen (see `ScreenCaptureManager::enabled_for_tests`).
+type Opens =
+    fn(&CaptureTargetInfo, &CaptureConfig) -> Result<Box<dyn ScreenCaptureBackend>, CaptureError>;
+
+/// A test's capture of `target`: a mock of its size, set as asked. It
+/// cannot fail; the platform's, whose shape it has, can.
+#[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
+fn open_a_mock(
+    target: &CaptureTargetInfo,
+    config: &CaptureConfig,
+) -> Result<Box<dyn ScreenCaptureBackend>, CaptureError> {
+    Ok(Box::new(MockBackend::new(
+        target.label.clone(),
+        target.width,
+        target.height,
+        config.clone(),
+    )))
+}
+
+/// A test's capture that does not open: a window closed since it was
+/// listed, a screen macOS will not let be captured.
+#[cfg(test)]
+fn open_nothing(
+    target: &CaptureTargetInfo,
+    _config: &CaptureConfig,
+) -> Result<Box<dyn ScreenCaptureBackend>, CaptureError> {
+    Err(CaptureError::Backend(format!(
+        "'{}' did not open",
+        target.label
+    )))
 }
 
 /// Manages capture-target enumeration, capture sessions, and shared textures.
@@ -106,6 +167,34 @@ pub struct ScreenCaptureManager {
     /// Capture threads let go of and still ending — closing their session,
     /// which macOS may never finish (see [`retire`]).
     retiring: Vec<std::thread::JoinHandle<()>>,
+    /// Opens a target nothing captures yet (see [`Opens`]).
+    opens: Opens,
+    /// How many times the size its picture is drawn at a capture is asked
+    /// for (see [`Self::size_as_drawn`], [`room_of`]).
+    room: f32,
+    /// Whether inputs draw a capture from its view as coded (see
+    /// [`Self::coded_view`], [`coded_of`]).
+    coded: bool,
+}
+
+/// The room a capture is given when nothing says: twice the size it is
+/// drawn at.
+const ROOM: f32 = 2.0;
+
+/// The room `NIDA_CAPTURE_ROOM` says (`said`), read once as the app starts:
+/// from 1 — each capture asked for as it is drawn, as it was before it was
+/// given room — to 4; [`ROOM`] when it says nothing or no such number.
+fn room_of(said: Option<&str>) -> f32 {
+    said.and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|times| times.is_finite() && (1.0..=4.0).contains(times))
+        .unwrap_or(ROOM)
+}
+
+/// Whether captures are drawn from their code values, as
+/// `NIDA_CAPTURES_CODED` says (`said`), read once as the app starts: they
+/// are, but for `0` — each filtered as light, as it was before.
+fn coded_of(said: Option<&str>) -> bool {
+    said.is_none_or(|s| s.trim() != "0")
 }
 
 /// Capture threads still ending past which it is said, at each such many
@@ -129,6 +218,9 @@ impl ScreenCaptureManager {
             permission: platform::permission_state(),
             disabled: false,
             retiring: Vec::new(),
+            opens: platform::open,
+            room: room_of(std::env::var("NIDA_CAPTURE_ROOM").ok().as_deref()),
+            coded: coded_of(std::env::var("NIDA_CAPTURES_CODED").ok().as_deref()),
         };
         mgr.scan_targets();
         mgr
@@ -143,13 +235,26 @@ impl ScreenCaptureManager {
             permission: PermissionState::NotRequired,
             disabled: true,
             retiring: Vec::new(),
+            opens: platform::open,
+            room: 1.0,
+            coded: true,
         }
     }
 
-    /// Enabled, as `new`, without asking the platform for permission or
-    /// targets.
+    /// Disabled (nothing opens), knowing `targets`: what a show restores
+    /// against, without a screen to capture.
     #[cfg(test)]
-    fn enabled_for_tests() -> Self {
+    pub(crate) fn disabled_with_targets(targets: Vec<CaptureTargetInfo>) -> Self {
+        let mut manager = Self::new_disabled();
+        manager.targets = targets;
+        manager
+    }
+
+    /// Enabled, as `new`, without asking the platform for permission or
+    /// targets — or for a capture: a target nothing captures yet opens as
+    /// a mock of it, or not at all (see `opening_fails`).
+    #[cfg(test)]
+    pub(crate) fn enabled_for_tests() -> Self {
         Self {
             targets: Vec::new(),
             active: HashMap::new(),
@@ -157,7 +262,59 @@ impl ScreenCaptureManager {
             permission: PermissionState::NotRequired,
             disabled: false,
             retiring: Vec::new(),
+            opens: open_a_mock,
+            room: 1.0,
+            coded: true,
         }
+    }
+
+    /// Each capture asked for `times` the size it is drawn at from here on
+    /// (see [`Self::size_as_drawn`]): a test's managers give none (1), the
+    /// app's [`ROOM`].
+    #[cfg(test)]
+    pub(crate) fn give_room(&mut self, times: f32) {
+        self.room = times;
+    }
+
+    /// Inputs draw captures from their code values, or — not `coded` —
+    /// from their light: each capture opened from here on, and each
+    /// running one from its next size on (see [`Self::coded_view`]).
+    #[cfg(test)]
+    pub(crate) fn draw_coded(&mut self, coded: bool) {
+        self.coded = coded;
+    }
+
+    /// As it is, on a GPU that can do what `flags` say. One that reads a
+    /// texture in its own format alone (OpenGL ES: no `VIEW_FORMATS`) makes
+    /// no texture asked for a second one, so a capture has no view as
+    /// coded there, and inputs draw it from its light (see
+    /// [`Self::coded_view`]).
+    #[must_use]
+    pub fn on_gpu(mut self, flags: wgpu::DownlevelFlags) -> Self {
+        self.coded &= flags.contains(wgpu::DownlevelFlags::VIEW_FORMATS);
+        self
+    }
+
+    /// Enabled, knowing `targets`: the screens of a desk, to open by
+    /// [`ScreenCaptureManager::open_mock`].
+    #[cfg(test)]
+    pub(crate) fn enabled_with_targets(targets: Vec<CaptureTargetInfo>) -> Self {
+        let mut manager = Self::enabled_for_tests();
+        manager.targets = targets;
+        manager
+    }
+
+    /// From here on nothing opens: what is picked has gone since it was
+    /// listed. A capture running already is still shared.
+    #[cfg(test)]
+    pub(crate) fn opening_fails(&mut self) {
+        self.opens = open_nothing;
+    }
+
+    /// How many hold capture `id`: none when it is not running.
+    #[cfg(test)]
+    pub(crate) fn holders(&self, id: CaptureId) -> u32 {
+        self.active.get(&id).map_or(0, |active| active.ref_count)
     }
 
     /// Whether a capture can actually be opened.
@@ -226,13 +383,19 @@ impl ScreenCaptureManager {
     /// match on `app` alone — an editor or browser that was retitled is the
     /// common case, but if two windows of the same app are open there is no
     /// principled way to choose, so the fallback declines.
+    ///
+    /// A display is found by its own identity, and by its name only when
+    /// that is not plugged in or was never kept (see
+    /// [`backend::find_display`]).
     pub fn find_target(&self, identity: &TargetIdentity) -> Option<&CaptureTargetInfo> {
-        if let Some(exact) = self.targets.iter().find(|t| &t.identity() == identity) {
-            return Some(exact);
-        }
         match identity {
-            TargetIdentity::Display { .. } => None,
+            TargetIdentity::Display { label, uuid } => {
+                backend::find_display(&self.targets, label, uuid.as_deref())
+            }
             TargetIdentity::Window { app, .. } => {
+                if let Some(exact) = self.targets.iter().find(|t| &t.identity() == identity) {
+                    return Some(exact);
+                }
                 let mut matches = self
                     .targets
                     .iter()
@@ -246,6 +409,19 @@ impl ScreenCaptureManager {
                 }
             }
         }
+    }
+
+    /// Whether `identity` is a display kept by its name alone here, where
+    /// displays have an identity to be kept by: it shows whichever screen
+    /// has that name now, until its screen is picked again (see
+    /// [`TargetIdentity::restored_to`]).
+    #[must_use]
+    pub fn goes_by_name(&self, identity: &TargetIdentity) -> bool {
+        identity.is_display_by_name()
+            && self
+                .targets
+                .iter()
+                .any(|t| t.kind == CaptureTargetKind::Display && t.uuid.is_some())
     }
 
     /// Open a capture and start its thread. If an identical target is already
@@ -279,12 +455,12 @@ impl ScreenCaptureManager {
             }
         }
 
-        if let Some(shared) = self.share(target) {
+        if let Some(shared) = self.share(target, &config, false) {
             return Ok(shared);
         }
 
         let config = config.sanitized();
-        let session = platform::open(target, &config)?;
+        let session = (self.opens)(target, &config)?;
         self.start_session(target, session, config, device)
     }
 
@@ -306,14 +482,94 @@ impl ScreenCaptureManager {
 
     /// The session already capturing `target` — the same window, not only
     /// one of its app and title — with one more holder.
-    fn share(&mut self, target: &CaptureTargetInfo) -> Option<(CaptureId, u32, u32)> {
+    fn share(
+        &mut self,
+        target: &CaptureTargetInfo,
+        config: &CaptureConfig,
+        presentation: bool,
+    ) -> Option<(CaptureId, u32, u32)> {
         let identity = target.identity();
-        let (id, active) = self
-            .active
-            .iter_mut()
-            .find(|(_, a)| a.identity == identity && a.platform_id == target.platform_id)?;
+        let (id, active) = self.active.iter_mut().find(|(_, a)| {
+            a.identity == identity
+                && a.platform_id == target.platform_id
+                && a.presentation == presentation
+        })?;
         active.ref_count += 1;
-        Some((*id, active.width, active.height))
+        let id = *id;
+        let opened = (id, active.width, active.height);
+        // At least as large as its new opener asks — a show opened at 4K
+        // while one at 1080p captured the same screen — never smaller: what
+        // is on air from it does not blur for an input added. Its other
+        // settings are left as they are.
+        let raised = self.config(id).and_then(|running| match (running.scale_to, config.scale_to) {
+            (Some((w, h)), Some((bw, bh))) => Some((w.max(bw), h.max(bh))),
+            _ => None,
+        });
+        self.cap_to(id, raised);
+        Some(opened)
+    }
+
+    /// Capture `id` capped at `bound` (the show's size) from its next tick,
+    /// its other settings — another input's crop on a shared one — kept.
+    pub fn cap_to(&mut self, id: CaptureId, bound: Option<(u32, u32)>) {
+        self.update_config(id, |config| config.scale_to = bound);
+    }
+
+    /// Capture `id` sized as its picture is `drawn` in the show's frame: the
+    /// most among the inputs showing it (see `Deck::capture_drawn`) — one
+    /// that fills a frame of another shape, or is zoomed into, wants more
+    /// of its pixels than one fitted. Capped at the size that fits whatever
+    /// it was drawn at — how it was — a 4K screen zoomed into twice over in
+    /// a 1080p show came 1920 × 1080 and was enlarged; so was one filling
+    /// an upright frame. It never comes bigger than its screen or window is
+    /// (see `resample::drawn_within`).
+    ///
+    /// With room: asked for twice the size it is drawn at, where its screen
+    /// or window has as much (`NIDA_CAPTURE_ROOM`, see [`room_of`]) — a 4K
+    /// screen fitted into a 1080p show comes whole, a 5K one at 3840 × 2160
+    /// — and drawn smaller from that by the show, which averages what each
+    /// pixel covers exactly (`scaled_sample.wgsl`). Asked for at the size it
+    /// is drawn, macOS made it smaller, and soft: a 4K screen's text at
+    /// exactly half its size came with seven tenths of its contrast.
+    ///
+    /// Bigger at once, though not within [`SIZED_EVERY`] of the last time;
+    /// smaller when its picture has been drawn smaller for
+    /// [`SMALLER_AFTER`] at `now`. Its other settings are kept, as
+    /// [`Self::cap_to`] keeps them. A presentation's capture is left as its
+    /// presentation has it.
+    pub fn size_as_drawn(&mut self, id: CaptureId, drawn: Drawn, now: std::time::Instant) {
+        let room = self.room;
+        let Some(active) = self.active.get_mut(&id) else {
+            return;
+        };
+        if active.presentation {
+            return;
+        }
+        let drawn = drawn.with_room(room);
+        let Ok(mut config) = active.config.lock() else {
+            return;
+        };
+        let runs = config.drawn;
+        if drawn == runs {
+            active.smaller_since = None;
+            return;
+        }
+        let bigger =
+            drawn.fitted > runs.fitted || drawn.across > runs.across || drawn.down > runs.down;
+        let due = if bigger {
+            active.smaller_since = None;
+            active
+                .sized
+                .is_none_or(|at| now.saturating_duration_since(at) >= SIZED_EVERY)
+        } else {
+            let since = *active.smaller_since.get_or_insert(now);
+            now.saturating_duration_since(since) >= SMALLER_AFTER
+        };
+        if due {
+            config.drawn = drawn;
+            active.sized = Some(now);
+            active.smaller_since = None;
+        }
     }
 
     /// Take a capture of `target` opened elsewhere — the slow part, done off
@@ -373,7 +629,9 @@ impl ScreenCaptureManager {
         let running = self
             .active
             .iter()
-            .find(|(_, a)| a.identity == identity && a.platform_id == target.platform_id)
+            .find(|(_, a)| {
+                a.identity == identity && a.platform_id == target.platform_id && a.presentation
+            })
             .map(|(id, a)| {
                 let same = a.target_size == (target.width, target.height)
                     && a.backend_size == session.resolution()
@@ -382,7 +640,7 @@ impl ScreenCaptureManager {
             });
         match running {
             Some((_, true)) if share => {
-                if let Some(shared) = self.share(target) {
+                if let Some(shared) = self.share(target, &config, true) {
                     return Ok(shared);
                 }
             }
@@ -405,7 +663,11 @@ impl ScreenCaptureManager {
                 target.label
             );
         }
-        self.start_session(target, session, config, device)
+        let started = self.start_session(target, session, config, device)?;
+        if let Some(active) = self.active.get_mut(&started.0) {
+            active.presentation = true;
+        }
+        Ok(started)
     }
 
     /// Capture `id` from `session` from now on, set to `config`: its thread
@@ -424,6 +686,7 @@ impl ScreenCaptureManager {
             return Err(CaptureError::Backend(format!("capture {id} is gone")));
         };
         let retired = retire(active);
+        let opened = config.clone();
         if let Ok(mut guard) = active.config.lock() {
             *guard = config;
         }
@@ -448,6 +711,7 @@ impl ScreenCaptureManager {
                     session.as_mut(),
                     id,
                     &frame_tx,
+                    opened,
                     &config_rx,
                     &stop_rx,
                     (&connected_tx, &current, mine),
@@ -492,7 +756,7 @@ impl ScreenCaptureManager {
         config: CaptureConfig,
         device: &wgpu::Device,
     ) -> Result<(CaptureId, u32, u32), CaptureError> {
-        if let Some(shared) = self.share(target) {
+        if let Some(shared) = self.share(target, &config, false) {
             return Ok(shared);
         }
         let config = config.sanitized();
@@ -534,8 +798,8 @@ impl ScreenCaptureManager {
             self.next_id = 0;
         }
 
-        let (texture, texture_view) =
-            Self::create_texture(device, id, &target.label, width, height, format);
+        let (texture, texture_view, coded_view) =
+            Self::create_texture(device, id, &target.label, width, height, format, self.coded);
 
         let mut picker = FramePicker::keeping(PICKER_FRAMES);
         if let Some(first) = first {
@@ -543,6 +807,7 @@ impl ScreenCaptureManager {
             drop(let_go);
         }
         let frame_data = Arc::new(Mutex::new(picker));
+        let opened = config.clone();
         let config = Arc::new(Mutex::new(config));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let connected = Arc::new(AtomicBool::new(false));
@@ -561,6 +826,7 @@ impl ScreenCaptureManager {
                     session.as_mut(),
                     id,
                     &frame_tx,
+                    opened,
                     &config_rx,
                     &stop_rx,
                     (&connected_tx, &current_rx, 0),
@@ -584,6 +850,7 @@ impl ScreenCaptureManager {
                 label: target.label.clone(),
                 texture,
                 texture_view,
+                coded_view,
                 width,
                 height,
                 format,
@@ -595,14 +862,21 @@ impl ScreenCaptureManager {
                 current,
                 thread: Some(thread),
                 uploaded: 0,
+                picture: 0,
                 fresh: 0,
                 last_picture: None,
+                presentation: false,
+                sized: None,
+                smaller_since: None,
             },
         );
 
         Ok((id, width, height))
     }
 
+    /// A capture's texture, with its view as light — sRGB, which the GPU
+    /// decodes as it is read — and, where captures are drawn as `coded`,
+    /// its view as it was coded (see [`Self::coded_view`]).
     fn create_texture(
         device: &wgpu::Device,
         id: CaptureId,
@@ -610,7 +884,12 @@ impl ScreenCaptureManager {
         width: u32,
         height: u32,
         format: CapturePixelFormat,
-    ) -> (wgpu::Texture, wgpu::TextureView) {
+        coded: bool,
+    ) -> (wgpu::Texture, wgpu::TextureView, Option<wgpu::TextureView>) {
+        // Read as the code values it holds, too — asked for only where it
+        // is drawn so: not every GPU makes a texture read two ways (see
+        // [`Self::on_gpu`]).
+        let twin = coded.then(|| format.coded_format());
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&format!("ScreenCapture {id} ({label})")),
             size: wgpu::Extent3d {
@@ -623,10 +902,17 @@ impl ScreenCaptureManager {
             dimension: wgpu::TextureDimension::D2,
             format: format.wgpu_format(),
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
+            view_formats: twin.as_slice(),
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        (texture, view)
+        let coded = twin.map(|twin| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("ScreenCapture as coded"),
+                format: Some(twin),
+                ..Default::default()
+            })
+        });
+        (texture, view, coded)
     }
 
     /// Release a capture reference. Stops the thread when the count hits zero.
@@ -691,6 +977,20 @@ impl ScreenCaptureManager {
         self.active.get(&id).map(|a| &a.texture_view)
     }
 
+    /// The same texture read as it was coded: its sRGB code values as they
+    /// are, not the light they stand for. An input draws its capture from
+    /// this one, filtering the code values and making them light after
+    /// (`light_of_coded`, `scaled_sample.wgsl`) — as every picture viewer,
+    /// browser and macOS itself shrink a picture. Filtered as light, dark
+    /// text on a light page drawn smaller came out pale and thin: the
+    /// light round a stroke counts for more than the stroke. None with
+    /// `NIDA_CAPTURES_CODED=0` (see [`coded_of`]) and on a GPU that reads
+    /// a texture one way (see [`Self::on_gpu`]): drawn from
+    /// [`Self::texture_view`] then, as it was.
+    pub fn coded_view(&self, id: CaptureId) -> Option<&wgpu::TextureView> {
+        self.active.get(&id).and_then(|a| a.coded_view.as_ref())
+    }
+
     pub fn resolution(&self, id: CaptureId) -> Option<(u32, u32)> {
         self.active.get(&id).map(|a| (a.width, a.height))
     }
@@ -711,6 +1011,19 @@ impl ScreenCaptureManager {
     /// shows nothing — a talk starting waits for it.
     pub fn has_picture(&self, id: CaptureId) -> bool {
         self.active.get(&id).is_some_and(|a| a.uploaded > 0)
+    }
+
+    /// Which picture the capture's texture holds: another number each time
+    /// a frame is put in it or it is made anew, no two the same across all
+    /// captures — a screen or window where nothing moves sends no frame,
+    /// and the number stands. `None` until it has a picture. What is drawn
+    /// from the texture need not be drawn again while this is the same (see
+    /// `Channel::keep_still_inputs`).
+    pub fn picture(&self, id: CaptureId) -> Option<u64> {
+        self.active
+            .get(&id)
+            .filter(|a| a.uploaded > 0)
+            .map(|a| a.picture)
     }
 
     /// Whether the capture sent a new frame within `within`: a screen not
@@ -741,19 +1054,37 @@ impl ScreenCaptureManager {
         ids
     }
 
+    /// A live capture's settings, as its inputs have them: how big it is
+    /// drawn, which is its own and no input's, apart (see [`Self::drawn`]).
     pub fn config(&self, id: CaptureId) -> Option<CaptureConfig> {
         let active = self.active.get(&id)?;
-        active.config.lock().ok().map(|c| c.clone())
+        active.config.lock().ok().map(|c| CaptureConfig {
+            drawn: Drawn::default(),
+            ..c.clone()
+        })
+    }
+
+    /// How big a live capture's picture is drawn, as it is sized for now
+    /// (see [`Self::size_as_drawn`]).
+    pub fn drawn(&self, id: CaptureId) -> Option<Drawn> {
+        let active = self.active.get(&id)?;
+        active.config.lock().ok().map(|c| c.drawn)
     }
 
     /// Update a live capture's config. The capture thread picks it up on its
-    /// next tick; no session restart.
+    /// next tick; no session restart. How big it is drawn stays as it is
+    /// sized: settings given it — an input's, a show's as saved — say
+    /// nothing of that.
     pub fn set_config(&mut self, id: CaptureId, config: CaptureConfig) {
         let Some(active) = self.active.get_mut(&id) else {
             return;
         };
         if let Ok(mut guard) = active.config.lock() {
-            *guard = config.sanitized();
+            let drawn = guard.drawn;
+            *guard = CaptureConfig {
+                drawn,
+                ..config.sanitized()
+            };
         }
     }
 
@@ -781,9 +1112,10 @@ impl ScreenCaptureManager {
         show_at: f64,
     ) {
         self.retiring.retain(|thread| !thread.is_finished());
+        let coded = self.coded;
         for (id, active) in &mut self.active {
             if needed.contains(id) {
-                Self::upload_frame(*id, active, context, show_at);
+                Self::upload_frame(*id, active, context, show_at, coded);
             }
         }
     }
@@ -804,12 +1136,19 @@ impl ScreenCaptureManager {
     /// `show_at`.
     pub fn update(&mut self, context: &GpuContext, show_at: f64) {
         self.retiring.retain(|thread| !thread.is_finished());
+        let coded = self.coded;
         for (id, active) in &mut self.active {
-            Self::upload_frame(*id, active, context, show_at);
+            Self::upload_frame(*id, active, context, show_at, coded);
         }
     }
 
-    fn upload_frame(id: CaptureId, active: &mut ActiveCapture, context: &GpuContext, show_at: f64) {
+    fn upload_frame(
+        id: CaptureId,
+        active: &mut ActiveCapture,
+        context: &GpuContext,
+        show_at: f64,
+        coded: bool,
+    ) {
         use crate::renderer::present_trace::{Step, TRACE};
         let device = &context.device;
         // Waits only while a frame is put in — moments: a show frame that
@@ -848,14 +1187,18 @@ impl ScreenCaptureManager {
             || frame.format != active.format
         {
             let (w, h) = (frame.width.max(1), frame.height.max(1));
-            let (texture, view) =
-                Self::create_texture(device, id, &active.label, w, h, frame.format);
+            let (texture, view, coded) =
+                Self::create_texture(device, id, &active.label, w, h, frame.format, coded);
             active.texture = texture;
             active.texture_view = view;
+            active.coded_view = coded;
             active.width = w;
             active.height = h;
             active.format = frame.format;
         }
+        // Another picture from here on: the texture made anew, a frame put
+        // in it (one that fails to go in costs a drawing, no more).
+        active.picture = crate::deck::next_picture();
 
         // In the GPU surface it was captured into: copied there, on the GPU.
         #[cfg(target_os = "macos")]
@@ -936,10 +1279,13 @@ fn poll_interval(frame_interval: std::time::Duration, self_paced: bool) -> std::
 /// Delivery is paced by `config.rate`, which is deliberately decoupled from the
 /// render rate: a self-capture at 60 fps would compound render cost every frame.
 /// See spec/screen-capture.md § Self-Capture and Feedback Safety.
+// The thread's inputs, each distinct; bundling them would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn capture_loop(
     session: &mut dyn ScreenCaptureBackend,
     id: CaptureId,
     frame_data: &Mutex<FramePicker<CaptureFrame>>,
+    opened: CaptureConfig,
     config: &Mutex<CaptureConfig>,
     stop: &AtomicBool,
     (connected, current, mine): (&AtomicBool, &std::sync::atomic::AtomicU64, u64),
@@ -947,7 +1293,10 @@ fn capture_loop(
     // Still the capture's thread, not one replaced still ending.
     let still_mine = || current.load(Ordering::SeqCst) == mine;
     let self_paced = session.is_self_paced();
-    let mut applied = config.lock().ok().map(|c| c.clone()).unwrap_or_default();
+    // What the backend was opened with, not what the settings say by the time
+    // this thread starts: a cap raised meanwhile (another input sharing it)
+    // would read as already applied, and never reach the backend.
+    let mut applied = opened;
     let mut interval = poll_interval(applied.frame_interval(), self_paced);
     log::debug!(
         "Screen capture {id} thread started ('{}', self_paced={self_paced}, poll={interval:?})",
@@ -967,6 +1316,8 @@ fn capture_loop(
                 }
             }
         }
+
+        session.follow_target();
 
         // Every frame come, each with when it was captured: the render
         // thread picks the one for each show frame. A self-paced backend may
@@ -1018,11 +1369,13 @@ fn retire(active: &mut ActiveCapture) -> Option<std::thread::JoinHandle<()>> {
 #[cfg(test)]
 mod tests {
     use super::backend::{
-        mock_targets, CaptureConfig, CaptureError, CaptureTargetInfo, CropRect, MockBackend,
+        mock_targets, CaptureConfig, CaptureError, CaptureTargetInfo, CaptureTargetKind, CropRect,
+        Drawn, MockBackend,
         ScreenCaptureBackend, TargetIdentity,
     };
     use super::{poll_interval, ScreenCaptureManager, SELF_PACED_MAX_POLL, SELF_PACED_MIN_POLL};
     use super::{capture_loop, CaptureFrame, FramePicker, PICKER_FRAMES};
+    use super::{coded_of, room_of, ROOM};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1136,8 +1489,155 @@ mod tests {
         mgr.targets = mock_targets();
         let missing = TargetIdentity::Display {
             label: "Nonexistent".into(),
+            uuid: None,
         };
         assert!(mgr.find_target(&missing).is_none());
+    }
+
+    /// The screens of a desk as macOS lists them: each `(uuid, width)` under
+    /// "Display N" by its place.
+    fn listed(screens: &[(&str, u32)]) -> Vec<CaptureTargetInfo> {
+        screens
+            .iter()
+            .zip(1u32..)
+            .map(|((uuid, width), n)| CaptureTargetInfo {
+                kind: CaptureTargetKind::Display,
+                platform_id: u64::from(n) + 10,
+                label: format!("Display {n}"),
+                app: None,
+                title: None,
+                width: *width,
+                height: width * 9 / 16,
+                is_varda: false,
+                uuid: Some((*uuid).to_string()),
+            })
+            .collect()
+    }
+
+    fn display(label: &str, uuid: Option<&str>) -> TargetIdentity {
+        TargetIdentity::Display {
+            label: label.into(),
+            uuid: uuid.map(str::to_string),
+        }
+    }
+
+    /// A show captured the 4K screen as "Display 1"; a third screen plugged
+    /// in, macOS lists the 4K as "Display 2" and another as "Display 1" (an
+    /// M5 Max, 2026-11-09). The show still finds the 4K, and keeps it under
+    /// the name it is listed by now.
+    #[test]
+    fn a_display_is_found_by_its_identity_whatever_number_it_is_listed_under() {
+        let mut mgr = ScreenCaptureManager::new_disabled();
+        mgr.targets = listed(&[("capture", 1920), ("4k", 3840), ("second", 1920)]);
+        let saved = display("Display 1", Some("4k"));
+        let found = mgr.find_target(&saved).expect("the 4K screen");
+        assert_eq!((found.width, found.label.as_str()), (3840, "Display 2"));
+        assert_eq!(saved.bound_to(found), display("Display 2", Some("4k")));
+    }
+
+    /// A display picked by its name alone — in the window, or by an API
+    /// client — is found by it, and kept by the identity of the one found
+    /// from then on.
+    #[test]
+    fn a_display_picked_by_name_alone_is_found_by_it_and_then_kept_by_identity() {
+        let mut mgr = ScreenCaptureManager::new_disabled();
+        mgr.targets = listed(&[("4k", 3840), ("second", 1920)]);
+        let picked = display("Display 1", None);
+        let found = mgr.find_target(&picked).expect("the first screen");
+        assert_eq!(found.width, 3840);
+        assert_eq!(picked.bound_to(found), display("Display 1", Some("4k")));
+        assert!(mgr.find_target(&display("Display 3", None)).is_none());
+    }
+
+    /// A show saved before displays were kept by identity has only the name.
+    /// Which screen had it then is not known — a capture box plugged in
+    /// since is "Display 1" now, the show's 4K "Display 2" (an M5 Max,
+    /// 2026-11-10) — so read from the show it stays by its name, and is not
+    /// made the screen that has the name today. One the show has by its
+    /// identity is named as it is listed now; one stood in for stays its own.
+    #[test]
+    fn a_display_a_show_has_by_name_alone_stays_by_name() {
+        let mut mgr = ScreenCaptureManager::new_disabled();
+        mgr.targets = listed(&[("capture", 1920), ("4k", 3840)]);
+        let saved = display("Display 1", None);
+        let found = mgr.find_target(&saved).expect("the screen of that name now");
+        assert_eq!(found.uuid.as_deref(), Some("capture"));
+        assert_eq!(saved.restored_to(found), saved, "not the capture box's for good");
+        assert!(saved.is_display_by_name());
+        assert!(mgr.goes_by_name(&saved));
+
+        let kept = display("Display 1", Some("4k"));
+        let found = mgr.find_target(&kept).expect("the 4K");
+        assert_eq!(kept.restored_to(found), display("Display 2", Some("4k")));
+        assert!(!kept.is_display_by_name());
+        assert!(!mgr.goes_by_name(&kept));
+
+        let away = display("Display 2", Some("led"));
+        let found = mgr.find_target(&away).expect("the one of its name");
+        assert_eq!(away.restored_to(found), away, "still the LED wall's");
+
+        let window = TargetIdentity::Window {
+            app: "com.example.mock".into(),
+            title: "Talk".into(),
+        };
+        assert!(!window.is_display_by_name());
+        assert!(!mgr.goes_by_name(&window));
+    }
+
+    /// Where displays have no identity to be kept by, one kept by its name
+    /// is kept as well as it can be: nothing to pick again, nothing said.
+    #[test]
+    fn a_display_by_name_is_all_there_is_where_displays_have_no_identity() {
+        let mut mgr = ScreenCaptureManager::new_disabled();
+        mgr.targets = listed(&[("a", 1920), ("b", 1920)]);
+        for target in &mut mgr.targets {
+            target.uuid = None;
+        }
+        let saved = display("Display 1", None);
+        assert!(saved.is_display_by_name());
+        assert!(!mgr.goes_by_name(&saved));
+    }
+
+    /// The screen a show kept is not plugged in — or the show came from
+    /// another computer: the one of its name stands in, and the show goes on
+    /// keeping its own, found again when it is back.
+    #[test]
+    fn a_display_not_plugged_in_is_stood_in_for_by_the_one_of_its_name() {
+        let mut mgr = ScreenCaptureManager::new_disabled();
+        mgr.targets = listed(&[("laptop", 1728), ("second", 1920)]);
+        let saved = display("Display 2", Some("4k"));
+        let found = mgr.find_target(&saved).expect("the screen of its name");
+        assert_eq!(found.uuid.as_deref(), Some("second"));
+        assert_eq!(saved.bound_to(found), saved, "still the 4K's");
+        assert!(mgr.find_target(&display("Display 3", Some("4k"))).is_none());
+
+        mgr.targets = listed(&[("laptop", 1728), ("second", 1920), ("4k", 3840)]);
+        let found = mgr.find_target(&saved).expect("the 4K, back");
+        assert_eq!(found.width, 3840);
+    }
+
+    /// Two identical screens may share an identity: the one of the name kept
+    /// is taken, and neither name fitting, the first.
+    #[test]
+    fn of_two_displays_of_one_identity_the_one_of_the_name_kept_is_found() {
+        let mut mgr = ScreenCaptureManager::new_disabled();
+        mgr.targets = listed(&[("laptop", 1728), ("twin", 1920), ("twin", 1920)]);
+        let found = mgr.find_target(&display("Display 3", Some("twin")));
+        assert_eq!(found.map(|t| t.label.as_str()), Some("Display 3"));
+        let found = mgr.find_target(&display("Display 1", Some("twin")));
+        assert_eq!(found.map(|t| t.label.as_str()), Some("Display 2"));
+    }
+
+    /// A window is kept as it was saved, whichever window was found for it:
+    /// one of its app found by another title is not that title's from then on.
+    #[test]
+    fn a_window_found_stays_as_it_was_kept() {
+        let targets = mock_targets();
+        let saved = TargetIdentity::Window {
+            app: "com.example.mock".into(),
+            title: "Something Else".into(),
+        };
+        assert_eq!(saved.bound_to(&targets[2]), saved);
     }
 
     #[test]
@@ -1207,6 +1707,69 @@ mod tests {
         needed.insert(id);
         mgr.update_selective(&gpu, &needed, crate::host_clock::host_seconds());
         assert_eq!(mgr.resolution(id), Some((160, 120)));
+        mgr.release(id);
+    }
+
+    /// A test's manager opens a mock of a target nothing captures yet, set
+    /// as asked — never the platform's capture, which would ask macOS for a
+    /// screen — and nothing once told so: no capture left behind, though
+    /// one running already is still shared.
+    #[test]
+    fn a_tests_manager_opens_a_mock_or_nothing() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        let mut mgr = ScreenCaptureManager::enabled_for_tests();
+        let mut targets = mock_targets();
+        let window = targets.remove(2);
+        let screen = targets.remove(0);
+        let asked = CaptureConfig {
+            rate: 24.0,
+            ..Default::default()
+        };
+        let (id, _, _) = mgr.open(&screen, asked.clone(), &gpu.device).expect("open");
+        assert_eq!(mgr.label(id), Some("Mock Display 1"));
+        assert_eq!(mgr.config(id), Some(asked.clone()), "as asked");
+
+        mgr.opening_fails();
+        let refused = mgr.open(&window, asked.clone(), &gpu.device);
+        assert!(
+            matches!(refused, Err(CaptureError::Backend(_))),
+            "nothing opens"
+        );
+        assert_eq!(mgr.active_ids(), vec![id], "nothing left behind");
+        let (again, _, _) = mgr.open(&screen, asked, &gpu.device).expect("shared");
+        assert_eq!(again, id);
+        mgr.release(id);
+        mgr.release(id);
+    }
+
+    /// A capture opened again — a show opened at 4K while one at 1080p
+    /// captured the same screen — takes the new opener's larger cap, never a
+    /// smaller one, and keeps the crop set on it.
+    #[test]
+    fn a_shared_capture_takes_its_new_openers_cap() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        let mut mgr = ScreenCaptureManager::enabled_for_tests();
+        let target = mock_targets().remove(0);
+        let at = |w, h| CaptureConfig {
+            scale_to: Some((w, h)),
+            ..Default::default()
+        };
+        let (id, _, _) = mgr.open_mock(&target, at(1920, 1080), &gpu.device).expect("open");
+        mgr.update_config(id, |c| c.crop.w = 0.5);
+        let (again, _, _) = mgr.open_mock(&target, at(3840, 2160), &gpu.device).expect("open");
+        assert_eq!(again, id, "shared");
+        let config = mgr.config(id).expect("live");
+        assert_eq!(config.scale_to, Some((3840, 2160)));
+        assert!((config.crop.w - 0.5).abs() < 1e-6, "its crop kept");
+        // Never lowered: what is on air from it stays as sharp.
+        let (_, _, _) = mgr.open_mock(&target, at(1920, 1080), &gpu.device).expect("open");
+        assert_eq!(mgr.config(id).expect("live").scale_to, Some((3840, 2160)));
+        mgr.release(id);
+        mgr.release(id);
         mgr.release(id);
     }
 
@@ -1571,7 +2134,15 @@ mod tests {
             );
             std::thread::spawn(move || {
                 let mut session = MockBackend::new("Old".to_string(), 32, 18, CaptureConfig::default());
-                capture_loop(&mut session, 7, &frames, &config, &stop, (&connected, &current, 0));
+                capture_loop(
+                    &mut session,
+                    7,
+                    &frames,
+                    CaptureConfig::default(),
+                    &config,
+                    &stop,
+                    (&connected, &current, 0),
+                );
             })
         };
         let until = std::time::Instant::now() + Duration::from_secs(5);
@@ -1588,6 +2159,592 @@ mod tests {
         assert_eq!(frames.lock().unwrap().waiting(), 0, "the old thread put nothing in");
         stop.store(true, Ordering::Relaxed);
         running.join().unwrap();
+    }
+
+    /// A cap raised while its thread was starting — another input sharing
+    /// the capture just then — still reaches the backend: the thread starts
+    /// from what the backend was opened with, not from the settings as they
+    /// are by the time it runs, which would read the raise as done.
+    #[test]
+    fn a_cap_raised_as_its_thread_starts_reaches_the_capture() {
+        let frames = Arc::new(Mutex::new(FramePicker::new()));
+        let opened = CaptureConfig {
+            scale_to: Some((32, 18)),
+            ..Default::default()
+        };
+        let raised = CaptureConfig {
+            scale_to: Some((64, 36)),
+            ..Default::default()
+        };
+        let config = Arc::new(Mutex::new(raised));
+        let stop = Arc::new(AtomicBool::new(false));
+        let connected = Arc::new(AtomicBool::new(false));
+        let current = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let running = {
+            let (frames, config, stop, connected, current, opened) = (
+                Arc::clone(&frames),
+                Arc::clone(&config),
+                Arc::clone(&stop),
+                Arc::clone(&connected),
+                Arc::clone(&current),
+                opened.clone(),
+            );
+            std::thread::spawn(move || {
+                let mut session = MockBackend::new("Screen".to_string(), 64, 36, opened.clone());
+                capture_loop(
+                    &mut session,
+                    7,
+                    &frames,
+                    opened,
+                    &config,
+                    &stop,
+                    (&connected, &current, 0),
+                );
+            })
+        };
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let size = loop {
+            let newest = frames.lock().unwrap().newest().map(|f| (f.width, f.height));
+            if newest == Some((64, 36)) {
+                break newest;
+            }
+            if std::time::Instant::now() > until {
+                break newest;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        stop.store(true, Ordering::Relaxed);
+        running.join().unwrap();
+        assert_eq!(size, Some((64, 36)), "the raised cap reached the capture");
+    }
+
+    /// A window resized while captured is followed: its frames come at its
+    /// new size, not squeezed into the one it started at.
+    #[test]
+    fn a_resized_window_is_captured_at_its_new_size() {
+        let frames = Arc::new(Mutex::new(FramePicker::new()));
+        let opened = CaptureConfig::default();
+        let config = Arc::new(Mutex::new(opened.clone()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let connected = Arc::new(AtomicBool::new(false));
+        let current = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let running = {
+            let (frames, config, stop, connected, current, opened) = (
+                Arc::clone(&frames),
+                Arc::clone(&config),
+                Arc::clone(&stop),
+                Arc::clone(&connected),
+                Arc::clone(&current),
+                opened.clone(),
+            );
+            std::thread::spawn(move || {
+                let mut session = MockBackend::new("Window".to_string(), 32, 18, opened.clone());
+                session.resize_target(64, 36);
+                capture_loop(
+                    &mut session,
+                    7,
+                    &frames,
+                    opened,
+                    &config,
+                    &stop,
+                    (&connected, &current, 0),
+                );
+            })
+        };
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        let size = loop {
+            let newest = frames.lock().unwrap().newest().map(|f| (f.width, f.height));
+            if newest == Some((64, 36)) || std::time::Instant::now() > until {
+                break newest;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        stop.store(true, Ordering::Relaxed);
+        running.join().unwrap();
+        assert_eq!(size, Some((64, 36)), "the window's new size");
+    }
+
+    /// A PowerPoint show's capture and an input's own capture of the same
+    /// window are two: capping the input's leaves the show's cap — its own,
+    /// the picture its slide is shown at — as it is.
+    #[test]
+    fn a_presentations_capture_is_never_shared_with_an_inputs() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        let mut mgr = ScreenCaptureManager::enabled_for_tests();
+        let target = mock_targets().remove(0);
+        let shows = CaptureConfig {
+            scale_to: Some((1920, 1146)),
+            ..Default::default()
+        };
+        let session = Box::new(MockBackend::new(
+            target.label.clone(),
+            target.width,
+            target.height,
+            shows.clone(),
+        ));
+        let (show, _, _) = mgr.adopt(&target, session, shows, &gpu.device).expect("adopt");
+        let input = CaptureConfig {
+            scale_to: Some((1920, 1080)),
+            ..Default::default()
+        };
+        let (own, _, _) = mgr.open_mock(&target, input, &gpu.device).expect("open");
+        assert_ne!(own, show, "two captures");
+        mgr.cap_to(own, Some((3840, 2160)));
+        assert_eq!(mgr.config(show).expect("live").scale_to, Some((1920, 1146)));
+        assert_eq!(mgr.config(own).expect("live").scale_to, Some((3840, 2160)));
+        mgr.release(own);
+        mgr.release(show);
+    }
+
+    /// A capture's size follows how big its picture is drawn: bigger at
+    /// once — though not twice within `SIZED_EVERY` — and smaller only once
+    /// drawn smaller for `SMALLER_AFTER` without a break.
+    #[test]
+    fn a_capture_is_sized_as_its_picture_is_drawn() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        let mut mgr = ScreenCaptureManager::new_disabled();
+        let target = mock_targets().remove(0);
+        let set = CaptureConfig {
+            scale_to: Some((960, 540)),
+            show_cursor: true,
+            ..Default::default()
+        };
+        let (id, _, _) = mgr.open_mock(&target, set.clone(), &gpu.device).expect("open");
+        assert_eq!(mgr.drawn(id), Some(Drawn::default()), "fitted, as opened");
+        let zoomed = |fitted| Drawn {
+            fitted,
+            ..Drawn::default()
+        };
+        let start = std::time::Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+
+        mgr.size_as_drawn(id, zoomed(2.0), at(0));
+        assert_eq!(mgr.drawn(id), Some(zoomed(2.0)), "bigger at once");
+        // Bigger again too soon after: held, then taken.
+        mgr.size_as_drawn(id, zoomed(3.0), at(499));
+        assert_eq!(mgr.drawn(id), Some(zoomed(2.0)), "held");
+        mgr.size_as_drawn(id, zoomed(3.0), at(500));
+        assert_eq!(mgr.drawn(id), Some(zoomed(3.0)), "taken");
+        // Smaller: once drawn so for long enough.
+        mgr.size_as_drawn(id, zoomed(1.0), at(1000));
+        mgr.size_as_drawn(id, zoomed(1.0), at(2999));
+        assert_eq!(mgr.drawn(id), Some(zoomed(3.0)), "not yet");
+        // Drawn as big again meanwhile: the wait starts over.
+        mgr.size_as_drawn(id, zoomed(3.0), at(2999));
+        mgr.size_as_drawn(id, zoomed(1.0), at(3000));
+        mgr.size_as_drawn(id, zoomed(1.0), at(4999));
+        assert_eq!(mgr.drawn(id), Some(zoomed(3.0)), "the wait started over");
+        mgr.size_as_drawn(id, zoomed(1.0), at(5000));
+        assert_eq!(mgr.drawn(id), Some(zoomed(1.0)), "smaller");
+        // Bigger one way, smaller the other — fitted and zoomed into, then
+        // filling its frame: what it needs now, at once.
+        mgr.size_as_drawn(id, zoomed(2.0), at(6000));
+        let fills = Drawn {
+            fitted: 1.0,
+            across: 1.0,
+            down: 1.0,
+        };
+        mgr.size_as_drawn(id, fills, at(7000));
+        assert_eq!(mgr.drawn(id), Some(fills));
+        // Its width alone bigger, then its height alone — stretched, and
+        // scaled one way: at once, each.
+        let wider = Drawn { across: 2.0, ..fills };
+        mgr.size_as_drawn(id, wider, at(7500));
+        assert_eq!(mgr.drawn(id), Some(wider), "wider at once");
+        let taller = Drawn {
+            fitted: 1.0,
+            across: 0.5,
+            down: 3.0,
+        };
+        mgr.size_as_drawn(id, taller, at(8000));
+        assert_eq!(mgr.drawn(id), Some(taller), "taller at once");
+        // A number no size comes of is none.
+        mgr.size_as_drawn(
+            id,
+            Drawn {
+                fitted: f32::NAN,
+                across: 4.0,
+                down: 4.0,
+            },
+            at(8500),
+        );
+        let filled_twice = Drawn {
+            fitted: 0.0,
+            across: 4.0,
+            down: 4.0,
+        };
+        assert_eq!(mgr.drawn(id), Some(filled_twice));
+
+        // A capture that is not there: nothing.
+        mgr.size_as_drawn(id + 1, zoomed(2.0), at(9000));
+        assert_eq!(mgr.drawn(id + 1), None);
+        mgr.release(id);
+    }
+
+    /// A capture's settings, as its inputs have them, say nothing of how
+    /// big it is drawn: they are as they were set, however it is sized.
+    #[test]
+    fn a_captures_settings_say_nothing_of_how_big_it_is_drawn() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        let mut mgr = ScreenCaptureManager::new_disabled();
+        let target = mock_targets().remove(0);
+        let set = CaptureConfig {
+            scale_to: Some((960, 540)),
+            show_cursor: true,
+            ..Default::default()
+        };
+        let (id, _, _) = mgr.open_mock(&target, set.clone(), &gpu.device).expect("open");
+        assert_eq!(mgr.config(id), Some(set.clone()), "as set");
+        let twice = Drawn {
+            fitted: 2.0,
+            across: 1.5,
+            down: 3.0,
+        };
+        mgr.size_as_drawn(id, twice, std::time::Instant::now());
+        assert_eq!(mgr.drawn(id), Some(twice), "sized");
+        assert_eq!(mgr.config(id), Some(set.clone()), "its settings as they were");
+        mgr.cap_to(id, Some((1920, 1080)));
+        assert_eq!(
+            mgr.config(id),
+            Some(CaptureConfig {
+                scale_to: Some((1920, 1080)),
+                ..set
+            }),
+            "capped anew, and no more said"
+        );
+        mgr.release(id);
+    }
+
+    /// Settings given a capture — an input's, a show's as saved — leave it
+    /// sized as it is drawn, whatever they say of that themselves.
+    #[test]
+    fn settings_given_a_capture_keep_how_big_it_is_drawn() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        let mut mgr = ScreenCaptureManager::new_disabled();
+        let target = mock_targets().remove(0);
+        let set = CaptureConfig {
+            scale_to: Some((960, 540)),
+            ..Default::default()
+        };
+        let (id, _, _) = mgr.open_mock(&target, set.clone(), &gpu.device).expect("open");
+        let twice = Drawn {
+            fitted: 2.0,
+            across: 1.5,
+            down: 3.0,
+        };
+        mgr.size_as_drawn(id, twice, std::time::Instant::now());
+        // An input's settings: they say nothing of it.
+        let given = CaptureConfig {
+            rate: 24.0,
+            ..set.clone()
+        };
+        mgr.set_config(id, given.clone());
+        assert_eq!(mgr.drawn(id), Some(twice), "sized as it was");
+        assert_eq!(mgr.config(id), Some(given.clone()), "the settings taken");
+        // And settings that do say: still as it is drawn.
+        mgr.set_config(
+            id,
+            CaptureConfig {
+                drawn: Drawn {
+                    fitted: 5.0,
+                    ..Drawn::default()
+                },
+                ..given.clone()
+            },
+        );
+        assert_eq!(mgr.drawn(id), Some(twice), "not as they said");
+        mgr.cap_to(id, Some((1920, 1080)));
+        assert_eq!(mgr.drawn(id), Some(twice), "capped anew, sized as it was");
+        mgr.release(id);
+    }
+
+    /// Sized as it is drawn, a capture's frames — and the texture its inputs
+    /// show — come so.
+    #[test]
+    fn a_capture_sized_as_drawn_comes_at_that_size() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        let mut mgr = ScreenCaptureManager::new_disabled();
+        let target = mock_targets().remove(0); // 1920x1080
+        let fitted = CaptureConfig {
+            scale_to: Some((960, 540)),
+            ..Default::default()
+        };
+        let (id, w, h) = mgr.open_mock(&target, fitted, &gpu.device).expect("open");
+        assert_eq!((w, h), (960, 540));
+        let zoomed = Drawn {
+            fitted: 1.5,
+            ..Drawn::default()
+        };
+        mgr.size_as_drawn(id, zoomed, std::time::Instant::now());
+        let needed = std::collections::HashSet::from([id]);
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while mgr.resolution(id) != Some((1440, 810)) && std::time::Instant::now() < until {
+            mgr.update_selective(&gpu, &needed, crate::host_clock::host_seconds());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(mgr.resolution(id), Some((1440, 810)), "as it is drawn");
+        mgr.release(id);
+    }
+
+    /// Given room, a capture is asked for so many times the size it is
+    /// drawn at and comes so — never bigger than its screen is — for the
+    /// show to make smaller itself. With none (a test's manager), as drawn.
+    #[test]
+    fn a_capture_given_room_comes_bigger_than_it_is_drawn() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        let mut mgr = ScreenCaptureManager::new_disabled();
+        let target = mock_targets().remove(0); // 1920x1080
+        let fitted = CaptureConfig {
+            scale_to: Some((640, 360)),
+            ..Default::default()
+        };
+        let (id, w, h) = mgr.open_mock(&target, fitted, &gpu.device).expect("open");
+        assert_eq!((w, h), (640, 360));
+        let zoomed = |fitted| Drawn {
+            fitted,
+            ..Drawn::default()
+        };
+        let start = std::time::Instant::now();
+        let needed = std::collections::HashSet::from([id]);
+        let comes = |mgr: &mut ScreenCaptureManager, size: (u32, u32)| {
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            while mgr.resolution(id) != Some(size) && std::time::Instant::now() < until {
+                mgr.update_selective(&gpu, &needed, crate::host_clock::host_seconds());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            mgr.resolution(id)
+        };
+
+        // No room: sized as it is drawn, and so it stays.
+        mgr.size_as_drawn(id, zoomed(1.0), start);
+        assert_eq!(mgr.drawn(id), Some(zoomed(1.0)), "as drawn");
+
+        // Room for twice: fitted, it comes twice the size that fits.
+        mgr.give_room(2.0);
+        mgr.size_as_drawn(id, zoomed(1.0), start + Duration::from_secs(1));
+        assert_eq!(mgr.drawn(id), Some(zoomed(2.0)), "twice what it is drawn at");
+        assert_eq!(comes(&mut mgr, (1280, 720)), Some((1280, 720)));
+
+        // Zoomed into twice over: four times fitted is more than the
+        // screen has.
+        mgr.size_as_drawn(id, zoomed(2.0), start + Duration::from_secs(2));
+        assert_eq!(mgr.drawn(id), Some(zoomed(4.0)));
+        assert_eq!(comes(&mut mgr, (1920, 1080)), Some((1920, 1080)), "all it has");
+        mgr.release(id);
+    }
+
+    /// The room a capture is given, as `NIDA_CAPTURE_ROOM` says it: from 1
+    /// to 4 times, twice when it says nothing or no such number.
+    #[test]
+    fn the_room_a_capture_is_given_is_as_said_or_twice() {
+        assert_eq!(room_of(None), 2.0);
+        assert_eq!(room_of(Some("1")), 1.0, "none: as it is drawn");
+        assert_eq!(room_of(Some(" 1.5 ")), 1.5);
+        assert_eq!(room_of(Some("4")), 4.0);
+        for none in ["", "0", "0.99", "4.5", "-2", "nan", "inf", "twice"] {
+            assert_eq!(room_of(Some(none)), ROOM, "{none:?}");
+        }
+    }
+
+    /// Captures are drawn as coded but where `NIDA_CAPTURES_CODED` says 0.
+    #[test]
+    fn captures_are_drawn_as_coded_unless_told_0() {
+        assert!(coded_of(None));
+        assert!(coded_of(Some("1")));
+        assert!(coded_of(Some("")));
+        assert!(coded_of(Some("00")));
+        assert!(!coded_of(Some("0")));
+        assert!(!coded_of(Some(" 0 ")));
+    }
+
+    /// A capture's texture has a view that reads it as it was coded — the
+    /// same pixels, in the format that does not make them light — for as
+    /// long as it is captured, of the texture it has now.
+    #[test]
+    fn a_capture_has_a_view_of_it_as_coded() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        if !gpu.reads_a_texture_two_ways() {
+            eprintln!("Skipping: this GPU reads a texture one way");
+            return;
+        }
+        let mut mgr = ScreenCaptureManager::new_disabled();
+        let target = mock_targets().remove(0); // 1920x1080
+        let fitted = CaptureConfig {
+            scale_to: Some((960, 540)),
+            ..Default::default()
+        };
+        let (id, _, _) = mgr.open_mock(&target, fitted, &gpu.device).expect("open");
+        assert!(mgr.coded_view(id + 1).is_none(), "no such capture");
+        let sized = |mgr: &ScreenCaptureManager| {
+            let light = mgr.texture_view(id).expect("its view");
+            let coded = mgr.coded_view(id).expect("its view as coded");
+            assert_ne!(coded, light, "another view");
+            assert_eq!(coded.texture(), light.texture(), "of one texture");
+            assert!(light.texture().format().is_srgb(), "light of itself");
+            (coded.texture().width(), coded.texture().height())
+        };
+        assert_eq!(sized(&mgr), (960, 540));
+
+        // Come at another size: a view of the texture it has now.
+        let bigger = Drawn {
+            fitted: 1.5,
+            ..Drawn::default()
+        };
+        mgr.size_as_drawn(id, bigger, std::time::Instant::now());
+        let needed = std::collections::HashSet::from([id]);
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while mgr.resolution(id) != Some((1440, 810)) && std::time::Instant::now() < until {
+            mgr.update_selective(&gpu, &needed, crate::host_clock::host_seconds());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(sized(&mgr), (1440, 810), "of the texture it has now");
+        mgr.release(id);
+        assert!(mgr.coded_view(id).is_none(), "released");
+    }
+
+    /// Where captures are drawn from their light, one opened has its view
+    /// alone: its texture is asked for read one way.
+    #[test]
+    fn a_capture_drawn_from_its_light_opens_with_no_view_as_coded() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        let mut mgr = ScreenCaptureManager::new_disabled();
+        mgr.draw_coded(false);
+        let target = mock_targets().remove(0);
+        let (id, _, _) = mgr
+            .open_mock(&target, CaptureConfig::default(), &gpu.device)
+            .expect("open");
+        assert!(mgr.texture_view(id).is_some(), "its view");
+        assert!(mgr.coded_view(id).is_none(), "drawn from its light");
+        mgr.release(id);
+    }
+
+    /// ...and one running has none from its next size on.
+    #[test]
+    fn a_capture_drawn_from_its_light_resized_has_no_view_as_coded() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        if !gpu.reads_a_texture_two_ways() {
+            eprintln!("Skipping: this GPU reads a texture one way");
+            return;
+        }
+        let mut mgr = ScreenCaptureManager::new_disabled();
+        let target = mock_targets().remove(0); // 1920x1080
+        let fitted = CaptureConfig {
+            scale_to: Some((960, 540)),
+            ..Default::default()
+        };
+        let (id, _, _) = mgr.open_mock(&target, fitted, &gpu.device).expect("open");
+        assert!(mgr.coded_view(id).is_some(), "as coded");
+
+        mgr.draw_coded(false);
+        let bigger = Drawn {
+            fitted: 1.5,
+            ..Drawn::default()
+        };
+        mgr.size_as_drawn(id, bigger, std::time::Instant::now());
+        let needed = std::collections::HashSet::from([id]);
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while mgr.resolution(id) != Some((1440, 810)) && std::time::Instant::now() < until {
+            mgr.update_selective(&gpu, &needed, crate::host_clock::host_seconds());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(mgr.resolution(id), Some((1440, 810)), "its next size");
+        assert_eq!(
+            mgr.texture_view(id).map(|view| view.texture().width()),
+            Some(1440),
+            "its view"
+        );
+        assert!(mgr.coded_view(id).is_none(), "drawn from its light");
+        mgr.release(id);
+    }
+
+    /// A GPU that reads a texture in its own format alone has captures
+    /// drawn from their light; one that reads it in another too, as coded
+    /// — where nothing said otherwise.
+    #[test]
+    fn a_gpu_reading_a_texture_one_way_has_captures_drawn_from_their_light() {
+        use wgpu::DownlevelFlags;
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        let target = mock_targets().remove(0);
+        // Whether a capture opened has its view, and its view as coded.
+        let views = |mut mgr: ScreenCaptureManager| {
+            let (id, _, _) = mgr
+                .open_mock(&target, CaptureConfig::default(), &gpu.device)
+                .expect("open");
+            let has = (mgr.texture_view(id).is_some(), mgr.coded_view(id).is_some());
+            mgr.release(id);
+            has
+        };
+        let on = |flags| ScreenCaptureManager::new_disabled().on_gpu(flags);
+        // (Asked of a GPU that does: one that does not makes no such
+        // texture, whatever it is said to do.)
+        if gpu.reads_a_texture_two_ways() {
+            assert_eq!(views(on(DownlevelFlags::all())), (true, true));
+            assert_eq!(views(on(DownlevelFlags::VIEW_FORMATS)), (true, true));
+        }
+        let one_way = DownlevelFlags::all().difference(DownlevelFlags::VIEW_FORMATS);
+        assert_eq!(views(on(one_way)), (true, false), "from its light");
+        assert_eq!(views(on(DownlevelFlags::empty())), (true, false));
+        // Told to draw them from their light, a GPU that could does not.
+        let mut told = ScreenCaptureManager::new_disabled();
+        told.draw_coded(false);
+        assert_eq!(views(told.on_gpu(DownlevelFlags::all())), (true, false));
+    }
+
+    /// A presentation's capture is left as its presentation has it, however
+    /// big its slide is drawn.
+    #[test]
+    fn a_presentations_capture_is_not_sized_as_drawn() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            return;
+        };
+        let mut mgr = ScreenCaptureManager::enabled_for_tests();
+        let target = mock_targets().remove(0);
+        let shows = CaptureConfig {
+            scale_to: Some((960, 540)),
+            ..Default::default()
+        };
+        let session = Box::new(MockBackend::new(
+            target.label.clone(),
+            target.width,
+            target.height,
+            shows.clone(),
+        ));
+        let (show, _, _) = mgr.adopt(&target, session, shows, &gpu.device).expect("adopt");
+        let (own, _, _) = mgr
+            .open_mock(&target, CaptureConfig::default(), &gpu.device)
+            .expect("open");
+        let bigger = Drawn {
+            fitted: 2.0,
+            across: 2.0,
+            down: 2.0,
+        };
+        let now = std::time::Instant::now();
+        mgr.size_as_drawn(show, bigger, now);
+        mgr.size_as_drawn(own, bigger, now);
+        assert_eq!(mgr.drawn(show), Some(Drawn::default()), "its presentation's");
+        assert_eq!(mgr.drawn(own), Some(bigger), "an input's own of that window");
+        mgr.release(own);
+        mgr.release(show);
     }
 
     #[test]

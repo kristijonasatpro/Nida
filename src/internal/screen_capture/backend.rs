@@ -50,6 +50,12 @@ pub struct CaptureTargetInfo {
     pub height: u32,
     /// This target belongs to Varda's own process.
     pub is_varda: bool,
+    /// A display's own identity where the platform gives one — on a Mac its
+    /// UUID, kept across restarts and whichever other screens are plugged in.
+    /// Its label ("Display 2") is only its place among them as they are now:
+    /// a third screen plugged in made a show's "Display 1" another screen
+    /// (an M5 Max, 2026-11-09).
+    pub uuid: Option<String>,
 }
 
 impl CaptureTargetInfo {
@@ -59,6 +65,7 @@ impl CaptureTargetInfo {
         match self.kind {
             CaptureTargetKind::Display => TargetIdentity::Display {
                 label: self.label.clone(),
+                uuid: self.uuid.clone(),
             },
             CaptureTargetKind::Window => TargetIdentity::Window {
                 app: self.app.clone().unwrap_or_default(),
@@ -71,8 +78,86 @@ impl CaptureTargetInfo {
 /// The persisted, handle-free identity of a capture target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetIdentity {
-    Display { label: String },
+    /// A display: by its own identity where one is known (see
+    /// [`CaptureTargetInfo::uuid`]), else by the name it was listed under.
+    Display { label: String, uuid: Option<String> },
     Window { app: String, title: String },
+}
+
+impl TargetIdentity {
+    /// What a deck keeps of this, picked now, once `found` is opened for it
+    /// — an input added, or its screen picked again. A display picked as
+    /// itself — or by its name alone, as the window lists it and an API
+    /// client may send no more — is kept as the one found: named as it is
+    /// listed now, and by its identity from here on. One stood in for by
+    /// another of its name, its own not plugged in, stays as it was, to be
+    /// found again; and a window, whose title may be another by then.
+    #[must_use]
+    pub fn bound_to(&self, found: &CaptureTargetInfo) -> Self {
+        match self {
+            Self::Display { uuid, .. }
+                if found.kind == CaptureTargetKind::Display
+                    && (uuid.is_none() || *uuid == found.uuid) =>
+            {
+                found.identity()
+            }
+            _ => self.clone(),
+        }
+    }
+
+    /// What a deck keeps of this, read from a show, once `found` is opened
+    /// for it. A display found as itself is named as it is listed now. One
+    /// the show has by its name alone — saved before displays had an
+    /// identity — stays so: which screen had that name when it was picked
+    /// is not known, and the one that has it now may be another. Kept as
+    /// that one, a show's two "Display 1" inputs, made of the 4K screen,
+    /// were a capture box's own screen for good once the show was opened
+    /// and closed with the box plugged in (a copy of a show, an M5 Max,
+    /// 2026-11-10). It goes by its name until its screen is picked again
+    /// (see [`Self::bound_to`]).
+    #[must_use]
+    pub fn restored_to(&self, found: &CaptureTargetInfo) -> Self {
+        match self {
+            Self::Display { uuid: Some(_), .. } => self.bound_to(found),
+            _ => self.clone(),
+        }
+    }
+
+    /// Whether this is a display kept by its name alone: its place among
+    /// the screens plugged in, not the screen itself.
+    #[must_use]
+    pub fn is_display_by_name(&self) -> bool {
+        matches!(self, Self::Display { uuid: None, .. })
+    }
+}
+
+/// The display among `targets` that a show's `label` and `uuid` mean: the one
+/// of that identity — of two with one (identical screens), the one so named —
+/// and only when none of it is plugged in, or none was kept, the one of that
+/// name: a show made on another computer still finds a screen.
+pub fn find_display<'a>(
+    targets: &'a [CaptureTargetInfo],
+    label: &str,
+    uuid: Option<&str>,
+) -> Option<&'a CaptureTargetInfo> {
+    let displays = || {
+        targets
+            .iter()
+            .filter(|t| t.kind == CaptureTargetKind::Display)
+    };
+    let named = || displays().find(|t| t.label == label);
+    let Some(uuid) = uuid else {
+        return named();
+    };
+    let same = || displays().filter(|t| t.uuid.as_deref() == Some(uuid));
+    same().find(|t| t.label == label).or_else(|| same().next()).or_else(|| {
+        let stand_in = named()?;
+        log::warn!(
+            "Screen capture: the screen kept as '{label}' is not plugged in — \
+             the one now listed as '{label}' is captured in its place"
+        );
+        Some(stand_in)
+    })
 }
 
 /// A normalized crop rectangle within the captured target (0.0–1.0).
@@ -133,6 +218,138 @@ pub const MAX_CAPTURE_RATE: f32 = 120.0;
 /// spec/screen-capture.md § Self-Capture and Feedback Safety.
 pub const DEFAULT_CAPTURE_RATE: f32 = 30.0;
 
+/// One of a capture's settings an input's parameters set (see
+/// spec/screen-capture.md § Parameters). Its cap is not among them: it is
+/// the show's (see `ScreenCaptureManager::cap_to`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureSetting {
+    Rate,
+    CropX,
+    CropY,
+    CropW,
+    CropH,
+    Cursor,
+    ExcludeVarda,
+}
+
+impl CaptureSetting {
+    /// The setting the capture parameter `name` sets.
+    pub fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "rate" => Self::Rate,
+            "crop_x" => Self::CropX,
+            "crop_y" => Self::CropY,
+            "crop_w" => Self::CropW,
+            "crop_h" => Self::CropH,
+            "cursor" => Self::Cursor,
+            "exclude_varda" => Self::ExcludeVarda,
+            _ => return None,
+        })
+    }
+}
+
+/// A setting an input of a capture was given, for the capture to be given.
+/// `at` orders these across the inputs of one screen or window, which share
+/// its capture: that is left as the last one given says, whichever input it
+/// was given to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CaptureGiven {
+    pub at: u64,
+    pub setting: CaptureSetting,
+    /// Normalized (0.0–1.0), as its parameter was given it.
+    pub value: f32,
+}
+
+/// How big a capture's picture is drawn in the show's frame
+/// ([`CaptureConfig::scale_to`]), which is the size it comes at: as many
+/// pixels as it is drawn with, where its screen or window has them (see
+/// `resample::drawn_within`). In times the size that fits within the frame,
+/// and its width and height in times the frame's — not one number: these
+/// sizes differ by the picture's shape, which only its capture knows to the
+/// pixel. It comes at the biggest of the three.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Drawn {
+    /// Times the size that fits within the frame, the picture whole: 1 as an
+    /// input fitted shows it, 2 zoomed into twice over.
+    pub fitted: f32,
+    /// Its width in times the frame's: 1 as an input that fills the frame
+    /// or is stretched to it shows it, 2 such a one zoomed into twice over.
+    /// 0: none shows it so.
+    pub across: f32,
+    /// Its height in times the frame's, likewise. An input that fills the
+    /// frame has the two alike — the picture comes at the size that fills
+    /// it, the bigger — one stretched and scaled apart has not.
+    pub down: f32,
+}
+
+impl Default for Drawn {
+    /// Fitted within the frame: how every capture came before its size
+    /// followed how it is drawn.
+    fn default() -> Self {
+        Self {
+            fitted: 1.0,
+            across: 0.0,
+            down: 0.0,
+        }
+    }
+}
+
+impl Drawn {
+    /// The most times any of its sizes a capture is asked for: past the 25
+    /// a Transform scales by (5, and 5 again an axis). What it comes at is
+    /// never more than its screen or window has.
+    pub const MOST: f32 = 32.0;
+
+    /// Each within 0 and [`Self::MOST`]; drawn at no size at all, as
+    /// fitted.
+    #[must_use]
+    pub fn sanitized(self) -> Self {
+        let part = |times: f32| {
+            if times.is_finite() {
+                times.clamp(0.0, Self::MOST)
+            } else {
+                0.0
+            }
+        };
+        let (fitted, across, down) = (part(self.fitted), part(self.across), part(self.down));
+        if fitted <= 0.0 && across <= 0.0 && down <= 0.0 {
+            return Self::default();
+        }
+        Self {
+            fitted,
+            across,
+            down,
+        }
+    }
+
+    /// `times` as big, each: what a capture is asked for to have room —
+    /// more pixels than it is drawn with, where its screen or window has
+    /// them, for the show to make smaller itself (see
+    /// `ScreenCaptureManager::size_as_drawn`). Never smaller than drawn;
+    /// within bounds, as [`Self::sanitized`].
+    #[must_use]
+    pub fn with_room(self, times: f32) -> Self {
+        let times = if times.is_finite() { times.max(1.0) } else { 1.0 };
+        let drawn = self.sanitized();
+        Self {
+            fitted: drawn.fitted * times,
+            across: drawn.across * times,
+            down: drawn.down * times,
+        }
+        .sanitized()
+    }
+
+    /// The bigger of each: what a capture two inputs show is sized for.
+    #[must_use]
+    pub fn or(self, other: Self) -> Self {
+        Self {
+            fitted: self.fitted.max(other.fitted),
+            across: self.across.max(other.across),
+            down: self.down.max(other.down),
+        }
+    }
+}
+
 /// Per-capture tunables. Shared with the capture thread and re-read each tick,
 /// so router-driven changes take effect without restarting the session.
 #[derive(Debug, Clone, PartialEq)]
@@ -145,6 +362,11 @@ pub struct CaptureConfig {
     /// Ask the OS to scale at capture time. Set to the deck render resolution so
     /// a 4K display does not move 33 MB per frame.
     pub scale_to: Option<(u32, u32)>,
+    /// How big its picture is drawn in that frame: the capture's own to
+    /// follow (`ScreenCaptureManager::size_as_drawn`), which its backend is
+    /// told with the rest. Not a setting an input has or gives: fitted, in
+    /// every settings but those a capture's thread runs by.
+    pub drawn: Drawn,
 }
 
 impl Default for CaptureConfig {
@@ -155,6 +377,7 @@ impl Default for CaptureConfig {
             show_cursor: false,
             exclude_varda: true,
             scale_to: None,
+            drawn: Drawn::default(),
         }
     }
 }
@@ -169,7 +392,56 @@ impl CaptureConfig {
             DEFAULT_CAPTURE_RATE
         };
         self.crop = self.crop.clamped();
+        self.drawn = self.drawn.sanitized();
         self
+    }
+
+    /// These settings for an input that captured `was`, pointed at `now`:
+    /// its rate, crop and cursor stay. Nida's own windows are left out of a
+    /// display and not of a window, as when one is added, once it becomes
+    /// the other — a window's input pointed at a screen would show Nida's
+    /// own window on that screen, itself within itself.
+    #[must_use]
+    pub fn repointed(mut self, was: &TargetIdentity, now: &CaptureTargetInfo) -> Self {
+        let display = now.kind == CaptureTargetKind::Display;
+        if matches!(was, TargetIdentity::Display { .. }) != display {
+            self.exclude_varda = display;
+        }
+        self
+    }
+
+    /// Give these one setting from a normalized value (0.0–1.0), as an
+    /// input's parameter does; the whole is then within its ranges — a
+    /// crop moved right is narrowed to what is left of the frame. A capture
+    /// given what its inputs were, in the order they were, runs as if each
+    /// had been set on it there and then (see
+    /// `VardaApp::send_capture_settings`).
+    pub fn give(&mut self, setting: CaptureSetting, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        match setting {
+            CaptureSetting::Rate => {
+                self.rate = MIN_CAPTURE_RATE + v * (MAX_CAPTURE_RATE - MIN_CAPTURE_RATE);
+            }
+            CaptureSetting::CropX => self.crop.x = v,
+            CaptureSetting::CropY => self.crop.y = v,
+            CaptureSetting::CropW => self.crop.w = v,
+            CaptureSetting::CropH => self.crop.h = v,
+            // Bucketed so a MIDI fader can drive it like every other toggle.
+            CaptureSetting::Cursor => self.show_cursor = v > 0.5,
+            CaptureSetting::ExcludeVarda => self.exclude_varda = v > 0.5,
+        }
+        *self = self.clone().sanitized();
+    }
+
+    /// These settings as their capture `runs`: its rate, crop and cursor,
+    /// which every input of one screen or window shares. The cap stays: it
+    /// is the show's, kept by each input.
+    #[must_use]
+    pub fn as_runs(&self, runs: &Self) -> Self {
+        Self {
+            scale_to: self.scale_to,
+            ..runs.clone()
+        }
     }
 
     /// Frame interval implied by `rate`.
@@ -191,6 +463,15 @@ impl CapturePixelFormat {
         match self {
             Self::Rgba8UnormSrgb => wgpu::TextureFormat::Rgba8UnormSrgb,
             Self::Bgra8UnormSrgb => wgpu::TextureFormat::Bgra8UnormSrgb,
+        }
+    }
+
+    /// The format that reads the same texture as it was coded: its sRGB
+    /// code values as they are, not made light.
+    pub fn coded_format(self) -> wgpu::TextureFormat {
+        match self {
+            Self::Rgba8UnormSrgb => wgpu::TextureFormat::Rgba8Unorm,
+            Self::Bgra8UnormSrgb => wgpu::TextureFormat::Bgra8Unorm,
         }
     }
 }
@@ -308,6 +589,10 @@ pub trait ScreenCaptureBackend: Send {
     fn is_self_paced(&self) -> bool {
         false
     }
+    /// Keep up with the target's own size: a window resized, a screen given
+    /// another resolution. Called every tick of the capture thread, which
+    /// the backend paces itself; by default, nothing to follow.
+    fn follow_target(&mut self) {}
     /// Apply a live config change (rate, crop, cursor).
     ///
     /// # Errors
@@ -328,6 +613,9 @@ pub struct MockBackend {
     config: CaptureConfig,
     frame: u64,
     marker: [u8; 3],
+    /// A size its target takes, found when it next follows it (see
+    /// `ScreenCaptureBackend::follow_target`): a window resized.
+    resized: Option<(u32, u32)>,
 }
 
 impl MockBackend {
@@ -351,28 +639,23 @@ impl MockBackend {
             config: config.sanitized(),
             frame: 0,
             marker,
+            resized: None,
         }
     }
 
+    /// Its target resized to `width × height`, as a window is: taken when
+    /// the capture next follows its target.
+    pub fn resize_target(&mut self, width: u32, height: u32) {
+        self.resized = Some((width, height));
+    }
+
     /// Output size after `scale_to`, which is what a real backend would deliver.
-    /// As the real captures size it: the target bounded by `scale_to` (a
-    /// bound, not an exact size: see `platform::macos::output_size`), then
-    /// the crop's part of that.
+    /// As the real captures size it: the part of the target its crop keeps,
+    /// as big as it is drawn in `scale_to` (a bound, not an exact size: see
+    /// `platform::macos::stream_size`), never enlarged.
     fn output_size(&self) -> (u32, u32) {
-        let (w, h) = self
-            .config
-            .scale_to
-            .map_or((self.width, self.height), |(bw, bh)| {
-                super::resample::fit_within(self.width, self.height, bw, bh)
-            });
-        let crop = self.config.crop.clamped();
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let part = |v: u32, share: f32| ((v as f32 * share).round() as u32).max(1);
-        (part(w, crop.w), part(h, crop.h))
+        let fitted = super::resample::Geometry::resolve(self.width, self.height, &self.config);
+        (fitted.out_w, fitted.out_h)
     }
 
     pub fn marker(&self) -> [u8; 3] {
@@ -426,6 +709,13 @@ impl ScreenCaptureBackend for MockBackend {
         })
     }
 
+    fn follow_target(&mut self) {
+        if let Some((width, height)) = self.resized.take() {
+            self.width = width;
+            self.height = height;
+        }
+    }
+
     fn set_config(&mut self, config: &CaptureConfig) -> Result<(), CaptureError> {
         self.config = config.clone().sanitized();
         Ok(())
@@ -444,6 +734,7 @@ pub fn mock_targets() -> Vec<CaptureTargetInfo> {
             width: 1920,
             height: 1080,
             is_varda: false,
+            uuid: None,
         },
         CaptureTargetInfo {
             kind: CaptureTargetKind::Display,
@@ -454,6 +745,7 @@ pub fn mock_targets() -> Vec<CaptureTargetInfo> {
             width: 1280,
             height: 720,
             is_varda: false,
+            uuid: None,
         },
         CaptureTargetInfo {
             kind: CaptureTargetKind::Window,
@@ -464,6 +756,7 @@ pub fn mock_targets() -> Vec<CaptureTargetInfo> {
             width: 800,
             height: 600,
             is_varda: false,
+            uuid: None,
         },
         CaptureTargetInfo {
             kind: CaptureTargetKind::Window,
@@ -474,6 +767,7 @@ pub fn mock_targets() -> Vec<CaptureTargetInfo> {
             width: 1920,
             height: 1080,
             is_varda: true,
+            uuid: None,
         },
     ]
 }
@@ -548,6 +842,166 @@ mod tests {
         );
     }
 
+    /// An input pointed at another screen or window keeps its settings;
+    /// Nida's own windows are left out of a screen and not of a window once
+    /// it becomes the other, and as it was set while it stays what it was.
+    #[test]
+    fn an_input_pointed_elsewhere_keeps_its_settings_but_for_nidas_own_windows() {
+        let targets = mock_targets();
+        let (screen, other_screen) = (&targets[0], &targets[1]);
+        let (window, other_window) = (&targets[2], &targets[3]);
+        let shown = CaptureConfig {
+            rate: 24.0,
+            crop: CropRect { x: 0.25, y: 0.0, w: 0.5, h: 1.0 },
+            show_cursor: true,
+            exclude_varda: false,
+            scale_to: Some((1920, 1080)),
+            drawn: Drawn::default(),
+        };
+        let left_out = CaptureConfig { exclude_varda: true, ..shown.clone() };
+        // A screen to another screen: Nida's windows shown, as it was set.
+        assert_eq!(shown.clone().repointed(&screen.identity(), other_screen), shown);
+        // A window to another window: left out, as it was set.
+        assert_eq!(left_out.clone().repointed(&window.identity(), other_window), left_out);
+        // A window to a screen: Nida's own windows left out, the rest kept.
+        assert_eq!(shown.clone().repointed(&window.identity(), screen), left_out);
+        // A screen to a window: not left out, as a window added is not.
+        assert_eq!(left_out.clone().repointed(&screen.identity(), window), shown);
+    }
+
+    /// A setting given is set as its parameter sets it — a rate across its
+    /// range, a side of the crop, a switch past halfway — each by its
+    /// parameter's name, the cap by none; and the whole is kept within its
+    /// ranges: a crop moved right is narrowed to what is left of the frame.
+    #[test]
+    fn a_setting_given_is_set_as_its_parameter_sets_it() {
+        let each = [
+            ("rate", CaptureSetting::Rate),
+            ("crop_x", CaptureSetting::CropX),
+            ("crop_y", CaptureSetting::CropY),
+            ("crop_w", CaptureSetting::CropW),
+            ("crop_h", CaptureSetting::CropH),
+            ("cursor", CaptureSetting::Cursor),
+            ("exclude_varda", CaptureSetting::ExcludeVarda),
+        ];
+        for (name, setting) in each {
+            assert_eq!(CaptureSetting::named(name), Some(setting), "{name}");
+        }
+        assert_eq!(CaptureSetting::named("scale_to"), None, "not an input's");
+
+        let base = CaptureConfig {
+            scale_to: Some((1920, 1080)),
+            ..CaptureConfig::default()
+        };
+        let given = |from: &CaptureConfig, setting, value| {
+            let mut config = from.clone();
+            config.give(setting, value);
+            config
+        };
+        let crop = |x, y, w, h| CaptureConfig {
+            crop: CropRect { x, y, w, h },
+            ..base.clone()
+        };
+        let rate = given(&base, CaptureSetting::Rate, 0.5).rate;
+        assert!((rate - 60.5).abs() < 1e-4, "halfway from 1 to 120: {rate}");
+        let rate = given(&base, CaptureSetting::Rate, 7.0).rate;
+        assert!((rate - MAX_CAPTURE_RATE).abs() < 1e-4, "all the way: {rate}");
+        assert_eq!(
+            given(&base, CaptureSetting::CropX, 0.25),
+            crop(0.25, 0.0, 0.75, 1.0),
+            "narrowed to what is left"
+        );
+        assert_eq!(
+            given(&base, CaptureSetting::CropY, 0.25),
+            crop(0.0, 0.25, 1.0, 0.75)
+        );
+        assert_eq!(
+            given(&base, CaptureSetting::CropW, 0.5),
+            crop(0.0, 0.0, 0.5, 1.0)
+        );
+        assert_eq!(
+            given(&base, CaptureSetting::CropH, 0.5),
+            crop(0.0, 0.0, 1.0, 0.5)
+        );
+        let shown = given(&base, CaptureSetting::Cursor, 0.6);
+        assert_eq!(
+            shown,
+            CaptureConfig {
+                show_cursor: true,
+                ..base.clone()
+            }
+        );
+        assert_eq!(given(&shown, CaptureSetting::Cursor, 0.4), base, "hidden again");
+        let seen = given(&base, CaptureSetting::ExcludeVarda, 0.4);
+        assert_eq!(
+            seen,
+            CaptureConfig {
+                exclude_varda: false,
+                ..base.clone()
+            }
+        );
+        assert_eq!(given(&seen, CaptureSetting::ExcludeVarda, 0.6), base);
+    }
+
+    /// What two inputs of one capture were given, given the capture in the
+    /// order they were: a width, then a left edge, leave both as given —
+    /// the edge narrows the width only past what is left of the frame.
+    #[test]
+    fn settings_given_in_turn_leave_each_as_given() {
+        let mut runs = CaptureConfig::default();
+        runs.give(CaptureSetting::CropW, 0.5);
+        runs.give(CaptureSetting::CropX, 0.25);
+        assert_eq!(
+            runs.crop,
+            CropRect {
+                x: 0.25,
+                y: 0.0,
+                w: 0.5,
+                h: 1.0
+            }
+        );
+        runs.give(CaptureSetting::CropX, 0.75);
+        assert_eq!(
+            runs.crop,
+            CropRect {
+                x: 0.75,
+                y: 0.0,
+                w: 0.25,
+                h: 1.0
+            },
+            "narrowed to what is left"
+        );
+    }
+
+    /// An input takes its capture's settings, but for its cap: the show's.
+    #[test]
+    fn an_input_takes_its_captures_settings_but_for_its_cap() {
+        let runs = CaptureConfig {
+            rate: 24.0,
+            crop: CropRect {
+                x: 0.25,
+                y: 0.0,
+                w: 0.5,
+                h: 1.0,
+            },
+            show_cursor: true,
+            exclude_varda: false,
+            scale_to: Some((1920, 1080)),
+            drawn: Drawn::default(),
+        };
+        let its = CaptureConfig {
+            scale_to: Some((640, 360)),
+            ..CaptureConfig::default()
+        };
+        assert_eq!(
+            its.as_runs(&runs),
+            CaptureConfig {
+                scale_to: Some((640, 360)),
+                ..runs
+            }
+        );
+    }
+
     #[test]
     fn default_config_excludes_varda_and_hides_cursor() {
         let c = CaptureConfig::default();
@@ -578,6 +1032,165 @@ mod tests {
         let f = b.next_frame().expect("frame");
         assert_eq!((f.width, f.height), (320, 180));
         assert_eq!(f.data.len(), 320 * 180 * 4);
+    }
+
+    /// As the real captures: the crop taken first, then fitted within the
+    /// bound — a quarter of the target at its own pixels where the bound
+    /// takes them.
+    #[test]
+    fn mock_backend_crops_then_fits_within_scale_to() {
+        let quarter = |scale_to| CaptureConfig {
+            scale_to,
+            crop: CropRect {
+                x: 0.0,
+                y: 0.0,
+                w: 0.5,
+                h: 0.5,
+            },
+            ..Default::default()
+        };
+        let sized = |scale_to| {
+            MockBackend::new("Mock", 1920, 1080, quarter(scale_to)).resolution()
+        };
+        assert_eq!(sized(Some((960, 540))), (960, 540));
+        assert_eq!(sized(Some((1920, 1080))), (960, 540), "never enlarged");
+        assert_eq!(sized(Some((480, 270))), (480, 270));
+    }
+
+    /// Drawn bigger than fitted — filling its frame, zoomed into — the mock
+    /// comes so, as the real captures do: never bigger than its target.
+    #[test]
+    fn mock_backend_comes_as_big_as_it_is_drawn() {
+        let sized = |drawn| {
+            let config = CaptureConfig {
+                scale_to: Some((960, 540)),
+                drawn,
+                ..Default::default()
+            };
+            MockBackend::new("Mock", 1920, 1080, config).resolution()
+        };
+        let zoomed = |fitted| Drawn {
+            fitted,
+            ..Drawn::default()
+        };
+        assert_eq!(sized(Drawn::default()), (960, 540));
+        assert_eq!(sized(zoomed(1.5)), (1440, 810));
+        assert_eq!(sized(zoomed(2.0)), (1920, 1080));
+        assert_eq!(sized(zoomed(4.0)), (1920, 1080), "never enlarged");
+        let mut live = MockBackend::new("Mock", 1920, 1080, CaptureConfig::default());
+        live.set_config(&CaptureConfig {
+            scale_to: Some((960, 540)),
+            drawn: zoomed(1.5),
+            ..Default::default()
+        })
+        .expect("set");
+        assert_eq!(live.resolution(), (1440, 810), "told while it runs");
+    }
+
+    /// With room a capture is asked for so many times what it is drawn at,
+    /// each of its sizes, within the same bounds — never less than drawn,
+    /// and drawn at no size, as one fitted with room.
+    #[test]
+    fn drawn_with_room_is_so_many_times_as_big() {
+        let apart = |fitted, across, down| Drawn {
+            fitted,
+            across,
+            down,
+        };
+        assert_eq!(Drawn::default().with_room(2.0), apart(2.0, 0.0, 0.0));
+        assert_eq!(apart(1.5, 1.0, 0.5).with_room(2.0), apart(3.0, 2.0, 1.0));
+        assert_eq!(apart(0.0, 0.75, 0.0).with_room(4.0), apart(0.0, 3.0, 0.0));
+        assert_eq!(
+            apart(20.0, 1.0, 0.0).with_room(2.0),
+            apart(Drawn::MOST, 2.0, 0.0),
+            "within bounds"
+        );
+        assert_eq!(
+            apart(0.0, 0.0, 0.0).with_room(2.0),
+            apart(2.0, 0.0, 0.0),
+            "at no size: as fitted"
+        );
+        assert_eq!(
+            apart(f32::NAN, 0.0, -1.0).with_room(1.5),
+            apart(1.5, 0.0, 0.0)
+        );
+        for none in [1.0, 0.5, 0.0, -2.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                apart(1.5, 1.0, 0.0).with_room(none),
+                apart(1.5, 1.0, 0.0),
+                "room {none}: as drawn"
+            );
+        }
+    }
+
+    /// Each format a capture's pixels come in has one that reads the same
+    /// texture as it was coded: the same bytes in the same order, not made
+    /// light.
+    #[test]
+    fn a_captures_format_has_one_that_reads_it_as_coded() {
+        use wgpu::TextureFormat::{Bgra8Unorm, Bgra8UnormSrgb, Rgba8Unorm, Rgba8UnormSrgb};
+        for (format, light, coded) in [
+            (CapturePixelFormat::Rgba8UnormSrgb, Rgba8UnormSrgb, Rgba8Unorm),
+            (CapturePixelFormat::Bgra8UnormSrgb, Bgra8UnormSrgb, Bgra8Unorm),
+        ] {
+            assert_eq!(format.wgpu_format(), light);
+            assert_eq!(format.coded_format(), coded);
+            assert_eq!(coded.add_srgb_suffix(), light, "the same texture's");
+        }
+    }
+
+    /// How big a capture is drawn is kept within bounds — a number no size
+    /// comes of taken as none — and two inputs' are the bigger of each.
+    #[test]
+    fn drawn_is_kept_within_bounds_and_the_bigger_of_two() {
+        // Fitted so many times, or filling the frame so many times over.
+        let drawn = |fitted, fills| Drawn {
+            fitted,
+            across: fills,
+            down: fills,
+        };
+        let apart = |fitted, across, down| Drawn {
+            fitted,
+            across,
+            down,
+        };
+        assert_eq!(Drawn::default(), drawn(1.0, 0.0));
+        assert_eq!(drawn(2.0, 0.5).sanitized(), drawn(2.0, 0.5));
+        assert_eq!(drawn(0.0, 1.5).sanitized(), drawn(0.0, 1.5), "filling alone");
+        assert_eq!(drawn(100.0, -3.0).sanitized(), drawn(Drawn::MOST, 0.0));
+        assert_eq!(drawn(f32::NAN, 2.0).sanitized(), drawn(0.0, 2.0));
+        assert_eq!(drawn(f32::INFINITY, 2.0).sanitized(), drawn(0.0, 2.0));
+        // As far as a Transform scales: 5, and 5 again an axis.
+        assert_eq!(drawn(25.0, 25.0).sanitized(), drawn(25.0, 25.0));
+        // Each of its sizes by itself.
+        assert_eq!(
+            apart(1.0, f32::NAN, 99.0).sanitized(),
+            apart(1.0, 0.0, Drawn::MOST)
+        );
+        assert_eq!(
+            apart(1.0, 99.0, -1.0).sanitized(),
+            apart(1.0, Drawn::MOST, 0.0)
+        );
+        assert_eq!(apart(0.0, 0.0, 0.5).sanitized(), apart(0.0, 0.0, 0.5), "its height alone");
+        assert_eq!(apart(0.0, 0.5, 0.0).sanitized(), apart(0.0, 0.5, 0.0), "its width alone");
+        for none in [drawn(0.0, 0.0), drawn(-1.0, f32::NAN), drawn(f32::NAN, f32::NAN)] {
+            assert_eq!(none.sanitized(), Drawn::default(), "{none:?}");
+        }
+        assert_eq!(drawn(2.0, 0.0).or(drawn(1.0, 1.5)), drawn(2.0, 1.5));
+        assert_eq!(drawn(1.0, 3.0).or(drawn(1.0, 1.0)), drawn(1.0, 3.0));
+        assert_eq!(
+            apart(1.0, 2.0, 0.5).or(apart(1.0, 0.5, 3.0)),
+            apart(1.0, 2.0, 3.0)
+        );
+        assert_eq!(
+            apart(1.0, 0.5, 3.0).or(apart(1.0, 2.0, 0.5)),
+            apart(1.0, 2.0, 3.0)
+        );
+        let wild = CaptureConfig {
+            drawn: drawn(f32::NAN, 99.0),
+            ..Default::default()
+        };
+        assert_eq!(wild.sanitized().drawn, drawn(0.0, Drawn::MOST));
     }
 
     #[test]
@@ -656,6 +1269,7 @@ mod tests {
             width: 1,
             height: 1,
             is_varda: false,
+            uuid: None,
         };
         let b = CaptureTargetInfo {
             platform_id: 999_999,

@@ -21,6 +21,10 @@ impl VardaApp {
         paths: &[String],
         settings: Option<SlidesSettings>,
     ) -> Result<String> {
+        // A talk taken out and put into a new input is asked anew for its
+        // slide pictures: what failed is forgotten for the decks no talk
+        // is of, before these are added.
+        self.forget_slide_pictures_of_talks_gone();
         let channel_idx = self.resolve_channel(channel_uuid)?;
         let talks = talks_of(paths)?;
         let count = talks.len();
@@ -49,6 +53,10 @@ impl VardaApp {
         deck_uuid: &str,
         edit: impl FnOnce(&mut crate::deck::slides::Slides) -> T,
     ) -> Result<T> {
+        // A talk taken out and put back is asked anew for its slide
+        // pictures: what failed is forgotten for the decks no talk is of,
+        // before the list is changed.
+        self.forget_slide_pictures_of_talks_gone();
         let (ch, dk) = self.resolve_deck(deck_uuid)?;
         let slides = self.mixer.channels_mut()[ch].decks[dk]
             .deck
@@ -232,6 +240,17 @@ impl VardaApp {
         let talk = started.map_err(anyhow::Error::msg)?;
         log::info!("Slides input {deck}: starting talk {talk}");
         self.presentations.last = Some(deck);
+        Ok(())
+    }
+
+    /// End the talk on of a Slides input (see `EngineCommand::StopTalk`):
+    /// what played it — PowerPoint's show, a page, a capture — is let go as
+    /// the frame is drawn, no longer wanted.
+    pub(crate) fn stop_talk(&mut self, deck_uuid: Option<&str>) -> Result<()> {
+        let deck = self.slides_target(deck_uuid)?;
+        if self.edit_slides(&deck, crate::deck::slides::Slides::stop)? {
+            log::info!("Slides input {deck}: its talk ended by hand");
+        }
         Ok(())
     }
 
@@ -430,6 +449,7 @@ impl VardaApp {
                 .iter()
                 .filter(|t| self.presentations.making(std::path::Path::new(&t.path)))
                 .count(),
+            pictures_given: crate::presentation::pictures::given_known() == Some(true),
         })
     }
 

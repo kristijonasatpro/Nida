@@ -5,6 +5,17 @@ mod program;
 mod render;
 mod transition;
 
+#[cfg(test)]
+mod blank_tests;
+#[cfg(test)]
+mod kept_tests;
+#[cfg(test)]
+mod main_pass_tests;
+#[cfg(test)]
+mod main_through_tests;
+#[cfg(test)]
+mod still_tests;
+
 pub use program::{
     MainFade, MainProgram, MainSnapshot, MainSource, MainTransition, MixMode, DEFAULT_FADE_SECS,
 };
@@ -88,6 +99,16 @@ impl GpuTimingFrame {
         Some((begin, end))
     }
 
+    /// The pair handed out last is given back: its deck drew nothing, so
+    /// neither time stamp was written. Left handed out, the pair would be
+    /// read back holding whatever an earlier frame wrote there — another
+    /// draw's time, taken for this deck's.
+    pub fn release_last(&mut self) {
+        if self.allocations.pop().is_some() {
+            self.next_index -= 2;
+        }
+    }
+
     /// Number of queries actually written this frame.
     pub fn query_count(&self) -> u32 {
         self.next_index
@@ -149,6 +170,17 @@ pub const TILE_FPS: u32 = 10;
 pub fn tile_every(target_fps: u32) -> u32 {
     let fps = if target_fps == 0 { 60 } else { target_fps };
     ((fps + TILE_FPS / 2) / TILE_FPS).max(1)
+}
+
+/// Whether a new mixer draws a slow deck less often when frames run late
+/// (see `Mixer::slow_layers_less_often`). A show does. A test build does
+/// not: a test draws its frames back to back with no frame's time to keep,
+/// and how long they take there says how busy the machine is with the
+/// other tests, not what the show costs — a deck's first draw taking
+/// 10 ms on a loaded machine left it undrawn the next frame, and a test
+/// reading its picture failed. A test of the rule turns it on.
+const fn slow_layers_less_often_by_default() -> bool {
+    !cfg!(any(test, feature = "test-fixtures"))
 }
 
 // The flags are unrelated render switches (visible parts, tiles, tap
@@ -317,6 +349,51 @@ pub struct Mixer {
     /// Draw a channel's blend-unit layers in one pass (see
     /// `Channel::merge_layer_passes`); off for comparing.
     pub merge_layer_passes: bool,
+    /// Draw a deck on Auto less often while the decks together run over a
+    /// frame's time (see `channel::auto_draws`), and then no covered deck
+    /// again for its thumbnail — one not drawn yet is drawn all the same
+    /// (see `channel::thumbnail_pick`). On in a show;
+    /// off in a test build (see [`slow_layers_less_often_by_default`]), and
+    /// off for comparing — a deck's own Rate, and leaving out what is not
+    /// seen, are as ever.
+    pub slow_layers_less_often: bool,
+    /// Leave a channel nothing of which shows — a lower third that is off —
+    /// undrawn, and off Main's layers, once it is drawn clear (see
+    /// `Channel::blank`); off draws it every frame, for comparing
+    /// (`SetCompositor`).
+    pub skip_blank_channels: bool,
+    /// Keep a lower third or a text standing still — a name on air, a text
+    /// shown, nothing of it moving — as it is drawn (see
+    /// `Deck::still_frame`); off draws it every frame, for comparing
+    /// (`SetCompositor`).
+    pub keep_still_text: bool,
+    /// Keep a clip's frame while the clip gives no new one — paused, or
+    /// between two of its frames in a show running faster (see
+    /// `Deck::still_frame`); off draws it every frame, for comparing
+    /// (`SetCompositor`).
+    pub keep_still_clips: bool,
+    /// Keep an input's picture while nothing it is made of changes (see
+    /// `Channel::keep_still_inputs`); off puts it together every frame,
+    /// for comparing (`SetCompositor`).
+    pub keep_still_inputs: bool,
+    /// Draw Main's bottom layer and each over it the blend unit composites
+    /// (Normal, Add, Screen, a dissolve's sum) in one render pass, which
+    /// loads and stores Main once — not once a layer (as
+    /// `Channel::merge_layer_passes` does for a channel's decks); off draws
+    /// each in a pass of its own, for comparing (`SetCompositor`).
+    pub merge_main_passes: bool,
+    /// Render passes the last frame's blend-unit layers of Main took (tests).
+    pub(crate) main_passes: u32,
+    /// Main that is one input, whole — at full level, with no master effect,
+    /// tone map, LUT or tap of Main after it — is that input's picture, so
+    /// hand that out as Main's (`composite_view`) and draw nothing: the pass
+    /// that copied it, over the whole frame, saved every frame the show is
+    /// one input with nothing over it. Off draws the pass, for comparing
+    /// (`SetCompositor`).
+    pub pass_main_through: bool,
+    /// The input's picture handed out as Main's since the last frame, when
+    /// that one was passed through (see `pass_main_through`).
+    main_through: Option<(wgpu::Texture, wgpu::TextureView)>,
     /// Decks whose thumbnails the control window drew last frame, by UUID
     /// (see `Channel::previewed`).
     pub previewed_decks: Vec<String>,
@@ -469,6 +546,15 @@ impl Mixer {
             draw_visible_parts: true,
             direct_layers: true,
             merge_layer_passes: true,
+            slow_layers_less_often: slow_layers_less_often_by_default(),
+            skip_blank_channels: true,
+            keep_still_text: true,
+            keep_still_clips: true,
+            keep_still_inputs: true,
+            merge_main_passes: true,
+            main_passes: 0,
+            pass_main_through: true,
+            main_through: None,
             previewed_decks: Vec::new(),
             render_order: Vec::new(),
             tap_shows: Vec::new(),
@@ -536,6 +622,8 @@ impl Mixer {
             .effect_ping_texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.main_transitions.resized();
+        // Main's own, at the new size, until the next frame is drawn.
+        self.main_through = None;
 
         // Tap targets are dropped rather than resized; `sync_tap_targets`
         // reallocates them at the new size on the next frame.
@@ -642,6 +730,10 @@ impl Mixer {
             .iter()
             .map(|ch| ch.tap_view().cloned())
             .collect();
+        // And which picture each holds, as it will stand when the channel
+        // showing it is put together: after its own render this frame.
+        let pictures: Vec<std::sync::Arc<std::sync::atomic::AtomicU64>> =
+            self.channels.iter().map(Channel::picture).collect();
         let labels: Vec<(String, String)> = self
             .channels
             .iter()
@@ -653,6 +745,9 @@ impl Mixer {
                 let Some(tap) = slot.deck.tap.as_ref() else {
                     continue;
                 };
+                // Which picture it shows is told only of a channel drawn
+                // before this one: Main's, or one a frame late, is not.
+                let mut picture = None;
                 let (view, label) = match &tap.source {
                     crate::deck::TapSource::MasterProgram => {
                         (master_view.clone(), "Master Program".to_string())
@@ -660,6 +755,7 @@ impl Mixer {
                     crate::deck::TapSource::Channel(uuid) => {
                         let view = index.get(uuid).and_then(|&ch| {
                             if position[ch] < position[at] {
+                                picture = Some(std::sync::Arc::clone(&pictures[ch]));
                                 Some(live[ch].clone())
                             } else {
                                 before[ch].clone()
@@ -669,6 +765,7 @@ impl Mixer {
                     }
                 };
                 slot.deck.external_source_view = view;
+                slot.deck.tapped_picture = picture;
                 // Renaming a channel has to move the tap deck's label with it,
                 // and this is the only place that sees both.
                 let name = format!("🔁 {label}");
@@ -1089,8 +1186,19 @@ impl Mixer {
     }
 
     /// The composited output texture view (post-crossfade, post-master-effects, post-tonemap).
+    ///
+    /// The one input's own picture when the last frame passed it through
+    /// (see `pass_main_through`): ask every frame, do not keep it.
     pub fn composite_view(&self) -> &wgpu::TextureView {
-        &self.composite_view
+        self.main_through
+            .as_ref()
+            .map_or(&self.composite_view, |(_, view)| view)
+    }
+
+    /// Whether the last frame handed one input's picture out as Main's
+    /// (see `pass_main_through`).
+    pub fn main_passed_through(&self) -> bool {
+        self.main_through.is_some()
     }
 
     /// The composited output texture (post-crossfade, post-master-effects, post-tonemap).
@@ -1100,7 +1208,9 @@ impl Mixer {
     /// created with `COPY_SRC` (see `GpuContext::create_compositing_texture`).
     /// Used by render-correctness tests (see /spec/render-testing.md).
     pub fn composite_texture(&self) -> &wgpu::Texture {
-        &self.composite_texture
+        self.main_through
+            .as_ref()
+            .map_or(&self.composite_texture, |(texture, _)| texture)
     }
 
     /// Current tonemap mode.
@@ -1629,6 +1739,15 @@ mod tests {
         let gpu = headless_gpu();
         let mixer = Mixer::new(&gpu, 64, 64).unwrap();
         assert_eq!(mixer.channel_count(), 2);
+    }
+
+    /// A test's mixer draws no deck less often for being slow (see
+    /// `slow_layers_less_often_by_default`).
+    #[test]
+    fn a_tests_mixer_does_not_draw_slow_decks_less_often() {
+        let gpu = headless_gpu();
+        let mixer = Mixer::new(&gpu, 64, 64).unwrap();
+        assert!(!mixer.slow_layers_less_often);
     }
 
     #[test]

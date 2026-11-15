@@ -285,6 +285,7 @@ impl VardaApp {
                     // Varda window is an explicit request, so it does not.
                     exclude_varda: exclude_varda.unwrap_or_else(|| target.is_display()),
                     scale_to: None,
+                    drawn: crate::screen_capture::backend::Drawn::default(),
                 };
                 wire_id(self.add_screen_capture_deck(&channel_uuid, &target, options))
             }
@@ -294,6 +295,9 @@ impl VardaApp {
             } => wire_id(self.add_tap_deck(&channel_uuid, &source)),
             EngineCommand::SetTapSource { deck_uuid, source } => {
                 wire(self.set_tap_source(&deck_uuid, &source))
+            }
+            EngineCommand::SetScreenCaptureTarget { deck_uuid, target } => {
+                wire(self.set_screen_capture_target(&deck_uuid, &target))
             }
             EngineCommand::RemoveDeck { deck_uuid } => {
                 let result = self.remove_deck(&deck_uuid);
@@ -1231,6 +1235,7 @@ impl VardaApp {
             EngineCommand::StartTalk { deck_uuid, to } => {
                 wire(self.start_talk(deck_uuid.as_deref(), &to))
             }
+            EngineCommand::StopTalk { deck_uuid } => wire(self.stop_talk(deck_uuid.as_deref())),
             EngineCommand::SetNextTalk { deck_uuid, talk_id } => {
                 wire(self.set_next_talk(&deck_uuid, talk_id))
             }
@@ -2366,14 +2371,41 @@ impl VardaApp {
             EngineCommand::SetCompositor {
                 direct_layers,
                 merge_layer_passes,
+                slow_layers_less_often,
+                skip_blank_channels,
+                keep_still_text,
+                merge_main_passes,
+                pass_main_through,
+                keep_still_clips,
+                keep_still_inputs,
             } => {
                 let mixer = &mut self.mixer;
                 mixer.direct_layers = direct_layers.unwrap_or(mixer.direct_layers);
                 mixer.merge_layer_passes = merge_layer_passes.unwrap_or(mixer.merge_layer_passes);
+                mixer.slow_layers_less_often =
+                    slow_layers_less_often.unwrap_or(mixer.slow_layers_less_often);
+                mixer.skip_blank_channels =
+                    skip_blank_channels.unwrap_or(mixer.skip_blank_channels);
+                mixer.keep_still_text = keep_still_text.unwrap_or(mixer.keep_still_text);
+                mixer.merge_main_passes = merge_main_passes.unwrap_or(mixer.merge_main_passes);
+                mixer.pass_main_through = pass_main_through.unwrap_or(mixer.pass_main_through);
+                mixer.keep_still_clips = keep_still_clips.unwrap_or(mixer.keep_still_clips);
+                mixer.keep_still_inputs = keep_still_inputs.unwrap_or(mixer.keep_still_inputs);
                 log::info!(
-                    "Compositor: layers drawn from their sources {}, blend-unit layers in one pass {}",
+                    "Compositor: layers drawn from their sources {}, blend-unit layers in one pass {}, \
+                     slow layers drawn less often {}, inputs showing nothing left undrawn {}, \
+                     lower thirds and texts standing still kept {}, Main's layers in one pass {}, \
+                     Main of one input passed through {}, clips between their frames kept {}, \
+                     inputs standing still kept {}",
                     mixer.direct_layers,
-                    mixer.merge_layer_passes
+                    mixer.merge_layer_passes,
+                    mixer.slow_layers_less_often,
+                    mixer.skip_blank_channels,
+                    mixer.keep_still_text,
+                    mixer.merge_main_passes,
+                    mixer.pass_main_through,
+                    mixer.keep_still_clips,
+                    mixer.keep_still_inputs
                 );
                 CommandResult::Ok
             }
@@ -2651,9 +2683,10 @@ pub(crate) fn command_is_undoable(cmd: &EngineCommand) -> bool {
             | C::LowerThirdShow { .. }
             | C::LowerThirdHide { .. }
             | C::LowerThirdStep { .. }
-            // Starting a talk, and which comes next, are live, like a
-            // playlist's transport; the list itself is undoable.
+            // Starting a talk, ending it, and which comes next, are live,
+            // like a playlist's transport; the list itself is undoable.
             | C::StartTalk { .. }
+            | C::StopTalk { .. }
             | C::SetNextTalk { .. }
             // Looking files over changes nothing in the show, nor does
             // having PowerPoint save them as pictures.
@@ -3113,6 +3146,72 @@ mod tests {
         let gpu = crate::renderer::context::GpuContext::new_headless().ok()?;
         let config = crate::testing::headless_config();
         super::VardaApp::new(gpu, &config).ok()
+    }
+
+    /// The NDI senders held once a frame has been drawn.
+    fn senders_after_a_frame(app: &mut super::VardaApp) -> Vec<String> {
+        app.advance_frame_state();
+        app.render_mixer_frame();
+        app.render_outputs();
+        app.external_io.ndi_manager.sender_names()
+    }
+
+    /// An NDI output closed, or sending under another name, takes its sender
+    /// with it: left behind, the sender stayed a source on the network — and
+    /// its thread ran on — till the app quit. An output not running keeps
+    /// its sender, and so does one still waiting to be made.
+    #[test]
+    fn an_ndi_sender_goes_with_its_output_and_with_its_name() {
+        use crate::engine::value::render::OutputTarget;
+
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let ndi = |name: &str| OutputTarget::NdiSend {
+            sender_name: name.into(),
+        };
+        // None of them started: a stopped output's sender stays.
+        let mut uuids = Vec::new();
+        for name in ["Stays", "Closed", "Renamed"] {
+            let made = app.execute_command(C::CreateHeadlessOutput { target: ndi(name) });
+            assert!(matches!(made, CommandResult::Ok), "{made:?}");
+            uuids.push(app.output.outputs.last().unwrap().uuid().to_string());
+            app.external_io.ndi_manager.hold_sender_for_test(name);
+        }
+        // And one waiting to be made, as a show's outputs are while it opens.
+        app.output
+            .pending_output_creates
+            .push(crate::scene::OutputConfig {
+                target: crate::scene::OutputTargetConfig::NdiSend {
+                    sender_name: "Waiting".into(),
+                },
+                ..crate::scene::OutputConfig::default_windowed()
+            });
+        app.external_io.ndi_manager.hold_sender_for_test("Waiting");
+        assert_eq!(
+            senders_after_a_frame(&mut app),
+            ["Closed", "Renamed", "Stays", "Waiting"]
+        );
+
+        let closed = app.execute_command(C::CloseOutput {
+            output_uuid: uuids[1].clone(),
+        });
+        assert!(matches!(closed, CommandResult::Ok), "{closed:?}");
+        assert_eq!(
+            senders_after_a_frame(&mut app),
+            ["Renamed", "Stays", "Waiting"]
+        );
+
+        let renamed = app.execute_command(C::SetOutputTarget {
+            output_uuid: uuids[2].clone(),
+            target: ndi("Named anew"),
+        });
+        assert!(matches!(renamed, CommandResult::Ok), "{renamed:?}");
+        assert_eq!(senders_after_a_frame(&mut app), ["Stays", "Waiting"]);
+
+        app.output.pending_output_creates.clear();
+        assert_eq!(senders_after_a_frame(&mut app), ["Stays"]);
+        assert_eq!(senders_after_a_frame(&mut app), ["Stays"]);
     }
 
     #[test]

@@ -348,8 +348,119 @@ fn render_tap_controls(
     );
 }
 
-/// Screen-capture controls for the selected deck: rate, crop, cursor, and
-/// (for display targets) Varda-window exclusion. See spec/screen-capture.md.
+/// What a screen capture layer captures, and the screens and windows it can
+/// be pointed at instead — or its own, picked again: a display a show saved
+/// by its name alone goes by that name, whichever screen has it, until then.
+fn render_capture_target(
+    ui: &mut egui::Ui,
+    deck: &DeckUIInfo,
+    capture: &ScreenCaptureUI,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
+    ui.horizontal(|ui| {
+        ui.label(if capture.is_display {
+            "Screen:"
+        } else {
+            "Window:"
+        });
+        let selected = if capture.bound {
+            capture.target_label.clone()
+        } else {
+            format!("{} (missing)", capture.target_label)
+        };
+        let mut chosen: Option<crate::scene::CaptureTargetConfig> = None;
+        egui::ComboBox::from_id_salt(("sel_deck_capture_target", &deck.uuid))
+            .selected_text(selected)
+            .width(180.0)
+            .show_ui(ui, |ui| {
+                for (heading, display) in [("Displays", true), ("Windows", false)] {
+                    let mut targets = data
+                        .capture_targets
+                        .iter()
+                        .filter(|t| (t.kind == "display") == display)
+                        .peekable();
+                    if targets.peek().is_none() {
+                        continue;
+                    }
+                    ui.label(egui::RichText::new(heading).small().weak());
+                    for target in targets {
+                        let current = is_captured(capture, target, &data.capture_targets);
+                        let text = if display {
+                            format!("{} — {}×{}", target.label, target.width, target.height)
+                        } else if target.is_varda {
+                            format!("{} (this app)", target.label)
+                        } else {
+                            target.label.clone()
+                        };
+                        if ui.selectable_label(current, text).clicked() {
+                            chosen = Some(super::add_input::capture_target(target));
+                        }
+                    }
+                }
+                if data.capture_targets.is_empty() {
+                    ui.label(egui::RichText::new("None found yet — press Refresh.").weak());
+                }
+            });
+        if ui
+            .small_button("Refresh")
+            .on_hover_text("Look again for the screens and windows there are")
+            .clicked()
+        {
+            actions.commands.push(EngineCommand::RescanCaptureTargets);
+        }
+        if let Some(target) = chosen {
+            actions.commands.push(EngineCommand::SetScreenCaptureTarget {
+                deck_uuid: deck.uuid.clone(),
+                target,
+            });
+        }
+    });
+    if capture.kept_by_name {
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 160, 60),
+            format!(
+                "Kept by its number: this shows whichever screen is {} now, and another once \
+                 the screens are numbered anew. Pick its screen above to keep that screen itself.",
+                capture.target_label
+            ),
+        );
+    }
+}
+
+/// Whether `target`, one of the `listed`, is what the input captures: its
+/// screen itself, where it is kept as itself — kept by its name alone, none
+/// is its own — or its window, as the show names it.
+fn is_captured(
+    capture: &ScreenCaptureUI,
+    target: &crate::engine::CaptureTargetSnapshot,
+    listed: &[crate::engine::CaptureTargetSnapshot],
+) -> bool {
+    let display = target.kind == "display";
+    if display != capture.is_display {
+        return false;
+    }
+    if !display {
+        return super::add_input::capture_target(target).label() == capture.target_label;
+    }
+    match (&capture.target_uuid, &target.uuid) {
+        // Two screens alike may share an identity: the one of its name then.
+        (Some(kept), Some(of_target)) => {
+            kept == of_target
+                && (target.label == capture.target_label
+                    || !listed.iter().any(|t| {
+                        t.uuid.as_ref() == Some(kept) && t.label == capture.target_label
+                    }))
+        }
+        // Where displays have no identity the name is all there is.
+        (None, None) => !capture.kept_by_name && target.label == capture.target_label,
+        _ => false,
+    }
+}
+
+/// Screen-capture controls for the selected deck: what it captures, rate,
+/// crop, cursor, and (for display targets) Varda-window exclusion. See
+/// spec/screen-capture.md.
 fn render_capture_controls(
     ui: &mut egui::Ui,
     deck: &DeckUIInfo,
@@ -377,11 +488,15 @@ fn render_capture_controls(
             Some(p) => p.message.clone().unwrap_or_else(|| {
                 "Black until PowerPoint plays the show and its window is found.".into()
             }),
-            None => "Target not found — showing black. Reopen the target and rescan.".into(),
+            None => "Target not found — showing black. Reopen it, or pick another below.".into(),
         };
         ui.colored_label(egui::Color32::from_rgb(220, 160, 60), why);
     } else if !capture.connected {
         ui.colored_label(egui::Color32::GRAY, "Waiting for frames…");
+    }
+    // A PowerPoint input's window is its show's: there is none to pick.
+    if deck.presentation.is_none() {
+        render_capture_target(ui, deck, capture, data, actions);
     }
 
     ui.horizontal(|ui| {
@@ -551,8 +666,9 @@ fn render_camera_signal(
         if signal.fps > 0.0 && signal.fps < opened * 0.6 {
             ui.label(
                 egui::RichText::new(format!(
-                    "Only {:.1} of {opened:.0} frames a second arrive: check its cable and USB \
-                     port (on a USB 2 link an HD capture cannot keep up)",
+                    "Only {:.1} of {opened:.0} frames a second arrive: its source may send \
+                     only that many; if it sends more, check its cable and USB port (on a \
+                     USB 2 link an HD capture cannot keep up)",
                     signal.fps
                 ))
                 .color(warn),
@@ -3589,5 +3705,193 @@ mod tests {
             })
             .collect();
         assert_eq!(added, ["crop", "transform"]);
+    }
+
+    fn listed(
+        kind: &str,
+        label: &str,
+        uuid: Option<&str>,
+        width: u32,
+    ) -> crate::engine::CaptureTargetSnapshot {
+        crate::engine::CaptureTargetSnapshot {
+            kind: kind.into(),
+            label: label.into(),
+            app: (kind == "window").then(|| "com.apple.Keynote".to_string()),
+            title: (kind == "window").then(|| label.to_string()),
+            width,
+            height: width * 9 / 16,
+            is_varda: false,
+            uuid: uuid.map(str::to_string),
+        }
+    }
+
+    /// A screen capture of "Display 1": kept by `uuid`, or by its name alone.
+    fn capture_of_display_1(uuid: Option<&str>) -> ScreenCaptureUI {
+        ScreenCaptureUI {
+            target_label: "Display 1".into(),
+            is_display: true,
+            target_uuid: uuid.map(str::to_string),
+            kept_by_name: uuid.is_none(),
+            rate: 0.5,
+            rate_fps: 60.0,
+            crop: [0.0, 0.0, 1.0, 1.0],
+            show_cursor: false,
+            exclude_varda: true,
+            bound: true,
+            connected: true,
+        }
+    }
+
+    /// The fixture's first layer as a screen capture, on a desk whose
+    /// capture box is "Display 1" and whose 4K "Display 2", a Keynote window
+    /// open.
+    fn capture_picker(
+        capture: ScreenCaptureUI,
+    ) -> egui_kittest::Harness<'static, UIActions> {
+        let mut data = UIData::test_fixture();
+        data.capture_targets = vec![
+            listed("display", "Display 1", Some("capture"), 1920),
+            listed("display", "Display 2", Some("4k"), 3840),
+            listed("window", "Opening", None, 1280),
+        ];
+        let deck = data.channels[0].decks[0].clone();
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(520.0, 400.0))
+            .build_ui_state(
+                move |ui, actions: &mut UIActions| {
+                    render_capture_target(ui, &deck, &capture, &data, actions);
+                },
+                UIActions::new(),
+            )
+    }
+
+    const KEPT_BY_NUMBER: &str = "Kept by its number: this shows whichever screen is Display 1 \
+         now, and another once the screens are numbered anew. Pick its screen above to keep \
+         that screen itself.";
+
+    /// A screen input a show has by its display's number says so, and its
+    /// screen picked in the list is sent as that screen itself — the way a
+    /// show's two inputs made of its 4K, showing a capture box's own screen,
+    /// are put right (an M5 Max, 2026-11-10).
+    #[test]
+    fn a_screen_kept_by_its_number_says_so_and_takes_the_screen_picked() {
+        let mut h = capture_picker(capture_of_display_1(None));
+        h.get_by_label(KEPT_BY_NUMBER);
+        h.get_by_value("Display 1").click();
+        h.run();
+        h.get_by_label("Display 2 — 3840×2160").click();
+        h.run();
+        let deck = UIData::test_fixture().channels[0].decks[0].uuid.clone();
+        let picked: Vec<_> = h
+            .state()
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                EngineCommand::SetScreenCaptureTarget { deck_uuid, target } => {
+                    Some((deck_uuid.clone(), target.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            picked,
+            vec![(
+                deck,
+                crate::scene::CaptureTargetConfig::Display {
+                    name: "Display 2".into(),
+                    uuid: Some("4k".into()),
+                }
+            )]
+        );
+    }
+
+    /// One kept as the screen itself says nothing of numbers; a window in
+    /// the list is sent by its app and title, and Refresh looks again.
+    #[test]
+    fn a_screen_kept_as_itself_can_be_given_a_window() {
+        let mut h = capture_picker(capture_of_display_1(Some("capture")));
+        assert!(h.query_by_label(KEPT_BY_NUMBER).is_none());
+        h.get_by_label("Refresh").click();
+        h.run();
+        h.get_by_value("Display 1").click();
+        h.run();
+        h.get_by_label("Opening").click();
+        h.run();
+        let commands = &h.state().commands;
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, EngineCommand::RescanCaptureTargets)),
+            "looked again"
+        );
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetScreenCaptureTarget {
+                    target: crate::scene::CaptureTargetConfig::Window { app, title },
+                    ..
+                } if app == "com.apple.Keynote" && title == "Opening"
+            )),
+            "the window, by its app and title"
+        );
+    }
+
+    /// The list marks what the input captures: its screen where it is kept
+    /// as itself — whatever number that screen has now — none where it is
+    /// kept by a number alone, and its window as the show names it. Of two
+    /// screens alike, the one of its name.
+    #[test]
+    fn the_list_marks_the_screen_or_window_the_input_captures() {
+        let targets = vec![
+            listed("display", "Display 1", Some("capture"), 1920),
+            listed("display", "Display 2", Some("4k"), 3840),
+            listed("window", "Opening", None, 1280),
+        ];
+        let marked =
+            |capture: &ScreenCaptureUI, targets: &[crate::engine::CaptureTargetSnapshot]| {
+                targets
+                    .iter()
+                    .filter(|t| is_captured(capture, t, targets))
+                    .map(|t| t.label.clone())
+                    .collect::<Vec<_>>()
+            };
+        // The 4K, saved as "Display 1" when it was that.
+        let the_4k = capture_of_display_1(Some("4k"));
+        assert_eq!(marked(&the_4k, &targets), ["Display 2"]);
+        let the_box = capture_of_display_1(Some("capture"));
+        assert_eq!(marked(&the_box, &targets), ["Display 1"]);
+        assert!(marked(&capture_of_display_1(None), &targets).is_empty());
+
+        let mut window = capture_of_display_1(None);
+        window.is_display = false;
+        window.kept_by_name = false;
+        window.target_label = "com.apple.Keynote — Opening".into();
+        assert_eq!(marked(&window, &targets), ["Opening"]);
+
+        let twins = vec![
+            listed("display", "Display 1", Some("twin"), 1920),
+            listed("display", "Display 2", Some("twin"), 1920),
+        ];
+        let mut second = capture_of_display_1(Some("twin"));
+        second.target_label = "Display 2".into();
+        assert_eq!(marked(&second, &twins), ["Display 2"]);
+
+        // No identities at all (not macOS): the name.
+        let plain = vec![
+            listed("display", "Display 1", None, 1920),
+            listed("display", "Display 2", None, 1920),
+        ];
+        let mut by_name = capture_of_display_1(None);
+        by_name.kept_by_name = false;
+        assert_eq!(marked(&by_name, &plain), ["Display 1"]);
+
+        // One screen with no identity among those that have: an input kept
+        // by that number is still none of them — the one of it tomorrow
+        // may be another.
+        let mixed = vec![
+            listed("display", "Display 1", None, 1920),
+            listed("display", "Display 2", Some("4k"), 3840),
+        ];
+        assert!(marked(&capture_of_display_1(None), &mixed).is_empty());
     }
 }

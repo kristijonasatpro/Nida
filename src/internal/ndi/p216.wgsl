@@ -16,11 +16,15 @@ var<uniform> params: ConvertParams;
 @group(0) @binding(2)
 var<storage, read_write> output_words: array<u32>;
 
-fn rec709_oetf(linear: vec3<f32>) -> vec3<f32> {
+// The sRGB curve, as every other output is encoded (the windows, eight-bit
+// NDI, NV12): a receiver turns these values back into a picture by the
+// matrix alone, so they are the program's own. With Rec.709's camera curve
+// here the dark parts came out darker than the program.
+fn srgb_oetf(linear: vec3<f32>) -> vec3<f32> {
     let value = clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0));
-    let lower = value * 4.5;
-    let upper = 1.099 * pow(value, vec3<f32>(0.45)) - 0.099;
-    return select(upper, lower, value < vec3<f32>(0.018));
+    let lower = value * 12.92;
+    let upper = 1.055 * pow(value, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(upper, lower, value <= vec3<f32>(0.0031308));
 }
 
 fn hash_noise(pixel: vec2<u32>, salt: u32) -> f32 {
@@ -52,8 +56,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let x1 = x0 + 1u;
-    let rgb0 = rec709_oetf(textureLoad(source, vec2<i32>(i32(x0), i32(y)), 0).rgb);
-    let rgb1 = rec709_oetf(textureLoad(source, vec2<i32>(i32(x1), i32(y)), 0).rgb);
+    let rgb0 = srgb_oetf(textureLoad(source, vec2<i32>(i32(x0), i32(y)), 0).rgb);
+    let rgb1 = srgb_oetf(textureLoad(source, vec2<i32>(i32(x1), i32(y)), 0).rgb);
 
     let luma0 = dot(rgb0, vec3<f32>(0.2126, 0.7152, 0.0722));
     let luma1 = dot(rgb1, vec3<f32>(0.2126, 0.7152, 0.0722));

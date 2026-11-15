@@ -328,6 +328,18 @@ impl Effect {
         self.mask.is_none() && self.shader.name() == crate::engine::value::mask::LAYER_MASK_EFFECT
     }
 
+    /// Run on a clear frame it leaves it clear: a layer's mask with no
+    /// shape, which does nothing, or a crop or Transform that only places
+    /// the picture (`is_static_framing`) — but a crop with its border on,
+    /// which draws the border whatever is in the frame.
+    pub(crate) fn keeps_clear(&self, modulation: &crate::modulation::ModulationEngine) -> bool {
+        if self.is_idle_layer_mask() {
+            return true;
+        }
+        let bordered = self.shader.name() == "crop" && self.switch("border_mode") != Some(false);
+        self.is_static_framing(modulation) && !bordered
+    }
+
     fn switch(&self, name: &str) -> Option<bool> {
         match self.params.values.get(name)? {
             crate::params::ParamValue::Bool(v) => Some(*v),

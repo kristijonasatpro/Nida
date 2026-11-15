@@ -37,7 +37,8 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::system::scan_depth_sensors, routes::decks::add_depth_sensor_deck,
         // Screen Capture
         routes::system::scan_capture_targets, routes::system::request_screen_capture_permission,
-        routes::decks::add_screen_capture_deck, routes::library::screen_capture,
+        routes::decks::add_screen_capture_deck, routes::decks::set_screen_capture_target,
+        routes::library::screen_capture,
         routes::state::screen_capture,
         // Program / channel tap
         routes::decks::add_tap_deck, routes::decks::set_tap_source,
@@ -487,6 +488,10 @@ pub fn build_router(shared: SharedState) -> Router {
         .route(
             "/api/channels/{channel_uuid}/decks/screen",
             axum::routing::post(routes::decks::add_screen_capture_deck),
+        )
+        .route(
+            "/api/decks/{deck_uuid}/screen/target",
+            axum::routing::put(routes::decks::set_screen_capture_target),
         )
         .route(
             "/api/channels/{channel_uuid}/decks/tap",

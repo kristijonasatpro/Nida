@@ -199,60 +199,17 @@ pub(crate) fn load_imported_textures(
 }
 
 impl Deck {
-    /// Create a new deck from an ISF shader
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the ISF fragment source fails to compile to SPIR-V,
-    /// or if the render pipeline cannot be created.
-    pub fn new(context: &GpuContext, shader: ISFShader, width: u32, height: u32) -> Result<Self> {
-        // Compile to SPIR-V
-        let spirv = compile_glsl_to_spirv(&shader.fragment_source, &shader.name())
-            .context("Failed to compile shader to SPIR-V")?;
-
-        // Extract passes from metadata
-        let passes = shader.metadata.passes.clone().unwrap_or_default();
-
-        // Create render target textures (two for ping-pong effect chain)
-        let texture = context.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Deck Texture (Linear)"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: context.compositing_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let texture_b = context.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Deck Texture B (Linear)"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: context.compositing_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let texture_b_view = texture_b.create_view(&wgpu::TextureViewDescriptor::default());
-
-        // Create pass buffers (with ping-pong for persistent buffers)
+    /// The buffers of a shader's `passes` for a deck `width × height`: each
+    /// sized by its WIDTH and HEIGHT expressions of that size, and
+    /// double-buffered.
+    pub(crate) fn make_pass_buffers(
+        context: &GpuContext,
+        passes: &[crate::isf::ISFPass],
+        width: u32,
+        height: u32,
+    ) -> HashMap<String, PassBuffer> {
         let mut pass_buffers = HashMap::new();
-
-        for pass in &passes {
+        for pass in passes {
             let target_name = match &pass.target {
                 Some(name) => name.clone(),
                 None => continue,
@@ -327,6 +284,63 @@ impl Deck {
                 },
             );
         }
+        pass_buffers
+    }
+}
+
+impl Deck {
+    /// Create a new deck from an ISF shader
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ISF fragment source fails to compile to SPIR-V,
+    /// or if the render pipeline cannot be created.
+    pub fn new(context: &GpuContext, shader: ISFShader, width: u32, height: u32) -> Result<Self> {
+        // Compile to SPIR-V
+        let spirv = compile_glsl_to_spirv(&shader.fragment_source, &shader.name())
+            .context("Failed to compile shader to SPIR-V")?;
+
+        // Extract passes from metadata
+        let passes = shader.metadata.passes.clone().unwrap_or_default();
+
+        // Create render target textures (two for ping-pong effect chain)
+        let texture = context.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Deck Texture (Linear)"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: context.compositing_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let texture_b = context.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Deck Texture B (Linear)"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: context.compositing_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let texture_b_view = texture_b.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Create pass buffers (with ping-pong for persistent buffers)
+        let pass_buffers = Self::make_pass_buffers(context, &passes, width, height);
 
         // Load ISF IMPORTED images
         let imported_textures =
@@ -425,6 +439,9 @@ impl Deck {
             frame_count: 0,
             last_frame_time: now,
             external_source_view: None,
+            external_source_coded_view: None,
+            external_source_picture: None,
+            tapped_picture: None,
             depth_rgb_view: None,
             depth_intrinsics: None,
             depth_source_size: None,
@@ -439,6 +456,10 @@ impl Deck {
             analyzers: crate::analyzer::DeckAnalyzers::new(),
             gpu_error: None,
             rendered_still: None,
+            keep_still_text: true,
+            keep_still_clips: false,
+            keep_still_sources: false,
+            instance: super::next_instance(),
             texture_generation: 0,
             visible: None,
             drawn_visible: None,
@@ -1291,6 +1312,9 @@ impl Deck {
             frame_count: 0,
             last_frame_time: now,
             external_source_view: None,
+            external_source_coded_view: None,
+            external_source_picture: None,
+            tapped_picture: None,
             depth_rgb_view: None,
             depth_intrinsics: None,
             depth_source_size: None,
@@ -1305,6 +1329,10 @@ impl Deck {
             analyzers: crate::analyzer::DeckAnalyzers::new(),
             gpu_error: None,
             rendered_still: None,
+            keep_still_text: true,
+            keep_still_clips: false,
+            keep_still_sources: false,
+            instance: super::next_instance(),
             texture_generation: 0,
             visible: None,
             drawn_visible: None,
@@ -1649,6 +1677,9 @@ impl Deck {
             frame_count: 0,
             last_frame_time: now,
             external_source_view: None,
+            external_source_coded_view: None,
+            external_source_picture: None,
+            tapped_picture: None,
             depth_rgb_view: None,
             depth_intrinsics: None,
             depth_source_size: None,
@@ -1663,6 +1694,10 @@ impl Deck {
             analyzers: crate::analyzer::DeckAnalyzers::new(),
             gpu_error: None,
             rendered_still: None,
+            keep_still_text: true,
+            keep_still_clips: false,
+            keep_still_sources: false,
+            instance: super::next_instance(),
             texture_generation: 0,
             visible: None,
             drawn_visible: None,

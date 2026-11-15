@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
@@ -189,10 +190,12 @@ impl PanelWindows {
     }
 
     /// Paint what each window's pass drew, with the control window's egui
-    /// renderer: its textures already set.
-    pub fn paint(&self, gpu: &GpuContext, renderer: &mut egui_wgpu::Renderer) {
+    /// renderer: its textures already set. Returns how long of it went
+    /// waiting for the windows' frames to draw into.
+    pub fn paint(&self, gpu: &GpuContext, renderer: &mut egui_wgpu::Renderer) -> Duration {
         let mut s = self.shared.borrow_mut();
         let drawn = std::mem::take(&mut s.drawn);
+        let mut waited = Duration::ZERO;
         for drawn in &drawn {
             let Some(window) = s.windows.get_mut(&drawn.id) else {
                 continue;
@@ -200,7 +203,7 @@ impl PanelWindows {
             if window.occluded {
                 continue;
             }
-            paint(
+            waited += paint(
                 gpu,
                 renderer,
                 &mut window.surface,
@@ -208,6 +211,7 @@ impl PanelWindows {
                 drawn.pixels_per_point,
             );
         }
+        waited
     }
 
     /// Close the windows the dock did not show this frame: their panels put
@@ -518,16 +522,21 @@ fn on_a_screen(at: (f64, f64), screens: &[[f64; 4]]) -> bool {
         .any(|[left, top, w, h]| x >= *left && x < left + w && y >= *top && y < top + h)
 }
 
-/// Draw `jobs` into the window's surface, and show them.
+/// Draw `jobs` into the window's surface, and show them. Returns how long it
+/// waited for the window's frame to draw into: its screen's pace, where the
+/// rest is the frame's own work.
 fn paint(
     gpu: &GpuContext,
     renderer: &mut egui_wgpu::Renderer,
     surface: &mut WindowSurface,
     jobs: &[egui::ClippedPrimitive],
     pixels_per_point: f32,
-) {
+) -> Duration {
     let _ = gpu.device.poll(wgpu::PollType::Poll);
-    let frame = match surface.surface.get_current_texture() {
+    let asked = Instant::now();
+    let acquired = surface.surface.get_current_texture();
+    let waited = asked.elapsed();
+    let frame = match acquired {
         wgpu::CurrentSurfaceTexture::Success(frame)
         | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
         wgpu::CurrentSurfaceTexture::Outdated => {
@@ -537,13 +546,13 @@ fn paint(
                 | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
                 other => {
                     log::debug!("Panel window surface unavailable: {other:?}");
-                    return;
+                    return waited;
                 }
             }
         }
         other => {
             log::debug!("Panel window surface unavailable: {other:?}");
-            return;
+            return waited;
         }
     };
     let view = frame
@@ -581,6 +590,7 @@ fn paint(
     }
     gpu.submit(std::iter::once(encoder.finish()));
     gpu.queue.present(frame);
+    waited
 }
 
 #[cfg(test)]

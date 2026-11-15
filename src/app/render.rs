@@ -577,6 +577,8 @@ impl VardaApp {
         // downscaling frames for the rest of the session.
         self.screen_capture_manager
             .reconcile_holders(&capture_holders);
+        // Display inputs a show has by their number alone: said.
+        self.warn_captures_by_name();
 
         // A camera missing when the show opened is picked up once it is here.
         self.reconcile_cameras();
@@ -700,6 +702,11 @@ impl VardaApp {
                 })
                 .collect();
 
+        // Router/UI edits land on the deck: capture settings changed go
+        // down to the capture threads here, once, and each input has what
+        // its capture runs with.
+        self.send_capture_settings();
+        self.size_captures_as_drawn();
         for channel in self.mixer.channels_mut() {
             for slot in &mut channel.decks {
                 if let Some(presenter) = slot.deck.presenter_mut() {
@@ -773,15 +780,6 @@ impl VardaApp {
                             self.external_io.html_manager.texture_view(idx).cloned()
                         }
                         ExternalSourceKind::ScreenCapture(id) => {
-                            // Router/UI edits land on the deck; push them down
-                            // to the capture thread here, once, when they change.
-                            if let Some(state) = &mut slot.deck.screen_capture {
-                                if state.config_dirty {
-                                    self.screen_capture_manager
-                                        .set_config(id, state.config.clone());
-                                    state.config_dirty = false;
-                                }
-                            }
                             // A crop or target resize reallocates the shared
                             // texture, so the deck's source dimensions are
                             // pushed down each frame rather than fixed at open.
@@ -803,6 +801,26 @@ impl VardaApp {
                             slot.deck.depth_source_size = self.depth_manager.resolution(id);
                             depth
                         }
+                    };
+                    // A screen or window captured is drawn from its code
+                    // values (see `Deck::external_source_coded_view`);
+                    // nothing else is, nor a PowerPoint show's capture.
+                    slot.deck.external_source_coded_view = match kind {
+                        ExternalSourceKind::ScreenCapture(id)
+                            if slot.deck.draws_its_capture_coded() =>
+                        {
+                            self.screen_capture_manager.coded_view(id).cloned()
+                        }
+                        _ => None,
+                    };
+                    // And which picture that is, where the source says: a
+                    // screen or window standing still is not put together
+                    // again (see `Deck::external_source_picture`).
+                    slot.deck.external_source_picture = match kind {
+                        ExternalSourceKind::ScreenCapture(id) => {
+                            self.screen_capture_manager.picture(id)
+                        }
+                        _ => None,
                     };
                 }
 
@@ -987,6 +1005,25 @@ impl VardaApp {
         self.draw_outputs();
     }
 
+    /// The NDI senders no output names any more — its output closed, or
+    /// sending under another name now — are destroyed (see
+    /// `NdiManager::keep_senders`). A stopped output keeps its sender, silent,
+    /// as before; so does one waiting to be made. (The stream's output and
+    /// the recording's are never NDI.)
+    fn let_unnamed_ndi_senders_go(&mut self) {
+        use crate::renderer::context::OutputTarget;
+        use crate::scene::OutputTargetConfig;
+
+        let (outputs, waiting) = (&self.output.outputs, &self.output.pending_output_creates);
+        self.external_io.ndi_manager.keep_senders(|name| {
+            outputs.iter().any(|output| {
+                matches!(output.target(), OutputTarget::NdiSend { sender_name } if sender_name == name)
+            }) || waiting.iter().any(|config| {
+                matches!(&config.target, OutputTargetConfig::NdiSend { sender_name } if sender_name == name)
+            })
+        });
+    }
+
     /// Render content to all outputs (windowed + headless) using the surface
     /// layout, handing the windows' frames to their presenters.
     pub fn draw_outputs(&mut self) {
@@ -996,6 +1033,7 @@ impl VardaApp {
         self.poll_stream();
         self.poll_recording();
         self.poll_blackmagic_outputs();
+        self.let_unnamed_ndi_senders_go();
         for output in &mut self.output.outputs {
             if let crate::renderer::context::UnifiedOutput::Window(window) = output {
                 window.clock_display = self.frame_stats.clock_display;
@@ -2074,7 +2112,7 @@ impl VardaApp {
                             crate::renderer::context::DeliveryResult::Ok
                         }
                     } else {
-                        h.deliver_frame(frame_data.bytes(), sinks.ndi_manager, sinks.encoder_fps)
+                        h.deliver_frame(frame_data, sinks.ndi_manager, sinks.encoder_fps)
                     };
                     match delivery {
                         crate::renderer::context::DeliveryResult::Failed(msg) => {

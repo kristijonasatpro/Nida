@@ -61,6 +61,11 @@ pub struct Placed {
     /// draws it — black where the source is clear or does not reach; 0: as
     /// it comes. Between, a Merge on its way from one to the other.
     pub over_black: f32,
+    /// The source is read as it was coded — a capture's sRGB code values,
+    /// through a view that does not make them light (see
+    /// `ScreenCaptureManager::coded_view`) — filtered so and made light
+    /// after: text drawn smaller keeps its weight.
+    pub coded: bool,
 }
 
 impl Placed {
@@ -122,8 +127,9 @@ struct Params {
     /// 0 for its colour straight, 1 premultiplied.
     opacity: f32,
     onto: u32,
-    /// To the 16 bytes a uniform block is a multiple of.
-    _pad: f32,
+    /// 1: the source read as it was coded (see [`Placed::coded`]). The
+    /// last word of the 16 bytes a uniform block is a multiple of.
+    coded: f32,
 }
 
 pub struct PlacedPicturePipeline {
@@ -267,7 +273,13 @@ fn pipeline(
     });
     let fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Placed Picture Fragment Shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/placed_picture.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(
+            concat!(
+                include_str!("shaders/scaled_sample.wgsl"),
+                include_str!("shaders/placed_picture.wgsl")
+            )
+            .into(),
+        ),
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("Placed Picture Pipeline"),
@@ -365,7 +377,7 @@ fn params_of(placed: &Placed, frame: (u32, u32)) -> Params {
         over_black: placed.over_black,
         opacity: 1.0,
         onto: 0,
-        _pad: 0.0,
+        coded: if placed.coded { 1.0 } else { 0.0 },
     }
 }
 
@@ -522,7 +534,18 @@ mod tests {
             crop,
             premultiplied: false,
             over_black: 0.0,
+            coded: false,
         }
+    }
+
+    /// A picture read as it was coded tells its shader so, and one read as
+    /// light that it is not.
+    #[test]
+    fn a_picture_read_as_coded_tells_its_shader_so() {
+        let light = placed([0.0; 2], [1.0; 2], None);
+        let coded = Placed { coded: true, ..light };
+        assert_eq!(params_of(&light, (64, 36)).coded, 0.0);
+        assert_eq!(params_of(&coded, (64, 36)).coded, 1.0);
     }
 
     /// Flipped, the part a crop keeps shows mirrored, and the bounds with it.

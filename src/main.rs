@@ -178,6 +178,13 @@ fn run() -> anyhow::Result<()> {
     }
 
     log::info!("Nida - Starting up...");
+    // Built with the tests' fixtures, as `cargo test` builds it: not a
+    // show's build (see `Mixer::slow_layers_less_often`).
+    if cfg!(feature = "test-fixtures") {
+        log::warn!(
+            "A test build (the tests' fixtures are in it): slow layers are not drawn less often when frames run late, unless turned on (PUT /api/compositor)"
+        );
+    }
     if config.headless {
         log::info!("Headless mode enabled (API port {})", config.api_port);
     }

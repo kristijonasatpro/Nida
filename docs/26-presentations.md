@@ -36,7 +36,7 @@ why.
 
 | | |
 |---|---|
-| **ON AIR** | The Slides input's picture beside the talk on: where it is (**4 / 31**, a clip's time), **⏮** (back to its first slide — the talk from the start, all tried out before the show), **◀ ▶**, **Black**, **White**, the slide's title and notes (PowerPoint), how long the talk has run; a talk starting. Red when the Slides input is on air, and where |
+| **ON AIR** | The Slides input's picture beside the talk on: where it is (**4 / 31**, a clip's time), **⏮** (back to its first slide — the talk from the start, all tried out before the show), **◀ ▶**, **Black**, **White**, **End talk** (see [Ending a talk](#ending-a-talk)), the slide's title and notes (PowerPoint), how long the talk has run; a talk starting. Red when the Slides input is on air, and where |
 | **NEXT** | The talk **Start next talk** takes: the one after the talk on, unless another was picked — and whether it is **ready** (PowerPoint has the deck open, the page has loaded). **⏮ Previous talk** goes back to the talk before |
 | **Running order** | Each talk: **▶** starts it now (or double-click its name), **⏶ ⏷** move it, **🗑** takes it out. Its name's right-click: **Start this next**, **Rename…**, **Replace file…** (a speaker's new version keeps its place and name), **Show in Finder**, **Remove** |
 | **Between talks** | **Cut**, **Fade** or **Slide**, and how long |
@@ -66,6 +66,27 @@ slide. The room never sees black, a desktop or PowerPoint's window.
   it at the slide it was left on. A talk two away is closed.
 - **The speaker's clicker never changes the talk**: past its last slide a
   talk stays on its end; only **Start next talk** takes the next.
+
+### Ending a talk
+
+**End talk** — or `StopTalk` over the API — ends the talk on, and one being
+started: the Slides input shows nothing (what is under it shows),
+PowerPoint's show of it ends and the deck is closed — without saving, if
+Nida opened it; a deck already open in PowerPoint stays open — and Nida does
+not play it again. Black or White over the talk goes with it.
+
+- The talk stays in the running order, where it was left: **⏮ Previous
+  talk** starts it again at its slide. NEXT is the talk after it — after the
+  last, the first again — unless another was picked. The list changed
+  meanwhile, it is still the talk after the one ended, where that is now:
+  a talk added after it comes next.
+- Nothing is opened ahead until a talk is on again, so PowerPoint is left
+  alone meanwhile — but for the slide pictures still to make (see
+  [Presenter view](#presenter-view)): each such deck is opened, saved and
+  closed again. The first talk started then opens its deck as it starts — a
+  few seconds for a large one.
+- A talk taken out of the list while it is on is ended the same way: it
+  stays on until **End talk**, or another talk started.
 
 ### What follows the talk
 
@@ -147,7 +168,8 @@ after copying a missing video beside its deck, or installing a font.
 The running order, the talk on and where each talk was left are kept with
 the show: opened again, the talk on is started again at its slide. A talk
 taken out of the list while it is on stays on — and is kept with the show
-so — until another is started.
+so — until another is started or it is ended (**End talk**). A talk ended is
+not started again when the show is opened.
 
 ### Limits
 
@@ -328,18 +350,49 @@ clock** in the presenter view's settings — the **Source** tab of its Input
 Settings, or **Properties** with its layer selected — puts it back to 0:00.
 Removed, its PowerPoint input leaves it saying so.
 
-**Slide pictures** in the Presentations panel — **Make** — has PowerPoint
-save each PowerPoint talk's slides as pictures (a PDF in Nida's folder,
-"Slide pictures"), so the presenter view shows a PowerPoint talk's next
-slide too: as it looks once its builds are done. Make them before the show,
-or between talks: with a PowerPoint talk on — or any slide show running in
-PowerPoint, started there by hand too — they are not made, as the first time
-PowerPoint asks for access to that folder — click **Grant Access** in
-PowerPoint — and holds its show till that is answered. While they are made
-("making…") PowerPoint is busy: a talk started meanwhile waits for the deck
-being saved, and the decks not yet begun are left — made again with **Make**
-later. "3 of 5 PowerPoint talks" says how many have them; a deck changed
-since needs them made again. A save cut short leaves nothing behind.
+**Slide pictures** in the Presentations panel: PowerPoint saves each
+PowerPoint talk's slides as pictures (a PDF in Nida's folder, "Slide
+pictures"), so the presenter view shows a PowerPoint talk's next slide too:
+as it looks once its builds are done. "3 of 5 PowerPoint talks" says how
+many have them; a deck changed since has them made again. A save cut short
+leaves nothing behind.
+
+A copy of each PDF made is put **beside its deck** too: a folder "Slide
+pictures" where the deck is, the PDF under the deck's name
+("talk.pptx.pdf"), written again whenever the pictures are made again.
+PowerPoint itself still saves into Nida's folder, and Nida draws from
+there: PowerPoint would ask for access to every other folder. The first
+time Nida writes into Downloads, Desktop or Documents macOS may ask
+whether Nida may — the show goes on meanwhile; answered no, or the folder
+not to be written, the pictures work all the same (the log says so once a
+folder). Pictures made before this are not copied till made again.
+
+- **The first time, press Make** — with no PowerPoint talk on: PowerPoint
+  asks for access to that folder — click **Grant Access** in PowerPoint —
+  and would hold a show till that is answered. Till PowerPoint has saved
+  into the folder once, nothing is made by itself ("press Make the first
+  time"), and **Make** waits for no PowerPoint talk to be on.
+- **From then on they are made by themselves** (**by themselves**, on for a
+  new Slides input; kept with the show): a PowerPoint talk added, or its
+  file changed, has its pictures made a few seconds later, with nothing
+  pressed. With no show running PowerPoint opens the deck, saves it and
+  closes it again. **Make** asks at once, and again for a deck that failed.
+- **Beside a PowerPoint talk on** — or any slide show running in PowerPoint,
+  started there by hand too — nothing is opened: only the decks PowerPoint
+  already has open for the input are saved (the talk on first, then the
+  next and the one before), one at a time and a few seconds apart, never
+  while a show is on its way up. The other talks' pictures are made when
+  the talk is ended, or as they come next. A talk added and started at
+  once has its next slide a few seconds into it.
+- **While PowerPoint saves a deck it does nothing else**: a step asked
+  meanwhile — the clicker, ▶ — is taken when the save is done, a second or
+  two for a deck of ordinary size; a talk started meanwhile waits for it
+  the same way. Beside a show a save is given up after twenty seconds (a
+  very large deck): said once, and not asked again by itself — press
+  **Make** after the talk. To keep PowerPoint from being asked beside a
+  show at all, turn **by themselves** off and press **Make** between talks.
+- Pictures that could not be made are said once, and not asked again by
+  themselves till the file changes: **Make** asks again.
 
 Its settings also lay it out, kept with the show and undone like any
 change:
@@ -384,6 +437,7 @@ POST /api/command  {"AddTalks": {"paths": ["/Talks/late.pptx", "/Talks/deck.html
 POST /api/command  {"StartTalk": {"to": "next"}}
 POST /api/command  {"StartTalk": {"to": "previous"}}
 POST /api/command  {"StartTalk": {"deck_uuid": "…", "to": {"id": "a1b2c3d4"}}}
+POST /api/command  {"StopTalk": {}}
 POST /api/command  {"SetNextTalk": {"deck_uuid": "…", "talk_id": "a1b2c3d4"}}
 POST /api/command  {"EditTalk": {"deck_uuid": "…", "talk_id": "a1b2c3d4", "name": "Ona J. — results"}}
 POST /api/command  {"EditTalk": {"deck_uuid": "…", "talk_id": "a1b2c3d4", "path": "/Talks/results-v2.pdf"}}
@@ -399,6 +453,9 @@ made on a new input, called Slides, when there is none — at `at` (a place in
 the list, from 0) or the end; its reply is the Slides layer's UUID.
 `StartTalk`'s `to` is `"next"`, `"previous"` or `{"id": "…"}`; without a
 `deck_uuid`, the Slides input on air, else the one started last.
+`StopTalk` ends the talk on, and one being started (the same input without
+a `deck_uuid`): nothing on, nothing opened ahead until a talk is started.
+With no talk on or being started it does nothing.
 `SetNextTalk` with `"talk_id": null` puts NEXT back to the talk after the one
 on. `SetSlidesTalks` (`deck_uuid`, `talks`) sets the whole list at once;
 `AddSlidesDeck` (`channel_uuid`, `paths`) adds a Slides layer to an input.
@@ -407,8 +464,11 @@ on. `SetSlidesTalks` (`deck_uuid`, `talks`) sets the whole list at once;
 take a Slides input too, and act on its talk on. `CheckTalks` looks the
 talks' files over again (without a `deck_uuid`, every Slides input's).
 `MakeSlidePictures` has PowerPoint save the PowerPoint talks without slide
-pictures as pictures (without a `deck_uuid`, every Slides input's) — refused
-while a PowerPoint talk is on; a talk's `pictures` says it has them.
+pictures as pictures (without a `deck_uuid`, every Slides input's) — with a
+PowerPoint talk on, refused till PowerPoint has saved into Nida's folder
+once (`pictures_given`), and then only the decks PowerPoint has open are
+saved (refused when it has none of them open); a talk's `pictures` says it
+has them.
 
 A Slides layer's `slides` in `GET /api/state`: its `talks` in order — each
 `id`, `name`, `given_name`, `path`, `kind` (`powerpoint`, `pdf`, `web`,
@@ -420,7 +480,10 @@ what was found when its file was looked over, in words; `live`, `starting`,
 `next` and `previous` (places in the list); `next_picked`; `on` — the talk
 on as it plays, in the list or not; `screen` (`slide`, `black`, `white`);
 `talk_secs`; `making_pictures` (PowerPoint talks being saved as pictures
-now); and `settings` (`transition`, `transition_secs`, `plays_on`).
+now); `pictures_given` (PowerPoint has saved into Nida's folder before:
+slide pictures are made by themselves, and beside a talk on); and
+`settings` (`transition`, `transition_secs`, `plays_on`, `make_pictures` —
+slide pictures made by themselves, `true` unless set).
 
 ### PowerPoint inputs
 

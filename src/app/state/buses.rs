@@ -121,7 +121,8 @@ impl VardaApp {
         if self.production_buses.routing_quarantined() && input != BusInputRef::Black {
             return CommandResult::Err {
                 code: ErrorCode::Unavailable,
-                message: "bus routing is held black until a workspace loads with                           matching stage and scene; reload before re-routing"
+                message: "bus routing is held black until a workspace loads with \
+                          matching stage and scene; reload before re-routing"
                     .into(),
             };
         }

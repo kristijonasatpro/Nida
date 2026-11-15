@@ -1078,11 +1078,14 @@ impl RateWatch {
     }
 }
 
-/// What is said of camera `name` whose frames come at `fps` of `opened`.
+/// What is said of camera `name` whose frames come at `fps` of `opened`: by
+/// its link, or by what feeds it — a capture device opened for 60 gave 30 to
+/// 37 on a fast link, its source sending no more (an M5 Max, 2026-11-09).
 pub fn slow_camera_warning(name: &str, fps: f64, opened: f64) -> String {
     format!(
-        "{name}: only {fps:.1} of {opened:.0} frames a second arrive — check its cable and \
-         USB port (on a USB 2 link an HD capture cannot keep up)"
+        "{name}: only {fps:.1} of {opened:.0} frames a second arrive — its source may send only \
+         that many; if it sends more, check its cable and USB port (on a USB 2 link an HD \
+         capture cannot keep up)"
     )
 }
 

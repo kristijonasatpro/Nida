@@ -779,6 +779,9 @@ pub struct VardaApp {
     ui_selected_deck: Option<(usize, usize)>,
     /// When decks waiting for their camera are next looked for.
     camera_retry_at: Option<std::time::Instant>,
+    /// The display inputs that go by their name alone, as last looked: the
+    /// operator is told when one is new (see `warn_captures_by_name`).
+    captures_by_name: Vec<String>,
     /// The lower thirds' list files, looked at for changes off the frame.
     lower_third_lists: state::lower_thirds::ListWatch,
     /// The control window is up, showing every channel's picture as a tile:
@@ -985,7 +988,10 @@ impl VardaApp {
             screen_capture_manager: if config.screen_capture_disabled {
                 ScreenCaptureManager::new_disabled()
             } else {
+                // Captures drawn as coded only where the GPU reads a
+                // texture two ways (see `ScreenCaptureManager::on_gpu`).
                 ScreenCaptureManager::new()
+                    .on_gpu(gpu.adapter.get_downlevel_capabilities().flags)
             },
             presentations: state::presentations::Presentations::new(config.powerpoint_disabled),
             web_talks: state::slides::WebTalks::new(config.headless),
@@ -1151,6 +1157,7 @@ impl VardaApp {
             clock_recheck: false,
             ui_selected_deck: None,
             camera_retry_at: None,
+            captures_by_name: Vec::new(),
             lower_third_lists: state::lower_thirds::ListWatch::default(),
             ui_tiles: false,
             midi_pending_undo: false,
@@ -1859,6 +1866,19 @@ impl VardaApp {
         let buses_now = self.production_buses.picture_sizes((width, height));
         self.rescale_led_parts(from, (width, height), &buses_were, &buses_now);
         self.mixer.resize(&self.context, width, height);
+        // Screen captures follow the show's size, as when they were added:
+        // each capture once, whatever number of inputs share it. A PowerPoint
+        // show's is its own, never shared with these (see
+        // `ScreenCaptureManager::adopt`), and keeps its cap.
+        let mut captures = std::collections::BTreeSet::new();
+        for channel in self.mixer.channels_mut() {
+            for slot in &mut channel.decks {
+                captures.extend(slot.deck.cap_capture_to_show(width, height));
+            }
+        }
+        for id in captures {
+            self.screen_capture_manager.cap_to(id, Some((width, height)));
+        }
         // Clear sub-mix cache since textures were recreated
         self.mixer.clear_sub_mix_cache();
         let stopped = self.resize_headless_outputs(width, height);
@@ -2300,6 +2320,2467 @@ mod tests {
 
     fn channel_uuid(app: &VardaApp, idx: usize) -> String {
         app.build_engine_state().mixer.channels[idx].uuid.clone()
+    }
+
+    /// A show opened at 4K caps its screen captures at 4K, whatever the
+    /// screen's size in points: a 4K screen set to "looks like 1920×1080" is
+    /// 1920×1080 points, and capped at those it was captured at 1920×1080
+    /// and blurred on the wall.
+    #[test]
+    fn a_capture_restored_in_a_4k_show_is_capped_at_4k() {
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        app.screen_capture_manager =
+            crate::screen_capture::ScreenCaptureManager::disabled_with_targets(vec![
+                crate::screen_capture::backend::CaptureTargetInfo {
+                    kind: crate::screen_capture::backend::CaptureTargetKind::Display,
+                    platform_id: 1,
+                    label: "Display 1".into(),
+                    app: None,
+                    title: None,
+                    width: 1920,
+                    height: 1080,
+                    is_varda: false,
+                    uuid: None,
+                },
+            ]);
+        let config: crate::scene::DeckConfig = serde_json::from_value(serde_json::json!({
+            "name": "Display 1",
+            "source": {
+                "type": "ScreenCapture",
+                "target": { "kind": "display", "name": "Display 1" }
+            }
+        }))
+        .expect("a saved capture");
+        let deck = crate::persistence::restore_deck(
+            &config,
+            &app.context,
+            &app.registry,
+            &mut app.camera_manager,
+            &mut app.screen_capture_manager,
+            &mut app.depth_manager,
+            &mut app.external_io.ndi_manager,
+            &mut app.external_io.stream_manager,
+            &mut app.external_io.html_manager,
+            3840,
+            2160,
+        )
+        .expect("restored");
+        let state = deck.screen_capture.as_ref().expect("a capture");
+        assert_eq!(state.config.scale_to, Some((3840, 2160)));
+    }
+
+    /// A desk's screens as macOS lists them — each `(uuid, width)` under
+    /// "Display N" by its place — every one captured already (a mock for
+    /// macOS's capture), so an input opening one shares it.
+    fn with_screens(app: &mut VardaApp, screens: &[(&str, u32)]) {
+        use crate::screen_capture::backend::{CaptureTargetInfo, CaptureTargetKind};
+        let targets: Vec<_> = screens
+            .iter()
+            .zip(1u32..)
+            .map(|((uuid, width), n)| CaptureTargetInfo {
+                kind: CaptureTargetKind::Display,
+                platform_id: u64::from(n),
+                label: format!("Display {n}"),
+                app: None,
+                title: None,
+                width: *width,
+                height: width * 9 / 16,
+                is_varda: false,
+                uuid: Some((*uuid).to_string()),
+            })
+            .collect();
+        with_targets(app, &targets);
+    }
+
+    /// A desk with `targets` to capture, each captured already.
+    fn with_targets(
+        app: &mut VardaApp,
+        targets: &[crate::screen_capture::backend::CaptureTargetInfo],
+    ) {
+        use crate::screen_capture::backend::CaptureConfig;
+        app.screen_capture_manager =
+            crate::screen_capture::ScreenCaptureManager::enabled_with_targets(targets.to_vec());
+        for target in targets {
+            app.screen_capture_manager
+                .open_mock(target, CaptureConfig::default(), &app.context.device)
+                .expect("open");
+        }
+    }
+
+    /// What the input a show saved as capturing `target` captures once the
+    /// show is opened: the screen's name now, and what the show saves of it
+    /// from then on.
+    fn restored_capture(
+        app: &mut VardaApp,
+        target: &serde_json::Value,
+    ) -> (String, serde_json::Value) {
+        let deck = restored_capture_deck(app, target);
+        let state = deck.screen_capture.as_ref().expect("a capture");
+        let captured = app
+            .screen_capture_manager
+            .label(state.capture_id)
+            .expect("bound")
+            .to_string();
+        (captured, saved_target(&deck))
+    }
+
+    /// What a show saves of the screen or window `deck` captures.
+    fn saved_target(deck: &crate::deck::Deck) -> serde_json::Value {
+        let state = deck.screen_capture.as_ref().expect("a capture");
+        serde_json::to_value(crate::scene::CaptureTargetConfig::from(&state.identity))
+            .expect("serialize")
+    }
+
+    /// The input a show saved as capturing `target`, as the show opened
+    /// gives it.
+    fn restored_capture_deck(
+        app: &mut VardaApp,
+        target: &serde_json::Value,
+    ) -> crate::deck::Deck {
+        restored_input(
+            app,
+            "Screen",
+            &serde_json::json!({ "type": "ScreenCapture", "target": target }),
+        )
+    }
+
+    /// The input a show saved under `name` with `source`, as the show
+    /// opened gives it.
+    fn restored_input(
+        app: &mut VardaApp,
+        name: &str,
+        source: &serde_json::Value,
+    ) -> crate::deck::Deck {
+        let config: crate::scene::DeckConfig =
+            serde_json::from_value(serde_json::json!({ "name": name, "source": source }))
+                .expect("a saved input");
+        crate::persistence::restore_deck(
+            &config,
+            &app.context,
+            &app.registry,
+            &mut app.camera_manager,
+            &mut app.screen_capture_manager,
+            &mut app.depth_manager,
+            &mut app.external_io.ndi_manager,
+            &mut app.external_io.stream_manager,
+            &mut app.external_io.html_manager,
+            1920,
+            1080,
+        )
+        .expect("restored")
+    }
+
+    /// A show saved its capture of the 4K screen as "Display 1". Opened with
+    /// one more screen plugged in — macOS lists that one first, the 4K as
+    /// "Display 2" (an M5 Max, 2026-11-09) — the input still captures the
+    /// 4K, and the show saves it under the name it has now. Its own screen
+    /// not plugged in, the one of its name stands in, and the show goes on
+    /// saving the screen it was made with.
+    #[test]
+    fn a_captured_screen_restored_is_the_one_saved_whatever_its_number() {
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+
+        let saved = serde_json::json!({ "kind": "display", "name": "Display 1", "uuid": "4k" });
+        let (captured, saved) = restored_capture(&mut app, &saved);
+        assert_eq!(captured, "Display 2", "the 4K, wherever it is listed");
+        assert_eq!(
+            saved,
+            serde_json::json!({ "kind": "display", "name": "Display 2", "uuid": "4k" })
+        );
+
+        let away = serde_json::json!({ "kind": "display", "name": "Display 2", "uuid": "led" });
+        let (captured, saved) = restored_capture(&mut app, &away);
+        assert_eq!(captured, "Display 2");
+        assert_eq!(saved, away);
+    }
+
+    /// A show saved before screens were kept by identity has the name alone:
+    /// it captures the screen of that name, and goes on saving the name
+    /// alone. Made of the 4K when that was "Display 1", opened with a
+    /// capture box plugged in and listed first, it must not become the
+    /// box's own screen for good by being opened and closed (a copy of a
+    /// show, an M5 Max, 2026-11-10).
+    #[test]
+    fn a_screen_saved_by_name_alone_stays_so_until_its_screen_is_picked() {
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let old = serde_json::json!({ "kind": "display", "name": "Display 1" });
+        let (captured, saved) = restored_capture(&mut app, &old);
+        assert_eq!(captured, "Display 1", "the one of that name today");
+        assert_eq!(saved, old, "and no screen's identity written for it");
+    }
+
+    /// The input of `uuid`.
+    fn deck_of<'a>(app: &'a VardaApp, uuid: &str) -> &'a crate::internal::deck::Deck {
+        let (ch, dk) = app.mixer.find_deck_by_uuid(uuid).expect("the input");
+        &app.mixer.channels()[ch].decks[dk].deck
+    }
+
+    /// The capture of the input at (channel, place).
+    fn capture_state_at(
+        app: &mut VardaApp,
+        at: (usize, usize),
+    ) -> &mut crate::internal::deck::ScreenCaptureState {
+        app.mixer.channels_mut()[at.0].decks[at.1]
+            .deck
+            .screen_capture
+            .as_mut()
+            .expect("a capture")
+    }
+
+    /// The screen capture inputs of `app`, as the window and the API are
+    /// told of them, by layer.
+    fn capture_snapshot(app: &VardaApp, uuid: &str) -> crate::engine::ScreenCaptureDeckSnapshot {
+        snapshot::build_mixer_snapshot(app)
+            .channels
+            .into_iter()
+            .flat_map(|channel| channel.decks)
+            .find(|deck| deck.uuid == uuid)
+            .and_then(|deck| deck.screen_capture)
+            .expect("a capture layer")
+    }
+
+    /// The same, as the control window's settings are given it.
+    fn capture_in_the_window(app: &VardaApp, uuid: &str) -> crate::usecases::ui::ScreenCaptureUI {
+        let none = std::collections::HashMap::new();
+        crate::usecases::ui::build_ui_data(
+            app,
+            &crate::usecases::ui::UILayoutState::default(),
+            &std::collections::HashMap::new(),
+            &none,
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .channels
+        .into_iter()
+        .flat_map(|channel| channel.decks)
+        .find(|deck| deck.uuid == uuid)
+        .and_then(|deck| deck.screen_capture)
+        .expect("a capture layer")
+    }
+
+    /// An input a show has by its display's name alone says so, and its
+    /// screen picked — the 4K, "Display 2" today — it captures that one and
+    /// is kept by its identity; named after its screen, it is named after
+    /// the new one. Picked by name alone, as an API client may, it is kept
+    /// by identity too.
+    #[test]
+    fn a_screen_picked_again_is_captured_and_kept_by_its_identity() {
+        use crate::engine::MixerCommands;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let old = serde_json::json!({ "kind": "display", "name": "Display 1" });
+        let deck = restored_capture_deck(&mut app, &old);
+        let uuid = deck.uuid().to_string();
+        app.mixer.channels_mut()[0].add_deck(deck);
+        let captured = |app: &VardaApp| {
+            let id = deck_of(app, &uuid).screen_capture_id().expect("a capture");
+            app.screen_capture_manager
+                .label(id)
+                .map(str::to_string)
+        };
+        let before = capture_snapshot(&app, &uuid);
+        assert!(before.kept_by_name, "the show has it by its number");
+        assert_eq!(before.target_uuid, None);
+        let shown = capture_in_the_window(&app, &uuid);
+        assert!(shown.kept_by_name, "and its settings say so");
+        assert_eq!(shown.target_uuid, None);
+
+        let the_4k = crate::scene::CaptureTargetConfig::Display {
+            name: "Display 2".into(),
+            uuid: Some("4k".into()),
+        };
+        app.set_screen_capture_target(&uuid, &the_4k).expect("picked");
+        assert_eq!(captured(&app).as_deref(), Some("Display 2"));
+        assert_eq!(
+            saved_target(deck_of(&app, &uuid)),
+            serde_json::json!({ "kind": "display", "name": "Display 2", "uuid": "4k" })
+        );
+        assert_eq!(deck_of(&app, &uuid).source_name(), "🖥 Display 2");
+        assert_eq!(deck_of(&app, &uuid).source_size(), Some([3840, 2160]), "the 4K's picture");
+        let after = capture_snapshot(&app, &uuid);
+        assert!(!after.kept_by_name);
+        assert_eq!(after.target_uuid.as_deref(), Some("4k"));
+        let shown = capture_in_the_window(&app, &uuid);
+        assert!(!shown.kept_by_name);
+        assert_eq!(shown.target_uuid.as_deref(), Some("4k"));
+
+        // By its name alone: the one of that name now, kept as itself.
+        let by_name = crate::scene::CaptureTargetConfig::Display {
+            name: "Display 1".into(),
+            uuid: None,
+        };
+        app.set_screen_capture_target(&uuid, &by_name).expect("picked");
+        assert_eq!(captured(&app).as_deref(), Some("Display 1"));
+        assert_eq!(
+            saved_target(deck_of(&app, &uuid)),
+            serde_json::json!({ "kind": "display", "name": "Display 1", "uuid": "capture" })
+        );
+    }
+
+    /// How many times it has been said that inputs go by a display's
+    /// number, and the last of them.
+    fn said_by_number(app: &VardaApp) -> (usize, String) {
+        let said: Vec<_> = app
+            .session
+            .notifications
+            .history()
+            .iter()
+            .filter(|n| n.message.contains("by a display's number"))
+            .collect();
+        let last = said.last().map(|n| n.message.clone()).unwrap_or_default();
+        (said.len(), last)
+    }
+
+    /// A show's inputs kept by a display's number alone are said once, as a
+    /// warning, with the numbers they go by — not every frame, not when one
+    /// has its screen picked, and again when another such input comes. One
+    /// kept by its screen's identity is not among them.
+    #[test]
+    fn inputs_kept_by_a_displays_number_are_said_once() {
+        use crate::engine::MixerCommands;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let old = serde_json::json!({ "kind": "display", "name": "Display 1" });
+        let add = |app: &mut VardaApp, target: &serde_json::Value| {
+            let deck = restored_capture_deck(app, target);
+            let uuid = deck.uuid().to_string();
+            app.mixer.channels_mut()[0].add_deck(deck);
+            uuid
+        };
+        let first = add(&mut app, &old);
+        add(&mut app, &old);
+        add(
+            &mut app,
+            &serde_json::json!({ "kind": "display", "name": "Display 2", "uuid": "4k" }),
+        );
+        assert_eq!(said_by_number(&app).0, 0);
+
+        app.warn_captures_by_name();
+        let (times, said) = said_by_number(&app);
+        assert_eq!(times, 1);
+        assert!(
+            said.starts_with(
+                "2 screen inputs go by a display's number (Display 1), not the screen itself: \
+                 they show whichever screen has that number today."
+            ),
+            "{said}"
+        );
+        let level = app.session.notifications.history().last().map(|n| n.level);
+        assert_eq!(level, Some(crate::notifications::NotificationLevel::Warning));
+        for _ in 0..3 {
+            app.warn_captures_by_name();
+        }
+        assert_eq!(said_by_number(&app).0, 1, "not every frame");
+
+        // One's screen picked: one fewer, and nothing to say of that.
+        let the_4k = crate::scene::CaptureTargetConfig::Display {
+            name: "Display 2".into(),
+            uuid: Some("4k".into()),
+        };
+        app.set_screen_capture_target(&first, &the_4k).expect("picked");
+        app.warn_captures_by_name();
+        assert_eq!(said_by_number(&app).0, 1, "one picked");
+
+        // Another comes — a show opened into this one: said, of those there
+        // are now.
+        add(
+            &mut app,
+            &serde_json::json!({ "kind": "display", "name": "Display 2" }),
+        );
+        app.warn_captures_by_name();
+        let (times, said) = said_by_number(&app);
+        assert_eq!(times, 2, "a new one");
+        assert!(
+            said.starts_with("2 screen inputs go by a display's number (Display 1, Display 2)"),
+            "{said}"
+        );
+    }
+
+    /// With one screen there is no other to have its number: nothing is
+    /// said of an input kept by it until a second screen is there.
+    #[test]
+    fn an_input_by_a_displays_number_is_not_spoken_of_with_one_screen() {
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("laptop", 1728)]);
+        let old = serde_json::json!({ "kind": "display", "name": "Display 1" });
+        let deck = restored_capture_deck(&mut app, &old);
+        app.mixer.channels_mut()[0].add_deck(deck);
+        app.warn_captures_by_name();
+        assert_eq!(said_by_number(&app).0, 0, "the only screen there is");
+
+        with_screens(&mut app, &[("laptop", 1728), ("projector", 1920)]);
+        app.warn_captures_by_name();
+        let (times, said) = said_by_number(&app);
+        assert_eq!(times, 1);
+        assert!(
+            said.starts_with(
+                "1 screen input goes by a display's number (Display 1), not the screen itself: \
+                 it shows whichever screen has that number today. Check it, and pick its screen"
+            ),
+            "{said}"
+        );
+    }
+
+    /// A screen picked for an input lets go of the capture it held, and
+    /// leaves a name given it as it was. Its own screen picked again holds
+    /// its capture once, not twice, a setting not yet sent down still its
+    /// own; another screen's capture, running already, is shared as it runs.
+    #[test]
+    fn a_screen_picked_lets_go_of_the_capture_the_input_held() {
+        use crate::engine::MixerCommands;
+        use crate::screen_capture::backend::CaptureConfig;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let display = |name: &str, uuid: &str| crate::scene::CaptureTargetConfig::Display {
+            name: name.into(),
+            uuid: Some(uuid.into()),
+        };
+        let ch0 = channel_uuid(&app, 0);
+        let uuid = app
+            .add_screen_capture_deck(&ch0, &display("Display 1", "capture"), CaptureConfig::default())
+            .expect("added");
+        let (ch, dk) = app.mixer.find_deck_by_uuid(&uuid).expect("the input");
+        {
+            let deck = &mut app.mixer.channels_mut()[ch].decks[dk].deck;
+            deck.set_source_name("Slides".into());
+            assert!(deck.set_capture_param("crop_w", 0.5));
+        }
+        let first = app.mixer.channels()[ch].decks[dk]
+            .deck
+            .screen_capture_id()
+            .expect("a capture");
+        // The desk's mock, and the input.
+        assert_eq!(app.screen_capture_manager.holders(first), 2);
+
+        app.set_screen_capture_target(&uuid, &display("Display 1", "capture"))
+            .expect("picked");
+        let deck = &app.mixer.channels()[ch].decks[dk].deck;
+        assert_eq!(deck.screen_capture_id(), Some(first), "its own");
+        assert_eq!(app.screen_capture_manager.holders(first), 2, "held once");
+        let state = deck.screen_capture.as_ref().expect("a capture");
+        assert!((state.config.crop.w - 0.5).abs() < 1e-6, "its crop");
+        assert_eq!(state.given.len(), 1, "still to be sent down");
+
+        app.set_screen_capture_target(&uuid, &display("Display 2", "4k"))
+            .expect("picked");
+        let deck = &app.mixer.channels()[ch].decks[dk].deck;
+        let second = deck.screen_capture_id().expect("a capture");
+        assert_ne!(second, first);
+        assert_eq!(app.screen_capture_manager.holders(first), 1, "let go");
+        assert_eq!(app.screen_capture_manager.holders(second), 2);
+        let state = deck.screen_capture.as_ref().expect("a capture");
+        let runs = app
+            .screen_capture_manager
+            .config(second)
+            .expect("running");
+        assert_eq!(
+            state.config,
+            CaptureConfig {
+                scale_to: Some((app.render_width, app.render_height)),
+                ..runs
+            },
+            "as the capture it shares runs, capped as the show is"
+        );
+        assert!(state.given.is_empty(), "nothing of its own to send down");
+        assert_eq!(deck.source_name(), "Slides", "a name given it stays");
+
+        // Its own picked again with nothing changed: nothing to send.
+        app.set_screen_capture_target(&uuid, &display("Display 2", "4k"))
+            .expect("picked");
+        let state = app.mixer.channels()[ch].decks[dk]
+            .deck
+            .screen_capture
+            .as_ref()
+            .expect("a capture");
+        assert!(state.given.is_empty(), "nothing changed");
+        // And nothing goes down: the crop it had on the first is not the
+        // second's.
+        draw_a_frame(&mut app);
+        let runs = app
+            .screen_capture_manager
+            .config(second)
+            .expect("running");
+        assert!(runs.crop.is_full_frame(), "as it ran: {:?}", runs.crop);
+    }
+
+    /// An input given a screen another input captures already sends none
+    /// of its own settings down to it: a crop that one had set the same
+    /// frame, not yet sent, was written over by the one that joined, and
+    /// the first showed the whole screen with half of it set. It shows and
+    /// saves that crop as its own from then on, so that something else
+    /// changed on it — its whole settings sent — does not put the whole
+    /// screen back either.
+    #[test]
+    fn a_screen_shared_keeps_the_crop_its_first_input_set() {
+        use crate::engine::MixerCommands;
+        use crate::screen_capture::backend::CaptureConfig;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let display = |name: &str, uuid: &str| crate::scene::CaptureTargetConfig::Display {
+            name: name.into(),
+            uuid: Some(uuid.into()),
+        };
+        let ch0 = channel_uuid(&app, 0);
+        let first = app
+            .add_screen_capture_deck(&ch0, &display("Display 1", "capture"), CaptureConfig::default())
+            .expect("added");
+        let joins = app
+            .add_screen_capture_deck(&ch0, &display("Display 2", "4k"), CaptureConfig::default())
+            .expect("added");
+        let (ch, dk) = app.mixer.find_deck_by_uuid(&first).expect("the input");
+        let (_, joins_at) = app.mixer.find_deck_by_uuid(&joins).expect("the input");
+        assert!(dk < joins_at, "the first is sent down first");
+        let deck = &mut app.mixer.channels_mut()[ch].decks[dk].deck;
+        assert!(deck.set_capture_param("crop_w", 0.5));
+        let capture = deck.screen_capture_id().expect("a capture");
+
+        app.set_screen_capture_target(&joins, &display("Display 1", "capture"))
+            .expect("picked");
+        app.update_frame_timing();
+        app.render_mixer_frame();
+        let runs = app
+            .screen_capture_manager
+            .config(capture)
+            .expect("running");
+        assert!((runs.crop.w - 0.5).abs() < 1e-6, "{:?}", runs.crop);
+
+        let joined = capture_state_at(&mut app, (ch, joins_at));
+        assert_eq!(joined.capture_id, capture);
+        assert!(
+            (joined.config.crop.w - 0.5).abs() < 1e-6,
+            "the crop it is captured with: {:?}",
+            joined.config.crop
+        );
+        set_capture(&mut app, (ch, joins_at), "cursor", 1.0);
+        app.update_frame_timing();
+        app.render_mixer_frame();
+        let runs = app
+            .screen_capture_manager
+            .config(capture)
+            .expect("running");
+        assert!((runs.crop.w - 0.5).abs() < 1e-6, "{:?}", runs.crop);
+        assert!(runs.show_cursor, "what it changed is taken");
+        let first = capture_state_at(&mut app, (ch, dk));
+        assert!(first.config.show_cursor, "and the first shows it too");
+    }
+
+    /// Set the capture setting `name` of the input at (channel, place), as
+    /// its parameter path does.
+    fn set_capture(app: &mut VardaApp, at: (usize, usize), name: &str, value: f32) {
+        let deck = &mut app.mixer.channels_mut()[at.0].decks[at.1].deck;
+        assert!(deck.set_capture_param(name, value), "a capture setting");
+    }
+
+    /// An input of the only screen of a desk (`with_screens`) added to the
+    /// first channel with settings `asked`: where it is.
+    fn screen_input(
+        app: &mut VardaApp,
+        asked: crate::screen_capture::backend::CaptureConfig,
+    ) -> (usize, usize) {
+        use crate::engine::MixerCommands;
+        let screen = crate::scene::CaptureTargetConfig::Display {
+            name: "Display 1".into(),
+            uuid: Some("capture".into()),
+        };
+        let ch0 = channel_uuid(app, 0);
+        let uuid = app
+            .add_screen_capture_deck(&ch0, &screen, asked)
+            .expect("added");
+        app.mixer.find_deck_by_uuid(&uuid).expect("the input")
+    }
+
+    /// Two inputs of one screen changed the same frame — one its crop, the
+    /// other its cursor: the capture they share takes both, and both show
+    /// and save the same. Each sent its settings whole, and the second put
+    /// back the whole screen the first had just cropped.
+    #[test]
+    fn two_inputs_of_one_screen_changed_at_once_keep_both_changes() {
+        use crate::screen_capture::backend::CaptureConfig;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920)]);
+        let first = screen_input(&mut app, CaptureConfig::default());
+        let second = screen_input(&mut app, CaptureConfig::default());
+        let capture = capture_state_at(&mut app, first).capture_id;
+        assert_eq!(capture_state_at(&mut app, second).capture_id, capture);
+
+        // Each input's cap is the show's; the capture's, as the desk's own
+        // opened it: none.
+        let show = Some((app.render_width, app.render_height));
+        for at in [first, second] {
+            assert_eq!(capture_state_at(&mut app, at).config.scale_to, show);
+        }
+        set_capture(&mut app, first, "crop_w", 0.5);
+        set_capture(&mut app, second, "cursor", 1.0);
+        app.update_frame_timing();
+        app.render_mixer_frame();
+        let runs = app
+            .screen_capture_manager
+            .config(capture)
+            .expect("running");
+        assert!(
+            (runs.crop.w - 0.5).abs() < 1e-6,
+            "the first's crop: {:?}",
+            runs.crop
+        );
+        assert!(runs.show_cursor, "the second's cursor");
+        assert_eq!(runs.scale_to, None, "its cap not an input's to set");
+        for at in [first, second] {
+            let state = capture_state_at(&mut app, at);
+            assert!(state.given.is_empty(), "sent");
+            assert_eq!(state.config.scale_to, show, "its cap kept: the show's");
+            assert_eq!(
+                state.config,
+                CaptureConfig {
+                    scale_to: show,
+                    ..runs.clone()
+                },
+                "as its capture runs"
+            );
+        }
+    }
+
+    /// Two inputs of one screen given the same setting the same frame —
+    /// its cursor shown on one, then hidden on the other: the capture they
+    /// share is left as the last given says, whichever input that was, and
+    /// both show and save so. Each input's settings were compared with
+    /// what the capture ran with to find what it had changed, and a cursor
+    /// hidden on a capture that ran without one was nothing changed: it
+    /// stayed shown.
+    #[test]
+    fn two_inputs_of_one_screen_given_one_setting_keep_the_last_given() {
+        use crate::screen_capture::backend::CaptureConfig;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920)]);
+        let first = screen_input(&mut app, CaptureConfig::default());
+        let second = screen_input(&mut app, CaptureConfig::default());
+        let capture = capture_state_at(&mut app, first).capture_id;
+        // A frame drawn: whether the capture shows the cursor, as both its
+        // inputs then do.
+        let cursor = |app: &mut VardaApp| {
+            draw_a_frame(app);
+            let runs = app
+                .screen_capture_manager
+                .config(capture)
+                .expect("running")
+                .show_cursor;
+            for at in [first, second] {
+                assert_eq!(
+                    capture_state_at(app, at).config.show_cursor,
+                    runs,
+                    "as its capture runs"
+                );
+            }
+            runs
+        };
+        // Either input the later given: the later counts, not its place.
+        for (one, other) in [(first, second), (second, first)] {
+            set_capture(&mut app, one, "cursor", 1.0);
+            set_capture(&mut app, other, "cursor", 0.0);
+            assert!(!cursor(&mut app), "hidden last");
+            set_capture(&mut app, one, "cursor", 0.0);
+            set_capture(&mut app, other, "cursor", 1.0);
+            assert!(cursor(&mut app), "shown last");
+            set_capture(&mut app, other, "cursor", 0.0);
+            assert!(!cursor(&mut app), "hidden again");
+        }
+    }
+
+    /// Two inputs of one screen given its crop the same frame — a width on
+    /// one, a left edge on the other: the capture takes both as given, and
+    /// both inputs show so. The input given the edge narrowed its own,
+    /// older width to fit, which went down as a width changed: it took
+    /// away the one the first was given.
+    #[test]
+    fn two_inputs_of_one_screen_given_its_crop_keep_each_side_given() {
+        use crate::screen_capture::backend::CaptureConfig;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920)]);
+        let first = screen_input(&mut app, CaptureConfig::default());
+        let second = screen_input(&mut app, CaptureConfig::default());
+        let capture = capture_state_at(&mut app, first).capture_id;
+
+        set_capture(&mut app, first, "crop_w", 0.5);
+        set_capture(&mut app, second, "crop_x", 0.25);
+        draw_a_frame(&mut app);
+        let crop = app
+            .screen_capture_manager
+            .config(capture)
+            .expect("running")
+            .crop;
+        assert!(
+            (crop.x - 0.25).abs() < 1e-6 && (crop.w - 0.5).abs() < 1e-6,
+            "the edge and the width, each as given: {crop:?}"
+        );
+        for at in [first, second] {
+            assert_eq!(
+                capture_state_at(&mut app, at).config.crop,
+                crop,
+                "as its capture runs"
+            );
+        }
+    }
+
+    /// A setting given twice before its capture has it is given it twice,
+    /// not once as last given: a crop's left edge moved far right narrows
+    /// its width, and moved back leaves it narrowed — as on one input
+    /// alone, a frame apart. On one input, and on one then the other.
+    #[test]
+    fn a_crop_edge_given_twice_in_a_frame_is_given_its_capture_twice() {
+        use crate::screen_capture::backend::{CaptureConfig, CropRect};
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920)]);
+        let first = screen_input(&mut app, CaptureConfig::default());
+        let second = screen_input(&mut app, CaptureConfig::default());
+        let capture = capture_state_at(&mut app, first).capture_id;
+        for (one, other) in [(first, first), (first, second), (second, first)] {
+            // The whole screen again.
+            set_capture(&mut app, one, "crop_x", 0.0);
+            set_capture(&mut app, one, "crop_w", 1.0);
+            draw_a_frame(&mut app);
+            let whole = app
+                .screen_capture_manager
+                .config(capture)
+                .expect("running")
+                .crop;
+            assert!(whole.is_full_frame(), "{whole:?}");
+
+            set_capture(&mut app, one, "crop_x", 0.75);
+            set_capture(&mut app, other, "crop_x", 0.25);
+            draw_a_frame(&mut app);
+            let crop = app
+                .screen_capture_manager
+                .config(capture)
+                .expect("running")
+                .crop;
+            assert_eq!(
+                crop,
+                CropRect {
+                    x: 0.25,
+                    y: 0.0,
+                    w: 0.25,
+                    h: 1.0
+                },
+                "narrowed, then moved back"
+            );
+            for at in [first, second] {
+                assert_eq!(
+                    capture_state_at(&mut app, at).config.crop,
+                    crop,
+                    "as its capture runs"
+                );
+            }
+        }
+    }
+
+    /// A setting given an input whose screen is not there stays on the
+    /// input, nothing of it kept to go down to whatever it is given next;
+    /// and the screen it is then given, which nothing captures yet, is
+    /// opened as the input is set.
+    #[test]
+    fn a_setting_given_an_input_whose_screen_is_gone_stays_on_it() {
+        use crate::engine::MixerCommands;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let gone = serde_json::json!({ "kind": "display", "name": "Display 5" });
+        let deck = restored_capture_deck(&mut app, &gone);
+        let uuid = deck.uuid().to_string();
+        app.mixer.channels_mut()[0].add_deck(deck);
+        let at = app.mixer.find_deck_by_uuid(&uuid).expect("the input");
+        set_capture(&mut app, at, "crop_w", 0.5);
+        // The desk's own captures, which no input shows, close with it.
+        draw_a_frame(&mut app);
+        let state = capture_state_at(&mut app, at);
+        assert!(state.given.is_empty(), "nothing to go down");
+        assert!(
+            (state.config.crop.w - 0.5).abs() < 1e-6,
+            "kept on it: {:?}",
+            state.config.crop
+        );
+
+        let the_4k = crate::scene::CaptureTargetConfig::Display {
+            name: "Display 2".into(),
+            uuid: Some("4k".into()),
+        };
+        app.set_screen_capture_target(&uuid, &the_4k).expect("picked");
+        let id = capture_of(&app, &uuid);
+        assert_eq!(app.screen_capture_manager.holders(id), 1, "opened for it");
+        let runs = app.screen_capture_manager.config(id).expect("running");
+        assert!(
+            (runs.crop.w - 0.5).abs() < 1e-6,
+            "as the input is set: {:?}",
+            runs.crop
+        );
+    }
+
+    /// An input added of a screen another input captures already shares
+    /// that capture as it runs, and shows and saves its rate, crop and
+    /// cursor — not those asked for it, which were never sent: they went
+    /// down whole at its first change, the other input's crop with them.
+    #[test]
+    fn an_input_added_of_a_screen_captured_takes_its_captures_settings() {
+        use crate::screen_capture::backend::{CaptureConfig, DEFAULT_CAPTURE_RATE};
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920)]);
+        let first = screen_input(&mut app, CaptureConfig::default());
+        let capture = capture_state_at(&mut app, first).capture_id;
+        set_capture(&mut app, first, "crop_w", 0.5);
+        app.update_frame_timing();
+        app.render_mixer_frame();
+
+        let asked = CaptureConfig {
+            rate: 24.0,
+            ..CaptureConfig::default()
+        };
+        let second = screen_input(&mut app, asked);
+        let show = (app.render_width, app.render_height);
+        let state = capture_state_at(&mut app, second);
+        assert_eq!(state.capture_id, capture, "the one capture of that screen");
+        assert!(
+            (state.config.crop.w - 0.5).abs() < 1e-6,
+            "the crop it is captured with: {:?}",
+            state.config.crop
+        );
+        assert!(
+            (state.config.rate - DEFAULT_CAPTURE_RATE).abs() < 1e-6,
+            "and the rate: {}",
+            state.config.rate
+        );
+        assert_eq!(state.config.scale_to, Some(show), "capped as the show is");
+
+        // Changed before a frame is drawn: only that goes down.
+        set_capture(&mut app, second, "cursor", 1.0);
+        app.update_frame_timing();
+        app.render_mixer_frame();
+        let runs = app
+            .screen_capture_manager
+            .config(capture)
+            .expect("running");
+        assert!((runs.crop.w - 0.5).abs() < 1e-6, "{:?}", runs.crop);
+        assert!((runs.rate - DEFAULT_CAPTURE_RATE).abs() < 1e-6, "{}", runs.rate);
+        assert!(runs.show_cursor);
+    }
+
+    /// A show opened captures a screen the show before captured too in the
+    /// one capture there is of it, and runs it as it saved it — not with
+    /// the crop the show before left on it, which its input would then
+    /// show and save for its own.
+    #[test]
+    fn a_show_opened_runs_its_captures_as_it_saved_them() {
+        use crate::screen_capture::backend::CaptureConfig;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920)]);
+        let at = screen_input(&mut app, CaptureConfig::default());
+        let uuid = app.mixer.channels()[at.0].decks[at.1].deck.uuid().to_string();
+        let capture = capture_state_at(&mut app, at).capture_id;
+        app.update_frame_timing();
+        app.render_mixer_frame();
+        let saved = crate::persistence::snapshot_scene(
+            &app.mixer,
+            None,
+            app.render_width,
+            app.render_height,
+        );
+
+        // Cropped since: the show there is, which the one saved replaces.
+        set_capture(&mut app, at, "crop_w", 0.5);
+        app.update_frame_timing();
+        app.render_mixer_frame();
+        let runs = app
+            .screen_capture_manager
+            .config(capture)
+            .expect("running");
+        assert!((runs.crop.w - 0.5).abs() < 1e-6, "{:?}", runs.crop);
+
+        app.replace_scene(&saved).expect("opened");
+        let at = app.mixer.find_deck_by_uuid(&uuid).expect("its input");
+        assert_eq!(
+            capture_state_at(&mut app, at).capture_id,
+            capture,
+            "the capture there was of that screen"
+        );
+        let runs = app
+            .screen_capture_manager
+            .config(capture)
+            .expect("running");
+        assert!(runs.crop.is_full_frame(), "as saved: {:?}", runs.crop);
+        app.update_frame_timing();
+        app.render_mixer_frame();
+        let state = capture_state_at(&mut app, at);
+        assert!(
+            state.config.crop.is_full_frame(),
+            "and its input shows so: {:?}",
+            state.config.crop
+        );
+    }
+
+    /// An input of the screen `name`, kept as `uuid`, added to the first
+    /// channel: its layer.
+    fn input_of_screen(app: &mut VardaApp, name: &str, uuid: &str) -> String {
+        use crate::engine::MixerCommands;
+        let screen = crate::scene::CaptureTargetConfig::Display {
+            name: name.into(),
+            uuid: Some(uuid.into()),
+        };
+        let ch0 = channel_uuid(app, 0);
+        app.add_screen_capture_deck(
+            &ch0,
+            &screen,
+            crate::screen_capture::backend::CaptureConfig::default(),
+        )
+        .expect("added")
+    }
+
+    /// The capture the input `uuid` shows.
+    fn capture_of(app: &VardaApp, uuid: &str) -> crate::screen_capture::CaptureId {
+        deck_of(app, uuid).screen_capture_id().expect("a capture")
+    }
+
+    /// A frame drawn: who holds each capture is counted again by it, and a
+    /// capture no input holds — a desk's own (`with_targets`) — closed.
+    fn draw_a_frame(app: &mut VardaApp) {
+        app.update_frame_timing();
+        app.render_mixer_frame();
+    }
+
+    /// A screen picked for an input that alone held its capture — a frame
+    /// drawn since it was added, the holders counted — closes that capture
+    /// at once: a screen no input shows is not captured on until the next
+    /// frame finds it so. The one picked is held by both its inputs, and
+    /// stays so.
+    #[test]
+    fn a_screen_picked_closes_the_capture_only_its_input_held() {
+        use crate::engine::MixerCommands;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let moves = input_of_screen(&mut app, "Display 1", "capture");
+        let stays = input_of_screen(&mut app, "Display 2", "4k");
+        draw_a_frame(&mut app);
+        let first = capture_of(&app, &moves);
+        let second = capture_of(&app, &stays);
+        let holders = |app: &VardaApp| {
+            (
+                app.screen_capture_manager.holders(first),
+                app.screen_capture_manager.holders(second),
+            )
+        };
+        assert_eq!(holders(&app), (1, 1), "each its input's alone");
+
+        let the_4k = crate::scene::CaptureTargetConfig::Display {
+            name: "Display 2".into(),
+            uuid: Some("4k".into()),
+        };
+        app.set_screen_capture_target(&moves, &the_4k)
+            .expect("picked");
+        assert_eq!(capture_of(&app, &moves), second);
+        assert!(
+            !app.screen_capture_manager.is_active(first),
+            "closed: no input shows it"
+        );
+        assert_eq!(holders(&app), (0, 2), "the one picked, held by both");
+        draw_a_frame(&mut app);
+        assert_eq!(holders(&app), (0, 2), "and so it stays");
+        assert_eq!(capture_of(&app, &moves), second);
+    }
+
+    /// A window picked for an input that showed a screen, and a screen for
+    /// it again: it captures each in turn and holds it once, is saved and
+    /// told of as what it captures, and — named after its screen — is
+    /// named after each.
+    #[test]
+    fn a_window_picked_for_a_screens_input_is_captured_and_a_screen_again() {
+        use crate::engine::MixerCommands;
+        use crate::scene::CaptureTargetConfig;
+        use crate::screen_capture::backend::{CaptureTargetInfo, CaptureTargetKind};
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920)]);
+        let mut targets = app.screen_capture_manager.targets().to_vec();
+        targets.push(CaptureTargetInfo {
+            kind: CaptureTargetKind::Window,
+            platform_id: 900,
+            label: "Keynote — Opening".into(),
+            app: Some("com.apple.Keynote".into()),
+            title: Some("Opening".into()),
+            width: 1280,
+            height: 720,
+            is_varda: false,
+            uuid: None,
+        });
+        with_targets(&mut app, &targets);
+        let uuid = input_of_screen(&mut app, "Display 1", "capture");
+        let screen = capture_of(&app, &uuid);
+        assert_eq!(deck_of(&app, &uuid).source_name(), "🖥 Display 1");
+
+        let window = CaptureTargetConfig::Window {
+            app: "com.apple.Keynote".into(),
+            title: "Opening".into(),
+        };
+        app.set_screen_capture_target(&uuid, &window)
+            .expect("picked");
+        let deck = deck_of(&app, &uuid);
+        let shown = capture_of(&app, &uuid);
+        assert_ne!(shown, screen);
+        assert_eq!(
+            app.screen_capture_manager.label(shown),
+            Some("Keynote — Opening")
+        );
+        // The desk's own, and the input.
+        assert_eq!(app.screen_capture_manager.holders(shown), 2);
+        assert_eq!(app.screen_capture_manager.holders(screen), 1, "let go");
+        assert_eq!(
+            saved_target(deck),
+            serde_json::json!({ "kind": "window", "app": "com.apple.Keynote", "title": "Opening" })
+        );
+        assert_eq!(deck.source_name(), "🖥 Keynote — Opening");
+        let told = capture_snapshot(&app, &uuid);
+        assert!(told.bound && !told.is_display, "a window");
+        assert!(!told.kept_by_name && told.target_uuid.is_none());
+
+        // By its name, as the window lists it: kept by its identity.
+        let display = CaptureTargetConfig::Display {
+            name: "Display 1".into(),
+            uuid: None,
+        };
+        app.set_screen_capture_target(&uuid, &display)
+            .expect("picked");
+        let deck = deck_of(&app, &uuid);
+        assert_eq!(capture_of(&app, &uuid), screen);
+        assert_eq!(app.screen_capture_manager.holders(screen), 2);
+        assert_eq!(app.screen_capture_manager.holders(shown), 1, "let go");
+        assert_eq!(
+            saved_target(deck),
+            serde_json::json!({ "kind": "display", "name": "Display 1", "uuid": "capture" })
+        );
+        assert_eq!(deck.source_name(), "🖥 Display 1");
+        let told = capture_snapshot(&app, &uuid);
+        assert!(told.bound && told.is_display && !told.kept_by_name);
+        assert_eq!(told.target_uuid.as_deref(), Some("capture"));
+    }
+
+    /// A window as macOS lists it, for a desk (`with_targets`).
+    fn keynote_window() -> crate::screen_capture::backend::CaptureTargetInfo {
+        crate::screen_capture::backend::CaptureTargetInfo {
+            kind: crate::screen_capture::backend::CaptureTargetKind::Window,
+            platform_id: 900,
+            label: "Keynote — Opening".into(),
+            app: Some("com.apple.Keynote".into()),
+            title: Some("Opening".into()),
+            width: 1280,
+            height: 720,
+            is_varda: false,
+            uuid: None,
+        }
+    }
+
+    /// A desk of `screens` and a window, an input on the first screen, and
+    /// a frame drawn: the rest, which no input shows, captured by nothing.
+    /// The input's layer.
+    fn a_screens_input_beside_a_window(app: &mut VardaApp, screens: &[(&str, u32)]) -> String {
+        with_screens(app, screens);
+        let mut targets = app.screen_capture_manager.targets().to_vec();
+        targets.push(keynote_window());
+        with_targets(app, &targets);
+        let uuid = input_of_screen(app, "Display 1", screens[0].0);
+        draw_a_frame(app);
+        uuid
+    }
+
+    /// A window nothing captures yet, picked for a screen's input, is
+    /// opened for it as the input is set — its rate and crop kept, Nida's
+    /// own windows no longer left out, as of a window added — and the
+    /// screen's capture, the input's alone, closed. The screen picked back
+    /// is opened so again, Nida's own windows left out of it once more.
+    #[test]
+    fn a_window_nothing_captures_is_opened_as_its_input_is_set() {
+        use crate::engine::MixerCommands;
+        use crate::scene::CaptureTargetConfig;
+        use crate::screen_capture::backend::CaptureConfig;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        let uuid = a_screens_input_beside_a_window(&mut app, &[("capture", 1920)]);
+        let at = app.mixer.find_deck_by_uuid(&uuid).expect("the input");
+        set_capture(&mut app, at, "rate", 0.5);
+        set_capture(&mut app, at, "crop_w", 0.5);
+        draw_a_frame(&mut app);
+        let screen = capture_of(&app, &uuid);
+        let set = capture_state_at(&mut app, at).config.clone();
+        assert!((set.rate - 60.5).abs() < 1e-4, "{}", set.rate);
+        assert!((set.crop.w - 0.5).abs() < 1e-6, "{:?}", set.crop);
+        assert!(set.exclude_varda, "left out of a screen");
+        assert_eq!(set.scale_to, Some((app.render_width, app.render_height)));
+
+        let window = CaptureTargetConfig::Window {
+            app: "com.apple.Keynote".into(),
+            title: "Opening".into(),
+        };
+        app.set_screen_capture_target(&uuid, &window)
+            .expect("picked");
+        let shown = capture_of(&app, &uuid);
+        assert_ne!(shown, screen);
+        assert_eq!(
+            app.screen_capture_manager.label(shown),
+            Some("Keynote — Opening")
+        );
+        assert_eq!(app.screen_capture_manager.holders(shown), 1, "opened for it");
+        assert!(
+            !app.screen_capture_manager.is_active(screen),
+            "closed: no input shows it"
+        );
+        let as_a_window = CaptureConfig {
+            exclude_varda: false,
+            ..set.clone()
+        };
+        assert_eq!(
+            app.screen_capture_manager.config(shown),
+            Some(as_a_window.clone()),
+            "opened as the input is set"
+        );
+        assert_eq!(capture_state_at(&mut app, at).config, as_a_window);
+
+        let display = CaptureTargetConfig::Display {
+            name: "Display 1".into(),
+            uuid: None,
+        };
+        app.set_screen_capture_target(&uuid, &display)
+            .expect("picked");
+        let again = capture_of(&app, &uuid);
+        assert_eq!(app.screen_capture_manager.label(again), Some("Display 1"));
+        assert_eq!(app.screen_capture_manager.holders(again), 1, "opened for it");
+        assert!(!app.screen_capture_manager.is_active(shown), "closed");
+        assert_eq!(
+            app.screen_capture_manager.config(again),
+            Some(set.clone()),
+            "left out of a screen again"
+        );
+        assert_eq!(capture_state_at(&mut app, at).config, set);
+        // And so it stays once the holders are counted.
+        draw_a_frame(&mut app);
+        assert_eq!(capture_of(&app, &uuid), again);
+        assert_eq!(app.screen_capture_manager.holders(again), 1);
+        assert_eq!(capture_state_at(&mut app, at).config, set);
+    }
+
+    /// A window listed that does not open — closed since — and a screen
+    /// macOS will not let be captured leave the input as it was: on the
+    /// screen it showed, whose capture runs on, still its alone and as it
+    /// was set, the input named and saved as before; and each says why.
+    #[test]
+    fn a_window_that_does_not_open_leaves_the_input_as_it_was() {
+        use crate::scene::CaptureTargetConfig;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        let uuid = a_screens_input_beside_a_window(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let at = app.mixer.find_deck_by_uuid(&uuid).expect("the input");
+        set_capture(&mut app, at, "crop_w", 0.5);
+        draw_a_frame(&mut app);
+        let held = capture_of(&app, &uuid);
+        let set = capture_state_at(&mut app, at).config.clone();
+        let runs = app.screen_capture_manager.config(held).expect("running");
+        let saved = saved_target(deck_of(&app, &uuid));
+        app.screen_capture_manager.opening_fails();
+
+        let does_not_open = [
+            (
+                CaptureTargetConfig::Window {
+                    app: "com.apple.Keynote".into(),
+                    title: "Opening".into(),
+                },
+                "Window not picked: ",
+            ),
+            (
+                CaptureTargetConfig::Display {
+                    name: "Display 2".into(),
+                    uuid: Some("4k".into()),
+                },
+                "Screen not picked: ",
+            ),
+        ];
+        for (target, said) in does_not_open {
+            let mut actions = crate::usecases::ui::UIActions::new();
+            actions
+                .commands
+                .push(crate::engine::EngineCommand::SetScreenCaptureTarget {
+                    deck_uuid: uuid.clone(),
+                    target,
+                });
+            let _ = app.apply_engine_actions(&mut actions);
+            let shown: Vec<&str> = app
+                .session
+                .notifications
+                .visible()
+                .iter()
+                .map(|n| n.message.as_str())
+                .collect();
+            assert!(
+                shown
+                    .iter()
+                    .any(|m| m.starts_with(said) && m.contains("did not open")),
+                "{said} {shown:?}"
+            );
+            assert_eq!(capture_of(&app, &uuid), held, "on the screen it showed");
+            assert!(app.screen_capture_manager.is_active(held), "running on");
+            assert_eq!(app.screen_capture_manager.holders(held), 1, "its alone");
+            assert_eq!(
+                app.screen_capture_manager.config(held),
+                Some(runs.clone()),
+                "as it ran"
+            );
+            assert_eq!(capture_state_at(&mut app, at).config, set, "as it was set");
+            let deck = deck_of(&app, &uuid);
+            assert_eq!(saved_target(deck), saved, "saved as before");
+            assert_eq!(deck.source_name(), "🖥 Display 1");
+        }
+        // Nothing of either pick left behind for a frame to find.
+        draw_a_frame(&mut app);
+        assert_eq!(capture_of(&app, &uuid), held);
+        assert_eq!(app.screen_capture_manager.holders(held), 1);
+    }
+
+    /// A screen picked is undone and done again as any change is: the input
+    /// goes back to the screen it showed, under the name it had, and on to
+    /// the one picked; and each screen's capture is held by the inputs that
+    /// show it, once a frame is drawn.
+    #[test]
+    fn a_screen_picked_is_undone_and_done_again() {
+        use crate::engine::{CommandResult, EngineCommand};
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        // An input stays on each screen: its capture runs on, to go back to.
+        let on_first = input_of_screen(&mut app, "Display 1", "capture");
+        let on_second = input_of_screen(&mut app, "Display 2", "4k");
+        let moves = input_of_screen(&mut app, "Display 1", "capture");
+        draw_a_frame(&mut app);
+        let first = capture_of(&app, &on_first);
+        let second = capture_of(&app, &on_second);
+        let holders = |app: &VardaApp| {
+            (
+                app.screen_capture_manager.holders(first),
+                app.screen_capture_manager.holders(second),
+            )
+        };
+        assert_eq!(holders(&app), (2, 1));
+        let saved = |app: &VardaApp| saved_target(deck_of(app, &moves));
+        let was = serde_json::json!({ "kind": "display", "name": "Display 1", "uuid": "capture" });
+        let picked = serde_json::json!({ "kind": "display", "name": "Display 2", "uuid": "4k" });
+
+        let pick = EngineCommand::SetScreenCaptureTarget {
+            deck_uuid: moves.clone(),
+            target: crate::scene::CaptureTargetConfig::Display {
+                name: "Display 2".into(),
+                uuid: Some("4k".into()),
+            },
+        };
+        assert!(app.makes_undo_step(&pick), "undone as any change");
+        // As the command bus does for an undoable command.
+        let before = app.history_snapshot_default();
+        app.push_history(before);
+        assert!(matches!(app.execute_command(pick), CommandResult::Ok));
+        assert_eq!(capture_of(&app, &moves), second);
+        assert_eq!(deck_of(&app, &moves).source_name(), "🖥 Display 2");
+        draw_a_frame(&mut app);
+        assert_eq!(holders(&app), (1, 2));
+
+        assert!(matches!(
+            app.execute_command(EngineCommand::Undo),
+            CommandResult::Ok
+        ));
+        assert_eq!(capture_of(&app, &moves), first, "undone");
+        assert_eq!(saved(&app), was);
+        assert_eq!(deck_of(&app, &moves).source_name(), "🖥 Display 1");
+        draw_a_frame(&mut app);
+        assert_eq!(holders(&app), (2, 1), "each held by those that show it");
+
+        assert!(matches!(
+            app.execute_command(EngineCommand::Redo),
+            CommandResult::Ok
+        ));
+        assert_eq!(capture_of(&app, &moves), second, "done again");
+        assert_eq!(saved(&app), picked);
+        assert_eq!(deck_of(&app, &moves).source_name(), "🖥 Display 2");
+        draw_a_frame(&mut app);
+        assert_eq!(holders(&app), (1, 2));
+    }
+
+    /// A screen or window picked that cannot be captured — a window closed
+    /// since it was listed, say — says why, as an input that cannot be
+    /// added does: the input just stays on what it showed.
+    #[test]
+    fn a_screen_or_window_that_cannot_be_picked_says_why() {
+        use crate::engine::MixerCommands;
+        use crate::scene::CaptureTargetConfig;
+        use crate::screen_capture::backend::CaptureConfig;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let ch0 = channel_uuid(&app, 0);
+        let screen = CaptureTargetConfig::Display {
+            name: "Display 1".into(),
+            uuid: Some("capture".into()),
+        };
+        let uuid = app
+            .add_screen_capture_deck(&ch0, &screen, CaptureConfig::default())
+            .expect("added");
+        let held = deck_of(&app, &uuid).screen_capture_id();
+
+        let gone = [
+            (
+                CaptureTargetConfig::Window {
+                    app: "com.apple.Keynote".into(),
+                    title: "Opening".into(),
+                },
+                "Window not picked: ",
+            ),
+            (
+                CaptureTargetConfig::Display {
+                    name: "Display 5".into(),
+                    uuid: None,
+                },
+                "Screen not picked: ",
+            ),
+        ];
+        for (target, said) in gone {
+            let mut actions = crate::usecases::ui::UIActions::new();
+            actions
+                .commands
+                .push(crate::engine::EngineCommand::SetScreenCaptureTarget {
+                    deck_uuid: uuid.clone(),
+                    target,
+                });
+            let _ = app.apply_engine_actions(&mut actions);
+            let shown: Vec<&str> = app
+                .session
+                .notifications
+                .visible()
+                .iter()
+                .map(|n| n.message.as_str())
+                .collect();
+            assert!(shown.iter().any(|m| m.starts_with(said)), "{said} {shown:?}");
+            assert_eq!(deck_of(&app, &uuid).screen_capture_id(), held, "as it was");
+        }
+    }
+
+    /// An input whose screen is not there — "Target not found", black — is
+    /// given another: it captures it, and holds it once.
+    #[test]
+    fn an_input_whose_screen_is_gone_is_given_another() {
+        use crate::engine::MixerCommands;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let gone = serde_json::json!({ "kind": "display", "name": "Display 5" });
+        let deck = restored_capture_deck(&mut app, &gone);
+        assert_eq!(
+            deck.screen_capture_id(),
+            Some(crate::screen_capture::UNBOUND_CAPTURE_ID),
+            "nothing to capture"
+        );
+        let uuid = deck.uuid().to_string();
+        app.mixer.channels_mut()[0].add_deck(deck);
+        let the_4k = crate::scene::CaptureTargetConfig::Display {
+            name: "Display 2".into(),
+            uuid: Some("4k".into()),
+        };
+        app.set_screen_capture_target(&uuid, &the_4k).expect("picked");
+        let (ch, dk) = app.mixer.find_deck_by_uuid(&uuid).expect("the input");
+        let deck = &app.mixer.channels()[ch].decks[dk].deck;
+        let id = deck.screen_capture_id().expect("a capture now");
+        assert_eq!(app.screen_capture_manager.label(id), Some("Display 2"));
+        assert_eq!(app.screen_capture_manager.holders(id), 2);
+        assert_eq!(
+            saved_target(deck),
+            serde_json::json!({ "kind": "display", "name": "Display 2", "uuid": "4k" })
+        );
+    }
+
+    /// The name a show saves for the input `uuid`.
+    fn saved_name(app: &VardaApp, uuid: &str) -> String {
+        crate::persistence::snapshot_scene(&app.mixer, None, app.render_width, app.render_height)
+            .channels
+            .into_iter()
+            .flat_map(|channel| channel.decks)
+            .find(|deck| deck.uuid == uuid)
+            .expect("saved")
+            .name
+    }
+
+    /// What the input `deck` was last named after
+    /// (`ScreenCaptureState::listed_as`).
+    fn listed_as(deck: &crate::deck::Deck) -> Option<&str> {
+        deck.screen_capture.as_ref()?.listed_as.as_deref()
+    }
+
+    /// What a show saves of what the input `uuid` shows, as it is written.
+    fn saved_source(app: &VardaApp, uuid: &str) -> serde_json::Value {
+        let saved = crate::persistence::snapshot_scene(
+            &app.mixer,
+            None,
+            app.render_width,
+            app.render_height,
+        )
+        .channels
+        .into_iter()
+        .flat_map(|channel| channel.decks)
+        .find(|deck| deck.uuid == uuid)
+        .expect("saved");
+        serde_json::to_value(saved.source).expect("serialize")
+    }
+
+    /// A show saved with an app's window for an input, opened with that app
+    /// closed: the input, capturing nothing, keeps its name, and the show
+    /// saves it under that name again. Its window is kept by the app's
+    /// bundle id, and named from that it read "🖥 com.apple.Keynote —
+    /// Opening" from then on (an M5 Max, 2026-11-10). A screen picked for
+    /// it, it is named after the screen: its name was what it captured, not
+    /// one given it.
+    #[test]
+    fn an_input_whose_app_is_closed_keeps_its_name() {
+        use crate::engine::MixerCommands;
+        use crate::scene::CaptureTargetConfig;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        let uuid = a_screens_input_beside_a_window(&mut app, &[("capture", 1920)]);
+        let window = CaptureTargetConfig::Window {
+            app: "com.apple.Keynote".into(),
+            title: "Opening".into(),
+        };
+        app.set_screen_capture_target(&uuid, &window)
+            .expect("picked");
+        assert_eq!(saved_name(&app, &uuid), "🖥 Keynote — Opening");
+        let saved = crate::persistence::snapshot_scene(
+            &app.mixer,
+            None,
+            app.render_width,
+            app.render_height,
+        );
+        drop(app);
+
+        // Another day at the same desk, Keynote not open.
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920)]);
+        app.replace_scene(&saved).expect("opened");
+        let deck = deck_of(&app, &uuid);
+        assert_eq!(
+            deck.screen_capture_id(),
+            Some(crate::screen_capture::UNBOUND_CAPTURE_ID),
+            "nothing to capture"
+        );
+        assert_eq!(deck.source_name(), "🖥 Keynote — Opening");
+        assert_eq!(saved_name(&app, &uuid), "🖥 Keynote — Opening", "saved so again");
+        assert_eq!(
+            saved_target(deck),
+            serde_json::json!({ "kind": "window", "app": "com.apple.Keynote", "title": "Opening" }),
+            "its window still the one looked for"
+        );
+
+        let screen = CaptureTargetConfig::Display {
+            name: "Display 1".into(),
+            uuid: Some("capture".into()),
+        };
+        app.set_screen_capture_target(&uuid, &screen)
+            .expect("picked");
+        assert_eq!(deck_of(&app, &uuid).source_name(), "🖥 Display 1");
+    }
+
+    /// An input a show saved as capturing a screen not there now.
+    fn a_gone_screen() -> serde_json::Value {
+        serde_json::json!({
+            "type": "ScreenCapture",
+            "target": { "kind": "display", "name": "Display 5" }
+        })
+    }
+
+    /// An input the show has no name for, its screen not there, is named
+    /// after the screen it was to capture.
+    #[test]
+    fn an_input_the_show_has_no_name_for_is_named_after_what_it_was_to_capture() {
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let deck = restored_input(&mut app, "", &a_gone_screen());
+        assert_eq!(
+            deck.screen_capture_id(),
+            Some(crate::screen_capture::UNBOUND_CAPTURE_ID),
+            "nothing to capture"
+        );
+        assert_eq!(deck.source_name(), "🖥 Display 5");
+    }
+
+    /// The name a show has for an input is the input's only while it
+    /// captures nothing: one that captures is named as its screen is listed
+    /// now. The 4K, "Display 1" when the show was saved, is "Display 2" with
+    /// one more screen plugged in.
+    #[test]
+    fn an_input_that_captures_is_named_as_its_screen_is_listed_now() {
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let deck = restored_input(
+            &mut app,
+            "🖥 Display 1",
+            &serde_json::json!({
+                "type": "ScreenCapture",
+                "target": { "kind": "display", "name": "Display 1", "uuid": "4k" }
+            }),
+        );
+        let id = deck.screen_capture_id().expect("a capture");
+        assert_eq!(app.screen_capture_manager.label(id), Some("Display 2"), "the 4K");
+        assert_eq!(deck.source_name(), "🖥 Display 2");
+        assert_eq!(listed_as(&deck), Some("Display 2"), "what it is named after now");
+    }
+
+    /// The name of the input a show saved under `name` with `source` — what
+    /// it was to capture not there — once the show is opened and the 4K
+    /// picked for it. Nothing with no GPU to run on.
+    fn named_once_the_4k_is_picked(name: &str, source: &serde_json::Value) -> Option<String> {
+        use crate::engine::MixerCommands;
+        let mut app = headless_app()?;
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let deck = restored_input(&mut app, name, source);
+        assert_eq!(
+            deck.screen_capture_id(),
+            Some(crate::screen_capture::UNBOUND_CAPTURE_ID),
+            "nothing to capture"
+        );
+        assert_eq!(deck.source_name(), name, "the show's name for it");
+        let uuid = deck.uuid().to_string();
+        app.mixer.channels_mut()[0].add_deck(deck);
+        let the_4k = crate::scene::CaptureTargetConfig::Display {
+            name: "Display 2".into(),
+            uuid: Some("4k".into()),
+        };
+        app.set_screen_capture_target(&uuid, &the_4k).expect("picked");
+        let deck = deck_of(&app, &uuid);
+        assert_eq!(
+            saved_target(deck),
+            serde_json::json!({ "kind": "display", "name": "Display 2", "uuid": "4k" })
+        );
+        Some(deck.source_name().to_string())
+    }
+
+    /// A name given an input — one not its screen's — is its name in the
+    /// show opened with its screen not there, and stays when a screen is
+    /// picked for it.
+    #[test]
+    fn a_name_given_an_input_that_captures_nothing_stays() {
+        let Some(name) = named_once_the_4k_is_picked("Slides", &a_gone_screen()) else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        assert_eq!(name, "Slides", "a name given it stays");
+    }
+
+    /// So does one that reads as a capture's: a screen's input is named
+    /// after the screen picked only when its name is the one the show has
+    /// its screen under.
+    #[test]
+    fn a_name_given_a_screens_input_stays_though_it_reads_as_a_captures() {
+        let Some(name) = named_once_the_4k_is_picked("🖥 Slides", &a_gone_screen()) else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        assert_eq!(name, "🖥 Slides", "not its screen's name: one given it");
+    }
+
+    /// An input a show saved as capturing Keynote's window.
+    fn keynotes_window_saved() -> serde_json::Value {
+        serde_json::json!({
+            "type": "ScreenCapture",
+            "target": { "kind": "window", "app": "com.apple.Keynote", "title": "Opening" }
+        })
+    }
+
+    /// A window's input, its app closed, keeps a name given it when a
+    /// screen is picked for it.
+    #[test]
+    fn a_name_given_a_windows_input_stays_when_a_screen_is_picked_for_it() {
+        let Some(name) = named_once_the_4k_is_picked("Slides", &keynotes_window_saved()) else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        assert_eq!(name, "Slides", "a name given it stays");
+    }
+
+    /// A show saved by a Nida that named a window's input by its app's
+    /// bundle id has that for its name. Opened with the app running, the
+    /// input captures its window and is named as the window is listed: the
+    /// show's name for it is its name only while it captures nothing.
+    #[test]
+    fn an_input_named_by_its_apps_id_is_named_as_its_window_is_listed_once_it_captures() {
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_targets(&mut app, &[keynote_window()]);
+        let deck = restored_input(
+            &mut app,
+            "🖥 com.apple.Keynote — Opening",
+            &keynotes_window_saved(),
+        );
+        let id = deck.screen_capture_id().expect("a capture");
+        assert_eq!(app.screen_capture_manager.label(id), Some("Keynote — Opening"));
+        assert_eq!(deck.source_name(), "🖥 Keynote — Opening");
+        assert_eq!(listed_as(&deck), Some("Keynote — Opening"), "what it is named after now");
+    }
+
+    /// Opened with the app closed, such a show's input keeps that name — it
+    /// is the show's for it — until its window is picked again: then it is
+    /// named as the window is listed.
+    #[test]
+    fn an_input_named_by_its_apps_id_is_named_after_the_window_picked_for_it() {
+        use crate::engine::MixerCommands;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920)]);
+        let deck = restored_input(
+            &mut app,
+            "🖥 com.apple.Keynote — Opening",
+            &keynotes_window_saved(),
+        );
+        assert_eq!(
+            deck.screen_capture_id(),
+            Some(crate::screen_capture::UNBOUND_CAPTURE_ID),
+            "nothing to capture"
+        );
+        assert_eq!(deck.source_name(), "🖥 com.apple.Keynote — Opening");
+        let uuid = deck.uuid().to_string();
+        app.mixer.channels_mut()[0].add_deck(deck);
+
+        // Keynote opened, and its window picked for the input.
+        let mut targets = app.screen_capture_manager.targets().to_vec();
+        targets.push(keynote_window());
+        with_targets(&mut app, &targets);
+        let window = crate::scene::CaptureTargetConfig::Window {
+            app: "com.apple.Keynote".into(),
+            title: "Opening".into(),
+        };
+        app.set_screen_capture_target(&uuid, &window)
+            .expect("picked");
+        assert_eq!(deck_of(&app, &uuid).source_name(), "🖥 Keynote — Opening");
+    }
+
+    /// What an input is named after is kept with it from when it is added
+    /// — its screen as it is listed — and with the show: its name is held
+    /// against that when another screen or window is picked for it, and an
+    /// input whose app is closed has nothing else to hold it against.
+    #[test]
+    fn what_an_input_is_named_after_is_kept_with_it_and_with_the_show() {
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920)]);
+        let uuid = input_of_screen(&mut app, "Display 1", "capture");
+        let deck = deck_of(&app, &uuid);
+        assert_eq!(deck.source_name(), "🖥 Display 1");
+        assert_eq!(listed_as(deck), Some("Display 1"), "named after its screen");
+        assert_eq!(
+            saved_source(&app, &uuid)["listed_as"],
+            serde_json::json!("Display 1"),
+            "and the show keeps that"
+        );
+    }
+
+    /// An input a show saved as capturing a window of Keynote's with no
+    /// title — one listed by its app alone, "Keynote", where the show has
+    /// the app by its bundle id — and, with `listed_as`, as named after it
+    /// so listed.
+    fn keynotes_untitled_window_saved(listed_as: Option<&str>) -> serde_json::Value {
+        let mut source = serde_json::json!({
+            "type": "ScreenCapture",
+            "target": { "kind": "window", "app": "com.apple.Keynote", "title": "" }
+        });
+        if let Some(listed_as) = listed_as {
+            source["listed_as"] = listed_as.into();
+        }
+        source
+    }
+
+    /// An input named after a window with no title, its app closed, is
+    /// named after the screen picked for it: the show kept what it was
+    /// named after, and nothing else tells — its name is what the app is
+    /// called, and the show has the app by its bundle id.
+    #[test]
+    fn an_input_named_after_a_window_with_no_title_is_named_after_the_screen_picked() {
+        let saved = keynotes_untitled_window_saved(Some("Keynote"));
+        let Some(name) = named_once_the_4k_is_picked("🖥 Keynote", &saved) else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        assert_eq!(name, "🖥 Display 2", "its name was its window's");
+    }
+
+    /// In a show saved before that was kept, the name of such an input may
+    /// as well be one given it — nothing in the show tells — and stays.
+    #[test]
+    fn a_name_no_record_tells_of_stays_on_an_input_of_a_window_with_no_title() {
+        let saved = keynotes_untitled_window_saved(None);
+        let Some(name) = named_once_the_4k_is_picked("🖥 Keynote", &saved) else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        assert_eq!(name, "🖥 Keynote", "nothing tells it is its window's");
+    }
+
+    /// So does one that ends in its window's title, as a listing of the
+    /// window does: its window's as it was listed, or one given the input
+    /// ("🖥 My — Opening") — the end of a name does not tell which, and a
+    /// name given is not to be replaced.
+    #[test]
+    fn a_name_that_ends_in_its_windows_title_stays_in_a_show_with_no_record() {
+        for given in ["🖥 Keynote — Opening", "🖥 My — Opening"] {
+            let Some(name) = named_once_the_4k_is_picked(given, &keynotes_window_saved()) else {
+                eprintln!("Skipping: no headless GPU available");
+                return;
+            };
+            assert_eq!(name, given, "nothing tells it is its window's");
+        }
+    }
+
+    /// The name of the input a preset named `name` has with `source` — what
+    /// it was to capture not there — once the preset is loaded, as the
+    /// Library loads it, and the 4K picked for the input. Nothing with no
+    /// GPU to run on.
+    fn a_presets_input_named_once_the_4k_is_picked(
+        name: &str,
+        source: &serde_json::Value,
+    ) -> Option<String> {
+        use crate::engine::{CommandResult, EngineCommand, MixerCommands};
+        let mut app = headless_app()?;
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let config: crate::scene::DeckConfig =
+            serde_json::from_value(serde_json::json!({ "name": name, "source": source }))
+                .expect("a saved input");
+        app.session
+            .preset_library
+            .deck_presets
+            .push(crate::persistence::presets::DeckPreset {
+                name: name.into(),
+                config,
+            });
+        let ch0 = channel_uuid(&app, 0);
+        let loaded = app.execute_command(EngineCommand::LoadDeckPreset {
+            channel_uuid: ch0,
+            preset_name: name.into(),
+        });
+        assert!(matches!(loaded, CommandResult::Ok), "loaded: {loaded:?}");
+        let decks = &app.mixer.channels()[0].decks;
+        assert_eq!(decks.len(), 1, "the preset's input, alone");
+        let deck = &decks[0].deck;
+        assert_eq!(
+            deck.screen_capture_id(),
+            Some(crate::screen_capture::UNBOUND_CAPTURE_ID),
+            "nothing to capture"
+        );
+        assert_eq!(deck.source_name(), name, "the preset's name for it");
+        let uuid = deck.uuid().to_string();
+        let the_4k = crate::scene::CaptureTargetConfig::Display {
+            name: "Display 2".into(),
+            uuid: Some("4k".into()),
+        };
+        app.set_screen_capture_target(&uuid, &the_4k).expect("picked");
+        let deck = deck_of(&app, &uuid);
+        assert_eq!(
+            saved_target(deck),
+            serde_json::json!({ "kind": "display", "name": "Display 2", "uuid": "4k" })
+        );
+        Some(deck.source_name().to_string())
+    }
+
+    /// A preset's name for a window's input is one given it, though it
+    /// reads as a capture's: "🖥 Slides", the preset saved of an input named
+    /// after Keynote's window. Loaded with Keynote closed and a screen
+    /// picked for it, the input keeps the name — it is not what the input
+    /// was named after.
+    #[test]
+    fn a_presets_name_that_reads_as_a_captures_stays_when_a_screen_is_picked() {
+        let mut saved = keynotes_window_saved();
+        saved["listed_as"] = "Keynote — Opening".into();
+        let Some(name) = a_presets_input_named_once_the_4k_is_picked("🖥 Slides", &saved) else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        assert_eq!(name, "🖥 Slides", "the preset's name: one given it");
+    }
+
+    /// So does the name of a preset with no record of what its input was
+    /// named after — one saved before that was kept, or of an input that
+    /// had none — also one that ends in its window's title.
+    #[test]
+    fn a_presets_name_no_record_tells_of_stays_when_a_screen_is_picked() {
+        for given in ["🖥 Slides", "🖥 My — Opening"] {
+            let Some(name) =
+                a_presets_input_named_once_the_4k_is_picked(given, &keynotes_window_saved())
+            else {
+                eprintln!("Skipping: no headless GPU available");
+                return;
+            };
+            assert_eq!(name, given, "the preset's name: one given it");
+        }
+    }
+
+    /// The PowerPoint input a show saved under `name`, its show's window
+    /// last titled `title`, as the show opened gives it: capturing nothing,
+    /// its show not yet playing.
+    fn restored_powerpoint_input(
+        app: &mut VardaApp,
+        name: &str,
+        title: &str,
+    ) -> crate::deck::Deck {
+        let deck = restored_input(
+            app,
+            name,
+            &serde_json::json!({
+                "type": "ScreenCapture",
+                "target": {
+                    "kind": "window",
+                    "app": crate::presentation::powerpoint::POWERPOINT_ID,
+                    "title": title
+                },
+                "presentation": { "path": "/talks/talk.pptx" }
+            }),
+        );
+        assert_eq!(
+            deck.screen_capture_id(),
+            Some(crate::screen_capture::UNBOUND_CAPTURE_ID),
+            "its show not yet playing"
+        );
+        assert!(deck.screen_capture.as_ref().is_some_and(|s| s.presentation.is_some()));
+        deck
+    }
+
+    /// A PowerPoint input in a show opened is named after its file, as when
+    /// it was added: its show's window is found once PowerPoint plays it,
+    /// and until then it captures nothing. A name given it is kept as well.
+    #[test]
+    fn a_powerpoint_input_in_a_show_opened_keeps_its_name() {
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920)]);
+        for name in ["📽 talk", "Opening talk"] {
+            let deck = restored_powerpoint_input(&mut app, name, "talk");
+            assert_eq!(deck.source_name(), name);
+        }
+    }
+
+    /// A show saved by a Nida that named a PowerPoint input by its window's
+    /// app at every open has that for its name: "🖥 com.microsoft.Powerpoint
+    /// — …" with the title its window had then — its file's, or its show's
+    /// once PowerPoint had played it. Opened, the input is named after its
+    /// file again: no window is ever picked for it, which mends another
+    /// window's input.
+    #[test]
+    fn a_powerpoint_input_named_by_its_windows_app_is_named_after_its_talk_again() {
+        use crate::presentation::powerpoint::POWERPOINT_ID;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920)]);
+        for (name, title) in [
+            (format!("🖥 {POWERPOINT_ID} — talk"), "talk"),
+            (format!("🖥 {POWERPOINT_ID} — talk"), "PowerPoint Slide Show - [talk]"),
+            (format!("🖥 {POWERPOINT_ID}"), ""),
+        ] {
+            let deck = restored_powerpoint_input(&mut app, &name, title);
+            assert_eq!(deck.source_name(), "📽 talk", "saved as {name}, its window {title:?}");
+        }
+    }
+
+    /// A PowerPoint input the show has no name for is named after its file
+    /// too.
+    #[test]
+    fn a_powerpoint_input_the_show_has_no_name_for_is_named_after_its_talk() {
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920)]);
+        let deck = restored_powerpoint_input(&mut app, "", "talk");
+        assert_eq!(deck.source_name(), "📽 talk");
+    }
+
+    /// Only a screen capture input has a screen to pick, and only one there
+    /// is: a layer that is no capture, a screen not listed and a layer not
+    /// there are each refused as what they are, the input left as it was.
+    #[test]
+    fn a_screen_is_picked_only_for_a_capture_and_only_one_there_is() {
+        use crate::engine::{CommandResult, EngineCommand, ErrorCode};
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let old = serde_json::json!({ "kind": "display", "name": "Display 1" });
+        let deck = restored_capture_deck(&mut app, &old);
+        let uuid = deck.uuid().to_string();
+        app.mixer.channels_mut()[0].add_deck(deck);
+        let pick = |app: &mut VardaApp, deck_uuid: &str, name: &str| {
+            app.execute_command(EngineCommand::SetScreenCaptureTarget {
+                deck_uuid: deck_uuid.to_string(),
+                target: crate::scene::CaptureTargetConfig::Display {
+                    name: name.into(),
+                    uuid: None,
+                },
+            })
+        };
+        let refused = |result: CommandResult, as_code: ErrorCode| {
+            matches!(result, CommandResult::Err { code, .. } if code == as_code)
+        };
+        assert!(refused(
+            pick(&mut app, &uuid, "Display 7"),
+            ErrorCode::InvalidInput
+        ));
+        let (ch, dk) = app.mixer.find_deck_by_uuid(&uuid).expect("the input");
+        assert_eq!(
+            saved_target(&app.mixer.channels()[ch].decks[dk].deck),
+            old,
+            "as it was"
+        );
+        assert!(refused(
+            pick(&mut app, "no-such-layer", "Display 2"),
+            ErrorCode::NotFound
+        ));
+        let CommandResult::OkWithId { uuid: colour } =
+            app.execute_command(EngineCommand::AddSolidColorDeck {
+                channel_uuid: channel_uuid(&app, 0),
+                color: [1.0, 0.0, 0.0, 1.0],
+            })
+        else {
+            panic!("a colour layer");
+        };
+        assert!(refused(
+            pick(&mut app, &colour, "Display 2"),
+            ErrorCode::InvalidInput
+        ));
+        // A PowerPoint input's window is its show's.
+        let talk: crate::presentation::PresentationConfig =
+            serde_json::from_value(serde_json::json!({ "path": "/talks/opening.pptx" }))
+                .expect("a talk");
+        capture_state_at(&mut app, (ch, dk)).presentation = Some(talk);
+        assert!(refused(
+            pick(&mut app, &uuid, "Display 2"),
+            ErrorCode::InvalidInput
+        ));
+        capture_state_at(&mut app, (ch, dk)).presentation = None;
+        assert!(matches!(
+            pick(&mut app, &uuid, "Display 2"),
+            CommandResult::Ok
+        ));
+        assert_eq!(
+            saved_target(&app.mixer.channels()[ch].decks[dk].deck),
+            serde_json::json!({ "kind": "display", "name": "Display 2", "uuid": "4k" })
+        );
+    }
+
+    /// A screen picked by its name — in the window, or by an API client
+    /// that sends no more — is kept by its identity: the input added saves
+    /// the screen itself, not its place among the screens.
+    #[test]
+    fn a_screen_added_by_name_is_kept_by_its_identity() {
+        use crate::engine::MixerCommands;
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        with_screens(&mut app, &[("capture", 1920), ("4k", 3840)]);
+        let ch0 = channel_uuid(&app, 0);
+        let picked = crate::scene::CaptureTargetConfig::Display {
+            name: "Display 2".into(),
+            uuid: None,
+        };
+        let options = crate::screen_capture::backend::CaptureConfig::default();
+        let deck = app
+            .add_screen_capture_deck(&ch0, &picked, options)
+            .expect("added");
+        let (ch, dk) = app.mixer.find_deck_by_uuid(&deck).expect("the deck");
+        let state = app.mixer.channels()[ch].decks[dk]
+            .deck
+            .screen_capture
+            .as_ref()
+            .expect("a capture");
+        assert_eq!(
+            serde_json::to_value(crate::scene::CaptureTargetConfig::from(&state.identity))
+                .expect("serialize"),
+            serde_json::json!({ "kind": "display", "name": "Display 2", "uuid": "4k" })
+        );
+    }
+
+    /// A PowerPoint show's capture keeps its own cap — its presentation's,
+    /// not the show's — through a show size change, beside an
+    /// input capturing the same window, which is capped; and through a
+    /// setting given its input, which goes down to it alone.
+    #[test]
+    fn a_powerpoint_shows_capture_keeps_its_cap() {
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        app.set_render_resolution(1920, 1080);
+        app.screen_capture_manager =
+            crate::screen_capture::ScreenCaptureManager::enabled_for_tests();
+        let target = crate::screen_capture::backend::mock_targets().remove(0);
+        let shows = crate::screen_capture::backend::CaptureConfig {
+            scale_to: Some((1920, 1146)),
+            ..Default::default()
+        };
+        let session = Box::new(crate::screen_capture::backend::MockBackend::new(
+            target.label.clone(),
+            target.width,
+            target.height,
+            shows.clone(),
+        ));
+        let show = app
+            .screen_capture_manager
+            .adopt(&target, session, shows.clone(), &app.context.device)
+            .expect("adopt");
+        let at_1080 = crate::screen_capture::backend::CaptureConfig {
+            scale_to: Some((1920, 1080)),
+            ..Default::default()
+        };
+        let own = app
+            .screen_capture_manager
+            .open_mock(&target, at_1080.clone(), &app.context.device)
+            .expect("open");
+        for ((id, w, h), config, presentation) in [(show, shows, true), (own, at_1080, false)] {
+            let deck = crate::deck::Deck::new_from_screen_capture(
+                &app.context,
+                crate::deck::ScreenCaptureState {
+                    capture_id: id,
+                    identity: target.identity(),
+                    config,
+                    given: Vec::new(),
+                    listed_as: None,
+                    presentation: presentation.then(|| crate::presentation::PresentationConfig {
+                        path: "/talks/a.pptx".into(),
+                        slide: None,
+                        plays_on: crate::engine::value::presentation::PlaysOn::default(),
+                    }),
+                },
+                &target.label,
+                w,
+                h,
+                1920,
+                1080,
+            )
+            .expect("a capture deck");
+            app.mixer.channel_mut(0).expect("a channel").add_deck(deck);
+        }
+        app.set_render_resolution(3840, 2160);
+        let config = |id| app.screen_capture_manager.config(id).expect("live").scale_to;
+        assert_eq!(config(show.0), Some((1920, 1146)));
+        assert_eq!(config(own.0), Some((3840, 2160)));
+
+        // Its cursor shown: its settings go down whole to its own capture,
+        // whose cap — the presentation's, moved on since the input was
+        // made — stays.
+        let slides = (0, app.mixer.channels()[0].decks.len() - 2);
+        app.screen_capture_manager
+            .cap_to(show.0, Some((2560, 1528)));
+        set_capture(&mut app, slides, "cursor", 1.0);
+        app.send_capture_settings();
+        let runs = app.screen_capture_manager.config(show.0).expect("live");
+        assert!(runs.show_cursor, "its cursor");
+        assert_eq!(runs.scale_to, Some((2560, 1528)), "its cap kept");
+        assert!(capture_state_at(&mut app, slides).given.is_empty(), "sent");
+        let beside = app.screen_capture_manager.config(own.0).expect("live");
+        assert!(!beside.show_cursor, "not the input's own capture of it");
+    }
+
+    /// The show going from 1080p to 4K takes its screen captures with it:
+    /// one added at 1080p stayed capped at 1080p, blurred on a 4K wall. Two
+    /// inputs on one screen share its capture: capped once, the crop one of
+    /// them set on it kept.
+    #[test]
+    fn a_show_size_change_takes_its_captures_along() {
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        app.set_render_resolution(1920, 1080);
+        app.screen_capture_manager =
+            crate::screen_capture::ScreenCaptureManager::enabled_for_tests();
+        let target = crate::screen_capture::backend::mock_targets().remove(0);
+        let at_1080 = crate::screen_capture::backend::CaptureConfig {
+            scale_to: Some((1920, 1080)),
+            ..Default::default()
+        };
+        let mut cropped = at_1080.clone();
+        cropped.crop.w = 0.5;
+        for config in [at_1080.clone(), cropped.clone()] {
+            let (id, w, h) = app
+                .screen_capture_manager
+                .open_mock(&target, config.clone(), &app.context.device)
+                .expect("open");
+            let deck = crate::deck::Deck::new_from_screen_capture(
+                &app.context,
+                crate::deck::ScreenCaptureState {
+                    capture_id: id,
+                    identity: target.identity(),
+                    config,
+                    given: Vec::new(),
+                    listed_as: None,
+                    presentation: None,
+                },
+                &target.label,
+                w,
+                h,
+                1920,
+                1080,
+            )
+            .expect("a capture deck");
+            app.mixer.channel_mut(0).expect("a channel").add_deck(deck);
+        }
+        let id = app.mixer.channels()[0].decks[0]
+            .deck
+            .screen_capture_id()
+            .expect("bound");
+        app.screen_capture_manager.set_config(id, cropped);
+        app.set_render_resolution(3840, 2160);
+        for slot in &app.mixer.channels()[0].decks {
+            let state = slot.deck.screen_capture.as_ref().expect("a capture");
+            assert_eq!(state.config.scale_to, Some((3840, 2160)));
+        }
+        let live = app.screen_capture_manager.config(id).expect("live");
+        assert_eq!(live.scale_to, Some((3840, 2160)));
+        assert!((live.crop.w - 0.5).abs() < 1e-6, "the crop kept");
+    }
+
+    /// A screen's capture comes as big as the most of its inputs draw it —
+    /// one fitted and zoomed into with its Transform, beside one that fills
+    /// the frame — bigger at once, smaller after a while. The inputs' own
+    /// settings say nothing of it, and a setting given one leaves it so.
+    #[test]
+    fn a_capture_comes_as_big_as_its_inputs_draw_it() {
+        use crate::deck::ScalingMode;
+        use crate::params::ParamValue::Float;
+        use crate::screen_capture::backend::{CaptureConfig, Drawn};
+        use std::time::{Duration, Instant};
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        app.set_render_resolution(1920, 1080);
+        with_screens(&mut app, &[("capture", 3840)]);
+        let first = screen_input(&mut app, CaptureConfig::default());
+        let second = screen_input(&mut app, CaptureConfig::default());
+        let capture = capture_state_at(&mut app, first).capture_id;
+        assert_eq!(capture_state_at(&mut app, second).capture_id, capture);
+        // Capped as a show's own is (the desk's mock opened it with none).
+        let show = Some((1920, 1080));
+        app.screen_capture_manager.cap_to(capture, show);
+        let drawn = |app: &VardaApp| app.screen_capture_manager.drawn(capture).expect("running");
+        let sized = |fitted, fills| Drawn {
+            fitted,
+            across: fills,
+            down: fills,
+        };
+        let fit = |app: &mut VardaApp, at: (usize, usize)| {
+            let deck = &mut app.mixer.channels_mut()[at.0].decks[at.1].deck;
+            deck.set_scaling_mode(ScalingMode::Fit);
+        };
+        let zoom = |app: &mut VardaApp, at: (usize, usize), times: f32| {
+            let deck = &mut app.mixer.channels_mut()[at.0].decks[at.1].deck;
+            let transform = deck
+                .effects
+                .iter_mut()
+                .find(|e| e.shader.name() == "transform")
+                .expect("its Transform");
+            transform.params.set("scale", Float(times));
+        };
+        assert_eq!(drawn(&app), Drawn::default(), "fitted, until a frame is drawn");
+
+        // A frame drawn: both fill the frame, as inputs added do.
+        draw_a_frame(&mut app);
+        assert_eq!(drawn(&app), sized(1.0, 1.0));
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+
+        // The first fitted and zoomed into three times over: at once.
+        fit(&mut app, first);
+        zoom(&mut app, first, 3.0);
+        app.size_captures_as_drawn_at(at(600));
+        assert_eq!(drawn(&app), sized(3.0, 1.0), "the most of each");
+
+        // A setting given an input: the capture sized as it was, and no
+        // input's settings saying how.
+        set_capture(&mut app, first, "cursor", 1.0);
+        app.send_capture_settings();
+        assert_eq!(drawn(&app), sized(3.0, 1.0), "as it was");
+        let runs = app
+            .screen_capture_manager
+            .config(capture)
+            .expect("running");
+        assert!(runs.show_cursor, "the setting taken");
+        for input in [first, second] {
+            let state = capture_state_at(&mut app, input);
+            assert_eq!(state.config.drawn, Drawn::default());
+            assert_eq!(
+                state.config,
+                CaptureConfig {
+                    scale_to: show,
+                    ..runs.clone()
+                },
+                "as its capture runs"
+            );
+        }
+
+        // The second fitted too: nothing fills the frame, once that has
+        // been so a while.
+        fit(&mut app, second);
+        app.size_captures_as_drawn_at(at(1000));
+        app.size_captures_as_drawn_at(at(2999));
+        assert_eq!(drawn(&app), sized(3.0, 1.0), "not yet");
+        app.size_captures_as_drawn_at(at(3000));
+        assert_eq!(drawn(&app), sized(3.0, 0.0), "smaller");
+        zoom(&mut app, first, 1.5);
+        app.size_captures_as_drawn_at(at(4000));
+        app.size_captures_as_drawn_at(at(6000));
+        assert_eq!(drawn(&app), sized(1.5, 0.0));
+
+        // And so it comes: a 4K screen, half as big again as fits a 1080p
+        // show.
+        let needed = std::collections::HashSet::from([capture]);
+        let until = Instant::now() + Duration::from_secs(10);
+        let comes = |app: &VardaApp| app.screen_capture_manager.resolution(capture);
+        while comes(&app) != Some((2880, 1620)) && Instant::now() < until {
+            app.screen_capture_manager.update_selective(
+                &app.context,
+                &needed,
+                crate::host_clock::host_seconds(),
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(comes(&app), Some((2880, 1620)), "as it is drawn");
+
+        // The second centred beside it: placed as it came fitted — whole —
+        // not by the pixels the first is zoomed into.
+        let deck = &mut app.mixer.channels_mut()[second.0].decks[second.1].deck;
+        deck.set_scaling_mode(ScalingMode::Center);
+        draw_a_frame(&mut app);
+        assert_eq!(drawn(&app), sized(1.5, 0.0), "centred: as one fitted");
+        let placed = |app: &mut VardaApp, at: (usize, usize)| {
+            app.mixer.channels_mut()[at.0].decks[at.1]
+                .deck
+                .source_size()
+        };
+        assert_eq!(placed(&mut app, first), Some([2880, 1620]), "zoomed into");
+        assert_eq!(placed(&mut app, second), Some([1920, 1080]), "as it came");
+
+        // Zoomed into itself, it wants what one fitted does.
+        zoom(&mut app, second, 2.0);
+        app.size_captures_as_drawn_at(at(7000));
+        assert_eq!(drawn(&app), sized(2.0, 0.0), "centred, zoomed into");
+    }
+
+    /// Given room, a screen's capture comes twice as big as its input draws
+    /// it — a 4K screen whole, for a 1080p show's input that fits it — and
+    /// the input draws it from its view as coded, of the texture it has now.
+    /// Centred, the input places it as it came fitted, not by the pixels
+    /// its room gave it.
+    #[test]
+    fn a_capture_comes_with_room_and_is_drawn_as_coded() {
+        use crate::deck::ScalingMode;
+        use crate::screen_capture::backend::{CaptureConfig, Drawn};
+        use std::time::{Duration, Instant};
+        fn deck_at(app: &mut VardaApp, at: (usize, usize)) -> &mut crate::deck::Deck {
+            &mut app.mixer.channels_mut()[at.0].decks[at.1].deck
+        }
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        if !app.context.reads_a_texture_two_ways() {
+            eprintln!("Skipping: this GPU reads a texture one way");
+            return;
+        }
+        app.set_render_resolution(1920, 1080);
+        with_screens(&mut app, &[("capture", 3840)]);
+        let input = screen_input(&mut app, CaptureConfig::default());
+        let capture = capture_state_at(&mut app, input).capture_id;
+        // Capped as a show's own is (the desk's mock opened it with none).
+        app.screen_capture_manager
+            .cap_to(capture, Some((1920, 1080)));
+        deck_at(&mut app, input).set_scaling_mode(ScalingMode::Fit);
+        let needed = std::collections::HashSet::from([capture]);
+        let comes = |app: &mut VardaApp, size: (u32, u32)| {
+            let until = Instant::now() + Duration::from_secs(10);
+            while app.screen_capture_manager.resolution(capture) != Some(size)
+                && Instant::now() < until
+            {
+                app.screen_capture_manager.update_selective(
+                    &app.context,
+                    &needed,
+                    crate::host_clock::host_seconds(),
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            app.screen_capture_manager.resolution(capture)
+        };
+        let fitted = |fitted| Drawn {
+            fitted,
+            ..Drawn::default()
+        };
+        let drawn = |app: &VardaApp| app.screen_capture_manager.drawn(capture).expect("running");
+        // The view the input draws its capture from as coded.
+        let coded = |app: &mut VardaApp| deck_at(app, input).external_source_coded_view.clone();
+
+        // No room, as a test's desk has it: as big as it is drawn.
+        draw_a_frame(&mut app);
+        assert_eq!(drawn(&app), fitted(1.0));
+        assert_eq!(comes(&mut app, (1920, 1080)), Some((1920, 1080)));
+        draw_a_frame(&mut app);
+        let small = coded(&mut app).expect("drawn as coded");
+        assert_eq!(
+            Some(&small),
+            app.screen_capture_manager.coded_view(capture),
+            "its capture's view of it as coded"
+        );
+        assert_eq!(small.texture().width(), 1920);
+
+        // Room for twice: all the screen has.
+        app.screen_capture_manager.give_room(2.0);
+        app.size_captures_as_drawn_at(Instant::now() + Duration::from_secs(1));
+        assert_eq!(drawn(&app), fitted(2.0), "twice what it is drawn at");
+        assert_eq!(comes(&mut app, (3840, 2160)), Some((3840, 2160)));
+        draw_a_frame(&mut app);
+        let big = coded(&mut app).expect("drawn as coded");
+        assert_eq!(
+            Some(&big),
+            app.screen_capture_manager.coded_view(capture),
+            "of the texture it has now"
+        );
+        assert_eq!(big.texture().width(), 3840);
+        assert_ne!(
+            deck_at(&mut app, input).external_source_view.as_ref(),
+            Some(&big),
+            "beside its view as light"
+        );
+
+        // Centred: placed as it came fitted, its room not seen.
+        deck_at(&mut app, input).set_scaling_mode(ScalingMode::Center);
+        draw_a_frame(&mut app);
+        assert_eq!(drawn(&app), fitted(2.0), "centred: as one fitted");
+        assert_eq!(
+            deck_at(&mut app, input).source_size(),
+            Some([1920, 1080]),
+            "as it came fitted"
+        );
+    }
+
+    /// A PowerPoint show's capture is left as it was: its input draws it
+    /// from its light, where a screen's or a window's is drawn as coded.
+    #[test]
+    fn a_shows_capture_is_not_drawn_as_coded() {
+        use crate::screen_capture::backend::CaptureConfig;
+        fn deck_at(app: &mut VardaApp, at: (usize, usize)) -> &mut crate::deck::Deck {
+            &mut app.mixer.channels_mut()[at.0].decks[at.1].deck
+        }
+        let Some(mut app) = headless_app() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        if !app.context.reads_a_texture_two_ways() {
+            eprintln!("Skipping: this GPU reads a texture one way");
+            return;
+        }
+        app.set_render_resolution(1920, 1080);
+        with_screens(&mut app, &[("capture", 1920)]);
+        let input = screen_input(&mut app, CaptureConfig::default());
+        let capture = capture_state_at(&mut app, input).capture_id;
+        draw_a_frame(&mut app);
+        assert!(
+            deck_at(&mut app, input).external_source_coded_view.is_some(),
+            "a screen's: as coded"
+        );
+
+        // Its show's from here on (no PowerPoint in a test: nothing plays).
+        capture_state_at(&mut app, input).presentation =
+            Some(crate::presentation::PresentationConfig {
+                path: "/talks/a.pptx".into(),
+                slide: None,
+                plays_on: crate::engine::value::presentation::PlaysOn::default(),
+            });
+        draw_a_frame(&mut app);
+        let deck = deck_at(&mut app, input);
+        assert_eq!(deck.screen_capture_id(), Some(capture), "the same capture");
+        assert!(deck.external_source_view.is_some(), "drawn");
+        assert!(deck.external_source_coded_view.is_none(), "from its light");
     }
 
     #[test]

@@ -518,20 +518,7 @@ impl Mixer {
             }
         }
 
-        // Apply GPU timing results to deck slots (EMA smoothing)
-        if !self.last_frame_gpu_times.is_empty() {
-            for (ch_idx, channel) in self.channels.iter_mut().enumerate() {
-                for (dk_idx, slot) in channel.decks.iter_mut().enumerate() {
-                    if let Some(&gpu_us) = self.last_frame_gpu_times.get(&(ch_idx, dk_idx)) {
-                        if slot.gpu_render_cost_us > 0.0 {
-                            slot.gpu_render_cost_us = 0.2 * gpu_us + 0.8 * slot.gpu_render_cost_us;
-                        } else {
-                            slot.gpu_render_cost_us = gpu_us;
-                        }
-                    }
-                }
-            }
-        }
+        self.apply_gpu_times();
 
         // Update global modulation engine
         let t_modulation = std::time::Instant::now();
@@ -610,19 +597,22 @@ impl Mixer {
         // This is updated at the end of the frame based on actual vs CPU-measured time.
         let gpu_load_ratio = self.gpu_load_ratio;
         // Only when last frame's decks together ran over a frame's time may a
-        // deck on Auto be drawn less often (see `channel::auto_draws`).
-        let frame_over_budget = crate::channel::decks_over_budget(
-            self.channels
-                .iter()
-                .filter(|ch| ch.active_deck_count > 0)
-                .flat_map(|ch| ch.decks.iter().map(move |slot| (ch, slot)))
-                .filter(|(ch, slot)| {
-                    (!slot.mute && slot.opacity > 0.0)
-                        || ch.shown_alone.iter().any(|s| s == slot.deck.uuid())
-                })
-                .map(|(_, slot)| slot.render_cost_us * gpu_load_ratio),
-            target_fps,
-        );
+        // deck on Auto be drawn less often (see `channel::auto_draws`) and a
+        // covered deck's thumbnail wait — and not at all with that turned
+        // off (see `slow_layers_less_often`).
+        let frame_over_budget = self.slow_layers_less_often
+            && crate::channel::decks_over_budget(
+                self.channels
+                    .iter()
+                    .filter(|ch| ch.active_deck_count > 0)
+                    .flat_map(|ch| ch.decks.iter().map(move |slot| (ch, slot)))
+                    .filter(|(ch, slot)| {
+                        (!slot.mute && slot.opacity > 0.0)
+                            || ch.shown_alone.iter().any(|s| s == slot.deck.uuid())
+                    })
+                    .map(|(_, slot)| slot.render_cost_us * gpu_load_ratio),
+                target_fps,
+            );
 
         // Allocate per-frame GPU timing context (128 queries = 64 deck measurements)
         let mut timing_frame = if self.query_set.is_some() {
@@ -650,6 +640,9 @@ impl Mixer {
             channel.draw_visible_parts = self.draw_visible_parts;
             channel.direct_layers = self.direct_layers;
             channel.merge_layer_passes = self.merge_layer_passes;
+            channel.keep_still_text = self.keep_still_text;
+            channel.keep_still_clips = self.keep_still_clips;
+            channel.keep_still_inputs = self.keep_still_inputs;
             channel.previewed.clone_from(&self.previewed_decks);
             channel.draw_every_deck = merging[idx];
         }
@@ -777,6 +770,26 @@ impl Mixer {
                 channel.transitions_ticked = true;
             }
             let channel_dt = dt + std::mem::take(&mut channel.dt_owed);
+            // An input nothing of which shows — a lower third that is off —
+            // is drawn clear once and then left: no deck of it drawn, no
+            // picture of it put together, frame after frame, for nothing
+            // (see `Channel::blank`).
+            if self.skip_blank_channels && channel.blank(&self.modulation) {
+                if channel.left_blank() {
+                    // As `render` would leave it for the next frame; and
+                    // nothing of it costs anything now (see
+                    // `decks_over_budget`).
+                    channel.transitions_ticked = false;
+                    channel.render_time_ms = 0.0;
+                    channel.active_deck_count = 0;
+                    for slot in &mut channel.decks {
+                        slot.render_cost_us = 0.0;
+                        slot.gpu_render_cost_us = 0.0;
+                    }
+                    continue;
+                }
+                channel.settle_blank = true;
+            }
             if let Err(e) = channel.render(
                 context,
                 audio_data,
@@ -1036,6 +1049,7 @@ impl Mixer {
 
     fn composite_channels(&mut self, context: &GpuContext) -> Vec<wgpu::CommandBuffer> {
         self.release_merge_frames();
+        self.main_through = None;
         if self.mix_mode == super::MixMode::Program {
             return self.composite_program(context);
         }
@@ -1272,6 +1286,36 @@ impl Mixer {
             }
             slot += 1;
         }
+        if is_first {
+            // No input at any level: Main is clear — not what its own
+            // texture last held, which may be from before an input was
+            // handed out as Main (see `pass_main_through`).
+            let mut encoder =
+                context
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Mixer Clear Encoder (no input)"),
+                    });
+            {
+                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Mixer Clear Pass (no input)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.composite_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+            cmd_buffers.push(encoder.finish());
+        }
 
         cmd_buffers
     }
@@ -1338,6 +1382,23 @@ impl Mixer {
             {
                 continue;
             }
+            // An overlay left blank (see `Channel::blank_drawn`) adds nothing
+            // to what is under it: no layer for it — a pass over the whole
+            // picture saved. Only over something, and with a blend that
+            // leaves what is under a clear picture as it is: the bottom layer
+            // is the one that clears Main.
+            if self.skip_blank_channels
+                && ch.blank_drawn
+                && !layers.is_empty()
+                && matches!(
+                    ch.blend_mode,
+                    crate::channel::BlendMode::Normal
+                        | crate::channel::BlendMode::Add
+                        | crate::channel::BlendMode::Screen
+                )
+            {
+                continue;
+            }
             let level = self.main.overlay_level(ch.uuid()) * self.channel_opacity(idx);
             if level > 0.0 {
                 layers.push(ProgramLayer::new(
@@ -1350,11 +1411,61 @@ impl Mixer {
         layers
     }
 
+    /// The channels layered on Main now, bottom first (see `program_layers`).
+    #[cfg(test)]
+    pub(crate) fn main_layer_channels(&self) -> Vec<usize> {
+        self.program_layers(false)
+            .iter()
+            .filter_map(|layer| match layer.source {
+                LayerSource::Channel(idx) => Some(idx),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The input whose picture is Main's as it stands (see
+    /// `pass_main_through`): Main's one layer, an input's own picture at
+    /// full level — drawn over a clear it would be copied texel for texel —
+    /// and nothing done to Main after it: no master effect that runs, no
+    /// tone map, no LUT, no tap of Main (which is drawn into the tap's
+    /// target). A deck taken to Main is not one — its frame is straight
+    /// alpha, premultiplied as it is drawn — nor an input of another size,
+    /// which is drawn to Main's.
+    fn main_input_through(&self, layers: &[ProgramLayer]) -> Option<usize> {
+        let [layer] = layers else {
+            return None;
+        };
+        let LayerSource::Channel(input) = layer.source else {
+            return None;
+        };
+        let picture = &self.channels[input].composite_texture;
+        (self.pass_main_through
+            && (layer.opacity - 1.0).abs() < f32::EPSILON
+            && self.master_tap.is_none()
+            && self.tonemap_mode == crate::renderer::tonemap::TonemapMode::Bypass
+            && self.active_lut.is_none()
+            && !self
+                .master_effects
+                .iter()
+                .any(|effect| effect.enabled && effect.offline().is_none())
+            && picture.size() == self.composite_texture.size())
+        .then_some(input)
+    }
+
     /// Composite Main ([`Self::program_layers`]) into the master.
     fn composite_program(&mut self, context: &GpuContext) -> Vec<wgpu::CommandBuffer> {
         let drawn = self.render_main_transition(context);
         let layers = self.program_layers(drawn.is_some());
         let mut cmd_buffers = drawn.unwrap_or_default();
+        if let Some(input) = self.main_input_through(&layers) {
+            let channel = &self.channels[input];
+            self.main_through = Some((
+                channel.composite_texture.clone(),
+                channel.composite_view.clone(),
+            ));
+            self.main_passes = 0;
+            return cmd_buffers;
+        }
         for pipeline in [
             &self.blit_pipeline,
             &self.add_pipeline,
@@ -1391,8 +1502,12 @@ impl Mixer {
                 });
             }
             cmd_buffers.push(encoder.finish());
+            self.main_passes = 0;
             return cmd_buffers;
         }
+        // Draws waiting to go out together in one render pass (see
+        // `merge_main_passes`), and whether that pass clears Main.
+        let mut waiting = MainUnit::default();
         for (slot, layer) in layers.iter().enumerate() {
             // Channel composites are premultiplied; a deck's own texture is
             // straight alpha and is premultiplied as it is drawn.
@@ -1418,55 +1533,31 @@ impl Mixer {
                     pipeline.write_params_slot_premultiplying(&context.queue, slot, layer.opacity);
                 }
             };
-            if slot == 0 {
-                write(&self.blit_pipeline);
-                let bind_group =
-                    self.blit_pipeline
-                        .create_ring_bind_group(&context.device, view, slot);
-                let mut encoder =
-                    context
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("Main Composite Encoder (first)"),
-                        });
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Main Composite Pass (first)"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &self.composite_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-                    self.blit_pipeline.render_at_slot(&mut pass, &bind_group);
-                }
-                cmd_buffers.push(encoder.finish());
-            } else if let Some(pipeline) = match layer.blend {
-                _ if layer.sum => Some(&self.sum_pipeline),
-                crate::channel::BlendMode::Normal => Some(&self.blit_pipeline),
-                crate::channel::BlendMode::Add => Some(&self.add_pipeline),
-                crate::channel::BlendMode::Screen => Some(&self.screen_pipeline),
-                _ => None,
-            } {
-                write(pipeline);
-                cmd_buffers.push(pipeline.blend_onto(
-                    &context.device,
-                    view,
-                    &self.composite_view,
-                    slot,
-                    "Main Composite (blend unit)",
-                ));
+            // The bottom layer, and each over it the blend unit composites.
+            let unit = if slot == 0 {
+                Some(&self.blit_pipeline)
             } else {
-                // Other blend modes read what is below: snapshot, then the
-                // composite shader. Only overlay channels get here.
+                match layer.blend {
+                    _ if layer.sum => Some(&self.sum_pipeline),
+                    crate::channel::BlendMode::Normal => Some(&self.blit_pipeline),
+                    crate::channel::BlendMode::Add => Some(&self.add_pipeline),
+                    crate::channel::BlendMode::Screen => Some(&self.screen_pipeline),
+                    _ => None,
+                }
+            };
+            if let Some(pipeline) = unit {
+                write(pipeline);
+                let bind_group = pipeline.create_ring_bind_group(&context.device, view, slot);
+                waiting.clears |= slot == 0;
+                waiting.draws.push((pipeline, bind_group));
+                if !self.merge_main_passes {
+                    waiting.flush(context, &self.composite_view, &mut cmd_buffers);
+                }
+            } else {
+                // Other blend modes read what is below — the draws waiting
+                // go out first — snapshot, then the composite shader. Only
+                // overlay channels get here.
+                waiting.flush(context, &self.composite_view, &mut cmd_buffers);
                 let mut copy_encoder =
                     context
                         .device
@@ -1523,6 +1614,8 @@ impl Mixer {
                 cmd_buffers.push(encoder.finish());
             }
         }
+        waiting.flush(context, &self.composite_view, &mut cmd_buffers);
+        self.main_passes = waiting.passes;
         cmd_buffers
     }
 
@@ -1965,6 +2058,33 @@ impl Mixer {
         }
     }
 
+    /// The GPU's times read back, given to the decks they were taken of
+    /// (EMA smoothing). A deck that costs nothing by the clock has drawn
+    /// nothing since — its frame kept, or drawn straight onto its input —
+    /// and is given none: the time is of a draw it makes no more, and on a
+    /// deck not drawn again (covered since, its input left out) nothing
+    /// would take it off: a cost on the GPU with none by the clock, counted
+    /// in the frame's load.
+    pub(super) fn apply_gpu_times(&mut self) {
+        if self.last_frame_gpu_times.is_empty() {
+            return;
+        }
+        for (ch_idx, channel) in self.channels.iter_mut().enumerate() {
+            for (dk_idx, slot) in channel.decks.iter_mut().enumerate() {
+                if slot.render_cost_us <= 0.0 {
+                    continue;
+                }
+                if let Some(&gpu_us) = self.last_frame_gpu_times.get(&(ch_idx, dk_idx)) {
+                    if slot.gpu_render_cost_us > 0.0 {
+                        slot.gpu_render_cost_us = 0.2 * gpu_us + 0.8 * slot.gpu_render_cost_us;
+                    } else {
+                        slot.gpu_render_cost_us = gpu_us;
+                    }
+                }
+            }
+        }
+    }
+
     /// Summed GPU and CPU render costs over the decks that are actually drawing
     /// *and* have GPU timing for this frame.
     ///
@@ -2208,5 +2328,75 @@ impl ProgramLayer {
             sum: true,
             ..Self::new(source, weight, crate::channel::BlendMode::Normal)
         }
+    }
+}
+
+/// Draws of Main's layers waiting to go out in one render pass, bottom
+/// first, each through the pipeline for its blend; `clears` when the first
+/// is Main's bottom layer, drawn over a transparent clear.
+#[derive(Default)]
+struct MainUnit<'a> {
+    draws: Vec<(&'a crate::renderer::BlitPipeline, wgpu::BindGroup)>,
+    clears: bool,
+    /// Passes drawn so far.
+    passes: u32,
+}
+
+impl MainUnit<'_> {
+    /// Draw what is waiting onto `target` in one render pass, and start
+    /// afresh. Main is loaded, or cleared for the pass its bottom layer
+    /// starts, and stored once at the end.
+    fn flush(
+        &mut self,
+        context: &GpuContext,
+        target: &wgpu::TextureView,
+        cmds: &mut Vec<wgpu::CommandBuffer>,
+    ) {
+        if self.draws.is_empty() {
+            return;
+        }
+        let (encoder_label, label, load) = if self.clears {
+            (
+                "Main Composite Encoder (first)",
+                "Main Composite Pass (first)",
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            )
+        } else {
+            (
+                "Main Composite (blend unit)",
+                "Main Composite (blend unit)",
+                wgpu::LoadOp::Load,
+            )
+        };
+        let mut encoder = context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some(encoder_label),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            for (pipeline, bind_group) in &self.draws {
+                pipeline.render_at_slot(&mut pass, bind_group);
+            }
+        }
+        cmds.push(encoder.finish());
+        self.draws.clear();
+        self.clears = false;
+        self.passes += 1;
     }
 }

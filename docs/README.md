@@ -87,6 +87,7 @@ New to Nida? Start with [Main mode](18-main.md), [Screen Layouts](20-layouts.md)
 - **26. [Presentations](26-presentations.md)** — a conference's talks in one Slides input — PowerPoint decks, PDFs, web presentations, clips, pictures — in running order, each started with one press in the Presentations panel; a PiP or presenter view showing it follows the talk on
   - [The Presentations panel](26-presentations.md#the-presentations-panel) — ON AIR, NEXT, the running order
   - [Starting a talk](26-presentations.md#starting-a-talk) — what is on stays on until the new talk's picture is there
+  - [Ending a talk](26-presentations.md#ending-a-talk) — End talk: nothing on, PowerPoint left alone until a talk is started
   - [PDF talks](26-presentations.md#pdf-talks) and [web talks](26-presentations.md#web-talks) — drawn by Nida; played by the Mac's WebKit off screen
   - [Checked before the show](26-presentations.md#checked-before-the-show) — linked videos not copied, fonts this Mac lacks, 4:3 decks, pages that need the internet
   - [PowerPoint](26-presentations.md#powerpoint) — a deck played by PowerPoint on this Mac, its transitions, animations and videos as PowerPoint plays them; as a talk or an input of its own

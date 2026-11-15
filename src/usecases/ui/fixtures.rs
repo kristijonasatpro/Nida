@@ -495,6 +495,7 @@ impl UIData {
             gpu_device_type: "IntegratedGpu".to_string(),
             gpu_utilization: 45.0,
             gpu_utilization_measured: true,
+            late_frames: 0,
             nida_gpu: Some(38.0),
             nida_ram: Some(3 * 1024 * 1024 * 1024),
             cpu_usage: 25.0,

@@ -326,6 +326,21 @@ impl VardaApp {
     /// yet, when the show was opened — their camera as soon as it opens:
     /// looked for by name every two seconds while any deck waits.
     pub(crate) fn reconcile_cameras(&mut self) {
+        // The cameras come this look, and how many inputs each is shown on:
+        // said once each, whichever way its inputs came by it. An input
+        // added started a camera two others waited for, and it was said
+        // connected for the one and again for the two.
+        let mut here: Vec<(crate::camera::CameraId, String, usize)> = Vec::new();
+        self.show_cameras_come(&mut here);
+        for (_, name, inputs) in here {
+            self.say_camera_here(&name, inputs);
+        }
+    }
+
+    /// The look of `reconcile_cameras`: cameras started in the background
+    /// that run now, and cameras open already, shown on the inputs that
+    /// waited for them — each counted in `here`, to be said.
+    fn show_cameras_come(&mut self, here: &mut Vec<(crate::camera::CameraId, String, usize)>) {
         type Waiting = (
             String,
             String,
@@ -342,7 +357,17 @@ impl VardaApp {
         // Cameras started for waiting decks that run now: shown.
         for opened in self.camera_manager.poll_opening(&self.context.device) {
             match opened.result {
-                Ok(size) => self.show_opened_camera(opened.id, &opened.decks, size),
+                Ok(size) => {
+                    if let Some((name, inputs)) =
+                        self.show_opened_camera(opened.id, &opened.decks, size)
+                    {
+                        count_camera_here(here, opened.id, name, inputs);
+                    }
+                    // Inputs that waited for it while another started it —
+                    // a show's, one more of it added — show it this look,
+                    // not at the next in two seconds, and are said with it.
+                    self.camera_retry_at = None;
+                }
                 // Its input waits for it, tried again every two seconds; the
                 // operator who just added it is told once.
                 Err(e) if opened.asked => {
@@ -395,7 +420,9 @@ impl VardaApp {
                     .camera_manager
                     .open_camera(id, &self.context.device, mode)
                 {
-                    self.bind_waiting_camera(&uuid, id, size);
+                    if let Some(name) = self.bind_waiting_camera(&uuid, id, size) {
+                        count_camera_here(here, id, name, 1);
+                    }
                 }
             } else if !self.camera_manager.is_opening(id) {
                 match starting.iter_mut().find(|(i, ..)| *i == id) {
@@ -449,16 +476,232 @@ impl VardaApp {
         );
     }
 
+    /// Display inputs the show has by their name alone — "Display 1", saved
+    /// before displays were kept by their own identity — show whichever
+    /// screen has that name today: said when one is new, where there is more
+    /// than one screen to have it. A show's two such inputs, made of its 4K
+    /// screen, showed a capture box's own screen with nothing said (a copy
+    /// of a show, an M5 Max, 2026-11-10). Each is looked at every frame, and
+    /// said again only once another comes.
+    pub(crate) fn warn_captures_by_name(&mut self) {
+        use crate::screen_capture::backend::CaptureTargetKind;
+        let manager = &self.screen_capture_manager;
+        // One screen alone is the one of its name.
+        let several = manager
+            .targets()
+            .iter()
+            .filter(|t| t.kind == CaptureTargetKind::Display)
+            .nth(1)
+            .is_some();
+        let by_name = || {
+            self.mixer
+                .channels()
+                .iter()
+                .flat_map(|channel| &channel.decks)
+                .filter(|slot| {
+                    several
+                        && slot
+                            .deck
+                            .screen_capture
+                            .as_ref()
+                            .is_some_and(|s| manager.goes_by_name(&s.identity))
+                })
+        };
+        if by_name()
+            .map(|slot| slot.deck.uuid())
+            .eq(self.captures_by_name.iter().map(String::as_str))
+        {
+            return;
+        }
+        let now: Vec<String> = by_name().map(|slot| slot.deck.uuid().to_string()).collect();
+        let mut names: Vec<String> = by_name()
+            .filter_map(|slot| slot.deck.screen_capture.as_ref())
+            .map(|s| crate::scene::CaptureTargetConfig::from(&s.identity).label())
+            .collect();
+        names.sort();
+        names.dedup();
+        let new = now.iter().any(|uuid| !self.captures_by_name.contains(uuid));
+        let inputs = now.len();
+        self.captures_by_name = now;
+        if !new {
+            return;
+        }
+        let message = format!(
+            "{inputs} screen {} by a display's number ({}), not the screen itself: {} whichever \
+             screen has that number today. Check {}, and pick its screen in its settings to \
+             keep that screen.",
+            if inputs == 1 { "input goes" } else { "inputs go" },
+            names.join(", "),
+            if inputs == 1 { "it shows" } else { "they show" },
+            if inputs == 1 { "it" } else { "each" },
+        );
+        self.session.notifications.warn(message);
+    }
+
+    /// Capture settings given to inputs — a rate, a crop, the cursor — sent
+    /// down to their captures, once; every input then shows and saves what
+    /// its capture runs with. A screen or window is captured once however
+    /// many inputs show it, so these settings are its inputs' in common:
+    /// the capture is given what they were given, in the order they were,
+    /// and runs as if each had been set on it there and then — the last
+    /// word on a setting the last one given, whichever input that was
+    /// given to.
+    ///
+    /// An input's own copy of them does not go down: an input that joined
+    /// a screen the same frame another cropped it kept its copy uncropped,
+    /// and put the whole screen back with the next thing changed on it. Nor
+    /// is that copy compared with what the capture runs with, to send what
+    /// differs: a cursor hidden on one input the frame it was shown on
+    /// another was as the capture ran, and stayed shown; a crop moved right
+    /// on one, its own older width narrowed to fit, took away the width
+    /// another had just been given.
+    pub(crate) fn send_capture_settings(&mut self) {
+        use crate::screen_capture::{
+            backend::{CaptureConfig, CaptureGiven},
+            CaptureId,
+        };
+        let captures = &mut self.screen_capture_manager;
+        // What the inputs were given, each for its capture; and the
+        // captures given any, each as it runs.
+        let mut given: Vec<(CaptureId, CaptureGiven)> = Vec::new();
+        let mut changed: Vec<(CaptureId, CaptureConfig)> = Vec::new();
+        for channel in self.mixer.channels_mut() {
+            for slot in &mut channel.decks {
+                let Some(state) = &mut slot.deck.screen_capture else {
+                    continue;
+                };
+                if state.given.is_empty() {
+                    continue;
+                }
+                let its = std::mem::take(&mut state.given);
+                let id = state.capture_id;
+                // Its screen or window not there: kept on the input.
+                let Some(runs) = captures.config(id) else {
+                    continue;
+                };
+                if state.presentation.is_some() {
+                    // A PowerPoint show's window is captured apart, as its
+                    // presentation has it: its settings whole, but for its
+                    // cap (see `Deck::cap_capture_to_show`).
+                    let mut config = state.config.clone();
+                    config.scale_to = runs.scale_to;
+                    captures.set_config(id, config);
+                    continue;
+                }
+                if !changed.iter().any(|(i, _)| *i == id) {
+                    changed.push((id, runs));
+                }
+                given.extend(its.into_iter().map(|g| (id, g)));
+            }
+        }
+        // In the order given, whichever input each was given to.
+        given.sort_by_key(|(_, g)| g.at);
+        for (id, g) in given {
+            if let Some((_, runs)) = changed.iter_mut().find(|(i, _)| *i == id) {
+                runs.give(g.setting, g.value);
+            }
+        }
+        for (id, runs) in changed {
+            captures.set_config(id, runs);
+        }
+        for channel in self.mixer.channels_mut() {
+            for slot in &mut channel.decks {
+                let Some(state) = &mut slot.deck.screen_capture else {
+                    continue;
+                };
+                if state.presentation.is_some() {
+                    continue;
+                }
+                if let Some(runs) = captures.config(state.capture_id) {
+                    state.config = state.config.as_runs(&runs);
+                }
+            }
+        }
+    }
+
+    /// Each screen or window captured comes sized as its picture is drawn
+    /// (see `ScreenCaptureManager::size_as_drawn`), every frame.
+    /// `NIDA_CAPTURES_AS_DRAWN=0`, read once, leaves each as it came before:
+    /// fitted within the show's size whatever it is drawn at.
+    pub(crate) fn size_captures_as_drawn(&mut self) {
+        static FOLLOWED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("NIDA_CAPTURES_AS_DRAWN").map_or(true, |v| v.trim() != "0")
+        });
+        if *FOLLOWED {
+            self.size_captures_as_drawn_at(std::time::Instant::now());
+        }
+    }
+
+    /// Each capture sized, at `now`, as the most of its inputs draw it: one
+    /// fitted beside one that fills its frame, or is zoomed into, comes as
+    /// that one needs — an input off air among them, which is sharp from
+    /// the frame it is cut to.
+    pub(crate) fn size_captures_as_drawn_at(&mut self, now: std::time::Instant) {
+        use crate::screen_capture::{backend::Drawn, CaptureId};
+        let modulation = self.mixer.modulation();
+        let mut most: Vec<(CaptureId, Drawn)> = Vec::new();
+        for slot in self.mixer.channels().iter().flat_map(|c| &c.decks) {
+            let Some((id, drawn)) = slot.deck.capture_drawn(modulation) else {
+                continue;
+            };
+            match most.iter_mut().find(|(i, _)| *i == id) {
+                Some((_, of_all)) => *of_all = of_all.or(drawn),
+                None => most.push((id, drawn)),
+            }
+        }
+        for (id, drawn) in most {
+            self.screen_capture_manager.size_as_drawn(id, drawn, now);
+        }
+    }
+
+    /// `config` for an input come to the capture `id`, as that capture runs
+    /// (see `CaptureConfig::as_runs`): one opened new, as this input asked;
+    /// one another input runs already, as that one has it — what is on air
+    /// does not change under it.
+    pub(crate) fn as_its_capture_runs(
+        &self,
+        id: crate::screen_capture::CaptureId,
+        config: crate::screen_capture::backend::CaptureConfig,
+    ) -> crate::screen_capture::backend::CaptureConfig {
+        match self.screen_capture_manager.config(id) {
+            Some(runs) => config.as_runs(&runs),
+            None => config,
+        }
+    }
+
+    /// A show opened runs its captures as it saved them. A screen the show
+    /// before captured too goes on in the one capture there is of it, which
+    /// ran on with that show's rate, crop and cursor — and the inputs would
+    /// take those for theirs (see `send_capture_settings`). Each capture is
+    /// set as its first input in the show has it: as one opened new is, by
+    /// that input.
+    pub(crate) fn run_captures_as_saved(&mut self) {
+        let mut set: Vec<crate::screen_capture::CaptureId> = Vec::new();
+        for slot in self.mixer.channels().iter().flat_map(|c| &c.decks) {
+            let Some(state) = &slot.deck.screen_capture else {
+                continue;
+            };
+            if state.presentation.is_some() || set.contains(&state.capture_id) {
+                continue;
+            }
+            set.push(state.capture_id);
+            self.screen_capture_manager
+                .set_config(state.capture_id, state.config.clone());
+        }
+    }
+
     /// A camera started in the background runs: the decks that waited for
     /// it show it — the first on the reference its start holds, the rest on
-    /// one each. Let go again when none is left to show it.
+    /// one each. Let go again when none is left to show it. Gives the name
+    /// it was waited for by and how many show it, to be said.
     fn show_opened_camera(
         &mut self,
         id: crate::camera::CameraId,
         decks: &[String],
         size: (u32, u32),
-    ) {
+    ) -> Option<(String, usize)> {
         let mut shown = 0;
+        let mut name = None;
         for uuid in decks {
             if shown > 0
                 && self
@@ -468,34 +711,48 @@ impl VardaApp {
             {
                 continue;
             }
-            if self.bind_waiting_camera(uuid, id, size) {
+            if let Some(waited_for) = self.bind_waiting_camera(uuid, id, size) {
                 shown += 1;
+                name.get_or_insert(waited_for);
             } else if shown > 0 {
                 self.camera_manager.release_camera(id);
             }
         }
-        if shown == 0 {
+        if name.is_none() {
             self.camera_manager.release_camera(id);
         }
+        name.map(|name| (name, shown))
     }
 
-    /// Point the deck `uuid`, if it still waits for a camera, at camera `id`.
+    /// A camera is here and the `inputs` that waited for it show it: said
+    /// once, however many they are — a show's four inputs on one camera
+    /// said "connected" four times as it opened.
+    fn say_camera_here(&mut self, name: &str, inputs: usize) {
+        if inputs == 1 {
+            log::info!("Camera '{name}' is here: showing it");
+        } else {
+            log::info!("Camera '{name}' is here: showing it on {inputs} inputs");
+        }
+        self.session
+            .notifications
+            .info(format!("📹 {name} connected"));
+    }
+
+    /// Point the deck `uuid`, if it still waits for a camera, at camera `id`:
+    /// the name it waited for it by, to be said (see `say_camera_here`).
     fn bind_waiting_camera(
         &mut self,
         uuid: &str,
         id: crate::camera::CameraId,
         size: (u32, u32),
-    ) -> bool {
+    ) -> Option<String> {
         let unique_id = self.camera_manager.unique_id(id).map(str::to_string);
-        let Some(slot) = self
+        let slot = self
             .mixer
             .channels_mut()
             .iter_mut()
             .flat_map(|c| c.decks.iter_mut())
-            .find(|slot| slot.deck.uuid() == uuid && slot.deck.camera_waiting_for().is_some())
-        else {
-            return false;
-        };
+            .find(|slot| slot.deck.uuid() == uuid && slot.deck.camera_waiting_for().is_some())?;
         let name = slot
             .deck
             .camera_waiting_for()
@@ -503,11 +760,21 @@ impl VardaApp {
             .to_string();
         slot.deck.bind_camera(id, size);
         slot.deck.camera_device = unique_id;
-        log::info!("Camera '{name}' is here: showing it");
-        self.session
-            .notifications
-            .info(format!("📹 {name} connected"));
-        true
+        Some(name)
+    }
+}
+
+/// One more camera come, shown on `inputs` inputs: counted in `here` with
+/// the inputs it is shown on already this look.
+fn count_camera_here(
+    here: &mut Vec<(crate::camera::CameraId, String, usize)>,
+    id: crate::camera::CameraId,
+    name: String,
+    inputs: usize,
+) {
+    match here.iter_mut().find(|(i, ..)| *i == id) {
+        Some((.., shown)) => *shown += inputs,
+        None => here.push((id, name, inputs)),
     }
 }
 
@@ -890,5 +1157,161 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A camera the OS starts at once, capturing until told to stop.
+    fn starts_at_once(
+        _: &crate::camera::CameraDeviceInfo,
+        _: Option<crate::camera::CameraMode>,
+        _: &std::sync::Arc<crate::camera::Sink>,
+        stop: &std::sync::atomic::AtomicBool,
+        opened: &std::sync::mpsc::Sender<anyhow::Result<crate::camera::CameraMode>>,
+    ) {
+        let _ = opened.send(Ok(crate::camera::CameraMode {
+            width: 64,
+            height: 36,
+            fps: 60,
+        }));
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A layer of a show waiting for the camera `name` of device `device`,
+    /// in the first channel; its UUID.
+    fn waiting_layer(app: &mut VardaApp, name: &str, device: &str) -> String {
+        let mut deck = crate::deck::Deck::new_from_camera(
+            &app.context,
+            crate::camera::UNBOUND_CAMERA,
+            name,
+            1920,
+            1080,
+            64,
+            64,
+        )
+        .expect("a camera layer");
+        deck.camera_device = Some(device.into());
+        let uuid = deck.uuid().to_string();
+        app.mixer.channels_mut()[0].add_deck(deck);
+        uuid
+    }
+
+    /// A show's four inputs on one camera: the camera come, each shows it,
+    /// and it is said once that it is connected — not four times (an M5
+    /// Max, 2026-11-10). Two more inputs put on it later, the camera running
+    /// already, are said once between them.
+    #[test]
+    fn a_camera_come_is_said_once_however_many_inputs_show_it() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        app.camera_manager =
+            crate::camera::CameraManager::with_devices(&[("a", "ATEM")], starts_at_once);
+        let id = app.camera_manager.devices()[0].id;
+        let said = |app: &VardaApp| {
+            app.session
+                .notifications
+                .history()
+                .iter()
+                .filter(|n| n.message == "📹 ATEM connected")
+                .count()
+        };
+        let waits = |app: &VardaApp| {
+            app.mixer
+                .channels()
+                .iter()
+                .flat_map(|c| &c.decks)
+                .filter(|slot| slot.deck.camera_waiting_for().is_some())
+                .count()
+        };
+        let reconcile_until_shown = |app: &mut VardaApp| {
+            let start = std::time::Instant::now();
+            while waits(app) > 0 && start.elapsed() < std::time::Duration::from_secs(3) {
+                app.reconcile_cameras();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(waits(app), 0, "every input shows its camera");
+        };
+
+        for _ in 0..4 {
+            waiting_layer(&mut app, "ATEM", "a");
+        }
+        assert_eq!(said(&app), 0);
+        reconcile_until_shown(&mut app);
+        assert!(app.camera_manager.is_active(id));
+        assert_eq!(said(&app), 1, "once for the four");
+
+        // The camera running: two more inputs of it, at the next look.
+        waiting_layer(&mut app, "ATEM", "a");
+        waiting_layer(&mut app, "ATEM", "a");
+        app.camera_retry_at = None;
+        reconcile_until_shown(&mut app);
+        assert_eq!(said(&app), 2, "once for the two");
+    }
+
+    /// Two inputs of a show wait for their camera — looked for again only
+    /// in a while, or (`due`) at every look — and a third input of it is
+    /// added, which starts it. Looked at until it runs: the inputs still
+    /// waiting then, and the times it was said connected.
+    fn camera_started_by_a_third_input(due: bool) -> Option<(usize, usize)> {
+        use crate::engine::MixerCommands;
+        let mut app = headless_app()?;
+        app.camera_manager =
+            crate::camera::CameraManager::with_devices(&[("a", "ATEM")], starts_at_once);
+        let id = app.camera_manager.devices()[0].id;
+        let waits = |app: &VardaApp| {
+            app.mixer
+                .channels()
+                .iter()
+                .flat_map(|c| &c.decks)
+                .filter(|slot| slot.deck.camera_waiting_for().is_some())
+                .count()
+        };
+        waiting_layer(&mut app, "ATEM", "a");
+        waiting_layer(&mut app, "ATEM", "a");
+        app.camera_retry_at =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3600));
+        let channel = app.mixer.channels()[0].uuid().to_string();
+        app.add_camera_deck(&channel, id, None).expect("added");
+        assert_eq!(waits(&app), 3, "started in the background");
+
+        let start = std::time::Instant::now();
+        while waits(&app) == 3 && start.elapsed() < std::time::Duration::from_secs(3) {
+            if due {
+                app.camera_retry_at = None;
+            }
+            app.reconcile_cameras();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let said = app
+            .session
+            .notifications
+            .history()
+            .iter()
+            .filter(|n| n.message == "📹 ATEM connected")
+            .count();
+        Some((waits(&app), said))
+    }
+
+    /// A camera started by an input just added shows on the show's inputs
+    /// that waited for it in the same look — not two seconds on, when they
+    /// are looked at next — and is said connected once for them all.
+    #[test]
+    fn a_camera_started_by_one_input_shows_on_those_that_waited_at_once() {
+        let Some(shown) = camera_started_by_a_third_input(false) else {
+            return;
+        };
+        assert_eq!(shown, (0, 1), "(inputs still waiting, times said)");
+    }
+
+    /// The same as the waiting inputs are looked at anyway: the camera was
+    /// said connected for the input that started it, and again in that
+    /// look for the two that found it open.
+    #[test]
+    fn a_camera_started_as_its_inputs_are_looked_at_is_said_once() {
+        let Some(shown) = camera_started_by_a_third_input(true) else {
+            return;
+        };
+        assert_eq!(shown, (0, 1), "(inputs still waiting, times said)");
     }
 }

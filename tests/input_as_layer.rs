@@ -421,6 +421,13 @@ fn an_input_moved_and_scaled_is_drawn_in_its_place_in_one_pass() {
         EngineCommand::SetCompositor {
             direct_layers: Some(false),
             merge_layer_passes: None,
+            slow_layers_less_often: None,
+            skip_blank_channels: None,
+            keep_still_text: None,
+            merge_main_passes: None,
+            pass_main_through: None,
+            keep_still_clips: None,
+            keep_still_inputs: None,
         },
     );
     send_cmd(
@@ -667,6 +674,13 @@ fn drawn_in_one_pass_looks_the_same(circle: bool, flip: bool, flattened: bool, d
         EngineCommand::SetCompositor {
             direct_layers: Some(direct),
             merge_layer_passes: None,
+            slow_layers_less_often: None,
+            skip_blank_channels: None,
+            keep_still_text: None,
+            merge_main_passes: None,
+            pass_main_through: None,
+            keep_still_clips: None,
+            keep_still_inputs: None,
         },
     );
     send_cmd(
@@ -873,4 +887,687 @@ fn drawn_in_one_pass_looks_the_same(circle: bool, flip: bool, flattened: bool, d
             );
         }
     }
+}
+
+/// Edge contrast of a row of an `Rgba16Float` texture between `from` and
+/// `to` across: the mean squared step from each pixel to the next.
+fn edge_energy(pixels: &[[f32; 4]], width: u32, y: u32, from: u32, to: u32) -> f32 {
+    let row = &pixels[(y * width) as usize..((y + 1) * width) as usize];
+    let steps: Vec<f32> = (from..to)
+        .map(|x| (row[x as usize + 1][0] - row[x as usize][0]).powi(2))
+        .collect();
+    steps.iter().sum::<f32>() / steps.len() as f32
+}
+
+/// Edge energy (see `edge_energy`) of black and white bars `bar` pixels wide,
+/// at the show's own size, shown in another input as a layer at each of
+/// `scales` by its transform.
+fn edges_at_scales(bar: u32, scales: &[f32]) -> Option<Vec<f32>> {
+    let gpu = common::headless_gpu()?;
+    let dir = tempfile::tempdir().unwrap();
+    let picture = dir.path().join("bars.png");
+    image::RgbaImage::from_fn(1920, 1080, |x, _| {
+        if (x / bar).is_multiple_of(2) {
+            image::Rgba([0, 0, 0, 255])
+        } else {
+            image::Rgba([255, 255, 255, 255])
+        }
+    })
+    .save(&picture)
+    .unwrap();
+    let mut app = VardaApp::new(gpu, &varda::testing::headless_config()).unwrap();
+    send_cmd(
+        &mut app,
+        EngineCommand::SetMixMode {
+            mode: varda::mixer::MixMode::Program,
+        },
+    );
+    let state = app.build_engine_state();
+    let (first, second) = (
+        state.mixer.channels[0].uuid.clone(),
+        state.mixer.channels[1].uuid.clone(),
+    );
+    for channel in &state.mixer.channels[..2] {
+        for deck in &channel.decks {
+            send_cmd(
+                &mut app,
+                EngineCommand::RemoveDeck {
+                    deck_uuid: deck.uuid.clone(),
+                },
+            );
+        }
+    }
+    id(send_cmd(
+        &mut app,
+        EngineCommand::AddImageDeck {
+            channel_uuid: first.clone(),
+            path: picture,
+        },
+    ));
+    let layer = id(send_cmd(
+        &mut app,
+        EngineCommand::AddTapDeck {
+            channel_uuid: second.clone(),
+            source: varda::scene::TapSourceConfig::Channel { uuid: first },
+        },
+    ));
+    let state = app.build_engine_state();
+    let transform = state.mixer.channels[1]
+        .decks
+        .iter()
+        .find(|d| d.uuid == layer)
+        .and_then(|d| d.effects.iter().find(|e| e.name == "transform"))
+        .expect("a new layer carries a transform")
+        .uuid
+        .clone();
+    send_cmd(
+        &mut app,
+        EngineCommand::TakeToMain {
+            source: MainSource::Channel(second),
+            fade: false,
+        },
+    );
+    let mut energy = Vec::new();
+    for &scale in scales {
+        send_cmd(
+            &mut app,
+            EngineCommand::SetEffectParam {
+                effect_uuid: transform.clone(),
+                name: "scale".into(),
+                value: varda::params::ParamValue::Float(scale),
+            },
+        );
+        app.render_mixer_frame();
+        app.render_mixer_frame();
+        let composite = &app.mixer_ref().channels()[1].composite_texture;
+        let pixels = frame_pixels(app.gpu_context(), composite);
+        energy.push(edge_energy(&pixels, 1920, 540, 760, 1160));
+    }
+    Some(energy)
+}
+
+/// An input shown as a layer and scaled by its transform keeps its edges:
+/// one bilinear tap blurred it — a window enlarged into its frame
+/// (KJ's app capture, 1.86×) and a 4K screen shrunk into one (0.89×, a
+/// fifth of its text's edges gone, measured on an M5 Max) — where the
+/// layer's own picture, drawn the same, came out sharp. Bars two pixels
+/// wide: text is drawn in stems a pixel or two wide.
+#[test]
+fn an_input_scaled_as_a_layer_keeps_its_edges() {
+    let Some(energy) = edges_at_scales(2, &[1.0, 0.891, 1.86]) else {
+        return;
+    };
+    // At its own size exactly as it is; a little smaller and enlarged,
+    // sharper than one bilinear tap (0.394 and 0.118 at these sizes: the
+    // bicubic gives 0.412 and 0.129).
+    assert!((energy[0] - 0.5).abs() < 1e-3, "at its own size: {energy:?}");
+    assert!(energy[1] > 0.403, "a little smaller: {energy:?}");
+    assert!(energy[2] > 0.124, "enlarged: {energy:?}");
+}
+
+/// A layer shrinking in a Merge takes no jump in sharpness where bicubic
+/// meets one tap (about its own size) or averaging (a quarter smaller) —
+/// a jump of a quarter of its edges' contrast there before. Each pair of
+/// sizes either side of one, close enough that the picture moves by a hair.
+/// (The averaging still steps at whole numbers of texels, a few hundredths,
+/// as every picture drawn smaller always has.) Bars five pixels wide:
+/// narrower ones beat with the pixels at these sizes, whatever the filter.
+#[test]
+fn an_input_shrinking_as_a_layer_does_not_jump_in_sharpness() {
+    let pairs = [(0.9806, 0.9801), (0.801, 0.799)];
+    let scales: Vec<f32> = pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
+    let Some(energy) = edges_at_scales(5, &scales) else {
+        return;
+    };
+    for (i, (a, b)) in pairs.iter().enumerate() {
+        let (ea, eb) = (energy[2 * i], energy[2 * i + 1]);
+        assert!(
+            (ea - eb).abs() < 0.02 * ea.max(eb),
+            "between {a} and {b}: {ea:.4} and {eb:.4} ({energy:?})"
+        );
+    }
+}
+
+/// A screen `w` × `h` as its capture brings it: red rising left to right,
+/// green top to bottom. Its texture too, kept while the view is shown.
+fn a_screen(
+    gpu: &varda::renderer::context::GpuContext,
+    w: u32,
+    h: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let size = wgpu::Extent3d {
+        width: w,
+        height: h,
+        depth_or_array_layers: 1,
+    };
+    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("a screen"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let part = |at: u32, of: u32| ((at as f32 + 0.5) / of as f32 * 255.0).round() as u8;
+    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            data.extend_from_slice(&[part(x, w), part(y, h), 128, 255]);
+        }
+    }
+    gpu.queue.write_texture(
+        texture.as_image_copy(),
+        &data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 4),
+            rows_per_image: Some(h),
+        },
+        size,
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// A screen capture shown centred looks the same when its capture comes
+/// bigger — as it does while another input of the same screen is zoomed
+/// into: the whole screen still, not its middle enlarged. Drawn by the
+/// deck's own pass.
+#[test]
+fn a_centred_capture_looks_the_same_when_it_comes_bigger() {
+    a_centred_capture_comes_bigger(false);
+}
+
+/// And shrunk by its Transform: drawn by the pass that draws a picture
+/// into its place.
+#[test]
+fn a_centred_capture_shrunk_looks_the_same_when_it_comes_bigger() {
+    a_centred_capture_comes_bigger(true);
+}
+
+/// A screen's input, centred — `shrunk` to half its size by a Transform,
+/// or as it is — shown its screen as it comes fitted, then twice as big:
+/// the same picture both times.
+fn a_centred_capture_comes_bigger(shrunk: bool) {
+    use varda::deck::{Deck, Effect, ScalingMode, ScreenCaptureState};
+    use varda::params::ParamValue::Float;
+    use varda::screen_capture::backend::{CaptureConfig, TargetIdentity};
+    let Some(gpu) = common::headless_gpu() else {
+        return;
+    };
+    let show: (u32, u32) = (64, 36);
+    let twice = (show.0 * 2, show.1 * 2);
+    let fitted = a_screen(&gpu, show.0, show.1);
+    let bigger = a_screen(&gpu, twice.0, twice.1);
+    let audio = varda::audio::AudioData::default();
+    let modulation = varda::modulation::ModulationEngine::new();
+    let effect = |name: &str| {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("shaders")
+            .join(format!("{name}.fs"));
+        let shader = varda::isf::ISFShader::from_file(path).expect("the shader");
+        Effect::new(&gpu, shader).expect("an effect")
+    };
+    let shows = |deck: &mut Deck, view: &wgpu::TextureView, size: (u32, u32)| {
+        deck.external_source_view = Some(view.clone());
+        deck.set_external_source_size(size.0, size.1);
+        let mut cmds = Vec::new();
+        deck.render(&gpu, &audio, &modulation, 0, &mut cmds)
+            .expect("drawn");
+        gpu.submit(cmds);
+        assert!(deck.gpu_error().is_none(), "drawn without a fault");
+        frame_pixels(&gpu, &deck.texture)
+    };
+    // The part of the frame compared, clear of the picture's edges: all of
+    // it, or the half-size picture in its middle.
+    let (across, down) = if shrunk {
+        (18..46u32, 11..25u32)
+    } else {
+        (2..62, 2..34)
+    };
+    let state = ScreenCaptureState {
+        capture_id: 1,
+        identity: TargetIdentity::Display {
+            label: "Display 1".into(),
+            uuid: None,
+        },
+        config: CaptureConfig {
+            scale_to: Some(show),
+            ..Default::default()
+        },
+        given: Vec::new(),
+        listed_as: None,
+        presentation: None,
+    };
+    let mut deck =
+        Deck::new_from_screen_capture(&gpu, state, "Display 1", show.0, show.1, show.0, show.1)
+            .expect("a screen's input");
+    deck.set_scaling_mode(ScalingMode::Center);
+    if shrunk {
+        deck.add_effect(effect("crop"));
+        deck.add_effect(effect("transform"));
+        deck.effects[1].params.set("scale", Float(0.5));
+    }
+    let before = shows(&mut deck, &fitted.1, show);
+    let after = shows(&mut deck, &bigger.1, twice);
+    let at = |x: u32, y: u32| (y * show.0 + x) as usize;
+    let (left, right) = (at(across.start, 18), at(across.end - 1, 18));
+    assert!(
+        before[right][0] - before[left][0] > 0.5,
+        "shrunk {shrunk}: the whole screen across, {:?} to {:?}",
+        before[left],
+        before[right]
+    );
+    let mut furthest = 0.0f32;
+    for y in down {
+        for x in across.clone() {
+            for part in 0..4 {
+                let apart = (before[at(x, y)][part] - after[at(x, y)][part]).abs();
+                furthest = furthest.max(apart);
+            }
+        }
+    }
+    assert!(
+        furthest < 0.03,
+        "shrunk {shrunk}: the picture changed by {furthest} when it came bigger"
+    );
+}
+
+/// A screen `w` × `h` as its capture brings it, each pixel as `pixel` says
+/// (sRGB): its texture, kept while its views are shown, its view as light
+/// and its view as it was coded (see `ScreenCaptureManager::coded_view`).
+fn a_coded_screen(
+    gpu: &varda::renderer::context::GpuContext,
+    w: u32,
+    h: u32,
+    pixel: impl Fn(u32, u32) -> [u8; 4],
+) -> (wgpu::Texture, wgpu::TextureView, wgpu::TextureView) {
+    let size = wgpu::Extent3d {
+        width: w,
+        height: h,
+        depth_or_array_layers: 1,
+    };
+    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("a coded screen"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+    });
+    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            data.extend_from_slice(&pixel(x, y));
+        }
+    }
+    gpu.queue.write_texture(
+        texture.as_image_copy(),
+        &data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * 4),
+            rows_per_image: Some(h),
+        },
+        size,
+    );
+    let light = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let coded = texture.create_view(&wgpu::TextureViewDescriptor {
+        format: Some(wgpu::TextureFormat::Rgba8Unorm),
+        ..Default::default()
+    });
+    (texture, light, coded)
+}
+
+/// A screen capture drawn smaller is averaged as it was coded, where its
+/// input has its view as coded: lines black and white by turns, two to a
+/// pixel, come out the grey half-way between them as coded — as dark as
+/// anything else that shrinks a picture makes them — not the lighter grey
+/// half-way between them as light. Drawn by the deck's own pass.
+#[test]
+fn a_capture_drawn_smaller_is_averaged_as_it_was_coded() {
+    a_capture_comes_smaller(false);
+}
+
+/// And shrunk by its Transform, four lines to a pixel: drawn by the pass
+/// that draws a picture into its place.
+#[test]
+fn a_capture_shrunk_is_averaged_as_it_was_coded() {
+    a_capture_comes_smaller(true);
+}
+
+/// A screen's input, fitted — `shrunk` to half its size by a Transform, or
+/// as it is — shown a screen twice the show's size, its columns black and
+/// white by turns: read as coded, then as light.
+fn a_capture_comes_smaller(shrunk: bool) {
+    use varda::deck::{Deck, Effect, ScalingMode, ScreenCaptureState};
+    use varda::params::ParamValue::Float;
+    use varda::screen_capture::backend::{CaptureConfig, TargetIdentity};
+    let Some(gpu) = common::headless_gpu() else {
+        return;
+    };
+    if !gpu.reads_a_texture_two_ways() {
+        eprintln!("Skipping: this GPU reads a texture one way");
+        return;
+    }
+    let show: (u32, u32) = (64, 36);
+    let twice = (show.0 * 2, show.1 * 2);
+    let (_screen, light, coded) = a_coded_screen(&gpu, twice.0, twice.1, |x, _| {
+        if x % 2 == 0 {
+            [255; 4]
+        } else {
+            [0, 0, 0, 255]
+        }
+    });
+    let audio = varda::audio::AudioData::default();
+    let modulation = varda::modulation::ModulationEngine::new();
+    let effect = |name: &str| {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("shaders")
+            .join(format!("{name}.fs"));
+        let shader = varda::isf::ISFShader::from_file(path).expect("the shader");
+        Effect::new(&gpu, shader).expect("an effect")
+    };
+    let shows = |deck: &mut Deck, coded: Option<&wgpu::TextureView>| {
+        deck.external_source_view = Some(light.clone());
+        deck.external_source_coded_view = coded.cloned();
+        deck.set_external_source_size(twice.0, twice.1);
+        let mut cmds = Vec::new();
+        deck.render(&gpu, &audio, &modulation, 0, &mut cmds)
+            .expect("drawn");
+        gpu.submit(cmds);
+        assert!(deck.gpu_error().is_none(), "drawn without a fault");
+        frame_pixels(&gpu, &deck.texture)
+    };
+    // The part of the frame looked at, clear of the picture's edges: all of
+    // it, or the half-size picture in its middle.
+    let (across, down) = if shrunk {
+        (18..46u32, 11..25u32)
+    } else {
+        (2..62, 2..34)
+    };
+    let state = ScreenCaptureState {
+        capture_id: 1,
+        identity: TargetIdentity::Display {
+            label: "Display 1".into(),
+            uuid: None,
+        },
+        config: CaptureConfig {
+            scale_to: Some(show),
+            ..Default::default()
+        },
+        given: Vec::new(),
+        listed_as: None,
+        presentation: None,
+    };
+    let mut deck =
+        Deck::new_from_screen_capture(&gpu, state, "Display 1", show.0, show.1, show.0, show.1)
+            .expect("a screen's input");
+    deck.set_scaling_mode(ScalingMode::Fit);
+    if shrunk {
+        deck.add_effect(effect("crop"));
+        deck.add_effect(effect("transform"));
+        deck.effects[1].params.set("scale", Float(0.5));
+    }
+    let as_coded = shows(&mut deck, Some(&coded));
+    let as_light = shows(&mut deck, None);
+    // Half-way between black and white as coded (sRGB 0.5), as light.
+    let grey = ((0.5f32 + 0.055) / 1.055).powf(2.4);
+    let at = |x: u32, y: u32| (y * show.0 + x) as usize;
+    for y in down {
+        for x in across.clone() {
+            for part in 0..3 {
+                let (dark, pale) = (as_coded[at(x, y)][part], as_light[at(x, y)][part]);
+                assert!(
+                    (dark - grey).abs() < 0.02,
+                    "shrunk {shrunk}, ({x}, {y}): {dark} read as coded, not {grey}"
+                );
+                assert!(
+                    (pale - 0.5).abs() < 0.02,
+                    "shrunk {shrunk}, ({x}, {y}): {pale} read as light"
+                );
+            }
+        }
+    }
+}
+
+/// A window an odd pixel narrower and lower than the show, centred, is
+/// drawn a pixel for a pixel: half a pixel off, as centred exactly, each
+/// pixel drawn was a blend of two (a window 1499 × 827 centred in a 4K
+/// show, measured on an M5 Max: four fifths of its edges' contrast gone).
+#[test]
+fn a_centred_capture_an_odd_pixel_smaller_is_drawn_pixel_for_pixel() {
+    // The frame's pixel (x, y) shows the screen's (x − 1, y − 1).
+    drawn_pixel_for_pixel(varda::deck::ScalingMode::Center, (63, 35), true);
+}
+
+/// A window as wide as the show and an odd pixel lower — a window made as
+/// big as its screen, under the menu bar — fitted: its bars whole pixels.
+#[test]
+fn a_fitted_capture_as_wide_as_the_show_is_drawn_pixel_for_pixel() {
+    // (x, y) shows the screen's (x, y − 1).
+    drawn_pixel_for_pixel(varda::deck::ScalingMode::Fit, (64, 35), false);
+}
+
+/// And one an odd pixel higher, filling the show: whole pixels cut.
+#[test]
+fn a_filling_capture_as_wide_as_the_show_is_drawn_pixel_for_pixel() {
+    // (x, y) shows the screen's (x, y).
+    drawn_pixel_for_pixel(varda::deck::ScalingMode::Fill, (64, 37), true);
+}
+
+/// A screen's input shown by `mode`, in a show of 64 × 36, a screen
+/// `source` big that it draws a pixel for a pixel — squares a pixel big,
+/// white and black by turns, its first one white: each pixel of the frame
+/// is one of the screen's, white or black (`first_is_white`: the frame's
+/// first one would be white), none the grey of two blended. Read as coded
+/// and as light; drawn by the deck's own pass, then moved four pixels
+/// across by a Transform — the squares as they were — by the pass that
+/// draws a picture into its place.
+fn drawn_pixel_for_pixel(mode: varda::deck::ScalingMode, source: (u32, u32), first_is_white: bool) {
+    use varda::deck::{Deck, Effect, ScreenCaptureState};
+    use varda::params::ParamValue::Float;
+    use varda::screen_capture::backend::{CaptureConfig, TargetIdentity};
+    let Some(gpu) = common::headless_gpu() else {
+        return;
+    };
+    if !gpu.reads_a_texture_two_ways() {
+        eprintln!("Skipping: this GPU reads a texture one way");
+        return;
+    }
+    let show: (u32, u32) = (64, 36);
+    let (_screen, light, coded) = a_coded_screen(&gpu, source.0, source.1, |x, y| {
+        if (x + y) % 2 == 0 {
+            [255; 4]
+        } else {
+            [0, 0, 0, 255]
+        }
+    });
+    let audio = varda::audio::AudioData::default();
+    let modulation = varda::modulation::ModulationEngine::new();
+    for (as_coded, moved) in [(true, false), (false, false), (true, true), (false, true)] {
+        let state = ScreenCaptureState {
+            capture_id: 1,
+            identity: TargetIdentity::Display {
+                label: "Display 1".into(),
+                uuid: None,
+            },
+            config: CaptureConfig {
+                scale_to: Some(show),
+                ..Default::default()
+            },
+            given: Vec::new(),
+            listed_as: None,
+            presentation: None,
+        };
+        let mut deck =
+            Deck::new_from_screen_capture(&gpu, state, "Display 1", show.0, show.1, show.0, show.1)
+                .expect("a screen's input");
+        deck.set_scaling_mode(mode);
+        if moved {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("shaders")
+                .join("transform.fs");
+            let shader = varda::isf::ISFShader::from_file(path).expect("the shader");
+            deck.add_effect(Effect::new(&gpu, shader).expect("an effect"));
+            // Four of the show's 64 pixels: the squares fall where they did.
+            deck.effects[0].params.set("pos_x", Float(0.0625));
+        }
+        deck.external_source_view = Some(light.clone());
+        deck.external_source_coded_view = as_coded.then(|| coded.clone());
+        deck.set_external_source_size(source.0, source.1);
+        let mut cmds = Vec::new();
+        deck.render(&gpu, &audio, &modulation, 0, &mut cmds)
+            .expect("drawn");
+        gpu.submit(cmds);
+        assert!(deck.gpu_error().is_none(), "drawn without a fault");
+        let frame = frame_pixels(&gpu, &deck.texture);
+        // Clear of the picture's edges, moved or not.
+        for y in 2..34u32 {
+            for x in 8..56u32 {
+                let white = ((x + y) % 2 == 0) == first_is_white;
+                let want = if white { 1.0 } else { 0.0 };
+                for &got in &frame[(y * show.0 + x) as usize][..3] {
+                    assert!(
+                        (got - want).abs() < 0.02,
+                        "{mode:?} {source:?}, as coded {as_coded}, moved {moved}, ({x}, {y}): {got}, not {want}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A capture's picture has a number: none before its first frame, another
+/// with each frame put in its texture, the same while none is — what is
+/// drawn from it need not be drawn again then (`keep_still_inputs`).
+#[test]
+fn a_captures_picture_has_another_number_with_each_frame() {
+    use varda::screen_capture::backend::{mock_targets, CaptureConfig};
+    use varda::screen_capture::ScreenCaptureManager;
+    let Some(gpu) = common::headless_gpu() else {
+        return;
+    };
+    let mut captures = ScreenCaptureManager::new_disabled();
+    let target = mock_targets().remove(0);
+    let config = CaptureConfig {
+        scale_to: Some((64, 36)),
+        ..Default::default()
+    };
+    let (id, _, _) = captures
+        .open_mock(&target, config, &gpu.device)
+        .expect("open");
+    assert_eq!(captures.picture(id), None, "no picture yet: no number");
+    let needed = std::collections::HashSet::from([id]);
+    let nothing = std::collections::HashSet::new();
+    // Frames put in till the number is another than `than`.
+    let another = |captures: &mut ScreenCaptureManager, than: Option<u64>| {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while captures.picture(id) == than && std::time::Instant::now() < until {
+            captures.update_selective(&gpu, &needed, varda::host_clock::host_seconds());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        captures.picture(id)
+    };
+    let first = another(&mut captures, None);
+    assert!(first.is_some(), "a picture: a number");
+    assert!(captures.has_picture(id), "with its picture");
+    // No frame put in — not looked at: the same picture, the same number.
+    for _ in 0..5 {
+        captures.update_selective(&gpu, &nothing, varda::host_clock::host_seconds());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(captures.picture(id), first, "nothing put in: the same");
+    let second = another(&mut captures, first);
+    assert!(second.is_some() && second != first, "another frame: another number");
+    let third = another(&mut captures, second);
+    assert!(
+        third.is_some() && third != second && third != first,
+        "and another: no number twice"
+    );
+    captures.release(id);
+}
+
+/// A capture's own two views — as light, and as it was coded — show the
+/// same picture at its own size: the one as coded reads its code values,
+/// which the pass that draws it makes light once. Read as light already
+/// they were made light twice, and the picture dark.
+#[test]
+fn a_captures_view_as_coded_shows_what_its_view_as_light_does() {
+    use varda::deck::{Deck, ScalingMode, ScreenCaptureState};
+    use varda::screen_capture::backend::{mock_targets, CaptureConfig};
+    use varda::screen_capture::ScreenCaptureManager;
+    let Some(gpu) = common::headless_gpu() else {
+        return;
+    };
+    if !gpu.reads_a_texture_two_ways() {
+        eprintln!("Skipping: this GPU reads a texture one way");
+        return;
+    }
+    let show: (u32, u32) = (64, 36);
+    let mut captures = ScreenCaptureManager::new_disabled();
+    let target = mock_targets().remove(0);
+    let config = CaptureConfig {
+        scale_to: Some(show),
+        ..Default::default()
+    };
+    let (id, w, h) = captures
+        .open_mock(&target, config.clone(), &gpu.device)
+        .expect("open");
+    assert_eq!((w, h), show);
+    let needed = std::collections::HashSet::from([id]);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !captures.has_picture(id) && std::time::Instant::now() < until {
+        captures.update_selective(&gpu, &needed, varda::host_clock::host_seconds());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(captures.has_picture(id), "a picture");
+    let light = captures.texture_view(id).expect("its view").clone();
+    let coded = captures.coded_view(id).expect("its view as coded").clone();
+    assert_ne!(light, coded, "another view of it");
+
+    let audio = varda::audio::AudioData::default();
+    let modulation = varda::modulation::ModulationEngine::new();
+    let state = ScreenCaptureState {
+        capture_id: id,
+        identity: target.identity(),
+        config,
+        given: Vec::new(),
+        listed_as: None,
+        presentation: None,
+    };
+    let mut deck =
+        Deck::new_from_screen_capture(&gpu, state, &target.label, w, h, show.0, show.1)
+            .expect("a screen's input");
+    deck.set_scaling_mode(ScalingMode::Fit);
+    let mut shows = |coded: Option<&wgpu::TextureView>| {
+        deck.external_source_view = Some(light.clone());
+        deck.external_source_coded_view = coded.cloned();
+        deck.set_external_source_size(w, h);
+        let mut cmds = Vec::new();
+        deck.render(&gpu, &audio, &modulation, 0, &mut cmds)
+            .expect("drawn");
+        gpu.submit(cmds);
+        assert!(deck.gpu_error().is_none(), "drawn without a fault");
+        frame_pixels(&gpu, &deck.texture)
+    };
+    let as_light = shows(None);
+    let as_coded = shows(Some(&coded));
+    let brightest = as_light.iter().map(|pixel| pixel[1]).fold(0.0f32, f32::max);
+    assert!(brightest > 0.5, "a picture to tell by: {brightest}");
+    let mut furthest = 0.0f32;
+    for (one, other) in as_light.iter().zip(&as_coded) {
+        for part in 0..4 {
+            furthest = furthest.max((one[part] - other[part]).abs());
+        }
+    }
+    assert!(
+        furthest < 0.01,
+        "read as coded the picture is {furthest} from itself read as light"
+    );
+    captures.release(id);
 }

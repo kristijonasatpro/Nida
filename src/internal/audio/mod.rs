@@ -984,11 +984,16 @@ impl AudioManager {
         devices.first().map(|d| d.id)
     }
 
-    /// A manager listing `names` and asking the OS nothing, for a test.
+    /// A manager listing `names` and asking the OS nothing, for a test: a
+    /// capture opened finds no device, as one unplugged since listed does
+    /// (see `open_without_devices_for_test` for ones that open). Looking
+    /// for it in the OS's list would take seconds on a Mac with a dozen
+    /// devices and other tests asking — and open one that had the name.
     #[cfg(test)]
     pub(crate) fn listing(names: &[&str]) -> Self {
         Self {
             devices: tests::info(names),
+            opener: Arc::new(|_, _, _| anyhow::bail!("Audio device not found")),
             ..Self::blank()
         }
     }

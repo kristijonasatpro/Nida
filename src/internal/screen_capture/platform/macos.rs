@@ -52,7 +52,7 @@ use objc2_screen_capture_kit::{
 
 use crate::screen_capture::backend::{
     CaptureConfig, CaptureError, CaptureFrame, CapturePixelFormat, CaptureTargetInfo,
-    CaptureTargetKind, CropRect, PermissionState, ScreenCaptureBackend,
+    CaptureTargetKind, PermissionState, ScreenCaptureBackend,
 };
 
 /// `kCVPixelFormatType_32BGRA` — the four-char code SCK uses for BGRA output.
@@ -91,6 +91,22 @@ pub fn request_permission() {
     log::info!("Screen recording access request returned granted={granted}");
 }
 
+/// A display's UUID, which macOS keeps across restarts and whatever else is
+/// plugged in (as `crate::app::screens` keeps a screen's given name by).
+fn display_uuid(display: u32) -> Option<String> {
+    use objc2_core_foundation::{CFRetained, CFUUID};
+
+    #[link(name = "ColorSync", kind = "framework")]
+    extern "C" {
+        fn CGDisplayCreateUUIDFromDisplayID(display: u32) -> Option<std::ptr::NonNull<CFUUID>>;
+    }
+    // SAFETY: any display number; a new reference, or null.
+    let uuid = unsafe { CGDisplayCreateUUIDFromDisplayID(display) }?;
+    // SAFETY: created above (the Create rule), released once.
+    let uuid = unsafe { CFRetained::from_raw(uuid) };
+    CFUUID::new_string(None, Some(&uuid)).map(|s| s.to_string())
+}
+
 /// Enumerate displays and on-screen windows.
 ///
 /// # Errors
@@ -107,15 +123,19 @@ pub fn enumerate() -> Result<Vec<CaptureTargetInfo>, CaptureError> {
     // library panel.
     for (i, display) in unsafe { content.displays() }.iter().enumerate() {
         let (w, h) = unsafe { (display.width(), display.height()) };
+        let id = unsafe { display.displayID() };
         targets.push(CaptureTargetInfo {
             kind: CaptureTargetKind::Display,
-            platform_id: u64::from(unsafe { display.displayID() }),
+            platform_id: u64::from(id),
+            // Its place in macOS's list as it is now: another screen plugged
+            // in, and the same one is listed under another number.
             label: format!("Display {}", i + 1),
             app: None,
             title: None,
             width: u32::try_from(w).unwrap_or(0),
             height: u32::try_from(h).unwrap_or(0),
             is_varda: false,
+            uuid: display_uuid(id),
         });
     }
 
@@ -159,6 +179,7 @@ pub fn enumerate() -> Result<Vec<CaptureTargetInfo>, CaptureError> {
             width,
             height,
             is_varda,
+            uuid: None,
         });
     }
 
@@ -438,6 +459,12 @@ pub struct MacosBackend {
     config: CaptureConfig,
     /// The target's size in points, which a crop is measured in.
     points: (f64, f64),
+    /// When the target's size was last looked at (see `follow_target`).
+    followed: std::time::Instant,
+    /// What it captures, to look its size up as it is now: a display or a
+    /// window, and its id.
+    kind: CaptureTargetKind,
+    platform_id: u64,
     /// Its pixels to a point: 2 on a Retina display.
     scale: f64,
 }
@@ -458,7 +485,8 @@ impl MacosBackend {
         };
         let points = (f64::from(target.width), f64::from(target.height));
         let (width, height) = output_size(target, scale, config);
-        let stream_config = build_configuration(config, width, height, points);
+        let stream_config =
+            build_configuration(config, width, height, pixels_of(target, scale), scale);
 
         let stream = unsafe {
             SCStream::initWithFilter_configuration_delegate(
@@ -503,8 +531,92 @@ impl MacosBackend {
             config: config.clone(),
             points,
             scale,
+            followed: std::time::Instant::now(),
+            kind: target.kind,
+            platform_id: target.platform_id,
         })
     }
+
+    /// The target's pixels as they are now.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn native(&self) -> (u32, u32) {
+        (
+            ((self.points.0 * self.scale).round() as u32).max(1),
+            ((self.points.1 * self.scale).round() as u32).max(1),
+        )
+    }
+
+    /// The stream set to the target's pixels as they are now: the part its
+    /// crop keeps, fitted within the size asked for (see [`stream_size`]).
+    fn reconfigure(&self) {
+        let native = self.native();
+        let (width, height) = stream_size(native, &self.config);
+        let stream_config =
+            build_configuration(&self.config, width, height, native, self.scale);
+        unsafe {
+            self.handles
+                .stream
+                .updateConfiguration_completionHandler(&stream_config, None);
+        }
+    }
+}
+
+/// How often a capture looks at its target's size.
+const FOLLOW_EVERY: Duration = Duration::from_millis(500);
+
+/// A display's size in points and its pixels to a point, as they are now:
+/// a "looks like" setting changed shows here at once.
+fn display_geometry(display: u32) -> Option<((f64, f64), f64)> {
+    use objc2_core_graphics::{CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMode};
+    let bounds = CGDisplayBounds(display);
+    let mode = CGDisplayCopyDisplayMode(display)?;
+    let points = CGDisplayMode::width(Some(&mode));
+    let pixels = CGDisplayMode::pixel_width(Some(&mode));
+    if points == 0 || pixels == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let scale = pixels as f64 / points as f64;
+    Some(((bounds.size.width, bounds.size.height), scale))
+}
+
+/// A window's size in points, and the pixels to a point of the screen its
+/// middle is on — none off every screen, where it is still captured — as the
+/// window server has them now. `ScreenCaptureKit`'s own account of a
+/// capture's filter keeps the size it was made with.
+fn window_geometry(window: u32) -> Option<((f64, f64), Option<f64>)> {
+    use objc2_core_foundation::{CFArray, CFDictionary, CFString, CFType};
+    use objc2_core_graphics::{
+        kCGWindowBounds, CGGetDisplaysWithPoint, CGRectMakeWithDictionaryRepresentation,
+        CGWindowListCopyWindowInfo, CGWindowListOption,
+    };
+    let list = CGWindowListCopyWindowInfo(CGWindowListOption::OptionIncludingWindow, window)?;
+    // SAFETY: the window server lists each window as a dictionary.
+    let list: &CFArray<CFDictionary<CFString, CFType>> = unsafe { list.cast_unchecked() };
+    let info = list.get(0)?;
+    // SAFETY: CoreGraphics' own key.
+    let key: &CFString = unsafe { kCGWindowBounds };
+    let bounds = info.get(key)?;
+    let bounds = bounds.downcast_ref::<CFDictionary>()?;
+    let mut rect = CGRect::default();
+    // SAFETY: a rectangle's dictionary, and a place for the rectangle.
+    if !unsafe { CGRectMakeWithDictionaryRepresentation(Some(bounds), &raw mut rect) } {
+        return None;
+    }
+    let middle = CGPoint {
+        x: rect.origin.x + rect.size.width / 2.0,
+        y: rect.origin.y + rect.size.height / 2.0,
+    };
+    let mut display = 0u32;
+    let mut found = 0u32;
+    // SAFETY: room for one display id and its count.
+    let err = unsafe { CGGetDisplaysWithPoint(middle, 1, &raw mut display, &raw mut found) };
+    let scale = if err.0 == 0 && found > 0 {
+        display_geometry(display).map(|(_, scale)| scale)
+    } else {
+        None
+    };
+    Some(((rect.size.width, rect.size.height), scale))
 }
 
 fn start_capture(stream: &SCStream) -> Result<(), CaptureError> {
@@ -594,11 +706,43 @@ fn build_filter(
 /// The target's size is in points; `scale` pixels to a point (2 on a Retina
 /// display) gives its size in pixels, what it is captured at.
 fn output_size(target: &CaptureTargetInfo, scale: f64, config: &CaptureConfig) -> (u32, u32) {
-    let (native_w, native_h) = pixels_of(target, scale);
-    let (base_w, base_h) = config.scale_to.map_or((native_w, native_h), |(w, h)| {
-        super::super::resample::fit_within(native_w, native_h, w, h)
-    });
-    scaled_crop_size(base_w, base_h, config)
+    stream_size(pixels_of(target, scale), config)
+}
+
+/// The size a stream of a target `native` pixels big is set to: the part
+/// its crop keeps, as big as it is drawn in `scale_to` and never enlarged — as
+/// [`Geometry::resolve`](super::super::resample::Geometry::resolve) has it
+/// on every platform — and not zero: a zero-sized capture would be an
+/// unrecoverable stream error rather than a merely tiny one.
+///
+/// To the pixel, odd or even: the stream is BGRA, which has no pairs of
+/// pixels to keep whole. Rounded down to even numbers — how this was — a
+/// window 1499 × 827 came in a stream 1498 × 826, and macOS, fitting it in,
+/// rescaled all of it by a thousandth: every pixel resampled between two,
+/// text a third as crisp for as long as the window kept that size (measured
+/// on an M5 Max: every window size with an odd side).
+///
+/// The crop comes first: bounding the whole target and taking the crop's
+/// share of that — how this was — gave half a 4K screen in a 1080p show
+/// 960 × 540 pixels, which the show then enlarged twice over, though the
+/// screen had all 1920 × 1080 of them.
+fn stream_size(native: (u32, u32), config: &CaptureConfig) -> (u32, u32) {
+    let fitted = super::super::resample::Geometry::resolve(native.0, native.1, config);
+    (fitted.out_w.max(1), fitted.out_h.max(1))
+}
+
+/// Whether a stream of a target `native` pixels big, set as `runs`, is
+/// already as `asked` would set it: only the size asked for moved — the
+/// bound, or how big the picture is drawn in it — and to one that gives the
+/// same size: a picture drawn bigger still than the target has pixels.
+/// Nothing to tell the stream then.
+fn same_stream(native: (u32, u32), runs: &CaptureConfig, asked: &CaptureConfig) -> bool {
+    let but_for_its_size = CaptureConfig {
+        scale_to: runs.scale_to,
+        drawn: runs.drawn,
+        ..asked.clone()
+    };
+    but_for_its_size == *runs && stream_size(native, asked) == stream_size(native, runs)
 }
 
 /// A target's size in pixels, its size in points `scale` times over.
@@ -609,35 +753,33 @@ fn pixels_of(target: &CaptureTargetInfo, scale: f64) -> (u32, u32) {
 }
 
 /// The part of the target a crop takes, in the target's points — what
-/// `sourceRect` is measured in, whatever size the capture is delivered at.
-fn source_rect(crop: CropRect, (width, height): (f64, f64)) -> CGRect {
+/// `sourceRect` is measured in, whatever size the capture is delivered at —
+/// on whole pixels of the target, `scale` of them to a point: the ones
+/// [`stream_size`] counts. Taken as the crop's share of the points — how
+/// this was — a third of a window began between two of its pixels and was
+/// a fraction of a pixel wider than the stream it came in, and macOS
+/// resampled all of it.
+fn source_rect(native: (u32, u32), scale: f64, config: &CaptureConfig) -> CGRect {
+    let part = super::super::resample::Geometry::resolve(native.0, native.1, config);
+    let points = |pixels: u32| f64::from(pixels) / scale;
     CGRect {
         origin: CGPoint {
-            x: width * f64::from(crop.x),
-            y: height * f64::from(crop.y),
+            x: points(part.src_x),
+            y: points(part.src_y),
         },
         size: CGSize {
-            width: width * f64::from(crop.w),
-            height: height * f64::from(crop.h),
+            width: points(part.src_w),
+            height: points(part.src_h),
         },
     }
-}
-
-/// Apply the crop extent to a base size, keeping the result even and non-zero.
-/// SCK wants even dimensions for several pixel formats, and a zero-sized capture
-/// would be an unrecoverable stream error rather than a merely tiny one.
-fn scaled_crop_size(base_w: u32, base_h: u32, config: &CaptureConfig) -> (u32, u32) {
-    let crop = config.crop.clamped();
-    let w = ((base_w as f32) * crop.w).round().max(2.0) as u32;
-    let h = ((base_h as f32) * crop.h).round().max(2.0) as u32;
-    (w & !1, h & !1)
 }
 
 fn build_configuration(
     config: &CaptureConfig,
     width: u32,
     height: u32,
-    points: (f64, f64),
+    native: (u32, u32),
+    scale: f64,
 ) -> Retained<SCStreamConfiguration> {
     let sc = unsafe { SCStreamConfiguration::new() };
     unsafe {
@@ -671,7 +813,7 @@ fn build_configuration(
 
     let crop = config.crop.clamped();
     if !crop.is_full_frame() {
-        unsafe { sc.setSourceRect(source_rect(crop, points)) };
+        unsafe { sc.setSourceRect(source_rect(native, scale, config)) };
     }
 
     unsafe {
@@ -709,31 +851,68 @@ impl ScreenCaptureBackend for MacosBackend {
         true
     }
 
+    /// A window resized, or moved to a screen of other pixels, or a screen
+    /// given another resolution ("looks like" changed): the stream kept the
+    /// size it started at, squeezing a window made bigger into it — then
+    /// enlarged again on the wall (a window taken from 1622×930 to 3400×1950
+    /// points stayed at 1622×930, measured on an M5 Max) until the capture
+    /// was added again. Looked at twice a second, on the capture's thread,
+    /// as the window server and the display have it now.
+    fn follow_target(&mut self) {
+        if self.followed.elapsed() < FOLLOW_EVERY {
+            return;
+        }
+        self.followed = std::time::Instant::now();
+        let Ok(id) = u32::try_from(self.platform_id) else {
+            return;
+        };
+        // A window off every screen keeps the pixels to a point it had.
+        let now = match self.kind {
+            CaptureTargetKind::Display => display_geometry(id),
+            CaptureTargetKind::Window => window_geometry(id)
+                .map(|(points, scale)| (points, scale.unwrap_or(self.scale))),
+        };
+        let Some((points, scale)) = now else {
+            return;
+        };
+        let sound = points.0.is_finite()
+            && points.1.is_finite()
+            && points.0 >= 1.0
+            && points.1 >= 1.0
+            && scale.is_finite()
+            && scale >= 1.0;
+        let same = (points.0 - self.points.0).abs() < 0.5
+            && (points.1 - self.points.1).abs() < 0.5
+            && (scale - self.scale).abs() < 0.01;
+        if !sound || same {
+            return;
+        }
+        log::info!(
+            "Screen capture '{}': now {:.0}x{:.0} points at {scale}x (was {:.0}x{:.0} at {}x)",
+            self.label,
+            points.0,
+            points.1,
+            self.points.0,
+            self.points.1,
+            self.scale
+        );
+        self.points = points;
+        self.scale = scale;
+        self.reconfigure();
+    }
+
     fn set_config(&mut self, config: &CaptureConfig) -> Result<(), CaptureError> {
         if *config == self.config {
             return Ok(());
         }
+        if same_stream(self.native(), &self.config, config) {
+            self.config = config.clone();
+            return Ok(());
+        }
         let exclusion_changed = config.exclude_varda != self.config.exclude_varda;
         self.config = config.clone();
-
-        // Recomputed as at the start: the target's pixels, fit within the
-        // size asked for, then cropped.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let native = (
-            ((self.points.0 * self.scale).round() as u32).max(1),
-            ((self.points.1 * self.scale).round() as u32).max(1),
-        );
-        let (base_w, base_h) = config.scale_to.map_or(native, |(w, h)| {
-            super::super::resample::fit_within(native.0, native.1, w, h)
-        });
-        let (width, height) = scaled_crop_size(base_w, base_h, config);
-
-        let stream_config = build_configuration(config, width, height, self.points);
-        unsafe {
-            self.handles
-                .stream
-                .updateConfiguration_completionHandler(&stream_config, None);
-        }
+        // Recomputed as at the start.
+        self.reconfigure();
 
         if exclusion_changed {
             // The window-exclusion set lives in the filter, not the config, so
@@ -765,6 +944,7 @@ impl Drop for MacosBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::screen_capture::backend::CropRect;
 
     fn target(w: u32, h: u32) -> CaptureTargetInfo {
         CaptureTargetInfo {
@@ -776,6 +956,7 @@ mod tests {
             width: w,
             height: h,
             is_varda: false,
+            uuid: None,
         }
     }
 
@@ -809,16 +990,46 @@ mod tests {
         assert_eq!(output_size(&target(3840, 2160), 1.0, &cfg), (1920, 1080));
     }
 
+    /// A Retina or scaled 4K screen, "looks like 1920×1080": its 1920×1080
+    /// points are 3840×2160 pixels. Capped at a 4K show it comes at its
+    /// pixels; capped at its points fitted into the show — how a capture was
+    /// opened before — it came at half of them and was blurred on the wall.
+    #[test]
+    fn a_retina_screen_in_a_4k_show_comes_at_its_pixels() {
+        let show = |w, h| CaptureConfig {
+            scale_to: Some((w, h)),
+            ..Default::default()
+        };
+        assert_eq!(
+            output_size(&target(1920, 1080), 2.0, &show(3840, 2160)),
+            (3840, 2160)
+        );
+        // In a 1080p show, still no more than the show takes.
+        assert_eq!(
+            output_size(&target(1920, 1080), 2.0, &show(1920, 1080)),
+            (1920, 1080)
+        );
+        // A window keeps its own shape within the show's size.
+        assert_eq!(
+            output_size(&target(1200, 800), 2.0, &show(3840, 2160)),
+            (2400, 1600)
+        );
+    }
+
     #[test]
     fn output_size_falls_back_to_the_target_size() {
         let cfg = CaptureConfig::default();
         assert_eq!(output_size(&target(1280, 720), 1.0, &cfg), (1280, 720));
     }
 
+    /// A crop zooms into the screen: the part it keeps comes at the
+    /// screen's own pixels, as far as the show takes them. Bounded whole and
+    /// then cropped — how it was — half a 4K screen came 960 × 540 in a
+    /// 1080p show and was enlarged twice over.
     #[test]
-    fn output_size_shrinks_with_crop_so_cropping_saves_bandwidth() {
-        let cfg = CaptureConfig {
-            scale_to: Some((1920, 1080)),
+    fn a_crop_comes_at_the_screens_pixels_within_the_bound() {
+        let half = |scale_to| CaptureConfig {
+            scale_to,
             crop: CropRect {
                 x: 0.25,
                 y: 0.25,
@@ -827,7 +1038,112 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(output_size(&target(3840, 2160), 1.0, &cfg), (960, 540));
+        let show = Some((1920, 1080));
+        assert_eq!(output_size(&target(3840, 2160), 1.0, &half(show)), (1920, 1080));
+        // No more than the show takes, a bigger screen's half.
+        assert_eq!(output_size(&target(5120, 2880), 1.0, &half(show)), (1920, 1080));
+        // No more than the screen has: a 1080p screen's half.
+        assert_eq!(output_size(&target(1920, 1080), 1.0, &half(show)), (960, 540));
+        assert_eq!(output_size(&target(3840, 2160), 1.0, &half(None)), (1920, 1080));
+    }
+
+    /// A bound moved past what the target has changes nothing of the
+    /// stream; one that changes its size, or any other setting, does.
+    #[test]
+    fn a_bound_past_the_targets_pixels_leaves_the_stream_as_it_is() {
+        let at = |w, h| CaptureConfig {
+            scale_to: Some((w, h)),
+            ..Default::default()
+        };
+        let native = (3840, 2160);
+        assert!(same_stream(native, &at(3840, 2160), &at(4800, 2700)));
+        assert!(same_stream(native, &at(4800, 2700), &at(7680, 4320)));
+        assert!(!same_stream(native, &at(1920, 1080), &at(2400, 1350)), "bigger");
+        assert!(!same_stream(native, &at(4800, 2700), &at(1920, 1080)), "smaller");
+        let cursor = CaptureConfig {
+            show_cursor: true,
+            ..at(4800, 2700)
+        };
+        assert!(!same_stream(native, &at(3840, 2160), &cursor), "its cursor shown");
+        let cropped = CaptureConfig {
+            crop: CropRect {
+                x: 0.0,
+                y: 0.0,
+                w: 0.5,
+                h: 1.0,
+            },
+            ..at(4800, 2700)
+        };
+        assert!(!same_stream(native, &at(3840, 2160), &cropped), "cropped");
+    }
+
+    /// Drawn bigger than fitted, the stream is asked for those pixels, as
+    /// far as the screen has them; and a size drawn that changes nothing of
+    /// what comes leaves the stream as it is.
+    #[test]
+    fn a_stream_is_sized_as_its_picture_is_drawn() {
+        use crate::screen_capture::backend::Drawn;
+        // Fitted so many times, or filling the frame so many times over.
+        let drawn = |w, h, fitted, fills| CaptureConfig {
+            scale_to: Some((w, h)),
+            drawn: Drawn {
+                fitted,
+                across: fills,
+                down: fills,
+            },
+            ..Default::default()
+        };
+        let four_k = target(3840, 2160);
+        assert_eq!(output_size(&four_k, 1.0, &drawn(1920, 1080, 1.0, 0.0)), (1920, 1080));
+        assert_eq!(output_size(&four_k, 1.0, &drawn(1920, 1080, 1.5, 0.0)), (2880, 1620));
+        assert_eq!(output_size(&four_k, 1.0, &drawn(1920, 1080, 2.0, 0.0)), (3840, 2160));
+        assert_eq!(output_size(&four_k, 1.0, &drawn(1920, 1080, 8.0, 0.0)), (3840, 2160));
+        // Filling an upright frame: 1920 high, not the 608 that fit.
+        assert_eq!(output_size(&four_k, 1.0, &drawn(1080, 1920, 1.0, 0.0)), (1080, 608));
+        assert_eq!(output_size(&four_k, 1.0, &drawn(1080, 1920, 1.0, 1.0)), (3413, 1920));
+        // Stretched to it, twice as wide and half as high: the pixels its
+        // width shows, not all the screen has.
+        let stretched = CaptureConfig {
+            drawn: Drawn {
+                fitted: 1.0,
+                across: 2.0,
+                down: 0.5,
+            },
+            ..drawn(1080, 1920, 1.0, 0.0)
+        };
+        assert_eq!(output_size(&four_k, 1.0, &stretched), (2160, 1215));
+        // As far as a Transform scales, in a frame however small.
+        assert_eq!(output_size(&four_k, 1.0, &drawn(128, 72, 25.0, 0.0)), (3200, 1800));
+
+        let native = (3840, 2160);
+        assert!(
+            !same_stream(native, &drawn(1920, 1080, 1.0, 0.0), &drawn(1920, 1080, 2.0, 0.0)),
+            "zoomed into: bigger"
+        );
+        assert!(
+            !same_stream(native, &drawn(1920, 1080, 2.0, 0.0), &drawn(1920, 1080, 1.0, 0.0)),
+            "and smaller again"
+        );
+        assert!(
+            same_stream(native, &drawn(1920, 1080, 2.0, 0.0), &drawn(1920, 1080, 5.0, 0.0)),
+            "past what the screen has"
+        );
+        assert!(
+            same_stream(native, &drawn(1920, 1080, 1.0, 0.0), &drawn(1920, 1080, 1.0, 1.0)),
+            "a frame of its shape, filled as it is fitted"
+        );
+        assert!(
+            same_stream((1920, 1080), &drawn(1920, 1080, 1.0, 0.0), &drawn(1920, 1080, 3.0, 3.0)),
+            "a screen with no more pixels"
+        );
+        let cursor = CaptureConfig {
+            show_cursor: true,
+            ..drawn(1920, 1080, 5.0, 0.0)
+        };
+        assert!(
+            !same_stream(native, &drawn(1920, 1080, 2.0, 0.0), &cursor),
+            "its cursor shown"
+        );
     }
 
     #[test]
@@ -862,19 +1178,109 @@ mod tests {
     /// it is measured in the target's points, not the delivered pixels.
     #[test]
     fn a_crop_takes_its_part_of_the_screen_in_points() {
-        let crop = CropRect {
-            x: 0.25,
-            y: 0.5,
-            w: 0.5,
-            h: 0.25,
+        let cropped = CaptureConfig {
+            scale_to: Some((1920, 1080)),
+            crop: CropRect {
+                x: 0.25,
+                y: 0.5,
+                w: 0.5,
+                h: 0.25,
+            },
+            ..Default::default()
         };
-        let rect = source_rect(crop, (1440.0, 900.0));
+        // 1440×900 points of 2880×1800 pixels.
+        let rect = source_rect((2880, 1800), 2.0, &cropped);
         assert_eq!((rect.origin.x, rect.origin.y), (360.0, 450.0));
         assert_eq!((rect.size.width, rect.size.height), (720.0, 225.0));
     }
 
+    /// A window comes at its own pixels, odd or even. Rounded down to even
+    /// numbers, a window with an odd side came a pixel short along it and
+    /// macOS rescaled all of it to fit: soft for as long as it kept that
+    /// size (the sizes are those measured on an M5 Max).
     #[test]
-    fn output_size_is_always_even_and_never_zero() {
+    fn a_stream_has_its_windows_pixels_odd_or_even() {
+        let room = CaptureConfig {
+            scale_to: Some((3840, 2160)),
+            ..Default::default()
+        };
+        for (w, h) in [(1500, 828), (1499, 828), (1500, 827), (1499, 827), (1301, 729)] {
+            assert_eq!(output_size(&target(w, h), 1.0, &room), (w, h));
+            assert_eq!(
+                output_size(&target(w, h), 1.0, &CaptureConfig::default()),
+                (w, h)
+            );
+        }
+        // Shrunk by macOS, to the nearest pixel either way.
+        let fitted = CaptureConfig {
+            scale_to: Some((1250, 704)),
+            ..Default::default()
+        };
+        assert_eq!(output_size(&target(1499, 827), 1.0, &fitted), (1250, 690));
+        // A third of a Retina window, 501 pixels of its 1503.
+        let third = CaptureConfig {
+            crop: CropRect {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0 / 3.0,
+                h: 1.0,
+            },
+            ..room.clone()
+        };
+        assert_eq!(output_size(&target(1503, 827), 1.0, &third), (501, 827));
+    }
+
+    /// A crop is taken on whole pixels of the target, the ones its stream
+    /// is as big as: it begins on a pixel and is as wide and high as the
+    /// stream, so macOS copies them and resamples nothing.
+    #[test]
+    fn a_crop_is_taken_on_whole_pixels_the_stream_has_one_for_each() {
+        let crop = |x, y, w, h| CaptureConfig {
+            scale_to: Some((3840, 2160)),
+            crop: CropRect { x, y, w, h },
+            ..Default::default()
+        };
+        // Of a window 1499×827 (one pixel to a point): a third of it from a
+        // third in is 499.67 points from 499.67 — pixels 500 to 1000.
+        let third = crop(1.0 / 3.0, 0.0, 1.0 / 3.0, 1.0);
+        let rect = source_rect((1499, 827), 1.0, &third);
+        assert_eq!((rect.origin.x, rect.origin.y), (500.0, 0.0));
+        assert_eq!((rect.size.width, rect.size.height), (500.0, 827.0));
+        assert_eq!(stream_size((1499, 827), &third), (500, 827));
+        // On a Retina screen a pixel is half a point.
+        let rect = source_rect((2998, 1654), 2.0, &third);
+        assert_eq!((rect.origin.x, rect.origin.y), (499.5, 0.0));
+        assert_eq!((rect.size.width, rect.size.height), (499.5, 827.0));
+        assert_eq!(stream_size((2998, 1654), &third), (999, 1654));
+        // Whatever the crop: a pixel's place, and the stream's size.
+        for native in [(1499_u32, 827_u32), (1920, 1080), (3024, 1964), (1301, 729)] {
+            for scale in [1.0, 2.0] {
+                for (x, y, w, h) in [
+                    (0.1, 0.2, 0.37, 0.41),
+                    (0.333, 0.0, 0.667, 0.5),
+                    (0.0, 0.123, 0.999, 0.877),
+                    (0.61, 0.59, 0.39, 0.41),
+                    // From the far corner: the last pixel, not one past it.
+                    (4095.0 / 4096.0, 4095.0 / 4096.0, 1.0 / 4096.0, 1.0 / 4096.0),
+                ] {
+                    let cropped = crop(x, y, w, h);
+                    let rect = source_rect(native, scale, &cropped);
+                    let pixels = |points: f64| points * scale;
+                    for at in [rect.origin.x, rect.origin.y] {
+                        assert_eq!(pixels(at), pixels(at).round(), "{native:?} {scale} {x}");
+                    }
+                    let (width, height) = stream_size(native, &cropped);
+                    assert_eq!(pixels(rect.size.width), f64::from(width));
+                    assert_eq!(pixels(rect.size.height), f64::from(height));
+                    assert!(pixels(rect.origin.x + rect.size.width) <= f64::from(native.0));
+                    assert!(pixels(rect.origin.y + rect.size.height) <= f64::from(native.1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn output_size_is_never_zero() {
         let cfg = CaptureConfig {
             scale_to: Some((3, 3)),
             crop: CropRect {
@@ -890,7 +1296,5 @@ mod tests {
             w > 0 && h > 0,
             "degenerate crop must not produce a 0-sized capture"
         );
-        assert_eq!(w % 2, 0);
-        assert_eq!(h % 2, 0);
     }
 }

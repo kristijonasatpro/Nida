@@ -376,6 +376,9 @@ impl VardaApp {
         at: Option<usize>,
         identity: Identity,
     ) -> anyhow::Result<String> {
+        // A talk that comes back with a layer pasted, or a preset loaded,
+        // is asked anew for its slide pictures.
+        self.forget_slide_pictures_of_talks_gone();
         Self::restore_deck_into_channel(
             config,
             ch_idx,

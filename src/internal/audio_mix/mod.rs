@@ -963,20 +963,31 @@ impl AudioEngine {
     ///
     /// Panics if the OS refuses to start the mixing thread.
     pub fn new() -> Self {
-        Self::with_opener(Box::new(|name, first_channel, ring| {
-            device::open(name, first_channel, ring)
-                .map(|d| Box::new(d) as Box<dyn outputs::Playing>)
-        }))
+        Self::with_openers(outputs::Openers::system(), Box::new(apps::SystemTaps))
     }
 
-    /// A mixer whose buses' devices are opened by `open`, taking apps' sound
-    /// through the system.
+    /// A mixer whose buses' devices are opened by `open` — none of them live
+    /// (see `outputs::Openers::standing_in`) — taking apps' sound through
+    /// the system.
     ///
     /// # Panics
     ///
     /// Panics if the OS refuses to start the mixing or device thread.
+    #[cfg(test)]
     fn with_opener(open: outputs::Opener) -> Self {
         Self::with_parts(open, Box::new(apps::SystemTaps))
+    }
+
+    /// A mixer whose buses' devices are opened by `open` — none of them live
+    /// — and whose apps' sound is taken through `taps`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS refuses to start the mixing, device or app sound
+    /// thread.
+    #[cfg(test)]
+    fn with_parts(open: outputs::Opener, taps: Box<dyn apps::Taps>) -> Self {
+        Self::with_openers(outputs::Openers::standing_in(open), taps)
     }
 
     /// A mixer whose buses' devices are opened by `open` and whose apps'
@@ -986,7 +997,7 @@ impl AudioEngine {
     ///
     /// Panics if the OS refuses to start the mixing, device or app sound
     /// thread.
-    fn with_parts(open: outputs::Opener, taps: Box<dyn apps::Taps>) -> Self {
+    fn with_openers(open: outputs::Openers, taps: Box<dyn apps::Taps>) -> Self {
         let core = Arc::new(Mutex::new(MixCore::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {

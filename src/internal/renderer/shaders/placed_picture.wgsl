@@ -55,6 +55,10 @@ struct Params {
     // layer's own picture (blit.wgsl, modes 0 and 2).
     opacity: f32,
     onto: u32,
+    // 1: the source is read as it was coded (sRGB code values, not light):
+    // a screen or window captured, filtered so and made light after (see
+    // `light_of_coded`, scaled_sample.wgsl).
+    coded: f32,
 };
 
 @group(0) @binding(0) var samp: sampler;
@@ -80,7 +84,7 @@ fn edge(inside: f32, pixel: f32) -> f32 {
 // writes them into its frame.
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return picture_at(in.uv);
+    return picture_at(in.uv, covers_at(in.uv));
 }
 
 // The layer's picture drawn straight onto its channel's composite, as the
@@ -88,7 +92,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 // written and read back: a 4K one is ~130 MB through memory each way.
 @fragment
 fn fs_onto(in: VertexOutput) -> @location(0) vec4<f32> {
-    let c = picture_at(in.uv);
+    let c = picture_at(in.uv, covers_at(in.uv));
     let a = c.a * params.opacity;
     if (params.onto == 0u) {
         return vec4<f32>(c.rgb, a);
@@ -96,18 +100,42 @@ fn fs_onto(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(c.rgb * a, a);
 }
 
-fn picture_at(uv: vec2<f32>) -> vec4<f32> {
-    // Back from this pixel to the picture point the transform shows here —
-    // its mirror, flipped.
+// Back from this pixel to the picture point the transform shows here —
+// its mirror, flipped.
+fn picture_point(uv: vec2<f32>) -> vec2<f32> {
     let placed = (uv - vec2<f32>(0.5) - params.pos) / params.scale + vec2<f32>(0.5);
-    let p = select(placed, vec2<f32>(1.0) - placed, params.flip > vec2<f32>(0.5));
+    return select(placed, vec2<f32>(1.0) - placed, params.flip > vec2<f32>(0.5));
+}
+
+// The source's texels this pixel covers (see `texels_per_pixel`): taken
+// where every pixel of the draw takes it, before any of them returns.
+fn covers_at(uv: vec2<f32>) -> vec2<f32> {
+    let source_uv = picture_point(uv) * params.uv_scale + params.uv_offset;
+    return texels_per_pixel(source_uv, vec2<f32>(textureDimensions(source)));
+}
+
+fn picture_at(uv: vec2<f32>, covers: vec2<f32>) -> vec4<f32> {
+    let p = picture_point(uv);
     if (any(p < vec2<f32>(0.0)) || any(p > vec2<f32>(1.0))) {
         return vec4<f32>(0.0);
     }
     let source_uv = p * params.uv_scale + params.uv_offset;
     var src = vec4<f32>(0.0);
     if (all(source_uv >= vec2<f32>(0.0)) && all(source_uv <= vec2<f32>(1.0))) {
-        src = textureSampleLevel(source, samp, source_uv, 0.0);
+        // Sharp where scaled, as a layer's own picture is drawn and with the
+        // same filter, so a Merge between the two ends where it began (see
+        // scaled_sample.wgsl): one bilinear tap blurred a window enlarged
+        // into its frame, and a screen shrunk into one.
+        src = sample_scaled(
+            source,
+            samp,
+            source_uv,
+            covers,
+            drawn_part(params.uv_scale, params.uv_offset),
+        );
+        if (params.coded > 0.5) {
+            src = light_of_coded(src);
+        }
         if (params.premultiplied == 1u && src.a > 0.0) {
             src = vec4<f32>(src.rgb / src.a, src.a);
         }

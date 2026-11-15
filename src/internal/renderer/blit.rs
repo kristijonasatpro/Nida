@@ -35,8 +35,11 @@ struct BlitParams {
     /// 1 puts the picture in video levels: black at code 16, white at 235
     /// (64 and 940 at ten bits) — a screen's `PresentationRequest::video_levels`.
     video_levels: u32,
-    /// Uniform structs are padded to a 16-byte multiple for WGSL layout.
-    _padding: u32,
+    /// 1 = the source is read as it was coded — sRGB code values, not
+    /// light — and made light after it is filtered: a screen or window
+    /// captured (see `BlitPipeline::set_uv_transform_of`). The twelfth
+    /// word: the struct a 16-byte multiple, as WGSL lays it out.
+    coded: u32,
 }
 
 pub struct BlitPipeline {
@@ -234,7 +237,7 @@ impl BlitPipeline {
                 quantization_levels: 0.0,
                 dither_enabled: 0,
                 video_levels: 0,
-                _padding: 0,
+                coded: 0,
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -387,7 +390,7 @@ impl BlitPipeline {
                 quantization_levels: 0.0,
                 dither_enabled: 0,
                 video_levels: 0,
-                _padding: 0,
+                coded: 0,
             }]),
         );
     }
@@ -400,12 +403,17 @@ impl BlitPipeline {
         uv_scale: [f32; 2],
         uv_offset: [f32; 2],
     ) {
-        self.set_uv_transform_of(queue, opacity, uv_scale, uv_offset, false);
+        self.set_uv_transform_of(queue, opacity, uv_scale, uv_offset, false, false);
     }
 
     /// [`Self::set_uv_transform`] for a source that holds premultiplied
     /// colour when `premultiplied` — a channel's composite or the master —
-    /// drawn out as straight colour, the way a deck holds it.
+    /// drawn out as straight colour, the way a deck holds it; and for one
+    /// read as it was `coded` — a capture's sRGB code values, through a
+    /// view that does not make them light (see
+    /// `ScreenCaptureManager::coded_view`) — filtered so and made light
+    /// after: text drawn smaller keeps its weight, as it does shrunk by
+    /// anything else.
     pub fn set_uv_transform_of(
         &self,
         queue: &wgpu::Queue,
@@ -413,6 +421,7 @@ impl BlitPipeline {
         uv_scale: [f32; 2],
         uv_offset: [f32; 2],
         premultiplied: bool,
+        coded: bool,
     ) {
         queue.write_buffer(
             &self.params_buffer,
@@ -427,7 +436,7 @@ impl BlitPipeline {
                 quantization_levels: 0.0,
                 dither_enabled: 0,
                 video_levels: 0,
-                _padding: 0,
+                coded: u32::from(coded),
             }]),
         );
     }
@@ -457,7 +466,7 @@ impl BlitPipeline {
                 quantization_levels: 0.0,
                 dither_enabled: 0,
                 video_levels: 0,
-                _padding: 0,
+                coded: 0,
             }]),
         );
     }
@@ -477,7 +486,7 @@ impl BlitPipeline {
                 quantization_levels: 0.0,
                 dither_enabled: 0,
                 video_levels: 0,
-                _padding: 0,
+                coded: 0,
             }]),
         );
     }
@@ -554,7 +563,7 @@ impl BlitPipeline {
                 // quantization in its dedicated GPU conversion pass.
                 dither_enabled: u32::from(dither_enabled),
                 video_levels: u32::from(video_levels),
-                _padding: 0,
+                coded: 0,
             }]),
         );
     }
@@ -676,7 +685,7 @@ impl BlitPipeline {
                 quantization_levels: 0.0,
                 dither_enabled: 0,
                 video_levels: 0,
-                _padding: 0,
+                coded: 0,
             }]),
         );
     }
@@ -2021,6 +2030,18 @@ mod tests {
         to: u32,
         part: Option<([f32; 2], [f32; 2])>,
     ) -> Vec<[f32; 4]> {
+        blit_columns_read(ctx, columns, to, part, false)
+    }
+
+    /// [`blit_columns`], the picture read as it was `coded` — its colours
+    /// code values, made light once filtered — or as light.
+    fn blit_columns_read(
+        ctx: &GpuContext,
+        columns: &[[f32; 4]],
+        to: u32,
+        part: Option<([f32; 2], [f32; 2])>,
+        coded: bool,
+    ) -> Vec<[f32; 4]> {
         let from = columns.len() as u32;
         let texture = |label, width, usage| {
             ctx.device.create_texture(&wgpu::TextureDescriptor {
@@ -2076,8 +2097,9 @@ mod tests {
         let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = pipeline.create_bind_group(&ctx.device, &source_view);
-        if let Some((scale, offset)) = part {
-            pipeline.set_uv_transform(&ctx.queue, 1.0, scale, offset);
+        if part.is_some() || coded {
+            let (scale, offset) = part.unwrap_or(([1.0, 1.0], [0.0, 0.0]));
+            pipeline.set_uv_transform_of(&ctx.queue, 1.0, scale, offset, false, coded);
         }
         let row_bytes = (to * 8).div_ceil(256) * 256;
         let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2191,6 +2213,280 @@ mod tests {
             highest - lowest < 0.3,
             "between {lowest:.3} and {highest:.3}"
         );
+    }
+
+    /// The average of `greys` from texel `from` to texel `to`, a texel in
+    /// part counted in part: what a pixel covering them shows.
+    fn covered(greys: &[f32], from: f32, to: f32) -> f32 {
+        let within = |x: usize| ((x as f32 + 1.0).min(to) - (x as f32).max(from)).max(0.0);
+        let sum: f32 = greys.iter().enumerate().map(|(x, g)| g * within(x)).sum();
+        sum / (to - from)
+    }
+
+    /// A picture drawn smaller by no whole number — a window fitted into a
+    /// show — is each pixel the average of the texels it covers exactly, a
+    /// texel covered in part counted in part: each tap in the middle of its
+    /// share took in the texels beside it too, and stripes a pixel and a
+    /// half apiece came with an eighth of their contrast gone (0.625 and
+    /// 0.375 where what they cover is 0.667 and 0.333).
+    #[test]
+    fn a_picture_drawn_smaller_is_each_pixel_what_it_covers_exactly() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        // One and a half texels a pixel, a little more, two and a half,
+        // three and a half: two, three and four taps across.
+        for from in [96usize, 100, 160, 224] {
+            let greys = stripes(from);
+            let smaller = blit_greys(&ctx, &greys, 64);
+            let each = from as f32 / 64.0;
+            for (x, g) in smaller.iter().enumerate().take(60).skip(4) {
+                let want = covered(&greys, x as f32 * each, (x + 1) as f32 * each);
+                assert!(
+                    (g - want).abs() < 0.012,
+                    "{from} wide, column {x}: {g:.3}, covers {want:.3}"
+                );
+            }
+        }
+    }
+
+    /// A picture grey `across[x] * down[y]` at each texel, only its `part`
+    /// (UV scale, offset) blitted onto a target `to` wide and high: each
+    /// target pixel's grey, line by line.
+    fn blit_grid(
+        ctx: &GpuContext,
+        across: &[f32],
+        down: &[f32],
+        to: (u32, u32),
+        part: ([f32; 2], [f32; 2]),
+    ) -> Vec<Vec<f32>> {
+        let from = (across.len() as u32, down.len() as u32);
+        let texture = |label, (width, height): (u32, u32), usage| {
+            ctx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let source = texture(
+            "Grid",
+            from,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        );
+        let target = texture(
+            "Grid Blitted",
+            to,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let opaque = half::f16::from_f32(1.0).to_bits();
+        let words: Vec<u16> = down
+            .iter()
+            .flat_map(|line| {
+                across.iter().flat_map(move |column| {
+                    let grey = half::f16::from_f32(column * line).to_bits();
+                    [grey, grey, grey, opaque]
+                })
+            })
+            .collect();
+        ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &source,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&words),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(from.0 * 8),
+                rows_per_image: Some(from.1),
+            },
+            wgpu::Extent3d {
+                width: from.0,
+                height: from.1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let pipeline = BlitPipeline::new(&ctx.device, wgpu::TextureFormat::Rgba16Float).unwrap();
+        let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = pipeline.create_bind_group(&ctx.device, &source_view);
+        pipeline.set_uv_transform_of(&ctx.queue, 1.0, part.0, part.1, false, false);
+        let row_bytes = (to.0 * 8).div_ceil(256) * 256;
+        let readback = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Grid Readback"),
+            size: u64::from(row_bytes) * u64::from(to.1),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Grid Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pipeline.render(&mut pass, &bind_group);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_bytes),
+                    rows_per_image: Some(to.1),
+                },
+            },
+            wgpu::Extent3d {
+                width: to.0,
+                height: to.1,
+                depth_or_array_layers: 1,
+            },
+        );
+        ctx.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().unwrap().unwrap();
+        let mapped = readback.slice(..).get_mapped_range().unwrap();
+        mapped
+            .chunks(row_bytes as usize)
+            .map(|line| {
+                bytemuck::cast_slice::<u8, u16>(&line[..to.0 as usize * 8])
+                    .chunks(4)
+                    .map(|pixel| half::f16::from_bits(pixel[0]).to_f32())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The grey a tap at `at` (in texels) shows of `greys`: of the two
+    /// texels whose middles it lies between, by how near each is.
+    fn between(greys: &[f32], at: f32) -> f32 {
+        let first = (at - 0.5).floor();
+        let far = at - 0.5 - first;
+        greys[first as usize] * (1.0 - far) + greys[first as usize + 1] * far
+    }
+
+    /// ...across and down alike, each by its own measure, of a part that
+    /// begins and ends within a texel — a window cropped, then fitted or
+    /// stretched: smaller both ways, each pixel is what it covers of both;
+    /// smaller across and bigger down, what it covers across of the two
+    /// lines it lies between.
+    #[test]
+    fn a_picture_drawn_smaller_across_and_down_is_what_each_pixel_covers() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        let across: Vec<f32> = (0..40).map(|x| ((x * 37) % 64) as f32 / 63.0).collect();
+        let down: Vec<f32> = (0..40).map(|y| ((y * 23) % 32) as f32 / 31.0).collect();
+        // Across: a texel and a half a pixel, from a quarter into the
+        // third texel. Down: two and a half, then four fifths of one.
+        let (left, wide) = (2.25_f32, 1.5_f32);
+        for (top, high, lines) in [(3.4_f32, 2.5_f32, 12_u32), (2.3, 0.8, 24)] {
+            let part = (
+                [24.0 * wide / 40.0, lines as f32 * high / 40.0],
+                [left / 40.0, top / 40.0],
+            );
+            let drawn = blit_grid(&ctx, &across, &down, (24, lines), part);
+            assert_eq!(drawn.len(), lines as usize);
+            for (y, line) in drawn.iter().enumerate().take(lines as usize - 2).skip(2) {
+                let begins = top + y as f32 * high;
+                let of_lines = if high > 1.0 {
+                    covered(&down, begins, begins + high)
+                } else {
+                    between(&down, begins + high * 0.5)
+                };
+                for (x, got) in line.iter().enumerate().take(22).skip(2) {
+                    let begins = left + x as f32 * wide;
+                    let want = covered(&across, begins, begins + wide) * of_lines;
+                    assert!(
+                        (got - want).abs() < 0.012,
+                        "{high} down, pixel {x} of line {y}: {got:.3}, covers {want:.3}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A code value (sRGB) as light, as the GPU makes it reading an sRGB
+    /// texture.
+    fn light(coded: f32) -> f32 {
+        if coded < 0.04045 {
+            coded / 12.92
+        } else {
+            ((coded + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// A picture read as it was coded is filtered so and made light after:
+    /// at its own size each pixel is its texel's light, as the GPU would
+    /// have made it, and drawn half its size, stripes
+    /// black and white come out the grey half-way between them as coded, as
+    /// dark as anything else that shrinks a picture makes them, not the
+    /// lighter grey half-way between them as light.
+    #[test]
+    fn a_picture_read_as_coded_is_filtered_so_then_made_light() {
+        let Ok(ctx) = GpuContext::new_headless() else {
+            return;
+        };
+        let columns =
+            |greys: &[f32]| -> Vec<[f32; 4]> { greys.iter().map(|&g| [g, g, g, 1.0]).collect() };
+        let greys: Vec<f32> = (0..64).map(|x| ((x * 37) % 64) as f32 / 63.0).collect();
+        let same = blit_columns_read(&ctx, &columns(&greys), 64, None, true);
+        for (x, (g, c)) in greys.iter().zip(&same).enumerate() {
+            let want = light(*g);
+            assert!(
+                (c[0] - want).abs() < 2e-3,
+                "column {x}: {g} became {}, its light {want}",
+                c[0]
+            );
+            assert!((c[3] - 1.0).abs() < 2e-3, "column {x}: alpha {}", c[3]);
+        }
+        let striped = columns(&stripes(128));
+        let coded = blit_columns_read(&ctx, &striped, 64, None, true);
+        let as_light = blit_columns_read(&ctx, &striped, 64, None, false);
+        for (x, (c, l)) in coded.iter().zip(&as_light).enumerate().take(60).skip(4) {
+            assert!(
+                (c[0] - light(0.5)).abs() < 0.01,
+                "column {x}: {} as coded, not {}",
+                c[0],
+                light(0.5)
+            );
+            assert!((l[0] - 0.5).abs() < 0.01, "column {x}: {} as light", l[0]);
+        }
     }
 
     /// Drawn at a half and a quarter size — a 4K show on an HD screen, a

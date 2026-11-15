@@ -63,6 +63,8 @@ pub trait MixerCommands {
     ) -> Result<String>;
     /// Add a screen / window capture deck. `target` is matched by name against
     /// the last enumeration; pass `None` for any option to take its default.
+    /// A target another deck captures already is shared as it runs: the
+    /// deck takes that capture's rate, crop and cursor, not `options`'.
     ///
     /// # Errors
     /// Returns an error if `channel_uuid` names no channel, if no enumerated
@@ -95,6 +97,20 @@ pub trait MixerCommands {
         &mut self,
         deck_uuid: &str,
         source: &crate::scene::TapSourceConfig,
+    ) -> Result<()>;
+    /// Point an existing screen capture deck at `target` — another screen
+    /// or window, or its own picked again — its rate, crop and cursor kept,
+    /// or, of a target another deck captures already, that capture's taken.
+    /// A display so picked is kept by its own identity from then on.
+    ///
+    /// # Errors
+    /// Returns an error if `deck_uuid` names no deck or one that is not a
+    /// screen capture (a PowerPoint input's window is its show's), if no
+    /// enumerated target matches, or if the OS refuses capture.
+    fn set_screen_capture_target(
+        &mut self,
+        deck_uuid: &str,
+        target: &crate::scene::CaptureTargetConfig,
     ) -> Result<()>;
     /// # Errors
     /// Returns an error if `deck_uuid` names no deck.

@@ -637,6 +637,11 @@ pub enum SourceConfig {
         /// it, found again when the show is opened (see `crate::presentation`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         presentation: Option<crate::presentation::PresentationConfig>,
+        /// What the input was last named after, as it was listed then (see
+        /// `crate::deck::ScreenCaptureState::listed_as`). Absent in a show
+        /// saved before 0.9.9 (see `persistence::restore_deck`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        listed_as: Option<String>,
     },
     /// Varda's own program or a channel composite, re-entered as a source.
     /// See spec/program-tap.md.
@@ -742,14 +747,23 @@ fn default_capture_rate() -> f32 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CaptureTargetConfig {
-    Display { name: String },
+    Display {
+        /// As it was listed when last captured: "Display 2".
+        name: String,
+        /// The display's own identity (see `CaptureTargetInfo::uuid`), what
+        /// it is found by when the show opens: its name is its place among
+        /// the screens plugged in, another once one more is. None in a show
+        /// saved before it was kept, or written by hand.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uuid: Option<String>,
+    },
     Window { app: String, title: String },
 }
 
 impl CaptureTargetConfig {
     pub fn label(&self) -> String {
         match self {
-            Self::Display { name } => name.clone(),
+            Self::Display { name, .. } => name.clone(),
             Self::Window { app, title } if title.is_empty() => app.clone(),
             Self::Window { app, title } => format!("{app} — {title}"),
         }
@@ -766,8 +780,9 @@ impl From<&crate::screen_capture::backend::TargetIdentity> for CaptureTargetConf
     fn from(id: &crate::screen_capture::backend::TargetIdentity) -> Self {
         use crate::screen_capture::backend::TargetIdentity;
         match id {
-            TargetIdentity::Display { label } => Self::Display {
+            TargetIdentity::Display { label, uuid } => Self::Display {
                 name: label.clone(),
+                uuid: uuid.clone(),
             },
             TargetIdentity::Window { app, title } => Self::Window {
                 app: app.clone(),
@@ -780,8 +795,9 @@ impl From<&crate::screen_capture::backend::TargetIdentity> for CaptureTargetConf
 impl From<&CaptureTargetConfig> for crate::screen_capture::backend::TargetIdentity {
     fn from(cfg: &CaptureTargetConfig) -> Self {
         match cfg {
-            CaptureTargetConfig::Display { name } => Self::Display {
+            CaptureTargetConfig::Display { name, uuid } => Self::Display {
                 label: name.clone(),
+                uuid: uuid.clone(),
             },
             CaptureTargetConfig::Window { app, title } => Self::Window {
                 app: app.clone(),
@@ -1252,7 +1268,7 @@ impl SourceConfig {
                     errors.push(format!("{prefix}: PowerPoint input has no file"));
                 }
                 match target {
-                    CaptureTargetConfig::Display { name } if name.trim().is_empty() => {
+                    CaptureTargetConfig::Display { name, .. } if name.trim().is_empty() => {
                         errors.push(format!("{prefix}: capture display name is empty"));
                     }
                     CaptureTargetConfig::Window { app, title } => {
@@ -1510,6 +1526,42 @@ impl SceneConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Screen capture ───────────────────────────────────────────────
+
+    /// A captured display is saved with its own identity beside its name,
+    /// and comes back with it; a show saved before, by the name alone, still
+    /// opens and is written back as it was.
+    #[test]
+    fn a_captured_display_is_saved_with_its_identity() {
+        use crate::screen_capture::backend::TargetIdentity;
+        let kept = TargetIdentity::Display {
+            label: "Display 2".into(),
+            uuid: Some("37D8832A-2D66-02CA-B9F7-8F30A301B230".into()),
+        };
+        let saved = serde_json::to_value(CaptureTargetConfig::from(&kept)).expect("serialize");
+        assert_eq!(
+            saved,
+            serde_json::json!({
+                "kind": "display",
+                "name": "Display 2",
+                "uuid": "37D8832A-2D66-02CA-B9F7-8F30A301B230"
+            })
+        );
+        let back: CaptureTargetConfig = serde_json::from_value(saved).expect("deserialize");
+        assert_eq!(TargetIdentity::from(&back), kept);
+
+        let old = serde_json::json!({ "kind": "display", "name": "Display 1" });
+        let back: CaptureTargetConfig = serde_json::from_value(old.clone()).expect("an old show");
+        assert_eq!(
+            TargetIdentity::from(&back),
+            TargetIdentity::Display {
+                label: "Display 1".into(),
+                uuid: None
+            }
+        );
+        assert_eq!(serde_json::to_value(&back).expect("serialize"), old);
+    }
 
     // ── Program / channel tap ────────────────────────────────────────
 

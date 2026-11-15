@@ -1113,6 +1113,7 @@ mod mac {
             width: size.width.round() as u32,
             height: size.height.round() as u32,
             is_varda: true,
+            uuid: None,
         };
         let spawned = std::thread::Builder::new()
             .name("web-talk-capture".into())
@@ -1297,6 +1298,7 @@ impl FakeWeb {
             width: 1920,
             height: 1080,
             is_varda: true,
+            uuid: None,
         };
         let config = CaptureConfig::default();
         let capture: Box<dyn ScreenCaptureBackend> = if s.blind > 0 {

@@ -972,7 +972,10 @@ fn macro_value_modulation_drives_targets_live() {
         },
     );
 
-    // LFO assigned to the macro's *value* key (the exact path the UI uses).
+    // LFO assigned to the macro's *value* key (the exact path the UI uses),
+    // at an amount that keeps the macro within its range: 0.5 to 0.9, never
+    // the 1.0 or the 0.1 the deck has without it.
+    let amount = 0.4_f32;
     send_cmd(
         &mut app,
         EngineCommand::AddLfo {
@@ -985,26 +988,265 @@ fn macro_value_modulation_drives_targets_live() {
         &mut app,
         EngineCommand::AssignModulation {
             target: format!("macro_{macro_uuid}:value"),
-            source_id: lfo_id,
-            amount: 1.0,
+            source_id: lfo_id.clone(),
+            amount,
         },
     );
     assert!(matches!(r, CommandResult::Ok), "{r:?}");
 
-    // Step frames and observe the deck opacity swing as the LFO drives the macro.
-    let mut min = f32::MAX;
-    let mut max = f32::MIN;
-    for _ in 0..60 {
+    // Step frames: on each the deck's opacity, set aside before it, is the
+    // macro's base and the LFO's value of that frame. (Not "it swings over
+    // these frames": they are drawn back to back, a few milliseconds in all,
+    // and where in the LFO's turn they fall is the wall clock's — at amount
+    // 1 the half of the turn that holds the macro at 1 took all sixty, one
+    // run in three on a busy machine.)
+    for frame in 0..60 {
+        // Set aside on the mixer itself: a command would take the deck's
+        // fader from the show.
+        app.mixer_mut()
+            .channels_mut()
+            .iter_mut()
+            .flat_map(|ch| ch.decks.iter_mut())
+            .find(|slot| slot.deck.uuid() == deck_uuid)
+            .expect("the deck")
+            .opacity = 0.1;
         app.update_frame_timing();
         app.render_mixer_frame();
+        let lfo = app
+            .build_engine_state()
+            .modulation
+            .current_values
+            .get(&lfo_id)
+            .copied()
+            .expect("the LFO's value");
+        assert!((0.0..=1.0).contains(&lfo), "frame {frame}: LFO at {lfo}");
         let op = deck_snapshot(&mut app, &deck_uuid).opacity;
-        min = min.min(op);
-        max = max.max(op);
+        assert!(
+            (op - (0.5 + amount * lfo)).abs() < 1e-4,
+            "frame {frame}: deck opacity {op} should be the macro's 0.5 and {amount} of the LFO's {lfo}"
+        );
     }
-    assert!(
-        max - min > 0.05,
-        "deck opacity should oscillate from macro-value modulation: min={min} max={max}"
-    );
+}
+
+/// `SetCompositor` turns drawing slow layers less often on and off, and
+/// leaves it be when left out. A test's app starts with it off (see
+/// `Mixer::slow_layers_less_often`).
+#[test]
+fn set_compositor_sets_slow_layers_less_often() {
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    assert!(!app.mixer_mut().slow_layers_less_often, "off in a test");
+    let set = |app: &mut VardaApp, direct_layers, slow_layers_less_often| {
+        let r = send_cmd(
+            app,
+            EngineCommand::SetCompositor {
+                direct_layers,
+                merge_layer_passes: None,
+                slow_layers_less_often,
+                skip_blank_channels: None,
+                keep_still_text: None,
+                merge_main_passes: None,
+                pass_main_through: None,
+                keep_still_clips: None,
+                keep_still_inputs: None,
+            },
+        );
+        assert!(matches!(r, CommandResult::Ok), "{r:?}");
+        app.mixer_mut().slow_layers_less_often
+    };
+    assert!(set(&mut app, None, Some(true)), "turned on");
+    assert!(set(&mut app, Some(false), None), "left as it is");
+    assert!(!set(&mut app, None, Some(false)), "turned off");
+}
+
+/// `SetCompositor` turns leaving an input that shows nothing undrawn off
+/// and on, and leaves it be when left out. On to begin with.
+#[test]
+fn set_compositor_sets_skip_blank_channels() {
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    assert!(app.mixer_mut().skip_blank_channels, "on to begin with");
+    let set = |app: &mut VardaApp, direct_layers, skip_blank_channels| {
+        let r = send_cmd(
+            app,
+            EngineCommand::SetCompositor {
+                direct_layers,
+                merge_layer_passes: None,
+                slow_layers_less_often: None,
+                skip_blank_channels,
+                keep_still_text: None,
+                merge_main_passes: None,
+                pass_main_through: None,
+                keep_still_clips: None,
+                keep_still_inputs: None,
+            },
+        );
+        assert!(matches!(r, CommandResult::Ok), "{r:?}");
+        app.mixer_mut().skip_blank_channels
+    };
+    assert!(!set(&mut app, None, Some(false)), "turned off");
+    assert!(!set(&mut app, Some(true), None), "left as it is");
+    assert!(set(&mut app, None, Some(true)), "turned on");
+}
+
+/// `SetCompositor` turns keeping the frame of a lower third or a text
+/// standing still off and on, and leaves it be when left out. On to begin
+/// with.
+#[test]
+fn set_compositor_sets_keep_still_text() {
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    assert!(app.mixer_mut().keep_still_text, "on to begin with");
+    let set = |app: &mut VardaApp, direct_layers, keep_still_text| {
+        let r = send_cmd(
+            app,
+            EngineCommand::SetCompositor {
+                direct_layers,
+                merge_layer_passes: None,
+                slow_layers_less_often: None,
+                skip_blank_channels: None,
+                keep_still_text,
+                merge_main_passes: None,
+                pass_main_through: None,
+                keep_still_clips: None,
+                keep_still_inputs: None,
+            },
+        );
+        assert!(matches!(r, CommandResult::Ok), "{r:?}");
+        app.mixer_mut().keep_still_text
+    };
+    assert!(!set(&mut app, None, Some(false)), "turned off");
+    assert!(!set(&mut app, Some(true), None), "left as it is");
+    assert!(set(&mut app, None, Some(true)), "turned on");
+}
+
+/// `SetCompositor` turns drawing Main's layers in one pass off and on, and
+/// leaves it be when left out. On to begin with.
+#[test]
+fn set_compositor_sets_merge_main_passes() {
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    assert!(app.mixer_mut().merge_main_passes, "on to begin with");
+    let set = |app: &mut VardaApp, direct_layers, merge_main_passes| {
+        let r = send_cmd(
+            app,
+            EngineCommand::SetCompositor {
+                direct_layers,
+                merge_layer_passes: None,
+                slow_layers_less_often: None,
+                skip_blank_channels: None,
+                keep_still_text: None,
+                merge_main_passes,
+                pass_main_through: None,
+                keep_still_clips: None,
+                keep_still_inputs: None,
+            },
+        );
+        assert!(matches!(r, CommandResult::Ok), "{r:?}");
+        app.mixer_mut().merge_main_passes
+    };
+    assert!(!set(&mut app, None, Some(false)), "turned off");
+    assert!(!set(&mut app, Some(true), None), "left as it is");
+    assert!(set(&mut app, None, Some(true)), "turned on");
+}
+
+/// `SetCompositor` turns giving Main out as its one input's picture off and
+/// on, and leaves it be when left out. On to begin with.
+#[test]
+fn set_compositor_sets_pass_main_through() {
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    assert!(app.mixer_mut().pass_main_through, "on to begin with");
+    let set = |app: &mut VardaApp, direct_layers, pass_main_through| {
+        let r = send_cmd(
+            app,
+            EngineCommand::SetCompositor {
+                direct_layers,
+                merge_layer_passes: None,
+                slow_layers_less_often: None,
+                skip_blank_channels: None,
+                keep_still_text: None,
+                merge_main_passes: None,
+                pass_main_through,
+                keep_still_clips: None,
+                keep_still_inputs: None,
+            },
+        );
+        assert!(matches!(r, CommandResult::Ok), "{r:?}");
+        app.mixer_mut().pass_main_through
+    };
+    assert!(!set(&mut app, None, Some(false)), "turned off");
+    assert!(!set(&mut app, Some(true), None), "left as it is");
+    assert!(set(&mut app, None, Some(true)), "turned on");
+}
+
+/// `SetCompositor` turns keeping a clip's frame between two of its frames
+/// off and on, and leaves it be when left out. On to begin with.
+#[test]
+fn set_compositor_sets_keep_still_clips() {
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    assert!(app.mixer_mut().keep_still_clips, "on to begin with");
+    let set = |app: &mut VardaApp, direct_layers, keep_still_clips| {
+        let r = send_cmd(
+            app,
+            EngineCommand::SetCompositor {
+                direct_layers,
+                merge_layer_passes: None,
+                slow_layers_less_often: None,
+                skip_blank_channels: None,
+                keep_still_text: None,
+                merge_main_passes: None,
+                pass_main_through: None,
+                keep_still_clips,
+                keep_still_inputs: None,
+            },
+        );
+        assert!(matches!(r, CommandResult::Ok), "{r:?}");
+        app.mixer_mut().keep_still_clips
+    };
+    assert!(!set(&mut app, None, Some(false)), "turned off");
+    assert!(!set(&mut app, Some(true), None), "left as it is");
+    assert!(set(&mut app, None, Some(true)), "turned on");
+    assert!(app.mixer_mut().keep_still_inputs, "the other left alone");
+}
+
+/// `SetCompositor` turns keeping an input's picture while nothing in it
+/// changes off and on, and leaves it be when left out. On to begin with.
+#[test]
+fn set_compositor_sets_keep_still_inputs() {
+    let Some(mut app) = headless_app() else {
+        return;
+    };
+    assert!(app.mixer_mut().keep_still_inputs, "on to begin with");
+    let set = |app: &mut VardaApp, direct_layers, keep_still_inputs| {
+        let r = send_cmd(
+            app,
+            EngineCommand::SetCompositor {
+                direct_layers,
+                merge_layer_passes: None,
+                slow_layers_less_often: None,
+                skip_blank_channels: None,
+                keep_still_text: None,
+                merge_main_passes: None,
+                pass_main_through: None,
+                keep_still_clips: None,
+                keep_still_inputs,
+            },
+        );
+        assert!(matches!(r, CommandResult::Ok), "{r:?}");
+        app.mixer_mut().keep_still_inputs
+    };
+    assert!(!set(&mut app, None, Some(false)), "turned off");
+    assert!(!set(&mut app, Some(true), None), "left as it is");
+    assert!(set(&mut app, None, Some(true)), "turned on");
+    assert!(app.mixer_mut().keep_still_clips, "the other left alone");
 }
 
 #[test]

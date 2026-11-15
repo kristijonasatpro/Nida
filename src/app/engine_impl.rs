@@ -373,35 +373,42 @@ impl MixerCommands for VardaApp {
                     target.label()
                 )
             })?;
+        // A display is kept by its own identity, not only the name it was
+        // picked by (see `TargetIdentity::bound_to`).
+        let identity = identity.bound_to(&info);
 
-        // Default the capture-time downscale to the largest deck-sized frame
-        // that keeps the target's own shape. Without a cap a 4K display would
-        // move 33 MB per frame only to be scaled down immediately after; without
-        // the shape, a window narrower than the stage would arrive pre-squashed
-        // and the deck's scaling mode would have nothing left to do.
+        // Capped at the show's size: a 4K display in a 1080p show is not moved
+        // at 33 MB a frame only to be scaled down after. The cap is a bound —
+        // the capture fits the target's pixels within it, in the target's own
+        // shape — so it is the show's size itself, not the target's fitted
+        // into it: the target's size is in points, and on a Retina or scaled
+        // display that fit halved the picture (a 4K screen "looks like
+        // 1920×1080" came at 1920×1080 into a 4K show, blurred).
         // See spec/screen-capture.md § Performance.
         let config = crate::screen_capture::backend::CaptureConfig {
-            scale_to: options.scale_to.or_else(|| {
-                Some(crate::screen_capture::resample::fit_within(
-                    info.width,
-                    info.height,
-                    self.render_width,
-                    self.render_height,
-                ))
-            }),
+            scale_to: options
+                .scale_to
+                .or(Some((self.render_width, self.render_height))),
             ..options
         };
         let (capture_id, src_w, src_h) = self
             .screen_capture_manager
             .open(&info, config.clone(), &self.context.device)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // A screen or window another input captures already is shared as it
+        // runs: this input shows and saves the rate, crop and cursor it is
+        // captured with, not those asked for it. Those were never sent —
+        // until its first change of anything sent its settings whole, and
+        // wrote over the other input's crop.
+        let config = self.as_its_capture_runs(capture_id, config);
         let mut deck = Deck::new_from_screen_capture(
             &self.context,
             crate::deck::ScreenCaptureState {
                 capture_id,
                 identity,
                 config,
-                config_dirty: false,
+                given: Vec::new(),
+                listed_as: Some(info.label.clone()),
                 presentation: None,
             },
             &info.label,
@@ -471,6 +478,103 @@ impl MixerCommands for VardaApp {
         state.source = crate::deck::TapSource::from(source);
         let label = state.source.label(&labels);
         deck.set_source_name(format!("🔁 {label}"));
+        Ok(())
+    }
+
+    fn set_screen_capture_target(
+        &mut self,
+        deck_uuid: &str,
+        target: &crate::scene::CaptureTargetConfig,
+    ) -> Result<()> {
+        use crate::screen_capture::backend::TargetIdentity;
+        use crate::screen_capture::UNBOUND_CAPTURE_ID;
+        let (ch, dk) = self.resolve_deck(deck_uuid)?;
+        let deck = &self.mixer.channels()[ch].decks[dk].deck;
+        let state = deck
+            .screen_capture
+            .as_ref()
+            .context("Deck is not a screen capture: it has no screen or window to pick")?;
+        // Its window is its show's, found once PowerPoint plays it.
+        anyhow::ensure!(
+            state.presentation.is_none(),
+            "A PowerPoint input captures its own show's window"
+        );
+        let identity = TargetIdentity::from(target);
+        let info = self
+            .screen_capture_manager
+            .find_target(&identity)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "No capture target matches '{}' — rescan and try again",
+                    target.label()
+                )
+            })?;
+        // Picked now: a display is kept by its own identity from here on
+        // (see `TargetIdentity::bound_to`).
+        let identity = identity.bound_to(&info);
+        // Its settings stay (see `CaptureConfig::repointed`).
+        let mut config = state.config.clone().repointed(&state.identity, &info);
+        config.scale_to = config
+            .scale_to
+            .or(Some((self.render_width, self.render_height)));
+        let held = state.capture_id;
+        let pending = state.given.clone();
+        // Named after what it captured, it is named after what it captures
+        // now; a name given it stays. What it was named after is kept with
+        // it (`ScreenCaptureState::listed_as`): a window's input whose app
+        // is closed has nothing else to hold its name against — the show
+        // keeps the window by its app's bundle id, not by what the app is
+        // called — and a name that only reads as a capture's may be a
+        // preset's ("🖥 Slides"). An input with no such record, of a show
+        // saved before 0.9.9, is held against what it captures, as before:
+        // a window's, its app closed, then keeps its name — nothing tells
+        // it from one given it.
+        let named_after_its_target = deck.source_name().strip_prefix("🖥 ").is_some_and(|name| {
+            state.listed_as.as_deref() == Some(name)
+                || name == crate::scene::CaptureTargetConfig::from(&state.identity).label()
+                || self.screen_capture_manager.label(held) == Some(name)
+        });
+        let (capture_id, width, height) = self
+            .screen_capture_manager
+            .open(&info, config.clone(), &self.context.device)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // A capture another input already runs is shared as that one set it
+        // — what is on air does not change under it — and this input shows
+        // and saves what it runs with. Its own, picked again, keeps its own.
+        let its_own = capture_id == held;
+        let config = if its_own {
+            config
+        } else {
+            self.as_its_capture_runs(capture_id, config)
+        };
+        let deck = &mut self.mixer.channels_mut()[ch].decks[dk].deck;
+        deck.rebind_screen_capture(capture_id, identity, config, width, height);
+        // Its own: what it was given this frame and has not yet sent down
+        // still is to be. Another's has nothing of this input's to be
+        // given: one running already is shared as it runs — sent all the
+        // same, this input's settings wrote over a crop an input of that
+        // capture had set the same frame — and one opened new was opened as
+        // this input is set.
+        if let Some(state) = deck.screen_capture.as_mut().filter(|_| its_own) {
+            state.given = pending;
+        }
+        if named_after_its_target {
+            deck.set_source_name(format!("🖥 {}", info.label));
+            // And that is what it is named after from here on.
+            if let Some(state) = deck.screen_capture.as_mut() {
+                state.listed_as = Some(info.label.clone());
+            }
+        }
+        // The one it held, let go: when that is the one opened — its own
+        // screen picked again — the holder just counted for it.
+        if held != UNBOUND_CAPTURE_ID {
+            self.screen_capture_manager.release(held);
+        }
+        log::info!(
+            "Screen capture deck {deck_uuid} now captures '{}'",
+            info.label
+        );
         Ok(())
     }
 

@@ -30,13 +30,20 @@
 # (shaders-left-out.txt).
 #
 # Usage: scripts/ci/build-macos.sh [--skip-deps] [--binary PATH] [--out DIR]
-#          [--min-macos 15.8.1] [--no-sources]
+#          [--min-macos 15.8.1] [--no-sources] [--label NAME] [--build-only]
 #   --binary      package a nida already built, instead of building one
+#   --build-only  build nida as the app carries it, say where it is, and
+#                 stop — no app, no DMG. For --binary on another Mac, the
+#                 one that packages and signs, spared the build: that Mac's
+#                 Homebrew libraries go into the app, and it is for it to
+#                 check that they are ones the program can run with (the
+#                 app's own start, further down, is a smoke check, no proof)
 #   --no-sources  skip the source archive (a try-out, not for giving away)
 #   --label NAME  a try-out's name after the version — its bundle version
 #                 and the DMG's name (Nida-0.9.1-ppt-70d687d-macOS-arm64.dmg)
 # Produces in DIR (the project root by default): Nida-<version>-macOS-arm64.dmg,
-# its .sha256, and Nida-<version>-third-party-source.tar.gz
+# its .sha256, and Nida-<version>-third-party-source.tar.gz — nothing with
+# --build-only
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -46,6 +53,7 @@ SKIP_DEPS=false
 SOURCES=true
 LABEL=""
 BINARY=""
+BUILD_ONLY=false
 OUT="$ROOT"
 MIN_MACOS="15.8.1"
 BUNDLE_ID="lt.proconf.nida"
@@ -53,7 +61,11 @@ FEATURES="--no-default-features --features screen-capture"
 while [ $# -gt 0 ]; do
   case "$1" in
     --skip-deps) SKIP_DEPS=true ;;
-    --binary) shift; BINARY="$1" ;;
+    --binary)
+      BINARY="${2:-}"
+      [ -n "$BINARY" ] || { echo "--binary needs the path of a nida already built" >&2; exit 1; }
+      shift ;;
+    --build-only) BUILD_ONLY=true ;;
     --out) shift; OUT="$1" ;;
     --min-macos) shift; MIN_MACOS="$1" ;;
     --no-sources) SOURCES=false ;;
@@ -63,6 +75,14 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+if [ "$BUILD_ONLY" = true ] && [ -n "$BINARY" ]; then
+  echo "--build-only builds a nida: not with --binary" >&2
+  exit 1
+fi
+if [ -n "$BINARY" ] && { [ ! -f "$BINARY" ] || [ ! -x "$BINARY" ]; }; then
+  echo "--binary $BINARY: no program there" >&2
+  exit 1
+fi
 if [ "$(uname -m)" != "arm64" ]; then
   echo "Build this on a Mac with Apple silicon" >&2
   exit 1
@@ -99,14 +119,45 @@ FFMPEG_FULL="$BREW/opt/ffmpeg-full"
 [ -x "$FFMPEG_FULL/bin/ffmpeg" ] || { echo "No ffmpeg-full: brew install ffmpeg-full" >&2; exit 1; }
 
 if [ -z "$BINARY" ]; then
+  # What the environment would have cargo build otherwise than is said here
+  # — other flags over these, another target or profile, another FFmpeg than
+  # ffmpeg-full: refused, not overruled (PKG_CONFIG_PATH is set below). Not
+  # all that could change it is looked for: another compiler, a wrapper, or
+  # flags for the C parts (RUSTC_WRAPPER, CC, CFLAGS) pass.
+  CHANGES_BUILD='^(CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_TARGET|CARGO_PROFILE_RELEASE_.*|FFMPEG_DIR|BINDGEN_EXTRA_CLANG_ARGS(_.*)?|(HOST_|TARGET_)?PKG_CONFIG(_.*)?)$'
+  names=0
+  while IFS= read -r -d '' pair; do
+    name="${pair%%=*}"
+    names=$((names + 1))
+    if [ "$name" != PKG_CONFIG_PATH ] && [[ "$name" =~ $CHANGES_BUILD ]]; then
+      echo "$name is set in the environment and would change what is built: unset it and build again" >&2
+      exit 1
+    fi
+  done < <(env -0)
+  [ "$names" -gt 0 ] || { echo "cannot read the environment (env -0)" >&2; exit 1; }
   # The flags .cargo/config.toml gives, which RUSTFLAGS would replace, and
   # room in the load commands for bundle-macos-libs.py to rewrite them.
   export MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS"
   export RUSTFLAGS="-L native=$FFMPEG_FULL/lib -L native=$BREW/lib -C link-arg=-Wl,-headerpad_max_install_names"
   export PKG_CONFIG_PATH="$FFMPEG_FULL/lib/pkgconfig"
+  # Where cargo puts the program, asked of cargo; one left there by an
+  # earlier build goes first: what is there afterwards, this build made.
+  TARGET_DIR="$(cargo metadata --format-version 1 --no-deps |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+  [ -n "$TARGET_DIR" ] || { echo "cargo does not say where it builds" >&2; exit 1; }
+  BINARY="$TARGET_DIR/release/varda"
+  rm -f "$BINARY"
   # shellcheck disable=SC2086
   cargo build --release --locked $FEATURES
-  BINARY="${CARGO_TARGET_DIR:-target}/release/varda"
+  if [ ! -f "$BINARY" ] || [ ! -x "$BINARY" ]; then
+    echo "cargo built, and no program is at $BINARY" >&2
+    exit 1
+  fi
+fi
+if [ "$BUILD_ONLY" = true ]; then
+  BINARY_DIR="$(cd "$(dirname "$BINARY")" && pwd -P)"
+  echo "==> Built, not packaged: $BINARY_DIR/$(basename "$BINARY")"
+  exit 0
 fi
 
 STAGE="$(mktemp -d)"

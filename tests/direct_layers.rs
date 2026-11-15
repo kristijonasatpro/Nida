@@ -179,6 +179,32 @@ fn direct(app: &mut VardaApp, on: bool) {
         EngineCommand::SetCompositor {
             direct_layers: Some(on),
             merge_layer_passes: None,
+            slow_layers_less_often: None,
+            skip_blank_channels: None,
+            keep_still_text: None,
+            merge_main_passes: None,
+            pass_main_through: None,
+            keep_still_clips: None,
+            keep_still_inputs: None,
+        },
+    ));
+}
+
+/// Whether a layer keeps the frame it drew of another input while that
+/// one stands still (`keep_still_inputs`); off, it draws every frame.
+fn keep_still(app: &mut VardaApp, on: bool) {
+    ok(&send_cmd(
+        app,
+        EngineCommand::SetCompositor {
+            direct_layers: None,
+            merge_layer_passes: None,
+            slow_layers_less_often: None,
+            skip_blank_channels: None,
+            keep_still_text: None,
+            merge_main_passes: None,
+            pass_main_through: None,
+            keep_still_clips: None,
+            keep_still_inputs: Some(on),
         },
     ));
 }
@@ -305,6 +331,8 @@ fn furthest(a: &[[f32; 4]], b: &[[f32; 4]]) -> f32 {
 /// Added, Screened, see-through and flattened — drawn from their source
 /// look as they did drawn into their own frames, but for the half-float
 /// rounding those frames did; and none of the four draws a frame of its own.
+/// In frames of their own, they keep them while the other input stands
+/// still.
 #[test]
 fn layers_drawn_from_their_source_look_as_drawn_into_frames_of_their_own() {
     let Some((mut app, channels)) = two_inputs() else {
@@ -328,7 +356,14 @@ fn layers_drawn_from_their_source_look_as_drawn_into_frames_of_their_own() {
             .map(|slot| slot.render_cost_us)
             .collect()
     };
+    // Input 1 standing still, each drew its frame once and keeps it (see
+    // `Deck::still_frame`): the second frame cost nothing. Drawn every
+    // frame, they cost.
+    assert!(costs(&app).iter().all(|&us| us == 0.0), "kept: {:?}", costs(&app));
+    keep_still(&mut app, false);
+    second(&mut app);
     assert!(costs(&app).iter().all(|&us| us > 0.0), "their frames cost: {:?}", costs(&app));
+    keep_still(&mut app, true);
     let lightest = own_frames.iter().map(|p| p[1]).fold(0.0, f32::max);
     let darkest = own_frames.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
     assert!(lightest - darkest > 0.3, "a picture, not a wash: {darkest}..{lightest}");

@@ -3,7 +3,8 @@
 //! opening what is new, closing what is gone, capturing each show's window
 //! once PowerPoint plays it. See `crate::presentation`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -40,10 +41,61 @@ pub(crate) struct Presentations {
     spots: std::collections::HashMap<String, (ScreenSpot, PlaysOn)>,
     /// A window's title bar on this macOS, points.
     title_bar: u32,
-    /// The decks PowerPoint is saving as slide pictures (see
-    /// `make_slide_pictures`).
+    /// The decks PowerPoint is saving as slide pictures, or is to: asked by
+    /// Make (see `make_slide_pictures`) or by themselves.
     making: std::collections::HashSet<std::path::PathBuf>,
+    /// Slide pictures made by themselves.
+    pictures: ByThemselves,
 }
+
+/// A deck's file as it was when its slide pictures were asked for: its
+/// size and when it last changed.
+type Stamp = (u64, Option<std::time::SystemTime>);
+
+/// Slide pictures made by themselves: what was asked, and what came of it
+/// (see `VardaApp::slide_pictures_waiting`).
+struct ByThemselves {
+    /// Not under a stand-in PowerPoint, unless a test asks.
+    on: bool,
+    /// When the talks without pictures were last looked for.
+    looked: Option<Instant>,
+    /// The decks PowerPoint is asked for, not answered yet: each file as it
+    /// was then, and whether it was asked by itself, not by Make.
+    asked: std::collections::HashMap<PathBuf, (Stamp, bool)>,
+    /// What came of each deck's last save, for its file as it was then: it
+    /// is not asked again by itself — till the time given or, with none,
+    /// till its file changes or Make is pressed.
+    tried: std::collections::HashMap<PathBuf, (Stamp, Option<Instant>)>,
+}
+
+/// A PowerPoint talk's deck whose slide pictures are to be made by
+/// themselves: its file, the PDF they go in, and the file as it is.
+struct Waiting {
+    path: PathBuf,
+    out: PathBuf,
+    stamp: Stamp,
+}
+
+/// How often the talks without slide pictures are looked for.
+const PICTURES_EVERY: Duration = Duration::from_millis(500);
+
+/// A deck's file is left this long after it last changed before its slide
+/// pictures are made by themselves: one still being copied or saved is not
+/// read half written.
+const PICTURES_SETTLED: Duration = Duration::from_secs(3);
+
+/// Whether a deck's file last changed at `modified` may still be being
+/// written at `wall`: changed less than [`PICTURES_SETTLED`] before. One
+/// with no time known, or a time ahead of this Mac's clock (a stick written
+/// by another clock), is not waited for.
+fn still_settling(modified: Option<std::time::SystemTime>, wall: std::time::SystemTime) -> bool {
+    modified.is_some_and(|at| wall.duration_since(at).is_ok_and(|age| age < PICTURES_SETTLED))
+}
+
+/// A deck whose pictures could not be made just then — a show on its way
+/// up, the deck not open beside a show — is asked again by itself after
+/// this long; so is one made, should its pictures be gone again.
+const PICTURES_AGAIN: Duration = Duration::from_secs(15);
 
 /// How a presenter view's show stood when it was last told.
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +124,12 @@ impl Presentations {
             spots: std::collections::HashMap::new(),
             title_bar: crate::presentation::manager::title_bar_points(),
             making: std::collections::HashSet::new(),
+            pictures: ByThemselves {
+                on: !disabled,
+                looked: None,
+                asked: std::collections::HashMap::new(),
+                tried: std::collections::HashMap::new(),
+            },
         }
     }
 
@@ -158,7 +216,8 @@ impl VardaApp {
                 scale_to: Some((self.render_width, self.render_height)),
                 ..CaptureConfig::default()
             },
-            config_dirty: false,
+            given: Vec::new(),
+            listed_as: None,
             presentation: Some(PresentationConfig {
                 path: path.to_string_lossy().into_owned(),
                 slide: None,
@@ -174,7 +233,7 @@ impl VardaApp {
             self.render_width,
             self.render_height,
         )?;
-        deck.set_source_name(format!("📽 {name}"));
+        deck.set_source_name(crate::presentation::input_name(&path));
         let uuid = deck.uuid().to_string();
         self.add_default_effects(&mut deck);
         let ch = self
@@ -591,8 +650,11 @@ impl VardaApp {
     pub(crate) fn reconcile_presentations(&mut self) {
         let wanted = self.presentation_decks();
         let talks = self.powerpoint_talks();
+        // Slide pictures to make by themselves need PowerPoint too.
+        let waiting = self.slide_pictures_waiting();
         if self.presentations.manager.is_none()
-            && ((wanted.is_empty() && talks.is_empty()) || self.presentations.disabled)
+            && ((wanted.is_empty() && talks.is_empty() && waiting.is_empty())
+                || self.presentations.disabled)
         {
             return;
         }
@@ -693,6 +755,7 @@ impl VardaApp {
             self.bind_presentation_window(found);
         }
         self.take_slide_pictures();
+        self.ask_slide_pictures(waiting);
         // A deck with no picture of a running show — its capture failed or
         // is gone, or an undo made it again — asks for its window again.
         let mut unbound: Vec<String> = self
@@ -1152,9 +1215,11 @@ impl VardaApp {
     /// Have PowerPoint save the PowerPoint talks of a Slides input — or of
     /// every one — as slide pictures, for the presenter view's next slide:
     /// those without them as their files are now (see
-    /// `crate::presentation::pictures`). Never with a PowerPoint show
-    /// running: PowerPoint may ask for access to Nida's folder for them
-    /// first (Grant Access), and holds its show till that is answered.
+    /// `crate::presentation::pictures`). With a PowerPoint show running,
+    /// only once PowerPoint has saved into Nida's folder for them before —
+    /// the first time it may ask for access to it (Grant Access), and holds
+    /// its show till that is answered — and only the decks an input keeps
+    /// open in PowerPoint: nothing is opened beside a show.
     pub(crate) fn make_slide_pictures(&mut self, deck_uuid: Option<&str>) -> Result<()> {
         if let Some(uuid) = deck_uuid {
             let (ch, dk) = self.resolve_deck(uuid)?;
@@ -1181,29 +1246,202 @@ impl VardaApp {
             .manager
             .as_ref()
             .context("PowerPoint plays nothing of this show yet")?;
+        let on = manager.any_showing();
+        // Asked by hand: of the disk, not of what was last found.
         anyhow::ensure!(
-            !manager.any_showing(),
-            "A PowerPoint talk is on: make the slide pictures with none on — PowerPoint may ask \
-             for access to Nida's folder first (Grant Access), and holds its show till that is \
-             answered"
+            !on || crate::presentation::pictures::folder()
+                .is_some_and(|folder| crate::presentation::pictures::given(&folder)),
+            "A PowerPoint talk is on, and PowerPoint has not saved slide pictures into Nida's \
+             folder before: make them once with no talk on — the first time PowerPoint may ask \
+             for access to the folder (Grant Access), and holds its show till that is answered"
         );
+        let mut asked = 0;
+        let mut not_open: Vec<String> = Vec::new();
         for path in paths {
             if self.presentations.making.contains(&path)
                 || crate::presentation::pictures::saved_for(&path).is_some()
             {
                 continue;
             }
-            let Some(out) = crate::presentation::pictures::pdf_for(&path) else {
+            // The file as it is on the disk now: what comes of it is kept
+            // for that file.
+            let Some((out, stamp)) = crate::presentation::pictures::pdf_and_file_for(&path)
+            else {
                 continue;
             };
+            // Asked for: whatever came of it before, by itself too again.
+            self.presentations.pictures.tried.remove(&path);
+            if on && !manager.holds_open(&path) {
+                not_open.push(
+                    path.file_name()
+                        .map_or_else(String::new, |f| f.to_string_lossy().into_owned()),
+                );
+                continue;
+            }
             manager.save_pdf(&path, &out);
+            self.presentations.pictures.asked.insert(path.clone(), (stamp, false));
             self.presentations.making.insert(path);
+            asked += 1;
         }
+        anyhow::ensure!(
+            asked > 0 || not_open.is_empty(),
+            "A PowerPoint talk is on, and PowerPoint does not have {} open: nothing is opened \
+             beside a show — the slide pictures are made once it is open (the talk on, the \
+             next, the one before), or with no talk on",
+            not_open.join(", ")
+        );
         Ok(())
     }
 
+    /// The decks of the PowerPoint talks there are, sorted, each once —
+    /// `by_themselves`: only those of the Slides inputs that make their
+    /// slide pictures by themselves (`SlidesSettings::make_pictures`).
+    fn slide_picture_decks(&self, by_themselves: bool) -> Vec<PathBuf> {
+        let mut decks: Vec<PathBuf> = Vec::new();
+        for slot in self.mixer.channels().iter().flat_map(|ch| &ch.decks) {
+            let Some(slides) = slot.deck.slides() else {
+                continue;
+            };
+            if by_themselves && !slides.settings().make_pictures {
+                continue;
+            }
+            for talk in slides.talks() {
+                if talk.kind() == Some(TalkKind::PowerPoint) {
+                    decks.push(PathBuf::from(&talk.path));
+                }
+            }
+            // The talk on as it was opened: given another file in the list
+            // since, it still plays that one.
+            for wanted in slides.wanted() {
+                if wanted.kind == TalkKind::PowerPoint {
+                    decks.push(PathBuf::from(wanted.path));
+                }
+            }
+        }
+        decks.sort();
+        decks.dedup();
+        decks
+    }
+
+    /// What came of the slide pictures tried is forgotten for each deck
+    /// no talk is of any more. At every look for pictures to make, and
+    /// before talks are added (`Self::edit_slides`,
+    /// `Self::add_slides_deck`), put back by undo or redo
+    /// (`Self::restore_history_snapshot`) or come with a layer pasted or
+    /// a preset loaded (`Self::restore_deck_at`): a talk taken out and
+    /// put back — between two looks too — is asked anew.
+    pub(crate) fn forget_slide_pictures_of_talks_gone(&mut self) {
+        if self.presentations.pictures.tried.is_empty() {
+            return;
+        }
+        let present = self.slide_picture_decks(false);
+        self.presentations
+            .pictures
+            .tried
+            .retain(|path, _| present.binary_search(path).is_ok());
+    }
+
+    /// The PowerPoint talks whose slide pictures are to be made by
+    /// themselves now, looked for twice a second: those of the Slides
+    /// inputs that have it so (`SlidesSettings::make_pictures`), without
+    /// pictures as their files are now — the files settled, PowerPoint not
+    /// saving them already, and not tried before as they are. None till
+    /// PowerPoint has saved into Nida's folder for them: the first time it
+    /// may ask for access to it (Grant Access) — left to Make, pressed when
+    /// that can be answered. All of it from what was last found
+    /// (`crate::file_facts`): the disk is not asked here.
+    fn slide_pictures_waiting(&mut self) -> Vec<Waiting> {
+        use crate::presentation::pictures;
+        let now = Instant::now();
+        let by = &mut self.presentations.pictures;
+        if !by.on
+            || by
+                .looked
+                .is_some_and(|at| now.duration_since(at) < PICTURES_EVERY)
+        {
+            return Vec::new();
+        }
+        by.looked = Some(now);
+        // What was tried is kept as long as a talk is of its deck, made by
+        // itself or not: an input told to leave its pictures to Make, and
+        // then to make them again, is not asked anew for what failed.
+        self.forget_slide_pictures_of_talks_gone();
+        // The decks whose pictures are made by themselves.
+        let paths = self.slide_picture_decks(true);
+        if paths.is_empty() || pictures::given_known() != Some(true) {
+            return Vec::new();
+        }
+        let by = &self.presentations.pictures;
+        let wall = std::time::SystemTime::now();
+        let mut waiting = Vec::new();
+        for path in paths {
+            if self.presentations.making.contains(&path) {
+                continue;
+            }
+            let Some((out, found)) = pictures::missing_known(&path) else {
+                continue;
+            };
+            // Changed a moment ago: it may still be being written.
+            if still_settling(found.modified, wall) {
+                continue;
+            }
+            let stamp = (found.len, found.modified);
+            if by
+                .tried
+                .get(&path)
+                .is_some_and(|(of, again)| *of == stamp && again.is_none_or(|at| now < at))
+            {
+                continue;
+            }
+            waiting.push(Waiting { path, out, stamp });
+        }
+        waiting
+    }
+
+    /// Ask PowerPoint for the slide pictures `waiting`. With no PowerPoint
+    /// show running: all of them — each deck opened for it and closed
+    /// again, a talk started meanwhile going before those left. With one
+    /// running: one deck, the talk on's first, and only one an input keeps
+    /// open in PowerPoint; none while a show is on its way up or PowerPoint
+    /// has another to save — the worker leaves it a while between two saves
+    /// beside a show.
+    fn ask_slide_pictures(&mut self, mut waiting: Vec<Waiting>) {
+        if waiting.is_empty() {
+            return;
+        }
+        let Some(manager) = self.presentations.manager.as_ref() else {
+            return;
+        };
+        let on = manager.any_showing();
+        if on {
+            if manager.any_starting() || !self.presentations.making.is_empty() {
+                return;
+            }
+            // The talk on first: its next slide is the one looked at now.
+            waiting.sort_by_key(|w| !manager.shows(&w.path));
+        }
+        for Waiting { path, out, stamp } in waiting {
+            if on && !manager.holds_open(&path) {
+                continue;
+            }
+            log::info!(
+                "Slide pictures of {}: asked of PowerPoint, by themselves",
+                path.display()
+            );
+            manager.save_pdf(&path, &out);
+            self.presentations.pictures.asked.insert(path.clone(), (stamp, true));
+            self.presentations.making.insert(path);
+            if on {
+                break;
+            }
+        }
+    }
+
     /// Take what PowerPoint made of the slide pictures asked: said when it
-    /// could not.
+    /// could not — but not of those asked by themselves that could only not
+    /// be made just then (a show on its way up, a deck not open beside a
+    /// show): they are asked again in a while. One that failed is not
+    /// asked again by itself, as its file is: said once.
     fn take_slide_pictures(&mut self) {
         let saved = self
             .presentations
@@ -1214,8 +1452,29 @@ impl VardaApp {
         // Said once for the decks that failed alike: a batch dropped is one
         // notice.
         let mut failed: Vec<(String, Vec<String>)> = Vec::new();
+        let now = Instant::now();
         for saved in saved {
             self.presentations.making.remove(&saved.path);
+            let by = &mut self.presentations.pictures;
+            // The file as it was when asked, and whether by itself.
+            let asked = by.asked.remove(&saved.path);
+            let by_itself = asked.is_some_and(|(_, by_itself)| by_itself);
+            // Made, or not just now: looked at again in a while — what is
+            // known of the files is a moment old, and a deck just made is
+            // not asked twice. Failed: not again by itself.
+            let later = match &saved.result {
+                Ok(()) => true,
+                Err(why) => crate::presentation::manager::not_now(why),
+            };
+            if let Some((stamp, _)) = asked {
+                by.tried.insert(
+                    saved.path.clone(),
+                    (stamp, later.then(|| now + PICTURES_AGAIN)),
+                );
+            }
+            if by_itself && later {
+                continue;
+            }
             if let Err(why) = saved.result {
                 let file = saved
                     .path
@@ -1273,6 +1532,24 @@ impl VardaApp {
         self.presentations.manager = Some(manager);
     }
 
+    /// Slide pictures made by themselves, or not: under a stand-in
+    /// PowerPoint they are not, unless a test asks.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn set_slide_pictures_by_themselves(&mut self, on: bool) {
+        self.presentations.pictures.on = on;
+    }
+
+    /// Every notice given so far, oldest first: for tests.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn notices(&self) -> Vec<String> {
+        self.session
+            .notifications
+            .history()
+            .iter()
+            .map(|n| n.message.clone())
+            .collect()
+    }
+
     /// The screens connected, as a test has them: read from macOS no more.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn set_presentation_screens(&mut self, screens: Vec<ScreenSpot>) {
@@ -1308,7 +1585,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(commands, 22);
+        assert_eq!(commands, 23);
     }
 
     /// Each screen a show can be told to play on, as the manual writes it.
@@ -1335,5 +1612,22 @@ mod tests {
             serde_json::to_string(&config).unwrap(),
             r#"{"path":"/Talks/talk.pptx"}"#
         );
+    }
+
+    /// A deck's file is left three seconds after it last changed before its
+    /// slide pictures are made by themselves; one with no time, or a time
+    /// ahead of the clock, is not waited for.
+    #[test]
+    fn a_decks_file_changed_a_moment_ago_is_still_settling() {
+        use std::time::{Duration, SystemTime};
+        let wall = SystemTime::now();
+        let ago = |ms: u64| Some(wall - Duration::from_millis(ms));
+        assert!(super::still_settling(ago(0), wall));
+        assert!(super::still_settling(ago(1500), wall));
+        assert!(super::still_settling(ago(2999), wall));
+        assert!(!super::still_settling(ago(3000), wall));
+        assert!(!super::still_settling(ago(60_000), wall));
+        assert!(!super::still_settling(None, wall));
+        assert!(!super::still_settling(Some(wall + Duration::from_secs(5)), wall));
     }
 }

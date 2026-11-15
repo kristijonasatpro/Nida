@@ -814,6 +814,9 @@ impl VardaApp {
         for h in releasing {
             self.release_held_resources(h);
         }
+        // Its captures as it saved them, not as the show before left those
+        // of the screens both capture.
+        self.run_captures_as_saved();
         // How the show counts frames and where it loops are
         // authored; where it was stopped is not, so the
         // position stays at zero and the arrangement stays
@@ -1385,6 +1388,10 @@ impl VardaApp {
         &mut self,
         snapshot: super::history::HistorySnapshot,
     ) -> super::history::HistoryRestore {
+        // A talk taken out and brought back by undo is asked anew for its
+        // slide pictures: what failed is forgotten for the decks no talk
+        // is of, before the lists are put back.
+        self.forget_slide_pictures_of_talks_gone();
         let rw = self.render_width;
         let rh = self.render_height;
         // Scene half — diff-apply (patches only what changed).

@@ -58,12 +58,17 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 fn read_texture(ctx: &GpuContext, tex: &wgpu::Texture) -> Vec<[f32; 4]> {
-    let unpadded = W * 8;
+    read_sized(ctx, tex, W, H)
+}
+
+/// `tex` (`Rgba16Float`, `w` × `h`) read back.
+fn read_sized(ctx: &GpuContext, tex: &wgpu::Texture, w: u32, h: u32) -> Vec<[f32; 4]> {
+    let unpadded = w * 8;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let padded = unpadded.div_ceil(align) * align;
     let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("broadcast looks readback"),
-        size: u64::from(padded * H),
+        size: u64::from(padded * h),
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -82,12 +87,12 @@ fn read_texture(ctx: &GpuContext, tex: &wgpu::Texture) -> Vec<[f32; 4]> {
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(padded),
-                rows_per_image: Some(H),
+                rows_per_image: Some(h),
             },
         },
         wgpu::Extent3d {
-            width: W,
-            height: H,
+            width: w,
+            height: h,
             depth_or_array_layers: 1,
         },
     );
@@ -103,15 +108,15 @@ fn read_texture(ctx: &GpuContext, tex: &wgpu::Texture) -> Vec<[f32; 4]> {
         })
         .ok();
     rx.recv().expect("map channel").expect("map ok");
-    let mut out = Vec::with_capacity((W * H) as usize);
+    let mut out = Vec::with_capacity((w * h) as usize);
     {
         let data = buffer.slice(..).get_mapped_range().expect("mapped");
         let channel = |px: usize, i: usize| {
             f16_to_f32(u16::from_le_bytes([data[px + i * 2], data[px + i * 2 + 1]]))
         };
-        for row in 0..H {
+        for row in 0..h {
             let base = (row * padded) as usize;
-            for col in 0..W {
+            for col in 0..w {
                 let px = base + (col as usize) * 8;
                 out.push([
                     channel(px, 0),
@@ -660,5 +665,113 @@ fn cost_of_each_look_at_4k() {
             .unwrap_or_default();
         let ms = time(Some(path));
         println!("{name}: {:.2} ms", (ms - base).max(0.0));
+    }
+}
+
+/// Each look drawn at 3840×2160 with its render size at Half and Quarter,
+/// against the same frame at Full: how far the picture moves and what each
+/// costs — a measurement, run by hand
+/// (`NIDA_SAVE_LOOKS=<dir> cargo test --test broadcast_looks -- --ignored
+/// --nocapture smaller_render_size`). With `NIDA_SAVE_LOOKS` it also writes a
+/// 960×540 crop from the middle of each, at the wall's own pixels.
+#[test]
+#[ignore = "a measurement"]
+fn each_look_at_a_smaller_render_size() {
+    use std::fmt::Write as _;
+    use varda::deck::DeckRenderScale;
+    const W4: u32 = 3840;
+    const H4: u32 = 2160;
+    const FRAMES: u32 = 20;
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let audio = AudioData::default();
+    let audio_values = AudioValues {
+        sources: std::collections::HashMap::default(),
+    };
+    let analyzer_values = AnalyzerValues::default();
+    let frame_at = |mixer: &mut Mixer| {
+        let inputs = varda::mixer::FrameInputs {
+            audio_data: &audio,
+            audio_values: &audio_values,
+            analyzer_values: &analyzer_values,
+            beat_time: None,
+            transport: None,
+            free_run_time: Some(1.0),
+        };
+        mixer.render(&ctx, &inputs, 60, &[]).expect("render");
+        ctx.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .ok();
+    };
+    let crop = |pixels: &[[f32; 4]], name: &str| {
+        let Some(dir) = std::env::var_os("NIDA_SAVE_LOOKS") else {
+            return;
+        };
+        let (cw, ch) = (960u32, 540u32);
+        let (x0, y0) = ((W4 - cw) / 2, (H4 - ch) / 2);
+        let mut img = image::RgbImage::new(cw, ch);
+        for y in 0..ch {
+            for x in 0..cw {
+                let px = pixels[((y0 + y) * W4 + x0 + x) as usize];
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let to8 = |c: f32| (srgb(c) * 255.0).round() as u8;
+                img.put_pixel(x, y, image::Rgb([to8(px[0]), to8(px[1]), to8(px[2])]));
+            }
+        }
+        img.save(Path::new(&dir).join(format!("{name}.png")))
+            .expect("save png");
+    };
+    for path in &looks() {
+        let name = path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let mut full: Vec<[f32; 4]> = Vec::new();
+        let mut line = format!("{name:28}");
+        for scale in DeckRenderScale::ALL {
+            let shader = ISFShader::from_file(path).expect("shader");
+            let mut deck = Deck::new(&ctx, shader, W4, H4).expect("deck");
+            deck.set_render_scale(&ctx, scale);
+            let mut mixer = Mixer::new(&ctx, W4, H4).expect("mixer");
+            mixer.set_tonemap_mode(&ctx.queue, TonemapMode::Bypass);
+            mixer.channel_mut(0).expect("a channel").add_deck(deck);
+            for _ in 0..3 {
+                frame_at(&mut mixer);
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..FRAMES {
+                frame_at(&mut mixer);
+            }
+            let ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(FRAMES);
+            let pixels = read_sized(&ctx, mixer.composite_texture(), W4, H4);
+            crop(&pixels, &format!("{name}_{scale:?}"));
+            if full.is_empty() {
+                full = pixels;
+                let _ = write!(line, "  Full {ms:5.2} ms");
+                continue;
+            }
+            let mut diffs: Vec<f32> = full
+                .iter()
+                .zip(&pixels)
+                .map(|(a, b)| (luma(*a) - luma(*b)).abs())
+                .collect();
+            let mean = diffs.iter().sum::<f32>() / diffs.len() as f32;
+            diffs.sort_unstable_by(f32::total_cmp);
+            let p999 = diffs[diffs.len() * 999 / 1000];
+            let worst = diffs[diffs.len() - 1];
+            let _ = write!(
+                line,
+                "  {scale:?} {ms:5.2} ms, mean {:.2}/255, 99.9% {:.1}/255, worst {:.1}/255",
+                mean * 255.0,
+                p999 * 255.0,
+                worst * 255.0
+            );
+        }
+        println!("{line}");
     }
 }

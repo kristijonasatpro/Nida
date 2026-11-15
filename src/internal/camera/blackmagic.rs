@@ -291,6 +291,19 @@ fn frames_coming(since_frame: Option<Duration>) -> bool {
     since_frame.is_some_and(|quiet| quiet < LOOK_EVERY)
 }
 
+/// How loudly a device without a signal is said to be looked for — on its
+/// next connection, or opened afresh: at `first` until that has been said
+/// once since a signal (`looked`), and after — every [`LOOK_EVERY`] until a
+/// signal comes — only when debugging (an UltraStudio with nothing plugged
+/// in wrote 12,000 such lines in a seven-hour show: an M5 Max, 2026-11-09).
+fn said_at(looked: bool, first: log::Level) -> log::Level {
+    if looked {
+        log::Level::Debug
+    } else {
+        first
+    }
+}
+
 /// The connection a device opened afresh is to be on: `remembered` — the
 /// one it had a signal on just before it stopped — else, no signal since it
 /// last moved (perhaps a box that sends no frames without one, its source
@@ -451,6 +464,8 @@ pub(super) fn run(
     let mut retry_at = started;
     // Since when it has had no signal on the connection it is on.
     let mut quiet_since: Option<Instant> = None;
+    // Whether the log has it that the device is looked for, since a signal
+    // (see `said_at`).
     let mut looked = false;
     // When it last switched connection; the one it last tried, and whether a
     // signal has come since; the one it found a signal on — set again when
@@ -484,7 +499,8 @@ pub(super) fn run(
                     let on = c.connection();
                     if let Some(next) = next_connection(&connections, on) {
                         if c.set_connection(next) {
-                            log::info!(
+                            log::log!(
+                                said_at(looked, log::Level::Info),
                                 "Camera '{name}': no signal on {} — looking on {}",
                                 on.map_or("its connection", Connection::label),
                                 next.label()
@@ -527,6 +543,8 @@ pub(super) fn run(
             if capture.take().is_some() {
                 log::info!("Camera '{name}' reset: opening it again");
             }
+            // Asked for: said in full again.
+            looked = false;
         }
         let lost = capture.as_ref().is_none_or(|c| {
             !c.alive()
@@ -539,8 +557,13 @@ pub(super) fn run(
         if !lost || now < retry_at {
             continue;
         }
+        // A device that sends no frames without a signal stalls, and is
+        // opened afresh, round after round until one comes: said the once.
         if capture.take().is_some() {
-            log::warn!("Camera '{name}' stopped: trying it again");
+            log::log!(
+                said_at(looked, log::Level::Warn),
+                "Camera '{name}' stopped: trying it again"
+            );
             sink.note_stop();
         }
         retry_at = now + RETRY_EVERY;
@@ -548,14 +571,19 @@ pub(super) fn run(
             Ok((c, rate, offered, on_offer)) => {
                 opened_code = rate.code;
                 rates = on_offer;
-                log::info!("Camera '{name}' is back, at {}", rate.label());
+                log::log!(
+                    said_at(looked, log::Level::Info),
+                    "Camera '{name}' is back, at {}",
+                    rate.label()
+                );
                 started = Instant::now();
                 quiet_since = None;
                 connections = offered;
                 let now_on = c.connection();
                 // No signal since it last moved: what it found before is no
                 // longer where the source is.
-                if !had_signal {
+                let quiet_round = !had_signal;
+                if quiet_round {
                     found_on = None;
                 }
                 let remembered = found_on;
@@ -572,16 +600,23 @@ pub(super) fn run(
                 if let Some(on) = to.filter(|on| Some(*on) != now_on) {
                     if c.set_connection(on) {
                         if keeping.is_none() && remembered.is_none() {
-                            log::info!(
+                            log::log!(
+                                said_at(looked, log::Level::Info),
                                 "Camera '{name}': no signal on {} — looking on {}",
                                 now_on.map_or("its connection", Connection::label),
                                 on.label()
                             );
+                            looked = true;
                         }
                         switched_at = Some(started);
                         last_tried = Some(on);
                         mark = signal.mark();
                     }
+                }
+                // A round without a signal, with or without another
+                // connection to look on: the next are not said again.
+                if quiet_round {
+                    looked = true;
                 }
                 capture = Some(c);
             }
@@ -701,6 +736,17 @@ mod tests {
         assert!(frames_coming(Some(Duration::from_millis(20))));
         assert!(!frames_coming(Some(LOOK_EVERY)));
         assert!(!frames_coming(None));
+    }
+
+    /// A device without a signal goes round its connections — or is opened
+    /// afresh — every two seconds: only the first time is written to the
+    /// log, each line as loudly as it is said.
+    #[test]
+    fn only_the_first_look_for_a_signal_is_logged() {
+        assert_eq!(said_at(false, log::Level::Info), log::Level::Info);
+        assert_eq!(said_at(false, log::Level::Warn), log::Level::Warn);
+        assert_eq!(said_at(true, log::Level::Info), log::Level::Debug);
+        assert_eq!(said_at(true, log::Level::Warn), log::Level::Debug);
     }
 
     /// Opened afresh, a device goes back to the connection it had a signal

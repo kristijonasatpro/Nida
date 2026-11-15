@@ -4297,4 +4297,47 @@ mod tests {
             "{sent:?}"
         );
     }
+
+    /// The screen or window a capture layer is pointed at is the body's: a
+    /// display by its name, with its identity when given, a window by its
+    /// app and title. A body with no target never reaches the engine.
+    #[tokio::test]
+    async fn a_captures_screen_or_window_is_picked_from_the_body() {
+        use crate::engine::EngineCommand as C;
+        use crate::scene::CaptureTargetConfig as T;
+        for (body, picked) in [
+            (
+                serde_json::json!({"target": {"kind": "display", "name": "Display 2"}}),
+                T::Display { name: "Display 2".into(), uuid: None },
+            ),
+            (
+                serde_json::json!({"target": {"kind": "display", "name": "Display 2", "uuid": "4k"}}),
+                T::Display { name: "Display 2".into(), uuid: Some("4k".into()) },
+            ),
+            (
+                serde_json::json!({"target": {"kind": "window", "app": "com.apple.Keynote", "title": "Opening"}}),
+                T::Window { app: "com.apple.Keynote".into(), title: "Opening".into() },
+            ),
+        ] {
+            let (app, sent) = router_recording_commands();
+            let (status, json) = put_json(app, "/api/decks/layer1/screen/target", body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            let sent = sent.lock().unwrap();
+            assert!(
+                matches!(&sent[..], [C::SetScreenCaptureTarget { deck_uuid, target }]
+                    if deck_uuid == "layer1" && *target == picked),
+                "{body}: {sent:?}"
+            );
+        }
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"target": {"kind": "display"}}),
+            serde_json::json!({"target": {"kind": "screen", "name": "Display 2"}}),
+        ] {
+            let (app, sent) = router_recording_commands();
+            let (status, _) = put_json(app, "/api/decks/layer1/screen/target", body.clone()).await;
+            assert!(status.is_client_error(), "{body}: {status}");
+            assert!(sent.lock().unwrap().is_empty(), "{body}");
+        }
+    }
 }

@@ -15,6 +15,8 @@ use crate::engine::value::lower_third::{
 use crate::renderer::GpuContext;
 use wgpu::util::DeviceExt as _;
 
+use super::Stand;
+
 thread_local! {
     /// Set while an Undo — not a Redo — restores the show (see
     /// [`LowerThird::restore_settings`]).
@@ -162,6 +164,9 @@ struct Picture {
     at: (f32, f32),
     bind_group: wgpu::BindGroup,
     params: wgpu::Buffer,
+    /// Which drawing it is: another number each one put on the GPU (see
+    /// `LowerThird::still`).
+    serial: u64,
 }
 
 /// Where and how far a drawing shows this frame (WGSL `Params`). A text
@@ -644,6 +649,46 @@ impl LowerThird {
         self.air != Air::Off
     }
 
+    /// Off, or waiting for its drawing before it comes in: its frame is
+    /// clear, and stays so until `show` — or, waiting, until a `tick` has
+    /// the drawing — so its channel need not be drawn (see
+    /// `Channel::blank`). By its state, not the time: a frame anything of it
+    /// could show in is never taken for a clear one.
+    pub fn is_off(&self) -> bool {
+        matches!(self.air, Air::Off | Air::In { since: None })
+    }
+
+    /// What its frame shows while it stands still; none while it comes in
+    /// or goes out. Off, or waiting for its drawing: clear. On air: its
+    /// drawing as placed — exactly what `render` draws, which then is the
+    /// same every frame, so its deck keeps the frame it has (see
+    /// `Deck::still_frame`). By its state, like `is_off`: a `tick` alone
+    /// moves it on, before the frame is drawn.
+    pub(super) fn still(&self) -> Option<Stand> {
+        match self.air {
+            Air::Off | Air::In { since: None } => Some(Stand::Clear),
+            Air::In { since: Some(_) } | Air::Out { .. } => None,
+            Air::On { .. } => {
+                let main = self
+                    .main_frame
+                    .and_then(|frame| self.variants.iter().find(|v| v.spec.frame == frame));
+                let Some(Variant {
+                    spec,
+                    picture: Some(picture),
+                }) = main
+                else {
+                    return Some(Stand::Clear);
+                };
+                // On air nothing of this depends on the time.
+                let placed = self.params_of(picture, spec.frame, Instant::now());
+                Some(placed.map_or(Stand::Clear, |params| Stand::Drawing {
+                    serial: picture.serial,
+                    placed: bytemuck::bytes_of(&params).to_vec(),
+                }))
+            }
+        }
+    }
+
     /// Where the words on air are in the list, if they are: the same of the
     /// rows with those words as it was shown from (else the last of them).
     pub fn row_on_air(&self) -> Option<usize> {
@@ -1001,6 +1046,7 @@ impl LowerThird {
                     .placer
                     .bind(&self.context.device, &plate, &text, &params),
                 params,
+                serial: super::next_drawing(),
             }
         });
         match self.variants.iter_mut().find(|v| v.spec.frame == frame) {
@@ -3284,5 +3330,86 @@ mod tests {
             "",
             crate::engine::value::lower_third::LITHUANIAN_LETTERS
         ));
+    }
+
+    /// Off (`is_off`) is off, or waiting for its drawing before it comes in:
+    /// its frame clear either way, and the input holding it left undrawn
+    /// (`Channel::blank`). Coming in, on, and going out (another to come in
+    /// or none), something of it shows.
+    #[test]
+    fn off_is_off_or_waiting_for_its_drawing() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            return;
+        };
+        let mut lower =
+            LowerThird::new(&gpu, LowerThirdSettings::default(), (1920, 1080)).expect("made");
+        let now = Instant::now();
+        let next = (LowerThirdRow::default(), 0);
+        for (air, off) in [
+            (Air::Off, true),
+            (Air::In { since: None }, true),
+            (Air::In { since: Some(now) }, false),
+            (Air::On { since: now }, false),
+            (Air::Out { since: now, then: None }, false),
+            (
+                Air::Out {
+                    since: now,
+                    then: Some(next),
+                },
+                false,
+            ),
+        ] {
+            let what = format!("{air:?}");
+            lower.air = air;
+            assert_eq!(lower.is_off(), off, "{what}");
+        }
+    }
+
+    /// What stands still (`still`): clear, off or waiting for its drawing;
+    /// none coming in or going out; on air its drawing as placed — the same
+    /// from frame to frame, another when it is placed otherwise or drawn
+    /// again.
+    #[test]
+    fn a_lower_third_standing_still_is_its_drawing_as_placed() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            return;
+        };
+        let fonts = super::super::svg::system_fonts();
+        let settings = LowerThirdSettings {
+            rows: vec![spec("Ana", "Pirmoji").row],
+            ..LowerThirdSettings::default()
+        };
+        let mut lower = LowerThird::new(&gpu, settings, (1920, 1080)).expect("made");
+        assert_eq!(lower.still(), Some(Stand::Clear), "off");
+        lower.show(Some(0));
+        assert_eq!(lower.still(), Some(Stand::Clear), "waiting for its drawing");
+        let on = lower.wanted().first().cloned().expect("wanted");
+        lower.came_back(on.clone(), draw(&on, &fonts));
+        let now = Instant::now();
+        lower.air = Air::In { since: Some(now) };
+        assert_eq!(lower.still(), None, "coming in");
+        lower.air = Air::Out { since: now, then: None };
+        assert_eq!(lower.still(), None, "going out");
+        lower.air = Air::On { since: now };
+        let stands = lower.still();
+        assert!(matches!(stands, Some(Stand::Drawing { .. })), "{stands:?}");
+        assert_eq!(lower.still(), stands, "the same from frame to frame");
+        // Placed otherwise: the drawing it has, to its shader other numbers.
+        let mut right = lower.settings().clone();
+        right.look.place = LowerThirdPlace::LowerRight;
+        lower.set_settings(right);
+        let placed = lower.still();
+        assert!(matches!(placed, Some(Stand::Drawing { .. })), "{placed:?}");
+        assert_ne!(placed, stands, "placed otherwise");
+        // Its drawing for the new place, and that drawn once more: placed
+        // the same, another drawing.
+        let again = lower.wanted().first().cloned().expect("wanted");
+        lower.came_back(again.clone(), draw(&again, &fonts));
+        let redrawn = lower.still();
+        assert!(matches!(redrawn, Some(Stand::Drawing { .. })), "{redrawn:?}");
+        assert_ne!(redrawn, placed, "its drawing for the new place");
+        let once_more = draw(&again, &fonts);
+        lower.put(again, once_more);
+        assert_ne!(lower.still(), redrawn, "another drawing, placed the same");
     }
 }

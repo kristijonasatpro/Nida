@@ -33,6 +33,12 @@ pub const WALK_TIMEOUT: Duration = Duration::from_secs(70);
 /// folder (Grant Access), which waits on the user.
 pub const SAVE_PDF_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long it may take with a show of PowerPoint's running: PowerPoint
+/// answers nothing else while it saves — a step of the show waits — and a
+/// save takes a second or two (measured: 0.3 to 1.8 s, a 135 MB deck too).
+/// Longer than this, it is asking for the folder, or stuck.
+pub const SAVE_PDF_WITH_SHOW_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Why PowerPoint did not do what it was told.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ScriptError {
@@ -639,15 +645,25 @@ impl<R: Runner> PowerPoint<R> {
     /// `out` — every slide a page, as it looks once its builds are done.
     /// The deck itself is left as it was. PowerPoint, sandboxed, asks once
     /// for `out`'s folder (Grant Access): it holds everything else it does
-    /// till the user answers.
+    /// till the user answers. `with_show`: saved with a slide show running
+    /// too (PowerPoint does, the show staying as it is — tried, 16.114),
+    /// and given less time; else [`ScriptError::Showing`] with one running.
     ///
     /// # Errors
     ///
     /// As for every command (see [`PowerPoint`]); [`ScriptError::TimedOut`]
-    /// when it took longer than [`SAVE_PDF_TIMEOUT`] — PowerPoint asking,
+    /// when it took longer than [`SAVE_PDF_TIMEOUT`]
+    /// ([`SAVE_PDF_WITH_SHOW_TIMEOUT`] with a show) — PowerPoint asking,
     /// unanswered.
-    pub fn save_pdf(&self, path: &Path, out: &Path) -> Result<(), ScriptError> {
-        let reply = self.runner.run(&scripts::save_pdf(path, out), SAVE_PDF_TIMEOUT)?;
+    pub fn save_pdf(&self, path: &Path, out: &Path, with_show: bool) -> Result<(), ScriptError> {
+        let timeout = if with_show {
+            SAVE_PDF_WITH_SHOW_TIMEOUT
+        } else {
+            SAVE_PDF_TIMEOUT
+        };
+        let reply = self
+            .runner
+            .run(&scripts::save_pdf(path, out, with_show), timeout)?;
         match reply.trim() {
             "saved" => Ok(()),
             "showing" => Err(ScriptError::Showing),
@@ -1046,15 +1062,20 @@ end findPres
 
     /// Save the deck as a PDF at `out`, and answer `saved`: given as long
     /// as PowerPoint takes, within the command's own timeout. Not with a
-    /// slide show running, of any deck: `showing` then.
+    /// slide show running, of any deck: `showing` then — unless
+    /// `with_show`, which asks nothing first and gives it 15 seconds.
     #[must_use]
-    pub fn save_pdf(path: &Path, out: &Path) -> String {
+    pub fn save_pdf(path: &Path, out: &Path, with_show: bool) -> String {
         let out = literal(&out.to_string_lossy());
+        let (asks, secs) = if with_show {
+            ("", 15)
+        } else {
+            ("if (count of slide show windows) > 0 then return \"showing\"\n", 110)
+        };
         with_deck(
             path,
             &format!(
-                "if (count of slide show windows) > 0 then return \"showing\"
-                 with timeout of 110 seconds
+                "{asks}with timeout of {secs} seconds
                  	save thePres in (POSIX file {out}) as save as PDF
                  end timeout
                  return \"saved\""
@@ -1583,15 +1604,32 @@ mod tests {
 
     /// A save asks PowerPoint for its slide shows first — any deck's — and
     /// saves only with none: its question (Grant Access) would hold one.
-    /// The count alone starts nothing and reads as a number.
+    /// One meant to be made with a show running asks nothing first, and is
+    /// given less time. The count alone starts nothing and reads as a
+    /// number.
     #[test]
-    fn a_pdf_is_saved_only_with_no_slide_show_running() {
-        let script = scripts::save_pdf(Path::new("/Talks/a.pptx"), Path::new("/P/a.saving.pdf"));
-        let asks = script
-            .find("if (count of slide show windows) > 0 then return \"showing\"")
-            .expect("asks first");
-        let saves = script.find("save thePres in (POSIX file \"/P/a.saving.pdf\") as save as PDF");
-        assert!(saves.is_some_and(|at| at > asks), "{script}");
+    fn a_pdf_is_saved_with_a_slide_show_running_only_when_meant() {
+        let (deck, out) = (Path::new("/Talks/a.pptx"), Path::new("/P/a.saving.pdf"));
+        let guard = "if (count of slide show windows) > 0 then return \"showing\"";
+        let save = "save thePres in (POSIX file \"/P/a.saving.pdf\") as save as PDF";
+        let script = scripts::save_pdf(deck, out, false);
+        let asks = script.find(guard).expect("asks first");
+        assert!(script.find(save).is_some_and(|at| at > asks), "{script}");
+        assert!(script.contains("with timeout of 110 seconds"), "{script}");
+        let script = scripts::save_pdf(deck, out, true);
+        assert!(!script.contains("return \"showing\""), "{script}");
+        assert!(script.contains(save), "{script}");
+        assert!(script.contains("with timeout of 15 seconds"), "{script}");
+        // Each given its own time: the runner's is longer than the script's.
+        let times = Times::default();
+        let ppt = PowerPoint::new(times.clone());
+        ppt.save_pdf(deck, out, false).unwrap();
+        ppt.save_pdf(deck, out, true).unwrap();
+        assert_eq!(
+            times.taken(),
+            vec![SAVE_PDF_TIMEOUT, SAVE_PDF_WITH_SHOW_TIMEOUT]
+        );
+        assert!(SAVE_PDF_WITH_SHOW_TIMEOUT > Duration::from_secs(15));
 
         let count = scripts::slide_shows();
         assert!(count.starts_with(&format!(
@@ -1603,9 +1641,35 @@ mod tests {
             assert_eq!(ppt.slide_shows().ok(), read, "{reply}");
         }
         assert!(matches!(
-            PowerPoint::new(Replies("showing")).save_pdf(Path::new("/a.pptx"), Path::new("/a.pdf")),
+            PowerPoint::new(Replies("showing")).save_pdf(
+                Path::new("/a.pptx"),
+                Path::new("/a.pdf"),
+                false
+            ),
             Err(ScriptError::Showing)
         ));
+    }
+
+    /// A runner that answers every script `saved`, and keeps the time each
+    /// was given.
+    #[derive(Clone, Default)]
+    struct Times(std::sync::Arc<std::sync::Mutex<Vec<Duration>>>);
+
+    impl Times {
+        fn taken(&self) -> Vec<Duration> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Runner for Times {
+        fn run(&self, _script: &str, timeout: Duration) -> Result<String, ScriptError> {
+            self.0.lock().unwrap().push(timeout);
+            Ok("saved".into())
+        }
+
+        fn open(&self, _path: &Path) -> Result<(), ScriptError> {
+            Ok(())
+        }
     }
 
     /// A runner that answers every script with the same reply.

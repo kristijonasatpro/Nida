@@ -145,6 +145,20 @@ pub struct SlidesSettings {
     /// docs/26-presentations.md, "Which screen it plays on").
     #[serde(default, skip_serializing_if = "PlaysOn::is_auto")]
     pub plays_on: PlaysOn,
+    /// The slide pictures of its PowerPoint talks — the presenter view's
+    /// next slide — are made by themselves as talks are added, once
+    /// PowerPoint has made some when asked (Make).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub make_pictures: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 fn cut() -> PlaylistTransition {
@@ -164,6 +178,7 @@ impl Default for SlidesSettings {
             transition: cut(),
             transition_secs: default_transition_secs(),
             plays_on: PlaysOn::Auto,
+            make_pictures: true,
         }
     }
 }
@@ -296,6 +311,11 @@ pub struct SlidesSnapshot {
     /// Its PowerPoint talks PowerPoint is saving as slide pictures now.
     #[serde(skip_serializing_if = "is_zero")]
     pub making_pictures: usize,
+    /// PowerPoint has saved slide pictures into Nida's folder before: from
+    /// now on they can be made with a PowerPoint talk on too, and are made
+    /// by themselves (`settings.make_pictures`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pictures_given: bool,
 }
 
 // Serde hands the field by reference.
@@ -368,6 +388,18 @@ mod tests {
         assert_eq!(serde_json::from_str::<Talk>(&json).unwrap(), talk);
         let s: SlidesSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(s, SlidesSettings::default());
+        // Slide pictures made by themselves: so unless switched off, and
+        // only the switch off is written.
+        assert!(s.make_pictures);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("make_pictures"), "{json}");
+        let off = SlidesSettings {
+            make_pictures: false,
+            ..SlidesSettings::default()
+        };
+        let json = serde_json::to_string(&off).unwrap();
+        assert!(json.contains(r#""make_pictures":false"#), "{json}");
+        assert_eq!(serde_json::from_str::<SlidesSettings>(&json).unwrap(), off);
         let to: TalkRef = serde_json::from_str(r#"{"id":"a1b2c3d4"}"#).unwrap();
         assert_eq!(to, TalkRef::Id("a1b2c3d4".into()));
         let to: TalkRef = serde_json::from_str(r#""next""#).unwrap();

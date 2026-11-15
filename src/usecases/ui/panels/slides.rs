@@ -599,7 +599,7 @@ fn next_box(ui: &mut egui::Ui, data: &UIData, input: Input<'_>, actions: &mut UI
 }
 
 /// ◀ ▶, black and white — what a clicker does — and back to the first slide,
-/// for the talk on.
+/// for the talk on; and its end.
 fn render_moves(
     ui: &mut egui::Ui,
     input: Input<'_>,
@@ -648,6 +648,23 @@ fn render_moves(
                     screen: which,
                 });
             }
+        }
+        // Apart from what is pressed all through a talk. Never greyed out:
+        // a talk being started that is not in the list (a saved show's) is
+        // not told here, and is ended all the same.
+        ui.add_space(8.0);
+        if ui
+            .add(egui::Button::new("End talk").min_size(egui::vec2(0.0, size.y)))
+            .on_hover_text(
+                "End the talk on: nothing on, PowerPoint's show of it ended and the deck Nida \
+                 opened closed — and it does not come back. The talk stays in the list, where \
+                 it was left: Previous talk starts it again",
+            )
+            .clicked()
+        {
+            actions.commands.push(EngineCommand::StopTalk {
+                deck_uuid: Some(deck.clone()),
+            });
         }
     });
 }
@@ -755,10 +772,11 @@ fn render_settings(ui: &mut egui::Ui, input: Input<'_>, actions: &mut UIActions)
 }
 
 /// PowerPoint talks' slides saved as pictures, for the presenter view's
-/// next slide: how many have them, and the button that has PowerPoint save
-/// the rest — not while a PowerPoint talk is on, as PowerPoint may ask for
-/// access first and holds its show till answered. Only with PowerPoint
-/// talks in the list.
+/// next slide: how many have them, the button that has PowerPoint save the
+/// rest, and whether they are made by themselves. With a PowerPoint talk on
+/// the button waits for PowerPoint to have saved into Nida's folder once:
+/// the first time it may ask for access, and holds its show till answered.
+/// Only with PowerPoint talks in the list.
 fn render_pictures(ui: &mut egui::Ui, input: Input<'_>, actions: &mut UIActions) {
     let s = input.slides;
     let decks: Vec<&TalkSnapshot> = s
@@ -777,7 +795,8 @@ fn render_pictures(ui: &mut egui::Ui, input: Input<'_>, actions: &mut UIActions)
         .is_some_and(|t| t.kind == Some(TalkKind::PowerPoint));
     ui.horizontal_wrapped(|ui| {
         ui.label("Slide pictures");
-        let can = !on && s.making_pictures == 0 && with < decks.len();
+        let first = on && !s.pictures_given;
+        let can = !first && s.making_pictures == 0 && with < decks.len();
         let button = ui
             .add_enabled(can, egui::Button::new("Make"))
             .on_hover_text(
@@ -785,9 +804,9 @@ fn render_pictures(ui: &mut egui::Ui, input: Input<'_>, actions: &mut UIActions)
                  view shows the next slide. The first time, PowerPoint asks for access to \
                  Nida's folder for them: click Grant Access there.",
             )
-            .on_disabled_hover_text(if on {
-                "With no PowerPoint talk on: PowerPoint may ask for access first, and holds its \
-                 show till that is answered"
+            .on_disabled_hover_text(if first {
+                "The first time with no PowerPoint talk on: PowerPoint may ask for access to \
+                 Nida's folder, and holds its show till that is answered"
             } else if s.making_pictures > 0 {
                 "PowerPoint is making them"
             } else {
@@ -798,12 +817,34 @@ fn render_pictures(ui: &mut egui::Ui, input: Input<'_>, actions: &mut UIActions)
                 deck_uuid: Some(input.deck.uuid.clone()),
             });
         }
+        let mut by_themselves = s.settings.make_pictures;
+        if ui
+            .checkbox(&mut by_themselves, "by themselves")
+            .on_hover_text(
+                "Made as PowerPoint talks are added, with nothing pressed — once Make has been \
+                 pressed a first time. Beside a PowerPoint talk on: only the decks PowerPoint \
+                 has open (the talk on, the next, the one before), one at a time; a step asked \
+                 meanwhile waits a moment for it",
+            )
+            .changed()
+        {
+            actions.commands.push(EngineCommand::SetSlidesSettings {
+                deck_uuid: input.deck.uuid.clone(),
+                settings: SlidesSettings {
+                    make_pictures: by_themselves,
+                    ..s.settings.clone()
+                },
+            });
+        }
         let said = if s.making_pictures > 0 {
             format!("making {}… ({with} of {} done)", s.making_pictures, decks.len())
         } else {
             format!("{with} of {} PowerPoint talks", decks.len())
         };
         ui.label(egui::RichText::new(said).small().weak());
+        if s.settings.make_pictures && !s.pictures_given {
+            ui.label(egui::RichText::new("press Make the first time").small().weak());
+        }
     });
 }
 
@@ -1417,6 +1458,7 @@ mod tests {
             previous: None,
             talk_secs: Some(65.0),
             making_pictures: 0,
+            pictures_given: false,
         });
         data.channels[0].on_air = Some("Main".into());
         data.keymap_bindings = crate::keymap::KeymapStore::defaults();
@@ -1458,12 +1500,52 @@ mod tests {
         );
     }
 
-    /// PowerPoint talks: a row says how many have their slides as pictures,
-    /// and Make asks for the rest — not while a PowerPoint talk is on (it
-    /// would hold the show), nor with every one made. No PowerPoint talks,
-    /// no row.
+    /// End talk ends the talk on, or one being started — and is to be
+    /// pressed with neither told: a saved show's talk out of the list,
+    /// being started, is ended by it too.
     #[test]
-    fn slide_pictures_are_asked_from_their_row_with_no_powerpoint_talk_on() {
+    fn end_talk_ends_the_talk_on_or_being_started() {
+        let mut data = with_slides();
+        let deck = data.channels[0].decks[0].uuid.clone();
+        let end = |data: &UIData| {
+            let mut harness = harness(data);
+            harness.run_steps(2);
+            let enabled = !harness
+                .get_by_label("End talk")
+                .accesskit_node()
+                .is_disabled();
+            if enabled {
+                harness.get_by_label("End talk").click();
+                harness.run_steps(2);
+            }
+            (enabled, sent(&harness))
+        };
+        let asked = format!("[StopTalk {{ deck_uuid: Some({deck:?}) }}]");
+        assert_eq!(end(&data), (true, asked.clone()));
+        // Nothing on, one being started: ended as well.
+        if let Some(s) = data.channels[0].decks[0].slides.as_mut() {
+            s.live = None;
+            s.on = None;
+            s.talk_secs = None;
+            s.talks[0].state = TalkState::Starting;
+            s.starting = Some(0);
+        }
+        assert_eq!(end(&data), (true, asked.clone()));
+        // Neither told: asked all the same (it does nothing with none).
+        if let Some(s) = data.channels[0].decks[0].slides.as_mut() {
+            s.talks[0].state = TalkState::Waiting;
+            s.starting = None;
+        }
+        assert_eq!(end(&data), (true, asked));
+    }
+
+    /// PowerPoint talks: a row says how many have their slides as pictures,
+    /// and Make asks for the rest — with a PowerPoint talk on only once
+    /// PowerPoint has saved into Nida's folder (the first time it may ask,
+    /// and would hold the show), and not with every one made. A box has
+    /// them made by themselves, or not. No PowerPoint talks, no row.
+    #[test]
+    fn slide_pictures_are_asked_from_their_row_and_made_by_themselves() {
         let mut data = with_slides();
         let deck = data.channels[0].decks[0].uuid.clone();
         let make = |data: &UIData| {
@@ -1485,12 +1567,54 @@ mod tests {
         if let Some(s) = data.channels[0].decks[0].slides.as_mut() {
             s.talks.push(talk("t4", "Closing", TalkKind::PowerPoint, TalkState::Ready));
         }
-        // The keynote — PowerPoint — on: not now.
+        // The keynote — PowerPoint — on, PowerPoint never having saved into
+        // the folder: not now, and said.
         let (shown, enabled, sent_now) = make(&data);
         assert_eq!(shown.as_deref(), Some("0 of 2 PowerPoint talks"));
         assert_eq!(enabled, Some(false));
         assert!(!sent_now.contains("MakeSlidePictures"), "{sent_now}");
-        // Nothing on: asked, of this Slides input.
+        {
+            let mut harness = harness(&data);
+            harness.run_steps(2);
+            harness.get_by_label("press Make the first time");
+        }
+        // Saved into before: asked with the talk on, of this Slides input.
+        if let Some(s) = data.channels[0].decks[0].slides.as_mut() {
+            s.pictures_given = true;
+        }
+        let (shown, enabled, sent_now) = make(&data);
+        assert_eq!(shown.as_deref(), Some("0 of 2 PowerPoint talks"));
+        assert_eq!(enabled, Some(true));
+        assert_eq!(
+            sent_now,
+            format!("[MakeSlidePictures {{ deck_uuid: Some({deck:?}) }}]")
+        );
+        {
+            let mut harness = harness(&data);
+            harness.run_steps(2);
+            assert!(harness.query_by_label("press Make the first time").is_none());
+            // By themselves, as a list comes: the box takes it off.
+            harness.get_by_label("by themselves").click();
+            harness.run_steps(2);
+            let sent_now = sent(&harness);
+            assert!(
+                sent_now.starts_with("[SetSlidesSettings {")
+                    && sent_now.contains(&format!("deck_uuid: {deck:?}"))
+                    && sent_now.contains("make_pictures: false"),
+                "{sent_now}"
+            );
+        }
+        // Off, and never saved into: nothing is said of a first time.
+        if let Some(s) = data.channels[0].decks[0].slides.as_mut() {
+            s.pictures_given = false;
+            s.settings.make_pictures = false;
+        }
+        {
+            let mut harness = harness(&data);
+            harness.run_steps(2);
+            assert!(harness.query_by_label("press Make the first time").is_none());
+        }
+        // Nothing on, never saved into: asked, of this Slides input.
         if let Some(s) = data.channels[0].decks[0].slides.as_mut() {
             s.live = None;
             s.on = None;
@@ -1514,8 +1638,9 @@ mod tests {
     }
 
     /// A panel narrower than a talk's long name: each row keeps its buttons
-    /// and how it stands in sight — the name cut short — and ◀ ▶, Black and
-    /// White, + Presenter view and Check again stay in sight too.
+    /// and how it stands in sight — the name cut short — and ◀ ▶, Black,
+    /// White and End talk, + Presenter view and Check again stay in sight
+    /// too.
     #[test]
     fn a_narrow_panel_hides_no_button() {
         let mut data = with_slides();
@@ -1542,7 +1667,15 @@ mod tests {
             for rect in starts {
                 assert!(inside(rect), "▶ at {rect:?} in a panel {width} wide");
             }
-            for label in ["⏮", "⚠ check", "Black", "White", "+ Presenter view", "Check again"] {
+            for label in [
+                "⏮",
+                "⚠ check",
+                "Black",
+                "White",
+                "End talk",
+                "+ Presenter view",
+                "Check again",
+            ] {
                 let rect = harness.get_by_label(label).rect();
                 assert!(inside(rect), "{label} at {rect:?} in a panel {width} wide");
             }

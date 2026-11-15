@@ -279,12 +279,16 @@ pub struct AddDepthSensorDeckBody {
 
 /// Capture target in handle-free form. Either `{"kind":"display","name":"..."}`
 /// or `{"kind":"window","app":"...","title":"..."}` — matched against the last
-/// enumeration, so call `POST /api/devices/screen/scan` first if unsure.
+/// enumeration, so call `POST /api/devices/screen/scan` first if unsure. A
+/// display's `uuid`, as the scan lists it, picks that screen whatever number
+/// it is listed under.
 #[derive(Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScreenCaptureTargetBody {
     Display {
         name: String,
+        #[serde(default)]
+        uuid: Option<String>,
     },
     Window {
         app: String,
@@ -296,7 +300,7 @@ pub enum ScreenCaptureTargetBody {
 impl From<ScreenCaptureTargetBody> for crate::scene::CaptureTargetConfig {
     fn from(b: ScreenCaptureTargetBody) -> Self {
         match b {
-            ScreenCaptureTargetBody::Display { name } => Self::Display { name },
+            ScreenCaptureTargetBody::Display { name, uuid } => Self::Display { name, uuid },
             ScreenCaptureTargetBody::Window { app, title } => Self::Window { app, title },
         }
     }
@@ -310,6 +314,9 @@ pub struct ScreenCaptureCropBody {
     pub h: f32,
 }
 
+/// A screen or window another layer captures already is shared with it as
+/// it runs: the rate, crop and cursor asked here are those of a capture
+/// opened new.
 #[derive(Deserialize, ToSchema)]
 pub struct AddScreenCaptureDeckBody {
     pub target: ScreenCaptureTargetBody,
@@ -347,6 +354,11 @@ impl From<TapSourceBody> for crate::scene::TapSourceConfig {
 #[derive(Deserialize, ToSchema)]
 pub struct TapSourceRequestBody {
     pub source: TapSourceBody,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct ScreenCaptureTargetRequestBody {
+    pub target: ScreenCaptureTargetBody,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -534,6 +546,30 @@ pub async fn set_tap_source(
         .send_command(EngineCommand::SetTapSource {
             deck_uuid,
             source: body.source.into(),
+        })
+        .await
+    {
+        Ok(r) => command_response(r),
+        Err(msg) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+    }
+}
+
+/// Point a screen capture layer at another screen or window, or at its own
+/// picked again; its rate, crop and cursor are kept — or, of a screen or
+/// window another layer captures already, taken from that capture, which
+/// the layers of one screen or window share. A display is kept by
+/// its own identity from then on — one a show saved by its name alone
+/// (before 0.9.9) goes by that name, whichever screen has it, until picked.
+#[utoipa::path(put, path = "/api/decks/{deck_uuid}/screen/target", params(("deck_uuid" = String, Path, description = "Deck UUID")), request_body = ScreenCaptureTargetRequestBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "Not a screen capture layer, or no capture target matches"), (status = 404, description = "Deck not found")), tag = "Screen Capture")]
+pub async fn set_screen_capture_target(
+    State(state): State<SharedState>,
+    Path(deck_uuid): Path<String>,
+    Json(body): Json<ScreenCaptureTargetRequestBody>,
+) -> impl IntoResponse {
+    match state
+        .send_command(EngineCommand::SetScreenCaptureTarget {
+            deck_uuid,
+            target: body.target.into(),
         })
         .await
     {

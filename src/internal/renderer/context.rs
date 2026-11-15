@@ -495,6 +495,16 @@ impl GpuContext {
         (required_features, timestamp_supported)
     }
 
+    /// Whether this GPU makes a texture that is read in a second format
+    /// beside its own — a capture's, read as its light and as its code
+    /// values (see `ScreenCaptureManager::on_gpu`). OpenGL ES makes none.
+    pub fn reads_a_texture_two_ways(&self) -> bool {
+        self.adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::VIEW_FORMATS)
+    }
+
     /// Create a headless GPU context (no window surface).
     ///
     /// Requests the same optional features as the windowed path (notably
@@ -2555,9 +2565,12 @@ impl HeadlessOutput {
     ///
     /// `fps` is the master render rate, used by NDI to declare its frame rate.
     /// ffmpeg targets already fixed theirs at spawn.
+    ///
+    /// The frame is taken whole: NDI's sender keeps it for its own thread,
+    /// with no copy of it made here.
     pub fn deliver_frame(
         &mut self,
-        frame_data: &[u8],
+        frame: super::ReadbackFrame,
         ndi_manager: &mut crate::ndi::NdiManager,
         fps: u32,
     ) -> DeliveryResult {
@@ -2567,7 +2580,7 @@ impl HeadlessOutput {
             | OutputTarget::DashStream { .. }
             | OutputTarget::RtmpStream { .. } => {
                 if let Some(sub) = &mut self.subprocess {
-                    if !sub.feed_frame(frame_data) {
+                    if !sub.feed_frame(frame.bytes()) {
                         if let Some(mut sub) = self.subprocess.take() {
                             sub.stop();
                         }
@@ -2581,7 +2594,7 @@ impl HeadlessOutput {
             }
             OutputTarget::SrtStream { .. } => {
                 if let Some(sub) = &mut self.subprocess {
-                    if !sub.feed_frame(frame_data) {
+                    if !sub.feed_frame(frame.bytes()) {
                         // Client disconnected. Tear down the dead listener and
                         // hand the respawn back to the caller, which re-subscribes
                         // audio passthrough (this method has no AudioManager).
@@ -2594,8 +2607,12 @@ impl HeadlessOutput {
                 DeliveryResult::Ok
             }
             OutputTarget::NdiSend { ref sender_name } => {
-                ndi_manager.send_frame(sender_name, frame_data, self.width, self.height, fps);
-                DeliveryResult::Ok
+                let (width, height) = (frame.width(), frame.height());
+                match ndi_manager.send_frame(sender_name, frame.into_bytes(), width, height, fps)
+                {
+                    Ok(()) => DeliveryResult::Ok,
+                    Err(error) => DeliveryResult::Failed(error),
+                }
             }
             // Handed to the device's own thread (see `crate::decklink`).
             OutputTarget::DeckLink { .. } => {
@@ -2603,7 +2620,7 @@ impl HeadlessOutput {
                     return DeliveryResult::Ok;
                 };
                 if self.width == sender.width && self.height == sender.height {
-                    sender.send(frame_data);
+                    sender.send(frame.bytes());
                 }
                 // Said as "Output '…' stopped: {why}" (`stop_headless_output`).
                 match sender.failed() {

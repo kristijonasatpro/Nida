@@ -23,7 +23,10 @@ struct BlitParams {
     // 1 = video levels: black at code 16, white at 235 (64 and 940 at ten
     // bits), for a screen that is video gear.
     video_levels: u32,
-    _padding: u32,
+    // 1 = the source is read as it was coded (sRGB code values, not light):
+    // a screen or window captured, filtered so and made light after (see
+    // `light_of_coded`, scaled_sample.wgsl).
+    coded: u32,
 }
 
 // Linear → sRGB (IEC 61966-2-1). Mirrors what an *UnormSrgb render target does
@@ -105,6 +108,9 @@ fn fs_main(
 
     let part = drawn_part(params.uv_scale, params.uv_offset);
     var color = sample_scaled(source_texture, texture_sampler, source_uv, covers, part);
+    if (params.coded == 1u) {
+        color = light_of_coded(color);
+    }
     if (params.premultiplied == 1u) {
         // Premultiplied source: scale rgb and alpha together so opacity dims the
         // channel uniformly. Paired with PREMULTIPLIED_ALPHA_BLENDING on the target.

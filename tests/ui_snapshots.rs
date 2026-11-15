@@ -1087,6 +1087,7 @@ fn snapshot_presentations_panel() {
         previous: None,
         talk_secs: Some(754.0),
         making_pictures: 0,
+        pictures_given: true,
     });
     let Some(mut harness) = unsettled_snapshot_harness(data) else {
         return;

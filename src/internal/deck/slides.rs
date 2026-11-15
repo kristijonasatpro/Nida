@@ -203,6 +203,19 @@ pub struct SlidesState {
     pub screen: Screen,
 }
 
+/// A stop by hand.
+struct Stopped {
+    /// The talk ended, when it was in the list: the one Previous talk
+    /// starts again.
+    talk: Option<String>,
+    /// The talk what comes next is counted from, while it is in the list:
+    /// the one after it (`1`: the talk ended) or itself (`0`: one only
+    /// being started).
+    from: Option<(String, usize)>,
+    /// The place it is counted from with that talk out of the list.
+    after: usize,
+}
+
 pub struct Slides {
     context: GpuContext,
     /// The size talks are drawn at: the master's.
@@ -234,6 +247,8 @@ pub struct Slides {
     positions: HashMap<(String, String), (u32, u32)>,
     started_at: Option<Instant>,
     last_step: Option<Instant>,
+    /// Stopped by hand, till a talk is on again: nothing is opened ahead.
+    stopped: Option<Stopped>,
     screen: Screen,
     mix: PlaylistMixPipeline,
     black: (wgpu::Texture, wgpu::TextureView),
@@ -271,6 +286,7 @@ impl Slides {
             positions: HashMap::new(),
             started_at: None,
             last_step: None,
+            stopped: None,
             screen: Screen::Slide,
             mix: PlaylistMixPipeline::new(&context.device, context.compositing_format),
             black: solid(context, [0, 0, 0, 255]),
@@ -329,6 +345,15 @@ impl Slides {
         self.talks.iter().position(|t| t.id == id)
     }
 
+    /// Stopped by hand: where the talk what comes next is counted from is
+    /// in the list.
+    fn stopped_from_at(&self) -> Option<usize> {
+        self.stopped
+            .as_ref()
+            .and_then(|s| s.from.as_ref())
+            .and_then(|(id, _)| self.index_of(id))
+    }
+
     fn talk(&self, id: &str) -> Option<&Talk> {
         self.talks.iter().find(|t| t.id == id)
     }
@@ -352,7 +377,8 @@ impl Slides {
     }
 
     /// What Start next takes: the talk picked to come next, else the one
-    /// after the talk on (or, nothing on, the first).
+    /// after the talk on (or, nothing on, the first — stopped by hand, the
+    /// one after the talk stopped).
     pub fn next_talk(&self) -> Option<String> {
         let busy = |id: &str| {
             self.live.as_ref().is_some_and(|o| o.id == id)
@@ -371,7 +397,20 @@ impl Slides {
         let after = match from.as_deref().and_then(|id| self.index_of(id)) {
             Some(i) => i + 1,
             None if from.is_some() => self.gone_at.unwrap_or(0),
-            None => 0,
+            // Stopped by hand: from the talk ended, where it is now — out
+            // of the list, from where it was. Past the list's end, the
+            // first again.
+            None => self
+                .stopped
+                .as_ref()
+                .map(|s| {
+                    s.from
+                        .as_ref()
+                        .and_then(|(id, add)| self.index_of(id).map(|i| i + add))
+                        .unwrap_or(s.after)
+                })
+                .filter(|at| *at < self.talks.len())
+                .unwrap_or(0),
         };
         self.talks
             .get(after..)
@@ -381,16 +420,22 @@ impl Slides {
             .map(|t| t.id.clone())
     }
 
-    /// The talk on before the one on now, while it is in the list.
+    /// The talk on before the one on now — stopped by hand, the talk ended
+    /// — while it is in the list.
     pub fn previous_talk(&self) -> Option<&str> {
-        self.previous
-            .as_deref()
+        let ended = self.stopped.as_ref().and_then(|s| s.talk.as_deref());
+        ended
             .filter(|id| self.index_of(id).is_some())
+            .or_else(|| {
+                self.previous
+                    .as_deref()
+                    .filter(|id| self.index_of(id).is_some())
+            })
     }
 
     /// A new list: talks added, taken out, moved, renamed, given another
     /// file. The talk on stays on — taken out of the list, until another is
-    /// started.
+    /// started or it is stopped.
     pub fn set_talks(&mut self, talks: Vec<Talk>) {
         let old_live_at = self.live.as_ref().and_then(|o| self.index_of(&o.id));
         // Where each talk was left is the show's, not the list's: kept — by
@@ -401,7 +446,14 @@ impl Slides {
             .iter()
             .map(|t| ((t.id.clone(), t.path.clone()), t.slide))
             .collect();
+        // Stopped by hand, what comes next is counted from a talk: taken
+        // out of the list, from where it was — as from a talk on.
+        let from_was = self.stopped_from_at();
         self.talks = talks;
+        let gone_from = from_was.filter(|_| self.stopped_from_at().is_none());
+        if let (Some(at), Some(stopped)) = (gone_from, &mut self.stopped) {
+            stopped.after = at;
+        }
         for talk in &mut self.talks {
             if let Some(slide) = slides.get(&(talk.id.clone(), talk.path.clone())) {
                 talk.slide = *slide;
@@ -569,6 +621,47 @@ impl Slides {
         self.opening = None;
     }
 
+    /// End the talk on, and one being started: nothing on, and nothing
+    /// kept open ahead, until a talk is on again. The list stays, each talk
+    /// where it was left, and the talk picked to come next; the talk ended
+    /// is the one Previous talk starts, and what came after it comes next.
+    /// Gives back whether a talk was on or being started: with neither,
+    /// nothing is done.
+    pub fn stop(&mut self) -> bool {
+        if self.live.is_none() && self.coming.is_none() && self.opening.is_none() {
+            return false;
+        }
+        let coming_at = self
+            .coming_talk()
+            .and_then(|(id, _)| self.index_of(id));
+        self.drop_coming();
+        let stopped = if let Some(OpenTalk { id, deck, .. }) = self.live.take() {
+            // What comes next is counted on from the talk ended.
+            let at = self.index_of(&id);
+            let_go(deck);
+            Stopped {
+                after: at.map_or_else(|| self.gone_at.unwrap_or(0), |i| i + 1),
+                from: at.map(|_| (id.clone(), 1)),
+                talk: at.map(|_| id),
+            }
+        } else {
+            // One only being started comes next itself — out of the list (a
+            // saved show's), what came after it; the talk a stop before
+            // this one ended is still the one before.
+            Stopped {
+                after: coming_at.or(self.gone_at).unwrap_or(0),
+                from: coming_at.map(|i| (self.talks[i].id.clone(), 0)),
+                talk: self.stopped.take().and_then(|s| s.talk),
+            }
+        };
+        self.stopped = Some(stopped);
+        // Not on again when the show is opened, either.
+        self.resume = None;
+        self.resume_unlisted = None;
+        self.screen = Screen::Slide;
+        true
+    }
+
     /// Open a clip or picture talk on a thread.
     fn open_file(&mut self, talk: &Talk) {
         let (id, path) = (talk.id.as_str(), talk.path.as_str());
@@ -729,7 +822,8 @@ impl Slides {
     }
 
     /// What the app keeps open: the talk on and the one coming, their shows
-    /// running; the next and the previous, opened ahead.
+    /// running; the next and the previous, opened ahead — not after a stop
+    /// by hand, till a talk is on again.
     pub fn wanted(&self) -> Vec<WantedTalk> {
         let mut out: Vec<WantedTalk> = Vec::new();
         let add = |out: &mut Vec<WantedTalk>, id: &str, show: bool| {
@@ -797,6 +891,9 @@ impl Slides {
                     slide: opening.slide,
                 });
             }
+        }
+        if self.stopped.is_some() {
+            return out;
         }
         if let Some(next) = self.next_talk() {
             add(&mut out, &next, false);
@@ -1027,6 +1124,12 @@ impl Slides {
         // that one is remembered no more.
         self.resume = None;
         self.resume_unlisted = None;
+        // Nor a stop by hand: the talk ended is the one before — started
+        // again itself, the one before it is as it was.
+        let ended = self.stopped.take().and_then(|s| s.talk);
+        if let Some(id) = ended.filter(|id| *id != new_id && self.index_of(id).is_some()) {
+            self.previous = Some(id);
+        }
         if self.index_of(&new_id).is_some() {
             self.gone_at = None;
         }
@@ -1226,7 +1329,8 @@ fn capture_deck(
             scale_to: Some(size),
             ..CaptureConfig::default()
         },
-        config_dirty: false,
+        given: Vec::new(),
+        listed_as: None,
         presentation: None,
     };
     let mut deck = Deck::new_from_screen_capture(

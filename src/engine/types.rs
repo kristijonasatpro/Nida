@@ -268,12 +268,28 @@ pub struct SlowFrame {
     pub at_secs: f64,
     /// From the start of the frame before.
     pub interval_ms: f32,
+    /// Of that, from the end of the frame before to this one's start: time
+    /// that is no part of either frame.
+    pub between_ms: f32,
     /// From the refresh that called for it to its start, when a screen's
     /// refresh starts frames.
     pub start_delay_ms: Option<f32>,
     /// From its start to its end.
     pub busy_ms: f32,
-    /// Its parts over 0.3 ms, in the order spent.
+    /// Its parts of 0.3 ms or more, in the order spent.
+    pub parts: Vec<FramePart>,
+    /// The frame before, when this one came or started late, less than a
+    /// second after that one started, and that one was not slow itself (a
+    /// slow one is a slow frame of its own).
+    pub before: Option<FrameBefore>,
+}
+
+/// The frame before a slow one.
+#[derive(Clone, Debug, Default, Serialize, utoipa::ToSchema)]
+pub struct FrameBefore {
+    /// From its start to its end.
+    pub busy_ms: f32,
+    /// Its parts of 0.3 ms or more, in the order spent; not its start delay.
     pub parts: Vec<FramePart>,
 }
 
@@ -943,7 +959,8 @@ pub struct DeckSnapshot {
     pub gpu_render_cost_us: f32,
     /// Smoothed FPS from actual deck render pipeline timing
     pub fps: f32,
-    /// An image drawn again only when its settings change (see
+    /// An image drawn again only when its settings change — or a lower
+    /// third or a text standing still, till it moves or changes (see
     /// `Deck::still_frame`): its `fps` counts redraws, not motion.
     #[serde(default)]
     pub still: bool,
@@ -1374,6 +1391,14 @@ pub struct ScreenCaptureDeckSnapshot {
     pub target_label: String,
     /// Display targets get the `exclude_varda` toggle; window targets do not.
     pub is_display: bool,
+    /// The identity its display is kept by (the UUID macOS has for it);
+    /// none for a window, or a display kept by its name alone.
+    pub target_uuid: Option<String>,
+    /// A display kept by its name alone — by a show saved before displays
+    /// had an identity (0.9.9) — where they have one: it shows whichever
+    /// screen has that name now, until its screen is picked again
+    /// (`PUT /api/decks/{deck_uuid}/screen/target`).
+    pub kept_by_name: bool,
     /// Capture rate as a 0–1 fraction of the 1–120 fps range, matching what
     /// `deck/<uuid>/capture/rate` accepts.
     pub rate_norm: f32,
@@ -1425,6 +1450,10 @@ pub struct CaptureTargetSnapshot {
     /// This target is one of Varda's own windows — capturing it is a deliberate
     /// self-capture, which the UI marks so it is an informed choice.
     pub is_varda: bool,
+    /// A display's own identity, where the platform gives one: the same
+    /// whatever number it is listed under. Displays only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
 }
 
 /// Screen-capture subsystem state for GUI/API/WS consumers.

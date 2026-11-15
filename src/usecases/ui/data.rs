@@ -228,6 +228,12 @@ pub struct DepthPreproUI {
 pub struct ScreenCaptureUI {
     pub target_label: String,
     pub is_display: bool,
+    /// The identity its display is kept by; none for a window, or a display
+    /// kept by its name alone.
+    pub target_uuid: Option<String>,
+    /// A display kept by its name alone: whichever screen has that name
+    /// now, until its screen is picked again.
+    pub kept_by_name: bool,
     /// Normalized rate, matching `deck/<uuid>/capture/rate`.
     pub rate: f32,
     pub rate_fps: f32,
@@ -701,6 +707,10 @@ pub struct UIData {
     /// Whether `gpu_utilization` is the OS's own figure for how busy the GPU
     /// is (macOS), rather than Nida's estimate from the layers' costs.
     pub gpu_utilization_measured: bool,
+    /// Frames of the last five seconds started more than half a frame late
+    /// (the rule of the API's `pacing.late_frames`, over five seconds
+    /// whatever the rate); none uncapped.
+    pub late_frames: u32,
     /// Nida's own share of the GPU (0–100), as Activity Monitor shows it.
     pub nida_gpu: Option<f32>,
     /// Nida's own memory in bytes (its footprint, as Activity Monitor).

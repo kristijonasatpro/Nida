@@ -178,10 +178,165 @@ struct NdiReceiver {
 
 struct NdiSender {
     instance: ffi::NDIlib_send_instance_t,
-    /// Reusable UYVY conversion buffer (avoids per-frame allocation).
-    uyvy_buf: Vec<u8>,
+    /// Its pictures, converted and sent from a thread of their own.
+    video: NdiVideoSend,
     /// The audio bus it carries, sent from a thread of its own.
     audio: Option<NdiAudioSend>,
+}
+
+/// A picture for a sender's thread to send.
+enum NdiPicture {
+    /// Eight-bit RGBA, tightly packed: converted to UYVY on the thread.
+    Rgba {
+        bytes: Vec<u8>,
+        width: u32,
+        height: u32,
+        fps: u32,
+    },
+    /// P216, as the GPU made it.
+    P216 {
+        bytes: Vec<u8>,
+        width: u32,
+        height: u32,
+        stride: u32,
+        fps: u32,
+    },
+}
+
+/// What a sender's thread and the render thread share.
+#[derive(Default)]
+struct VideoSlot {
+    /// The newest picture handed over, until the thread takes it.
+    picture: Option<NdiPicture>,
+    stop: bool,
+    /// Pictures sent.
+    sent: u64,
+    /// Pictures let go for a newer before the thread took them.
+    replaced: u64,
+}
+
+#[derive(Default)]
+struct VideoShared {
+    slot: Mutex<VideoSlot>,
+    pictures: std::sync::Condvar,
+}
+
+impl VideoShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VideoSlot> {
+        self.slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A sender's pictures, sent from a thread of their own. NDI's send returns
+/// when it has compressed the picture, and an eight-bit picture is converted
+/// to UYVY first — a 4K picture took the render thread 21 ms of its 16.7,
+/// and the whole show ran at 41 frames a second — so the render thread
+/// hands each picture over and waits on neither.
+struct NdiVideoSend {
+    shared: Arc<VideoShared>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl NdiVideoSend {
+    /// Send the pictures handed over through `submit`, until stopped.
+    ///
+    /// # Errors
+    ///
+    /// The thread could not be started.
+    fn start(
+        submit: impl FnMut(*const ffi::NDIlib_video_frame_v2_t) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let shared = Arc::new(VideoShared::default());
+        let thread = {
+            let shared = shared.clone();
+            std::thread::Builder::new()
+                .name("ndi-send-video".into())
+                .spawn(move || send_pictures(&shared, submit))?
+        };
+        Ok(Self { shared, thread })
+    }
+
+    /// The newest picture: sent as soon as the thread is free. One handed
+    /// over before it and not yet taken is let go. `false` when the thread
+    /// has ended — as it does only by a fault in it — and takes no picture.
+    fn hand(&self, picture: NdiPicture) -> bool {
+        if self.thread.is_finished() {
+            return false;
+        }
+        let mut slot = self.shared.lock();
+        let waiting = slot.picture.replace(picture);
+        if waiting.is_some() {
+            slot.replaced += 1;
+        }
+        drop(slot);
+        self.shared.pictures.notify_one();
+        // Freed with the lock let go: a 4K picture is 33 MB.
+        drop(waiting);
+        true
+    }
+
+    /// Stop the thread — after the picture it is sending — and say how many
+    /// pictures it sent, and how many were let go for a newer.
+    fn stop(self) -> (u64, u64) {
+        self.shared.lock().stop = true;
+        self.shared.pictures.notify_one();
+        let _ = self.thread.join();
+        let slot = self.shared.lock();
+        (slot.sent, slot.replaced)
+    }
+}
+
+/// A sender's thread: each picture handed over is converted, if it needs
+/// it, and sent, until the sender stops.
+fn send_pictures(
+    shared: &VideoShared,
+    mut submit: impl FnMut(*const ffi::NDIlib_video_frame_v2_t),
+) {
+    // Kept from picture to picture: not allocated for each.
+    let mut uyvy = Vec::new();
+    loop {
+        let picture = {
+            let mut slot = shared.lock();
+            loop {
+                if slot.stop {
+                    return;
+                }
+                if let Some(picture) = slot.picture.take() {
+                    break picture;
+                }
+                slot = shared
+                    .pictures
+                    .wait(slot)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        };
+        let sent = match picture {
+            NdiPicture::Rgba {
+                bytes,
+                width,
+                height,
+                fps,
+            } => submit_uyvy_with(&bytes, &mut uyvy, width, height, fps, &mut submit),
+            NdiPicture::P216 {
+                mut bytes,
+                width,
+                height,
+                stride,
+                fps,
+            } => match submit_p216_with(&mut bytes, width, height, stride, fps, &mut submit) {
+                Ok(()) => true,
+                Err(error) => {
+                    log::warn!("NDI P216 picture not sent: {error}");
+                    false
+                }
+            },
+        };
+        if sent {
+            shared.lock().sent += 1;
+        }
+    }
 }
 
 /// A sender's sound: an audio bus's mix, sent as it is made.
@@ -725,11 +880,13 @@ impl NdiManager {
         Ok(())
     }
 
-    /// Submit the oldest completed P216 readback frame through NDI.
+    /// Hand the oldest completed P216 readback frame to its sender's thread,
+    /// which submits it through NDI.
     ///
     /// # Errors
     ///
-    /// Returns an error when sender creation or frame-contract validation fails.
+    /// Returns an error when sender creation or frame-contract validation
+    /// fails, or the sender's thread has ended.
     pub(crate) fn try_send_p216(
         &mut self,
         sender_name: &str,
@@ -738,7 +895,7 @@ impl NdiManager {
         height: u32,
         fps: u32,
     ) -> Result<(), String> {
-        let Some((mut bytes, layout)) =
+        let Some((bytes, layout)) =
             self.p216_converters
                 .get_mut(sender_name)
                 .and_then(|converter| {
@@ -749,29 +906,25 @@ impl NdiManager {
         else {
             return Ok(());
         };
-        if !self.ensure_sender(sender_name, width, height) {
+        if !self.ensure_sender(sender_name) {
             return Err(format!("NDI sender '{sender_name}' could not be created"));
         }
-        let Some(sdk) = &self.sdk else {
-            return Err("NDI runtime is unavailable".to_string());
-        };
-        let Some(sender) = self.senders.get(sender_name) else {
-            return Err(format!("NDI sender '{sender_name}' disappeared"));
-        };
-        submit_p216_with(
-            &mut bytes,
-            width,
-            height,
-            layout.stride,
-            fps,
-            |frame| unsafe {
-                (sdk.send_send_video_v2)(sender.instance, frame);
+        // Checked here, where a frame out of its contract stops the output.
+        p216_contract(bytes.len(), width, height, layout.stride)
+            .map_err(|error| error.to_string())?;
+        self.hand(
+            sender_name,
+            NdiPicture::P216 {
+                bytes,
+                width,
+                height,
+                stride: layout.stride,
+                fps,
             },
         )
-        .map_err(|error| error.to_string())
     }
 
-    fn ensure_sender(&mut self, sender_name: &str, width: u32, height: u32) -> bool {
+    fn ensure_sender(&mut self, sender_name: &str) -> bool {
         if self.senders.contains_key(sender_name) {
             return true;
         }
@@ -794,11 +947,29 @@ impl NdiManager {
             log::error!("NDI send_create returned null for '{sender_name}'");
             return false;
         }
+        // The sender's address, for its thread: a sender is not tied to the
+        // thread that made it (see `NdiManager`'s `Send`), and NDI takes
+        // pictures and sound from different threads.
+        let send_video = sdk.send_send_video_v2;
+        let address = instance as usize;
+        let started = NdiVideoSend::start(move |frame| unsafe {
+            send_video(address as ffi::NDIlib_send_instance_t, frame);
+        });
+        let video = match started {
+            Ok(video) => video,
+            Err(error) => {
+                // Not kept without its thread: it would take every picture
+                // and send none. Tried again with the next picture.
+                log::error!("NDI sender '{sender_name}': no thread for its pictures: {error}");
+                unsafe { (sdk.send_destroy)(instance) };
+                return false;
+            }
+        };
         self.senders.insert(
             sender_name.to_string(),
             NdiSender {
                 instance,
-                uyvy_buf: vec![0u8; width as usize * height as usize * 2],
+                video,
                 audio: None,
             },
         );
@@ -806,73 +977,118 @@ impl NdiManager {
         true
     }
 
-    /// Send a frame via NDI for a specific sender name.
+    /// Send a frame via NDI for a specific sender name: handed to the
+    /// sender's thread, which converts it to UYVY and sends it — this never
+    /// waits on either. A frame still waiting when the next comes is let go.
     /// Creates the sender instance on first call for a given name.
     ///
+    /// `rgba` is the picture tightly packed, `width` × `height` × 4 bytes.
     /// `fps` is the master render rate, declared to receivers as this sender's
     /// frame rate. Pass it already resolved (see `app::state::encoder_fps`), so
     /// an uncapped stage still declares a real rate rather than zero.
+    ///
+    /// # Errors
+    ///
+    /// The sender's thread has ended (a fault in it): the sender is
+    /// destroyed, and its output is to stop. No sender to be had — no NDI
+    /// runtime, none made — is no error, as before: it is tried again with
+    /// the next picture.
     pub fn send_frame(
         &mut self,
         sender_name: &str,
-        rgba: &[u8],
+        rgba: Vec<u8>,
         width: u32,
         height: u32,
         fps: u32,
-    ) {
-        if !self.ensure_sender(sender_name, width, height) {
-            return;
+    ) -> Result<(), String> {
+        if !self.ensure_sender(sender_name) {
+            return Ok(());
         }
-        let Some(sdk) = &self.sdk else {
-            return;
-        };
+        self.hand(
+            sender_name,
+            NdiPicture::Rgba {
+                bytes: rgba,
+                width,
+                height,
+                fps,
+            },
+        )
+    }
 
-        let Some(sender) = self.senders.get_mut(sender_name) else {
-            log::error!("NDI sender '{sender_name}' not found after creation");
-            return;
+    /// Hand `picture` to `sender_name`'s thread. A sender whose thread has
+    /// ended is destroyed: one made anew sends when its output starts again.
+    fn hand(&mut self, sender_name: &str, picture: NdiPicture) -> Result<(), String> {
+        let Some(sender) = self.senders.get(sender_name) else {
+            return Err(format!("NDI sender '{sender_name}' disappeared"));
         };
-
-        // Convert RGBA → UYVY
-        let uyvy_size = (width as usize) * (height as usize) * 2;
-        if sender.uyvy_buf.len() != uyvy_size {
-            sender.uyvy_buf.resize(uyvy_size, 0);
+        if sender.video.hand(picture) {
+            return Ok(());
         }
-        rgba_to_uyvy(rgba, &mut sender.uyvy_buf, width, height);
-
-        // The NDI C ABI takes signed dimensions; frame sizes come from GPU
-        // textures and are orders of magnitude below i32::MAX, so clamp rather
-        // than let an implausible value wrap into a negative extent.
-        let frame = ffi::NDIlib_video_frame_v2_t {
-            xres: i32::try_from(width).unwrap_or(i32::MAX),
-            yres: i32::try_from(height).unwrap_or(i32::MAX),
-            FourCC: ffi::NDIlib_FourCC_video_type_e::UYVY,
-            frame_rate_N: i32::try_from(fps).unwrap_or(DEFAULT_NDI_FPS).max(1),
-            frame_rate_D: 1,
-            picture_aspect_ratio: 0.0,
-            frame_format_type: 1, // progressive
-            timecode: 0,          // auto
-            p_data: sender.uyvy_buf.as_mut_ptr(),
-            line_stride_in_bytes: i32::try_from(width.saturating_mul(2)).unwrap_or(i32::MAX),
-            p_metadata: std::ptr::null(),
-            timestamp: 0,
-        };
-
-        unsafe { (sdk.send_send_video_v2)(sender.instance, &raw const frame) };
+        self.destroy_sender(sender_name);
+        Err(format!(
+            "NDI sender '{sender_name}': the thread sending its pictures ended"
+        ))
     }
 
     /// Destroy a specific sender by name.
     pub fn destroy_sender(&mut self, sender_name: &str) {
         self.p216_converters.remove(sender_name);
         if let Some(mut sender) = self.senders.remove(sender_name) {
-            // Its sound stops first: the thread sends on this instance.
+            // Its sound and its pictures stop first: their threads send on
+            // this instance.
             if let Some(audio) = sender.audio.take() {
                 audio.stop();
             }
+            let (sent, replaced) = sender.video.stop();
             if let Some(ref sdk) = self.sdk {
                 unsafe { (sdk.send_destroy)(sender.instance) };
             }
-            log::info!("NDI sender destroyed: '{sender_name}'");
+            log::info!(
+                "NDI sender destroyed: '{sender_name}' ({sent} pictures sent, {replaced} let go for a newer)"
+            );
         }
+    }
+
+    /// Destroy every sender `named` does not know: one whose output was
+    /// closed, or sends under another name now. Left alone it stayed a
+    /// source on the network, with its thread and its converter, till the
+    /// app quit. Called every frame; it acts only when one has gone.
+    pub fn keep_senders(&mut self, named: impl Fn(&str) -> bool) {
+        // A ten-bit output's converter is made before its sender is.
+        let gone: Vec<String> = self
+            .senders
+            .keys()
+            .chain(self.p216_converters.keys())
+            .filter(|name| !named(name.as_str()))
+            .cloned()
+            .collect();
+        for name in gone {
+            self.destroy_sender(&name);
+        }
+    }
+
+    /// A sender under `sender_name` with no NDI behind it — its thread
+    /// takes pictures and sends them nowhere —, for a test of what holds
+    /// senders: without the NDI runtime none is ever made.
+    #[cfg(test)]
+    pub(crate) fn hold_sender_for_test(&mut self, sender_name: &str) {
+        let video = NdiVideoSend::start(|_| {}).expect("the thread starts");
+        self.senders.insert(
+            sender_name.to_string(),
+            NdiSender {
+                instance: std::ptr::null_mut(),
+                video,
+                audio: None,
+            },
+        );
+    }
+
+    /// The names of the senders held, in order.
+    #[cfg(test)]
+    pub(crate) fn sender_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.senders.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Keep a sender carrying `bus` of the audio mixer, or no sound with
@@ -943,6 +1159,64 @@ impl NdiManager {
     }
 }
 
+/// Convert a tightly packed RGBA picture to UYVY in `uyvy` and hand it to
+/// `submit`, which has done with it when it returns (as NDI's send has).
+/// `false`, nothing submitted, for a picture short of its size.
+fn submit_uyvy_with(
+    rgba: &[u8],
+    uyvy: &mut Vec<u8>,
+    width: u32,
+    height: u32,
+    fps: u32,
+    mut submit: impl FnMut(*const ffi::NDIlib_video_frame_v2_t),
+) -> bool {
+    let uyvy_size = (width as usize) * (height as usize) * 2;
+    if uyvy_size == 0 || rgba.len() < uyvy_size * 2 {
+        return false;
+    }
+    if uyvy.len() != uyvy_size {
+        uyvy.resize(uyvy_size, 0);
+    }
+    rgba_to_uyvy_in_bands(rgba, uyvy, width, height);
+
+    // The NDI C ABI takes signed dimensions; frame sizes come from GPU
+    // textures and are orders of magnitude below i32::MAX, so clamp rather
+    // than let an implausible value wrap into a negative extent.
+    let frame = ffi::NDIlib_video_frame_v2_t {
+        xres: i32::try_from(width).unwrap_or(i32::MAX),
+        yres: i32::try_from(height).unwrap_or(i32::MAX),
+        FourCC: ffi::NDIlib_FourCC_video_type_e::UYVY,
+        frame_rate_N: i32::try_from(fps).unwrap_or(DEFAULT_NDI_FPS).max(1),
+        frame_rate_D: 1,
+        picture_aspect_ratio: 0.0,
+        frame_format_type: 1, // progressive
+        timecode: 0,          // auto
+        p_data: uyvy.as_mut_ptr(),
+        line_stride_in_bytes: i32::try_from(width.saturating_mul(2)).unwrap_or(i32::MAX),
+        p_metadata: std::ptr::null(),
+        timestamp: 0,
+    };
+    submit(&raw const frame);
+    true
+}
+
+/// Whether `len` bytes at `stride` are a whole P216 picture of this size.
+fn p216_contract(
+    len: usize,
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<(), p216::P216Error> {
+    let layout = p216::P216Layout::new(width, height)?;
+    if stride != layout.stride || len as u64 != layout.byte_len {
+        return Err(p216::P216Error::InvalidBuffer {
+            expected: layout.byte_len,
+            actual: len,
+        });
+    }
+    Ok(())
+}
+
 fn submit_p216_with(
     data: &mut [u8],
     width: u32,
@@ -951,13 +1225,7 @@ fn submit_p216_with(
     fps: u32,
     mut submit: impl FnMut(*const ffi::NDIlib_video_frame_v2_t),
 ) -> Result<(), p216::P216Error> {
-    let layout = p216::P216Layout::new(width, height)?;
-    if stride != layout.stride || data.len() as u64 != layout.byte_len {
-        return Err(p216::P216Error::InvalidBuffer {
-            expected: layout.byte_len,
-            actual: data.len(),
-        });
-    }
+    p216_contract(data.len(), width, height, stride)?;
     let frame = ffi::NDIlib_video_frame_v2_t {
         xres: i32::try_from(width).unwrap_or(i32::MAX),
         yres: i32::try_from(height).unwrap_or(i32::MAX),
@@ -1087,26 +1355,98 @@ fn uyvy_to_rgba(uyvy: &[u8], rgba: &mut [u8], w: u32, h: u32, stride: usize) {
 /// levels (16–235), BT.709 for HD and up, BT.601 for standard definition.
 /// Each pair of pixels shares the average of their colour.
 pub(crate) fn rgba_to_uyvy(rgba: &[u8], uyvy: &mut [u8], w: u32, h: u32) {
-    // (Kr, Kb) of the picture's colour space.
-    let (kr, kb) = if h >= 720 {
+    rgba_rows_to_uyvy(rgba, uyvy, w as usize, h as usize, colour_coefficients(h));
+}
+
+/// (Kr, Kb) of the colour space of a picture `h` high.
+fn colour_coefficients(h: u32) -> (f32, f32) {
+    if h >= 720 {
         (0.2126, 0.0722)
     } else {
         (0.299, 0.114)
-    };
+    }
+}
+
+/// Pixels to a band of [`rgba_to_uyvy_in_bands`]: a 1080p picture's.
+const BAND_PIXELS: usize = 1920 * 1080;
+
+/// The most bands a picture is converted in: a 4K picture's four.
+const MAX_BANDS: usize = 4;
+
+/// Bands a picture of this size is converted in.
+fn band_count(width: usize, height: usize) -> usize {
+    (width * height / BAND_PIXELS).clamp(1, MAX_BANDS)
+}
+
+/// One band's rows: RGBA in, UYVY out.
+type Band<'a> = (&'a [u8], &'a mut [u8]);
+
+/// Convert a band, unless it has been.
+fn convert_band(band: &mut Option<Band<'_>>, width: usize, coefficients: (f32, f32)) {
+    if let Some((from, to)) = band.take() {
+        let rows = to.len() / (width * 2);
+        rgba_rows_to_uyvy(from, to, width, rows, coefficients);
+    }
+}
+
+/// [`rgba_to_uyvy`] — the same bytes — with a large picture's rows converted
+/// in bands, on threads at once: one thread alone takes longer over a 4K
+/// picture than a frame lasts at 60 a second. For a sender's own thread.
+fn rgba_to_uyvy_in_bands(rgba: &[u8], uyvy: &mut [u8], w: u32, h: u32) {
+    let (width, height) = (w as usize, h as usize);
+    let bands = band_count(width, height);
+    // In one pass: a small picture; an odd width, whose last pixel reaches
+    // into the next row; a buffer short of the picture.
+    if bands == 1
+        || !width.is_multiple_of(2)
+        || rgba.len() < width * height * 4
+        || uyvy.len() < width * height * 2
+    {
+        rgba_to_uyvy(rgba, uyvy, w, h);
+        return;
+    }
+    // The whole picture's colour space, whatever a band's height.
+    let coefficients = colour_coefficients(h);
+    let rows_each = height.div_ceil(bands);
+    let mut jobs: Vec<Option<Band<'_>>> = rgba[..width * height * 4]
+        .chunks(rows_each * width * 4)
+        .zip(uyvy[..width * height * 2].chunks_mut(rows_each * width * 2))
+        .map(Some)
+        .collect();
+    std::thread::scope(|scope| {
+        let mut jobs = jobs.iter_mut();
+        let ours = jobs.next();
+        for job in jobs {
+            // A band whose thread does not start is converted below.
+            let _ = std::thread::Builder::new()
+                .name("ndi-uyvy".into())
+                .spawn_scoped(scope, move || convert_band(job, width, coefficients));
+        }
+        if let Some(job) = ours {
+            convert_band(job, width, coefficients);
+        }
+    });
+    for job in &mut jobs {
+        convert_band(job, width, coefficients);
+    }
+}
+
+/// `rows` rows of [`rgba_to_uyvy`], in the colour space of (`kr`, `kb`).
+fn rgba_rows_to_uyvy(rgba: &[u8], uyvy: &mut [u8], w: usize, rows: usize, (kr, kb): (f32, f32)) {
     let kg = 1.0 - kr - kb;
     let luma = |r: f32, g: f32, b: f32| kr * r + kg * g + kb * b;
     let to_y = |l: f32| (16.0 + l * 219.0 / 255.0 + 0.5).clamp(0.0, 255.0) as u8;
     let to_c = |c: f32| (128.0 + c * 224.0 / 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-    for y in 0..h as usize {
-        for x in (0..w as usize).step_by(2) {
-            let src0 = (y * w as usize + x) * 4;
+    for y in 0..rows {
+        for x in (0..w).step_by(2) {
+            let src0 = (y * w + x) * 4;
             let src1 = src0 + 4;
 
             let r0 = f32::from(rgba[src0]);
             let g0 = f32::from(rgba[src0 + 1]);
             let b0 = f32::from(rgba[src0 + 2]);
 
-            let (r1, g1, b1) = if x + 1 < w as usize && src1 + 2 < rgba.len() {
+            let (r1, g1, b1) = if x + 1 < w && src1 + 2 < rgba.len() {
                 (
                     f32::from(rgba[src1]),
                     f32::from(rgba[src1 + 1]),
@@ -1121,7 +1461,7 @@ pub(crate) fn rgba_to_uyvy(rgba: &[u8], uyvy: &mut [u8], w: u32, h: u32) {
             let cb = (f32::midpoint(b0, b1) - pair_luma) / (2.0 * (1.0 - kb));
             let cr = (f32::midpoint(r0, r1) - pair_luma) / (2.0 * (1.0 - kr));
 
-            let dst = y * w as usize * 2 + x * 2;
+            let dst = y * w * 2 + x * 2;
             if dst + 3 < uyvy.len() {
                 uyvy[dst] = to_c(cb);
                 uyvy[dst + 1] = to_y(l0);
@@ -1136,6 +1476,277 @@ pub(crate) fn rgba_to_uyvy(rgba: &[u8], uyvy: &mut [u8], w: u32, h: u32) {
 mod tests {
     use super::*;
     use crate::engine::value::render::{PresentationDepth, PresentationPixelFormat};
+
+    /// What a sender's thread submitted.
+    struct Submitted {
+        /// The thread it was submitted on.
+        on: std::thread::ThreadId,
+        size: (i32, i32),
+        kind: ffi::NDIlib_FourCC_video_type_e,
+        stride: i32,
+        rate: i32,
+        /// The frame's first bytes.
+        bytes: Vec<u8>,
+    }
+
+    /// A sender's thread whose `submit` tells the test of each frame — its
+    /// first `bytes` bytes — and then waits for the test's word, as NDI
+    /// holds a send while it compresses the picture. With the word's sender
+    /// dropped it does not wait.
+    fn held_sender(
+        bytes: usize,
+    ) -> (
+        NdiVideoSend,
+        std::sync::mpsc::Receiver<Submitted>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (told, frames) = std::sync::mpsc::channel();
+        let (word, words) = std::sync::mpsc::channel::<()>();
+        let started = NdiVideoSend::start(move |frame_ptr| {
+            let frame = unsafe { &*frame_ptr };
+            let _ = told.send(Submitted {
+                on: std::thread::current().id(),
+                size: (frame.xres, frame.yres),
+                kind: frame.FourCC,
+                stride: frame.line_stride_in_bytes,
+                rate: frame.frame_rate_N,
+                bytes: unsafe { std::slice::from_raw_parts(frame.p_data, bytes) }.to_vec(),
+            });
+            // Till the test's word, or till the test lets go of it.
+            let _ = words.recv();
+        });
+        (started.expect("the thread starts"), frames, word)
+    }
+
+    #[test]
+    fn ndi_pictures_are_sent_from_a_thread_of_their_own_the_newest_first() {
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+        const RED: [u8; 3] = [255, 0, 0];
+        const GREEN: [u8; 3] = [0, 255, 0];
+        const BLUE: [u8; 3] = [0, 0, 255];
+        // A picture two pixels wide of one colour, and what it is as UYVY.
+        let rgba = |rgb: [u8; 3]| [rgb[0], rgb[1], rgb[2], 255].repeat(2);
+        let picture = |rgb: [u8; 3]| NdiPicture::Rgba {
+            bytes: rgba(rgb),
+            width: 2,
+            height: 1,
+            fps: 50,
+        };
+        let uyvy = |rgb: [u8; 3]| {
+            let mut out = vec![0u8; 4];
+            rgba_to_uyvy(&rgba(rgb), &mut out, 2, 1);
+            out
+        };
+        let (send, frames, word) = held_sender(4);
+
+        assert!(send.hand(picture(RED)));
+        let first = frames
+            .recv_timeout(WAIT)
+            .expect("the first picture is sent");
+        assert_ne!(
+            first.on,
+            std::thread::current().id(),
+            "the picture was sent from the thread that handed it over"
+        );
+        assert_eq!(first.size, (2, 1));
+        assert_eq!(first.kind, ffi::NDIlib_FourCC_video_type_e::UYVY);
+        assert_eq!((first.stride, first.rate), (4, 50));
+        assert_eq!(first.bytes, uyvy(RED));
+
+        // The thread is held in its send. Two more pictures are handed over:
+        // neither waits on it, and the older is let go for the newer.
+        assert!(send.hand(picture(GREEN)));
+        assert!(send.hand(picture(BLUE)));
+        assert!(
+            frames.try_recv().is_err(),
+            "a picture was sent while the first still was"
+        );
+        word.send(()).expect("the thread is there");
+        let second = frames
+            .recv_timeout(WAIT)
+            .expect("the newest picture is sent");
+        assert_eq!(
+            second.bytes,
+            uyvy(BLUE),
+            "the picture sent second is not the newest handed over"
+        );
+
+        // Its send let go, the thread stops: two sent, one let go.
+        drop(word);
+        assert_eq!(send.stop(), (2, 1));
+        assert!(frames.try_recv().is_err(), "a third picture was sent");
+    }
+
+    #[test]
+    fn a_p216_picture_is_sent_by_the_thread_as_it_was_made() {
+        let bytes = vec![0x00, 0x10, 0x00, 0xeb, 0x00, 0x80, 0x00, 0x80];
+        let (send, frames, word) = held_sender(8);
+        drop(word);
+        assert!(send.hand(NdiPicture::P216 {
+            bytes: bytes.clone(),
+            width: 2,
+            height: 1,
+            stride: 4,
+            fps: 60,
+        }));
+        let frame = frames
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the picture is sent");
+        assert_ne!(frame.on, std::thread::current().id());
+        assert_eq!(frame.size, (2, 1));
+        assert_eq!(frame.kind, ffi::NDIlib_FourCC_video_type_e::P216);
+        assert_eq!((frame.stride, frame.rate), (4, 60));
+        assert_eq!(frame.bytes, bytes);
+        assert_eq!(send.stop(), (1, 0));
+    }
+
+    #[test]
+    fn a_sender_whose_thread_has_ended_takes_no_picture() {
+        let picture = || NdiPicture::Rgba {
+            bytes: vec![0, 0, 0, 255, 0, 0, 0, 255],
+            width: 2,
+            height: 1,
+            fps: 50,
+        };
+        let (send, frames, word) = held_sender(4);
+        drop(word);
+        assert!(send.hand(picture()), "a thread that runs takes a picture");
+        frames
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the picture is sent");
+        // The thread ended, not through `stop`: as a fault in it would.
+        send.shared.lock().stop = true;
+        send.shared.pictures.notify_one();
+        let since = std::time::Instant::now();
+        while !send.thread.is_finished() {
+            assert!(since.elapsed().as_secs() < 10, "the thread did not end");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!send.hand(picture()), "a thread that has ended took one");
+        assert!(send.shared.lock().picture.is_none());
+        assert_eq!(send.stop(), (1, 0));
+    }
+
+    /// A sender no output names is destroyed, its thread ended; the others
+    /// run on. A second sweep finds nothing to do.
+    #[test]
+    fn a_sender_no_output_names_is_destroyed_and_its_thread_ends() {
+        let mut manager = NdiManager::new_disabled();
+        let mut hold = |name: &str| {
+            let (video, frames, word) = held_sender(4);
+            manager.senders.insert(
+                name.to_string(),
+                NdiSender {
+                    instance: std::ptr::null_mut(),
+                    video,
+                    audio: None,
+                },
+            );
+            (frames, word)
+        };
+        let (kept_frames, _kept_word) = hold("Kept");
+        let (gone_frames, _gone_word) = hold("Gone");
+
+        manager.keep_senders(|name| name == "Kept");
+
+        assert_eq!(manager.sender_names(), ["Kept"]);
+        // The thread has ended: what it sent through is let go with it.
+        assert_eq!(
+            gone_frames.try_recv().err(),
+            Some(std::sync::mpsc::TryRecvError::Disconnected)
+        );
+        assert_eq!(
+            kept_frames.try_recv().err(),
+            Some(std::sync::mpsc::TryRecvError::Empty)
+        );
+        manager.keep_senders(|name| name == "Kept");
+        assert_eq!(manager.sender_names(), ["Kept"]);
+        manager.keep_senders(|_| false);
+        assert!(manager.sender_names().is_empty());
+        assert_eq!(
+            kept_frames.try_recv().err(),
+            Some(std::sync::mpsc::TryRecvError::Disconnected)
+        );
+    }
+
+    /// A ten-bit output's converter is made before its sender: closed
+    /// before its first picture went out, the output leaves a converter and
+    /// no sender, and that goes too.
+    #[test]
+    fn a_converter_no_output_names_goes_with_the_senders() {
+        let Ok(context) = crate::renderer::context::GpuContext::new_headless() else {
+            return;
+        };
+        let mut manager = NdiManager::new_disabled();
+        for name in ["Kept", "Gone"] {
+            let converter = p216::P216Converter::new(&context.device, 2, 1).unwrap();
+            manager.p216_converters.insert(name.to_string(), converter);
+        }
+
+        manager.keep_senders(|name| name == "Kept");
+
+        let mut left: Vec<&str> = manager.p216_converters.keys().map(String::as_str).collect();
+        left.sort_unstable();
+        assert_eq!(left, ["Kept"]);
+    }
+
+    #[test]
+    fn a_p216_frame_out_of_its_contract_is_refused_before_it_is_handed_over() {
+        assert!(p216_contract(8, 2, 1, 4).is_ok());
+        // A byte short; another stride; an odd width.
+        assert!(p216_contract(7, 2, 1, 4).is_err());
+        assert!(p216_contract(8, 2, 1, 2).is_err());
+        assert!(p216_contract(12, 3, 1, 6).is_err());
+    }
+
+    /// A picture `w` × `h` with something else in every byte.
+    fn noise(w: u32, h: u32) -> Vec<u8> {
+        let mut state = 0x2545_f491_u32;
+        (0..w as usize * h as usize * 4)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// `rgba` converted whole, and in bands.
+    fn whole_and_banded(rgba: &[u8], w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
+        let mut whole = vec![1u8; w as usize * h as usize * 2];
+        rgba_to_uyvy(rgba, &mut whole, w, h);
+        let mut banded = vec![1u8; whole.len()];
+        rgba_to_uyvy_in_bands(rgba, &mut banded, w, h);
+        (whole, banded)
+    }
+
+    #[test]
+    fn a_large_picture_converted_in_bands_is_the_same_bytes() {
+        assert_eq!(band_count(1920, 1080), 1);
+        assert_eq!(band_count(3840, 1083), 2);
+        assert_eq!(band_count(3840, 2160), 4);
+        assert_eq!(band_count(7680, 4320), 4);
+        // Two bands, of 542 rows and 541: each fewer than the 720 a picture
+        // is in HD's colours from, as the whole picture is.
+        let (w, h) = (3840, 1083);
+        let (whole, banded) = whole_and_banded(&noise(w, h), w, h);
+        assert!(
+            banded == whole,
+            "a picture converted in bands differs from the same converted whole"
+        );
+    }
+
+    #[test]
+    fn a_picture_of_odd_width_is_converted_in_one_pass() {
+        // Large enough for two bands; but an odd width's last pixel reaches
+        // into the next row, which a band's last row does not have.
+        let (w, h) = (3841, 1083);
+        assert_eq!(band_count(3841, 1083), 2);
+        let (whole, banded) = whole_and_banded(&noise(w, h), w, h);
+        assert!(
+            banded == whole,
+            "an odd-width picture converted in bands differs from the same converted whole"
+        );
+    }
 
     #[test]
     fn ndi_pictures_are_sent_at_video_levels_in_their_colour_space() {

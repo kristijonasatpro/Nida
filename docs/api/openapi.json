@@ -3988,7 +3988,7 @@
         "tags": [
           "System"
         ],
-        "summary": "How the compositor draws: for comparing its ways on one show, GPU use\nwith each, without a restart. The picture is the same either way.",
+        "summary": "How the compositor draws: for comparing its ways on one show, GPU use\nwith each, without a restart. The picture is the same either way —\nbut for a slow layer's, repeated between its draws while frames run\nlate (`slow_layers_less_often`).",
         "operationId": "set_compositor",
         "requestBody": {
           "content": {
@@ -4953,6 +4953,54 @@
                 }
               }
             }
+          },
+          "404": {
+            "description": "Deck not found"
+          }
+        }
+      }
+    },
+    "/api/decks/{deck_uuid}/screen/target": {
+      "put": {
+        "tags": [
+          "Screen Capture"
+        ],
+        "summary": "Point a screen capture layer at another screen or window, or at its own\npicked again; its rate, crop and cursor are kept — or, of a screen or\nwindow another layer captures already, taken from that capture, which\nthe layers of one screen or window share. A display is kept by\nits own identity from then on — one a show saved by its name alone\n(before 0.9.9) goes by that name, whichever screen has it, until picked.",
+        "operationId": "set_screen_capture_target",
+        "parameters": [
+          {
+            "name": "deck_uuid",
+            "in": "path",
+            "description": "Deck UUID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScreenCaptureTargetRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiReply"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a screen capture layer, or no capture target matches"
           },
           "404": {
             "description": "Deck not found"
@@ -14521,6 +14569,7 @@
       },
       "AddScreenCaptureDeckBody": {
         "type": "object",
+        "description": "A screen or window another layer captures already is shared with it as\nit runs: the rate, crop and cursor asked here are those of a capture\nopened new.",
         "required": [
           "target"
         ],
@@ -15588,6 +15637,13 @@
             ],
             "description": "Window title at enumeration time. Windows only."
           },
+          "uuid": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A display's own identity, where the platform gives one: the same\nwhatever number it is listed under. Displays only."
+          },
           "width": {
             "type": "integer",
             "format": "int32",
@@ -15829,12 +15885,61 @@
             ],
             "description": "Draw a layer that is only its live source placed — a camera, a\nscreen, another input (a tap), cropped, moved or scaled — straight\nonto its input from that source, rather than into a frame of its own\nfirst (on by default). One left out stays as it is."
           },
+          "keep_still_clips": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Keep a clip's picture while the clip gives no new frame — paused,\nstopped on its last, or between two of its frames in a show running\nfaster than the clip — rather than draw it again every frame (on by\ndefault). Off draws it every frame, as before."
+          },
+          "keep_still_inputs": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Keep an input's picture while nothing in it changes — a still\npicture, a clip paused, a window captured that stands still —\nrather than put its layers together again every frame (on by\ndefault). Off puts them together every frame, as before."
+          },
+          "keep_still_text": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Keep a lower third or a text standing still — a name on air, a text\nshown, nothing of it moving — as it is drawn, rather than draw it\nagain every frame (on by default). Off draws it every frame, as\nbefore."
+          },
           "merge_layer_passes": {
             "type": [
               "boolean",
               "null"
             ],
             "description": "Draw an input's Normal, Add and Screen layers in one pass (on by\ndefault)."
+          },
+          "merge_main_passes": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Draw Main's layers — what is on it, a dissolve's two pictures, and\nthe Normal, Add and Screen overlays over them — in one pass (on by\ndefault). Off draws each in a pass of its own, as before."
+          },
+          "pass_main_through": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Give Main out as its one input's own picture, with no pass drawn,\nwhile Main is that input alone at full level and nothing is done to\nit after — no master effect, tone map, LUT or tap of Main (on by\ndefault). Off draws the pass, as before."
+          },
+          "skip_blank_channels": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Leave an input nothing of which shows — a lower third that is off, a\ntext hidden — undrawn, and off Main's layers, until something of it\nshows (on by default). Off draws it every frame, as before."
+          },
+          "slow_layers_less_often": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Draw a slow layer whose Rate is Auto less often while the show's\nframes run late, repeating its last picture between, and let a\ncovered layer's thumbnail wait meanwhile (on by default). Off: late\nframes make no layer drawn less often — a layer's own Rate, and\nleaving out what is not seen, are as ever."
           }
         }
       },
@@ -17049,6 +17154,28 @@
             "type": "number",
             "format": "float",
             "description": "Numeric value."
+          }
+        }
+      },
+      "FrameBefore": {
+        "type": "object",
+        "description": "The frame before a slow one.",
+        "required": [
+          "busy_ms",
+          "parts"
+        ],
+        "properties": {
+          "busy_ms": {
+            "type": "number",
+            "format": "float",
+            "description": "From its start to its end."
+          },
+          "parts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FramePart"
+            },
+            "description": "Its parts of 0.3 ms or more, in the order spent; not its start delay."
           }
         }
       },
@@ -20900,6 +21027,12 @@
               },
               "name": {
                 "type": "string"
+              },
+              "uuid": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             }
           },
@@ -20925,7 +21058,18 @@
             }
           }
         ],
-        "description": "Capture target in handle-free form. Either `{\"kind\":\"display\",\"name\":\"...\"}`\nor `{\"kind\":\"window\",\"app\":\"...\",\"title\":\"...\"}` — matched against the last\nenumeration, so call `POST /api/devices/screen/scan` first if unsure."
+        "description": "Capture target in handle-free form. Either `{\"kind\":\"display\",\"name\":\"...\"}`\nor `{\"kind\":\"window\",\"app\":\"...\",\"title\":\"...\"}` — matched against the last\nenumeration, so call `POST /api/devices/screen/scan` first if unsure. A\ndisplay's `uuid`, as the scan lists it, picks that screen whatever number\nit is listed under."
+      },
+      "ScreenCaptureTargetRequestBody": {
+        "type": "object",
+        "required": [
+          "target"
+        ],
+        "properties": {
+          "target": {
+            "$ref": "#/components/schemas/ScreenCaptureTargetBody"
+          }
+        }
       },
       "ScreenNameBody": {
         "type": "object",
@@ -21262,6 +21406,7 @@
         "required": [
           "at_secs",
           "interval_ms",
+          "between_ms",
           "busy_ms",
           "parts"
         ],
@@ -21270,6 +21415,22 @@
             "type": "number",
             "format": "double",
             "description": "When it started, in seconds after the first frame."
+          },
+          "before": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FrameBefore",
+                "description": "The frame before, when this one came or started late, less than a\nsecond after that one started, and that one was not slow itself (a\nslow one is a slow frame of its own)."
+              }
+            ]
+          },
+          "between_ms": {
+            "type": "number",
+            "format": "float",
+            "description": "Of that, from the end of the frame before to this one's start: time\nthat is no part of either frame."
           },
           "busy_ms": {
             "type": "number",
@@ -21286,7 +21447,7 @@
             "items": {
               "$ref": "#/components/schemas/FramePart"
             },
-            "description": "Its parts over 0.3 ms, in the order spent."
+            "description": "Its parts of 0.3 ms or more, in the order spent."
           },
           "start_delay_ms": {
             "type": [

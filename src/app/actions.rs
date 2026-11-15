@@ -73,6 +73,15 @@ impl VardaApp {
                 EngineCommand::AddInput { .. } => Some("Input not added"),
                 EngineCommand::StartRecording => Some("Recording not started"),
                 EngineCommand::StartStream => Some("Stream not started"),
+                // The input stays on what it showed: a window closed since
+                // it was listed, a screen macOS will not let be captured.
+                EngineCommand::SetScreenCaptureTarget { target, .. } => {
+                    Some(if target.is_display() {
+                        "Screen not picked"
+                    } else {
+                        "Window not picked"
+                    })
+                }
                 // A step not taken says so itself, wherever the press came
                 // from; these are the window's alone to say.
                 EngineCommand::AddRundownStep { .. } => Some("Step not added"),

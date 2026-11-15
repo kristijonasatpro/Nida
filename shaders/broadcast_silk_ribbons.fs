@@ -109,6 +109,15 @@
             "SCALE": 0.08,
             "WRAP": 4096.0
         }
+    ],
+    "PASSES": [
+        {
+            "TARGET": "look",
+            "WIDTH": "$WIDTH/2",
+            "HEIGHT": "$HEIGHT/2",
+            "FLOAT": true
+        },
+        {}
     ]
 }*/
 
@@ -136,7 +145,10 @@ layout(set = 0, binding = 0) uniform ISFUniforms {
     float PHASE_TIME_3;
 };
 
-layout(set = 0, binding = 1) uniform UserParams {
+layout(set = 0, binding = 1) uniform sampler texSampler;
+layout(set = 0, binding = 2) uniform texture2D look;
+
+layout(set = 0, binding = 3) uniform UserParams {
     float speed;
     float density;
     float calm;
@@ -244,6 +256,16 @@ void main() {
         return;
     }
 
+    // Second pass, at the deck's size: the picture drawn at half the size
+    // in the first, and the grain at the wall's own pixels. The look is all
+    // soft shapes, so half the size draws it the same at a quarter of the
+    // cost (tests/broadcast_looks.rs); the grain, scaled up, would no longer
+    // break up bands.
+    if (PASSINDEX != 0) {
+        fragColor = bc_finish(texture(sampler2D(look, texSampler), uv).rgb, uv * RENDERSIZE);
+        return;
+    }
+
     vec3 bgc;
     vec3 mainc;
     vec3 accentc;
@@ -251,7 +273,6 @@ void main() {
     float aspect = RENDERSIZE.x / max(RENDERSIZE.y, 1.0);
     vec2 p = vec2((uv.x - 0.5) * aspect, uv.y);
     float t = PHASE_TIME_0;
-    vec2 frag = uv * RENDERSIZE;
     // A preset's background is lifted a little toward its Main; Custom's is
     // the Background as picked (a colour picked on a preset starts as the
     // lifted one, so nothing moves). Near black is lifted at the end, for
@@ -283,5 +304,5 @@ void main() {
     vec2 o = bc_hash22(id) - 0.5;
     float mote = (1.0 - smoothstep(0.03, 0.07, length(f - o * 0.6))) * step(h, density * 0.12);
     col += accentc * mote * 0.35;
-    fragColor = bc_finish(bc_calm_all(col, base, uv, calm), frag);
+    fragColor = vec4(bc_calm_all(col, base, uv, calm), 1.0);
 }

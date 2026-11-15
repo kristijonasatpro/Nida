@@ -712,6 +712,7 @@ pub fn snapshot_scene(
                                 exclude_varda: Some(state.config.exclude_varda),
                                 scaling_mode: slot.deck.scaling_mode().unwrap_or_default(),
                                 presentation: state.presentation.clone(),
+                                listed_as: state.listed_as.clone(),
                             }
                         }
                         "tap" => {
@@ -1884,6 +1885,7 @@ pub(crate) fn restore_deck(
             exclude_varda,
             scaling_mode,
             presentation,
+            listed_as,
         } => {
             let identity = crate::screen_capture::backend::TargetIdentity::from(target);
             // A PowerPoint input's window is its show's, found by the
@@ -1894,27 +1896,20 @@ pub(crate) fn restore_deck(
             } else {
                 screen_capture_manager.find_target(&identity).cloned()
             };
+            // The name the show has for the input: `config` is its capture's
+            // settings from here on.
+            let saved_name = &config.name;
             let config = crate::screen_capture::backend::CaptureConfig {
                 rate: *rate,
                 crop: crop.map(Into::into).unwrap_or_default(),
                 show_cursor: *show_cursor,
                 exclude_varda: exclude_varda.unwrap_or_else(|| target.is_display()),
-                // Capped to the deck but kept in the target's own shape, so the
-                // deck's scaling mode still has an aspect mismatch to resolve.
-                // Falls back to the deck box when the target is missing; the
-                // real size is picked up if it comes back and rebinds.
-                scale_to: Some(
-                    found
-                        .as_ref()
-                        .map_or((render_width, render_height), |info| {
-                            crate::screen_capture::resample::fit_within(
-                                info.width,
-                                info.height,
-                                render_width,
-                                render_height,
-                            )
-                        }),
-                ),
+                // Capped at the show's size, a bound the capture fits the
+                // target's pixels within in the target's own shape (as when
+                // added: see `add_screen_capture_deck`).
+                scale_to: Some((render_width, render_height)),
+                // Its capture's to follow, once it is drawn.
+                drawn: crate::screen_capture::backend::Drawn::default(),
             }
             .sanitized();
 
@@ -1927,7 +1922,7 @@ pub(crate) fn restore_deck(
             // See spec/screen-capture.md § Configuration and Persistence.
             let opened = found.and_then(|info| {
                 match screen_capture_manager.open(&info, config.clone(), &context.device) {
-                    Ok(bound) => Some((info.label.clone(), bound)),
+                    Ok(bound) => Some((info.label.clone(), identity.restored_to(&info), bound)),
                     Err(e) => {
                         log::warn!(
                             "Capture target '{}' found but could not be opened: {e}",
@@ -1938,7 +1933,10 @@ pub(crate) fn restore_deck(
                 }
             });
 
-            let (label, capture_id, src_w, src_h) = opened.map_or_else(
+            // A display found as itself is named as it is listed now; one
+            // the show has by its name alone stays so (see
+            // `TargetIdentity::restored_to`).
+            let (label, identity, capture_id, src_w, src_h) = opened.map_or_else(
                 || {
                     if presentation.is_none() {
                         log::warn!(
@@ -1948,21 +1946,41 @@ pub(crate) fn restore_deck(
                     }
                     (
                         target.label(),
+                        identity.clone(),
                         crate::screen_capture::UNBOUND_CAPTURE_ID,
                         render_width,
                         render_height,
                     )
                 },
-                |(label, (id, w, h))| (label, id, w, h),
+                |(label, identity, (id, w, h))| (label, identity, id, w, h),
             );
 
+            let unbound = capture_id == crate::screen_capture::UNBOUND_CAPTURE_ID;
+            // What it was last named after (see
+            // `ScreenCaptureState::listed_as`). Capturing, it is named below
+            // as its screen or window is listed now. Capturing nothing, it
+            // is what the show kept. A show that kept none — one saved
+            // before 0.9.9, or a preset of such an input — tells nothing of
+            // it, and no rule makes it up from the name: one that ends as a
+            // listing of its window does ("🖥 My — Opening") may as well be
+            // one given the input, which is not to be replaced. A
+            // PowerPoint input is named after its talk, and no window is
+            // picked for it.
+            let listed_as = if presentation.is_some() {
+                None
+            } else if unbound {
+                listed_as.clone()
+            } else {
+                Some(label.clone())
+            };
             let mut deck = Deck::new_from_screen_capture(
                 context,
                 crate::deck::ScreenCaptureState {
                     capture_id,
                     identity,
                     config,
-                    config_dirty: false,
+                    given: Vec::new(),
+                    listed_as,
                     presentation: presentation.clone(),
                 },
                 &label,
@@ -1972,6 +1990,35 @@ pub(crate) fn restore_deck(
                 render_height,
             )?;
             deck.set_scaling_mode(*scaling_mode);
+            // Capturing nothing now — its app closed, its screen unplugged,
+            // a PowerPoint show not yet playing — it keeps the name the show
+            // has for it; one the show has no name for is named after what
+            // it was to capture. A window is saved by its app's bundle id,
+            // which is not what the app is called: named from that, an input
+            // read "lt.proconf.kmynas-klauso — …" where it had read "Kmynas
+            // klauso — …", and the show saved that as its name from then on.
+            // A PowerPoint input captures nothing in any show just opened,
+            // and no window is ever picked for it: named so at every open,
+            // a show saved since has it as "🖥 com.microsoft.Powerpoint — …",
+            // a name nothing would mend. That name — its window's app's —
+            // or none is its talk's again, as when it was added (see
+            // `add_presentation_deck`); any other it keeps.
+            let read_by_its_app = saved_name.strip_prefix("🖥 ").is_some_and(|rest| {
+                matches!(
+                    target,
+                    crate::scene::CaptureTargetConfig::Window { app, .. }
+                        if !app.is_empty() && rest.starts_with(app.as_str())
+                )
+            });
+            let its_talk = presentation
+                .as_ref()
+                .filter(|_| saved_name.is_empty() || read_by_its_app);
+            if let Some(talk) = its_talk {
+                let file = std::path::Path::new(&talk.path);
+                deck.set_source_name(crate::presentation::input_name(file));
+            } else if unbound && !saved_name.is_empty() {
+                deck.set_source_name(saved_name.clone());
+            }
             deck
         }
         SourceConfig::Tap {

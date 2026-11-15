@@ -34,6 +34,7 @@ const WHOLE: Placed = Placed {
     crop: None,
     premultiplied: true,
     over_black: 0.0,
+    coded: false,
 };
 
 /// Between two framings of one source by `by`: where it goes and how big,
@@ -104,6 +105,9 @@ fn between_framing(from: &Placed, to: &Placed, by: f32) -> Placed {
         // flattening comes in or goes as the picture moves — it shows only
         // where the source is see-through.
         over_black: mix(from.over_black, to.over_black),
+        // How the source is read, not a framing: the new side's (each
+        // side's own where they draw two sources, see `draw_merge`).
+        coded: to.coded,
     }
 }
 
@@ -1204,8 +1208,12 @@ impl Mixer {
                 pictures.push((placed, old_source, from.size, opacity));
             } else {
                 // Each side's frame at its own strength, weighted as the
-                // sides are mixed.
-                pictures.push((placed, old_source, from.size, old[i].opacity));
+                // sides are mixed — and read as its own side reads it.
+                let old_placed = Placed {
+                    coded: from.placed.coded,
+                    ..placed
+                };
+                pictures.push((old_placed, old_source, from.size, old[i].opacity));
                 pictures.push((placed, new_source, to.size, new[j].opacity));
             }
             new_travel[j] = Some(pictures.len() - 1);
@@ -1371,6 +1379,23 @@ mod tests {
         assert_eq!(borrowed(false, false, true), Some(1));
         assert_eq!(borrowed(true, false, false), None);
         assert_eq!(borrowed(false, true, true), None);
+    }
+
+    /// Between two framings, a source is read as the framing it goes to
+    /// reads it — coded or not — all the way: two sides drawing one source
+    /// read it alike, and of two sources the old side's is read as its own
+    /// framing has it (see `Mixer::draw_merge`).
+    #[test]
+    fn between_framings_a_source_is_read_as_the_one_it_goes_to_reads_it() {
+        let coded = Placed {
+            coded: true,
+            ..WHOLE
+        };
+        for by in [0.0, 0.5, 1.0] {
+            assert!(between_framing(&WHOLE, &coded, by).coded, "{by}");
+            assert!(!between_framing(&coded, &WHOLE, by).coded, "{by}");
+            assert!(between_framing(&coded, &coded, by).coded, "{by}");
+        }
     }
 
     /// Between framings, a crop or border on one side only grows from

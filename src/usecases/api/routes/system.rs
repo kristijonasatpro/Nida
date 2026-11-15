@@ -171,9 +171,52 @@ pub struct CompositorBody {
     /// default).
     #[serde(default)]
     pub merge_layer_passes: Option<bool>,
+    /// Draw a slow layer whose Rate is Auto less often while the show's
+    /// frames run late, repeating its last picture between, and let a
+    /// covered layer's thumbnail wait meanwhile (on by default). Off: late
+    /// frames make no layer drawn less often — a layer's own Rate, and
+    /// leaving out what is not seen, are as ever.
+    #[serde(default)]
+    pub slow_layers_less_often: Option<bool>,
+    /// Leave an input nothing of which shows — a lower third that is off, a
+    /// text hidden — undrawn, and off Main's layers, until something of it
+    /// shows (on by default). Off draws it every frame, as before.
+    #[serde(default)]
+    pub skip_blank_channels: Option<bool>,
+    /// Keep a lower third or a text standing still — a name on air, a text
+    /// shown, nothing of it moving — as it is drawn, rather than draw it
+    /// again every frame (on by default). Off draws it every frame, as
+    /// before.
+    #[serde(default)]
+    pub keep_still_text: Option<bool>,
+    /// Draw Main's layers — what is on it, a dissolve's two pictures, and
+    /// the Normal, Add and Screen overlays over them — in one pass (on by
+    /// default). Off draws each in a pass of its own, as before.
+    #[serde(default)]
+    pub merge_main_passes: Option<bool>,
+    /// Give Main out as its one input's own picture, with no pass drawn,
+    /// while Main is that input alone at full level and nothing is done to
+    /// it after — no master effect, tone map, LUT or tap of Main (on by
+    /// default). Off draws the pass, as before.
+    #[serde(default)]
+    pub pass_main_through: Option<bool>,
+    /// Keep a clip's picture while the clip gives no new frame — paused,
+    /// stopped on its last, or between two of its frames in a show running
+    /// faster than the clip — rather than draw it again every frame (on by
+    /// default). Off draws it every frame, as before.
+    #[serde(default)]
+    pub keep_still_clips: Option<bool>,
+    /// Keep an input's picture while nothing in it changes — a still
+    /// picture, a clip paused, a window captured that stands still —
+    /// rather than put its layers together again every frame (on by
+    /// default). Off puts them together every frame, as before.
+    #[serde(default)]
+    pub keep_still_inputs: Option<bool>,
 }
 /// How the compositor draws: for comparing its ways on one show, GPU use
-/// with each, without a restart. The picture is the same either way.
+/// with each, without a restart. The picture is the same either way —
+/// but for a slow layer's, repeated between its draws while frames run
+/// late (`slow_layers_less_often`).
 #[utoipa::path(put, path = "/api/compositor", request_body = CompositorBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "System")]
 pub async fn set_compositor(
     State(state): State<SharedState>,
@@ -183,6 +226,13 @@ pub async fn set_compositor(
         .send_command(EngineCommand::SetCompositor {
             direct_layers: b.direct_layers,
             merge_layer_passes: b.merge_layer_passes,
+            slow_layers_less_often: b.slow_layers_less_often,
+            skip_blank_channels: b.skip_blank_channels,
+            keep_still_text: b.keep_still_text,
+            merge_main_passes: b.merge_main_passes,
+            pass_main_through: b.pass_main_through,
+            keep_still_clips: b.keep_still_clips,
+            keep_still_inputs: b.keep_still_inputs,
         })
         .await
     {

@@ -98,6 +98,8 @@ pub(crate) fn build_ui_data(
                     let screen_capture = d.screen_capture.as_ref().map(|s| ScreenCaptureUI {
                         target_label: s.target_label.clone(),
                         is_display: s.is_display,
+                        target_uuid: s.target_uuid.clone(),
+                        kept_by_name: s.kept_by_name,
                         rate: s.rate_norm,
                         rate_fps: s.rate_fps,
                         crop: s.crop,
@@ -813,6 +815,7 @@ pub(crate) fn build_ui_data(
             .gpu_busy()
             .unwrap_or_else(|| app.mixer_ref().gpu_utilization()),
         gpu_utilization_measured: app.frame_stats.system_monitor.gpu_busy().is_some(),
+        late_frames: late_frames(&app.frame_stats.intervals, app.target_fps()),
         nida_gpu: app.frame_stats.system_monitor.nida_gpu(),
         nida_ram: app.frame_stats.system_monitor.nida_ram(),
         cpu_usage: app.frame_stats.system_monitor.cpu_usage(),
@@ -863,6 +866,38 @@ pub(crate) fn build_ui_data(
 }
 
 // ── Snapshot → UI type helpers ──────────────────────────────────────
+
+/// How many frames of the last five seconds started more than half a
+/// frame late, from the milliseconds between the last frames' starts
+/// (`intervals`, the latest last) — a screen showing every frame showed
+/// the one before twice. The rule of the API's `pacing.late_frames`, over
+/// five seconds whatever the rate: `intervals` holds a count of frames (ten
+/// seconds of them at 30 fps, two and a half at 120), so only the last five
+/// seconds are counted, and a history shorter than that (but a second at
+/// least) is counted as if it went on as it is for five. None uncapped
+/// (`target_fps` 0: no frame is due at any time); the gap after a pause (a
+/// launch, a dialog: a second or more) is not a frame.
+fn late_frames(intervals: &std::collections::VecDeque<f32>, target_fps: u32) -> u32 {
+    const OVER_MS: f32 = 5000.0;
+    if target_fps == 0 {
+        return 0;
+    }
+    let frame_ms = 1000.0 / target_fps as f32;
+    let (mut covered, mut late) = (0.0_f32, 0.0_f32);
+    for ms in intervals.iter().rev() {
+        if covered >= OVER_MS {
+            break;
+        }
+        covered += ms;
+        if *ms < 1000.0 && *ms > frame_ms * 1.5 {
+            late += 1.0;
+        }
+    }
+    if (1000.0..OVER_MS).contains(&covered) {
+        late = late * OVER_MS / covered;
+    }
+    late.round() as u32
+}
 
 /// A channel's frame rate as its motion shows it: the slowest of its visible
 /// layers that moves, from each layer's `(fps, still)`. A still image is drawn
@@ -946,6 +981,31 @@ fn shown_channel_name(name: &str, idx: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Frames started more than half a frame late are counted, against the
+    /// show's own rate; the gap after a pause is not one, and uncapped none.
+    #[test]
+    fn late_frames_are_those_started_more_than_half_a_frame_late() {
+        use std::collections::VecDeque;
+        // Oldest first: a late frame more than five seconds ago, then 299
+        // on time, then two late ones (25.1 and 100 ms) among the latest.
+        let mut long = vec![33.4_f32];
+        long.extend([16.7_f32; 299]);
+        long.extend([24.9, 25.1, 16.7, 100.0, 16.7]);
+        let long: VecDeque<f32> = long.into();
+        assert_eq!(super::late_frames(&long, 60), 2, "the last five seconds' alone");
+        assert_eq!(super::late_frames(&long, 30), 1, "100 ms alone, at 30");
+        assert_eq!(super::late_frames(&long, 0), 0, "uncapped");
+        // 150 frames at 120 fps are a second and a quarter: two late ones
+        // there are eight in five seconds.
+        let mut short = vec![8.33_f32; 148];
+        short.extend([20.0, 20.0]);
+        assert_eq!(super::late_frames(&short.into(), 120), 8, "as if it went on for five");
+        // The gap after a pause is not a late frame.
+        let paused: VecDeque<f32> = [16.7, 2500.0, 1000.0, 16.7].into();
+        assert_eq!(super::late_frames(&paused, 60), 0, "a pause");
+        assert_eq!(super::late_frames(&VecDeque::new(), 60), 0);
+    }
+
     use super::{channel_fps, shown_channel_name};
 
     /// A channel never named is called by where it is in the Inputs row,

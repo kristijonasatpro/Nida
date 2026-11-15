@@ -300,7 +300,7 @@ impl UIRunner {
             egui_wants: std::time::Duration::ZERO,
             ui_frame_period: std::time::Duration::ZERO,
             ui_frame_allowance: std::time::Duration::ZERO,
-            ui_parts: crate::app::frame_parts::FrameParts::default(),
+            ui_parts: crate::app::frame_parts::FrameParts::of("control window"),
             ui_frames: 0,
             stashed_actions: None,
             engine_late_reported: None,
@@ -2199,13 +2199,25 @@ impl UIRunner {
             }
         }
         for (part, took) in parts {
-            self.ui_parts.add(part, took);
+            // The wait for the window's next frame is its screen's pace, not
+            // the UI's work.
+            if part == UI_ACQUIRE {
+                self.ui_parts.add_wait(part, took);
+            } else {
+                self.ui_parts.add(part, took);
+            }
         }
         let t_part = std::time::Instant::now();
+        let mut waited = std::time::Duration::ZERO;
         if let (Some(context), Some(egui_renderer)) = (&self.gpu, &mut self.egui_renderer) {
-            self.panel_windows.paint(context, egui_renderer);
+            waited = self.panel_windows.paint(context, egui_renderer);
         }
-        self.part("ui panel windows", t_part);
+        // A panel's window waits for its screen as the control window does.
+        if !waited.is_zero() {
+            self.ui_parts.add_wait(UI_ACQUIRE_PANELS, waited);
+        }
+        self.ui_parts
+            .add("ui panel windows", t_part.elapsed().saturating_sub(waited));
         if let Some(egui_renderer) = &mut self.egui_renderer {
             for id in textures.iter().flat_map(|t| &t.free) {
                 egui_renderer.free_texture(id);
@@ -2279,10 +2291,14 @@ impl UIRunner {
             return parts;
         };
 
+        // The GPU's finished work taken in is the frame's own work; only the
+        // wait for the window's frame is its screen's pace.
         let t_part = std::time::Instant::now();
         let _ = context.device.poll(wgpu::PollType::Poll);
+        parts.push(("ui poll", t_part.elapsed()));
+        let t_part = std::time::Instant::now();
         let acquired = win_surface.surface.get_current_texture();
-        parts.push(("ui acquire", t_part.elapsed()));
+        parts.push((UI_ACQUIRE, t_part.elapsed()));
         let had = matches!(
             acquired,
             wgpu::CurrentSurfaceTexture::Success(_) | wgpu::CurrentSurfaceTexture::Suboptimal(_)
@@ -2440,6 +2456,13 @@ const ENGINE_PATIENCE: std::time::Duration = std::time::Duration::from_millis(10
 
 /// The control window's name in a present trace.
 const CONTROL: &str = "control window";
+
+/// The part of the control window's frame spent waiting for a frame of its
+/// own to draw into.
+const UI_ACQUIRE: &str = "ui acquire";
+
+/// The same wait of the panels' windows, all of them together.
+const UI_ACQUIRE_PANELS: &str = "ui panel acquire";
 
 /// A screen's `CGDirectDisplayID`, where there is one (macOS).
 // `None` off macOS, where there are no display ids.
