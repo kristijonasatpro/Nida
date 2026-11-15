@@ -480,6 +480,8 @@ pub struct UIData {
     /// The Broadcast backgrounds, by mood (also among `generators`).
     pub broadcast: Vec<crate::engine::BroadcastLook>,
     pub filters: Vec<(String, usize)>,
+    /// The frames a layer's picture can be put in (Position → Frame).
+    pub frames: Vec<crate::engine::FrameLook>,
     /// Each masked effect's mask, by effect UUID.
     pub effect_masks: std::collections::HashMap<String, crate::engine::value::mask::EffectMask>,
     pub shader_count: usize,

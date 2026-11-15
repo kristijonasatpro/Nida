@@ -598,6 +598,7 @@ pub(crate) fn build_ui_data(
         generators: engine.registry.generators,
         broadcast: engine.registry.broadcast,
         filters: engine.registry.filters,
+        frames: engine.registry.frames,
         effect_masks,
         shader_count: engine.registry.shader_count,
         channels,

@@ -880,6 +880,110 @@ fn an_effect_whose_shader_is_not_there_is_kept_offline() {
     assert_eq!(kept, gone, "as it was, its settings its own");
 }
 
+/// A frame whose shader is not there — a show from a newer Nida — is the
+/// layer's frame still: another put in its place takes it away and keeps
+/// the choices saved with it, which come back as plain numbers.
+#[test]
+fn a_frame_whose_shader_is_not_there_gives_way_keeping_its_choices() {
+    use varda::params::ParamValue;
+    let tmp = TempDir::new().unwrap();
+    let Some(mut app) = headless_app_in(tmp.path()) else {
+        return;
+    };
+    let ch = channel_uuid(&mut app, 0);
+    let CommandResult::OkWithId { uuid: deck } = send_cmd(
+        &mut app,
+        EngineCommand::AddSolidColorDeck {
+            channel_uuid: ch,
+            color: [1.0, 0.0, 0.0, 1.0],
+        },
+    ) else {
+        panic!("no deck");
+    };
+    let CommandResult::OkWithId { uuid: frame } = send_cmd(
+        &mut app,
+        EngineCommand::SetLayerFrame {
+            deck_uuid: deck,
+            frame: Some("frame_hud".to_string()),
+        },
+    ) else {
+        panic!("no frame");
+    };
+    // Changed on it: a square window, filled.
+    for (name, value) in [("shape", ParamValue::Long(3)), ("fill", ParamValue::Bool(true))] {
+        fire(
+            &mut app,
+            EngineCommand::SetEffectParam {
+                effect_uuid: frame.clone(),
+                name: name.into(),
+                value,
+            },
+        );
+    }
+    app.save_workspace(&UILayoutState::default())
+        .expect("save workspace");
+
+    // Its shader one this Nida does not have.
+    let scene = tmp.path().join(".varda/scene.json");
+    let mut saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&scene).unwrap()).unwrap();
+    let effect = saved
+        .pointer_mut("/channels/0/decks/0/effects")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["path"].as_str().unwrap().ends_with("frame_hud.fs"))
+        .expect("the frame");
+    effect["path"] = "/Users/elsewhere/Show/.varda/shaders/frame_future.fs".into();
+    std::fs::write(&scene, serde_json::to_string_pretty(&saved).unwrap()).unwrap();
+
+    let Some(mut app) = headless_app_in(tmp.path()) else {
+        return;
+    };
+    assert!(app.load_workspace().is_ok());
+    let state = app.build_engine_state();
+    let layer = &state.mixer.channels[0].decks[0];
+    assert!(
+        layer
+            .effects
+            .iter()
+            .any(|e| e.offline.is_some() && e.name == "frame_future"),
+        "kept, offline"
+    );
+    let deck = layer.uuid.clone();
+
+    let CommandResult::OkWithId { uuid: panel } = send_cmd(
+        &mut app,
+        EngineCommand::SetLayerFrame {
+            deck_uuid: deck,
+            frame: Some("frame_panel".to_string()),
+        },
+    ) else {
+        panic!("not put in its place");
+    };
+    let state = app.build_engine_state();
+    let effects = &state.mixer.channels[0].decks[0].effects;
+    let names: Vec<&str> = effects.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, ["crop", "frame_panel", "transform"], "the one without its shader gone");
+    let setting = |name: &str| {
+        effects
+            .iter()
+            .find(|e| e.uuid == panel)
+            .expect("the new frame")
+            .params
+            .params
+            .iter()
+            .find(|p| p.name == name)
+            .expect("its setting")
+            .value
+    };
+    let shape = setting("shape");
+    assert!(matches!(shape, ParamValue::Long(3)), "the Shape saved: {shape:?}");
+    let fill = setting("fill");
+    assert!(matches!(fill, ParamValue::Bool(true)), "Fill the frame, saved: {fill:?}");
+}
+
 /// An offline effect duplicated, or the channel it is on, comes along
 /// offline: not refused, nor left out of the channel's copy.
 #[test]

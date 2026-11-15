@@ -2335,8 +2335,8 @@ pub(super) fn render_playback_controls(
 }
 
 /// Chain positions of the deck's framing effects — its first crop and first
-/// transform — and of its own mask, all shown in the framing controls. Any
-/// further ones are ordinary effects in the list.
+/// transform — and of its own mask and its frame, all shown in the framing
+/// controls. Any further ones are ordinary effects in the list.
 pub(super) fn framing_indices(deck: &DeckUIInfo) -> Vec<usize> {
     use crate::engine::value::mask::LAYER_MASK_EFFECT;
     FRAMING_EFFECTS
@@ -2344,7 +2344,16 @@ pub(super) fn framing_indices(deck: &DeckUIInfo) -> Vec<usize> {
         .map(|(name, _)| *name)
         .chain([LAYER_MASK_EFFECT])
         .filter_map(|name| deck.effects.iter().position(|(_, n, ..)| n == name))
+        .chain(deck.effects.iter().position(|(_, n, ..)| is_frame_effect(n)))
         .collect()
+}
+
+/// Whether a layer's effect, by the name it is shown under, is its frame:
+/// a `frame_*` filter — one whose shader is not there too, shown as
+/// "⚠ frame_… — offline" (see `effect_snapshot_to_ui`).
+fn is_frame_effect(shown: &str) -> bool {
+    use crate::engine::value::frame::is_frame;
+    is_frame(shown) || shown.strip_prefix("⚠ ").is_some_and(is_frame)
 }
 
 /// Width the columns after the preview take, so the preview can have the rest
@@ -2552,6 +2561,7 @@ pub(super) fn render_framing(
             render_border(ui, deck, effect, border, data, actions);
         }
     }
+    render_frame(ui, deck, data, actions);
     ui.add_space(4.0);
     ui.label(section_title(ui, "Mask")).on_hover_text(
         "Cut a shape out of the layer — or keep only the shape — so what is under it shows",
@@ -2570,6 +2580,70 @@ pub(super) fn render_framing(
                     shader_name: name.to_string(),
                 });
             }
+        }
+    }
+}
+
+/// The Frame section: which frame holds the layer's picture — None, or one
+/// of the library's — and that frame's own settings. The frame's effect
+/// sits before Transform in the layer's chain, so the layer is moved and
+/// scaled frame and all.
+fn render_frame(ui: &mut egui::Ui, deck: &DeckUIInfo, data: &UIData, actions: &mut UIActions) {
+    let current = deck.effects.iter().find(|(_, name, ..)| is_frame_effect(name));
+    // A library with no frames offers none (a layer that has one, from a
+    // show made with them, still shows it).
+    if data.frames.is_empty() && current.is_none() {
+        return;
+    }
+    // The frame's title; one the library does not list — its shader gone
+    // from it, or not there — by the name it is shown under. None only
+    // when there is none.
+    let title = match current {
+        None => "None",
+        Some((_, name, ..)) => data
+            .frames
+            .iter()
+            .find(|frame| frame.name == *name)
+            .map_or(name.as_str(), |frame| frame.title.as_str()),
+    };
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(section_title(ui, "Frame")).on_hover_text(
+            "Put the layer's picture in a moving frame: it holds the picture, cuts it to its \
+             shape, and goes where the layer goes",
+        );
+        egui::ComboBox::from_id_salt(("layer_frame", &deck.uuid))
+            .selected_text(title)
+            .width(150.0)
+            .show_ui(ui, |ui| frame_choices(ui, deck, data, actions));
+    });
+    if let Some(effect) = current {
+        render_deck_effect_controls(ui, &deck.uuid, effect, data, actions);
+    }
+}
+
+/// What the Frame drop-down lists: None, then every frame by its title.
+/// Picking one puts the layer's picture in it (in place of the frame it
+/// has); None takes the frame away.
+fn frame_choices(ui: &mut egui::Ui, deck: &DeckUIInfo, data: &UIData, actions: &mut UIActions) {
+    let current = deck
+        .effects
+        .iter()
+        .find(|(_, name, ..)| is_frame_effect(name))
+        .map(|(_, name, ..)| name.as_str());
+    if ui.selectable_label(current.is_none(), "None").clicked() && current.is_some() {
+        actions.commands.push(EngineCommand::SetLayerFrame {
+            deck_uuid: deck.uuid.clone(),
+            frame: None,
+        });
+    }
+    for frame in &data.frames {
+        let selected = current == Some(frame.name.as_str());
+        if ui.selectable_label(selected, frame.title.as_str()).clicked() && !selected {
+            actions.commands.push(EngineCommand::SetLayerFrame {
+                deck_uuid: deck.uuid.clone(),
+                frame: Some(frame.name.clone()),
+            });
         }
     }
 }
@@ -2865,8 +2939,9 @@ pub(super) fn render_effect_controls(
     } else {
         render_effect_param_widgets(ui, owner, effect, data, actions);
     }
-    // Framing places the whole picture; a mask on it would make no sense.
-    if !FRAMING_EFFECTS.iter().any(|(name, _)| name == eff_name) {
+    // Framing places the whole picture, and a frame holds it; a mask on
+    // either would make no sense.
+    if !FRAMING_EFFECTS.iter().any(|(name, _)| name == eff_name) && !is_frame_effect(eff_name) {
         super::mask_edit::render_mask_row(ui, eff_uuid, data, actions);
     }
 }
@@ -3087,6 +3162,118 @@ mod tests {
         assert!(
             framing_indices(with_mask).contains(&at),
             "not an ordinary effect in the list"
+        );
+    }
+
+    /// The Frame drop-down lists every frame by its title: picking one asks
+    /// for it on this layer, and — in a frame — None takes it away; the
+    /// frame's effect is shown with the framing controls, not among the
+    /// layer's effects.
+    #[test]
+    fn the_frame_section_puts_the_layer_in_a_frame() {
+        let mut data = UIData::test_fixture();
+        data.frames = vec![crate::engine::FrameLook {
+            name: "frame_hud".into(),
+            title: "HUD frame".into(),
+        }];
+        let (ch, dk) = data.selected_deck.expect("fixture selects a deck");
+        let deck = data.channels[ch].decks[dk].clone();
+        let mut actions = UIActions::new();
+        {
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(400.0, 300.0))
+                .build_ui(|ui| frame_choices(ui, &deck, &data, &mut actions));
+            h.get_by_label("HUD frame").click();
+            h.run();
+        }
+        assert!(
+            actions.commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetLayerFrame {
+                    deck_uuid,
+                    frame: Some(frame),
+                } if *deck_uuid == deck.uuid && frame == "frame_hud"
+            )),
+            "{:?}",
+            actions.commands
+        );
+
+        let framed = &mut data.channels[ch].decks[dk];
+        framed.effects.push((
+            "fx0frame".into(),
+            "frame_hud".into(),
+            true,
+            ShaderParamsUI {
+                shader_name: "frame_hud".into(),
+                params: Vec::new(),
+            },
+        ));
+        let at = framed.effects.len() - 1;
+        assert!(
+            framing_indices(framed).contains(&at),
+            "not an ordinary effect in the list"
+        );
+        let deck = framed.clone();
+        let mut actions = UIActions::new();
+        {
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(400.0, 300.0))
+                .build_ui(|ui| frame_choices(ui, &deck, &data, &mut actions));
+            h.get_by_label("None").click();
+            h.run();
+        }
+        assert!(
+            actions.commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetLayerFrame {
+                    deck_uuid,
+                    frame: None,
+                } if *deck_uuid == deck.uuid
+            )),
+            "{:?}",
+            actions.commands
+        );
+    }
+
+    /// A frame whose shader is not there is shown under another name
+    /// ("⚠ … — offline"): it is the layer's frame still — with the framing
+    /// controls, not among the effects, and None takes it away.
+    #[test]
+    fn a_frame_without_its_shader_is_the_layers_frame_still() {
+        let mut data = UIData::test_fixture();
+        let (ch, dk) = data.selected_deck.expect("fixture selects a deck");
+        let framed = &mut data.channels[ch].decks[dk];
+        framed.effects.push((
+            "fx0frame".into(),
+            "⚠ frame_future — offline".into(),
+            true,
+            ShaderParamsUI {
+                shader_name: "frame_future".into(),
+                params: Vec::new(),
+            },
+        ));
+        let at = framed.effects.len() - 1;
+        assert!(framing_indices(framed).contains(&at), "not among the effects");
+        assert!(!is_frame_effect("⚠ blur — offline"), "another effect's shader gone");
+        let deck = framed.clone();
+        let mut actions = UIActions::new();
+        {
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(400.0, 300.0))
+                .build_ui(|ui| frame_choices(ui, &deck, &data, &mut actions));
+            h.get_by_label("None").click();
+            h.run();
+        }
+        assert!(
+            actions.commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetLayerFrame {
+                    deck_uuid,
+                    frame: None,
+                } if *deck_uuid == deck.uuid
+            )),
+            "{:?}",
+            actions.commands
         );
     }
 

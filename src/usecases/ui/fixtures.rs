@@ -308,6 +308,7 @@ impl UIData {
                 ("test_generator_d".to_string(), 3),
             ],
             broadcast: vec![],
+            frames: vec![],
             effect_masks: std::collections::HashMap::new(),
             filters: vec![
                 ("test_effect".to_string(), 0),

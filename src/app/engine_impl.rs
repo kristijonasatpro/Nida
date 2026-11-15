@@ -25,6 +25,40 @@ use anyhow::{Context as _, Result};
 /// Effects every new deck starts with, in chain order. See `add_default_effects`.
 const DEFAULT_DECK_EFFECTS: [&str; 2] = ["crop", "transform"];
 
+/// Whether a setting `value`, taken from one frame, goes on another whose
+/// own is `now`: of the same kind — or a number for a choice or a switch,
+/// which is kept as one (`ShaderParams::set`). A frame whose shader is
+/// not there has its saved choices as plain numbers (a saved show has one
+/// kind of number); a colour never goes where a number is.
+fn goes_on(now: &ParamValue, value: &ParamValue) -> bool {
+    matches!(
+        (now, value),
+        (ParamValue::Float(_), ParamValue::Float(_))
+            | (ParamValue::Long(_), ParamValue::Long(_) | ParamValue::Float(_))
+            | (
+                ParamValue::Bool(_),
+                ParamValue::Bool(_) | ParamValue::Long(_) | ParamValue::Float(_)
+            )
+            | (ParamValue::Color(_), ParamValue::Color(_))
+            | (ParamValue::Point2D(_), ParamValue::Point2D(_))
+    )
+}
+
+/// Whether two settings of an effect are the same: numbers to a hair.
+fn same_setting(a: &ParamValue, b: &ParamValue) -> bool {
+    let near = |x: f32, y: f32| (x - y).abs() < 1e-6;
+    match (a, b) {
+        (ParamValue::Float(x), ParamValue::Float(y)) => near(*x, *y),
+        (ParamValue::Bool(x), ParamValue::Bool(y)) => x == y,
+        (ParamValue::Long(x), ParamValue::Long(y)) => x == y,
+        (ParamValue::Color(x), ParamValue::Color(y)) => x.iter().zip(y).all(|(x, y)| near(*x, *y)),
+        (ParamValue::Point2D(x), ParamValue::Point2D(y)) => {
+            x.iter().zip(y).all(|(x, y)| near(*x, *y))
+        }
+        _ => false,
+    }
+}
+
 /// Sanitize a float to the 0.0..=1.0 range with a fallback for NaN/Inf.
 /// Used at every command boundary that accepts a unit-range float.
 #[inline]
@@ -82,6 +116,88 @@ impl VardaApp {
                     .find(|e| e.shader.name() == crate::engine::value::mask::LAYER_MASK_EFFECT)
                     .map(|e| e.uuid().to_owned())
             })
+    }
+
+    /// Put the layer `deck_uuid`'s picture in the frame `frame` — a
+    /// `frame_*` filter (see [`crate::engine::value::frame`]) — in place of
+    /// the frame it has, or with `None` take its frame away (see
+    /// [`EngineCommand::SetLayerFrame`]): the UUID of the frame's effect,
+    /// empty once the layer has none.
+    ///
+    /// The frame runs before the layer's Transform, so the layer is moved
+    /// and scaled frame and all (after it, it would be a frame round the
+    /// whole picture's place). A frame put in another's place keeps the
+    /// settings changed on that one — its size, shape, colours — where it
+    /// has the same; what was left as it came is the new frame's own.
+    ///
+    /// [`EngineCommand::SetLayerFrame`]: crate::engine::EngineCommand::SetLayerFrame
+    pub(crate) fn set_layer_frame(&mut self, deck_uuid: &str, frame: Option<&str>) -> Result<String> {
+        use crate::engine::value::frame::is_frame;
+        let (ch, dk) = self.resolve_deck(deck_uuid)?;
+        if let Some(name) = frame {
+            // Asked before the old frame goes: a name that is no frame
+            // leaves the layer as it was.
+            let known = is_frame(name) && self.registry.filters().iter().any(|s| s.name() == name);
+            if !known {
+                anyhow::bail!("'{name}' is not a frame: GET /api/state/registry lists them (`frames`)");
+            }
+        }
+        // The frames it has — one, unless a show was put together by hand —
+        // and what was changed on the first of them. By the name each was
+        // saved under: one whose shader is not there (a show from a newer
+        // Nida) is a frame still, to be taken away or given up for another.
+        let mut had: Vec<String> = Vec::new();
+        let mut changed: Vec<(String, ParamValue)> = Vec::new();
+        if let Some(slot) = self.mixer.channels().get(ch).and_then(|c| c.decks.get(dk)) {
+            for effect in slot.deck.effects.iter().filter(|e| is_frame(&e.name())) {
+                if had.is_empty() {
+                    for (name, value) in &effect.params.values {
+                        let as_it_came = effect.params.definitions.get(name).map(ParamValue::from_isf_input);
+                        if !as_it_came.is_some_and(|came| same_setting(&came, value)) {
+                            changed.push((name.clone(), *value));
+                        }
+                    }
+                }
+                had.push(effect.uuid().to_owned());
+            }
+        }
+        // The new frame is made before the old one goes: one that cannot be
+        // built leaves the layer in the frame it had.
+        let target = EffectTarget::Deck(deck_uuid.to_string());
+        let made = match frame {
+            Some(name) => Some(self.add_effect(target.clone(), name)?),
+            None => None,
+        };
+        for uuid in &had {
+            self.remove_effect(uuid)?;
+        }
+        let Some(uuid) = made else {
+            return Ok(String::new());
+        };
+        // Added last (before the layer's own mask): moved to just before
+        // the layer's Transform.
+        let places = self.mixer.channels().get(ch).and_then(|c| c.decks.get(dk)).map(|slot| {
+            let effects = &slot.deck.effects;
+            (
+                effects.iter().position(|e| e.uuid() == uuid),
+                effects.iter().position(|e| e.shader.name() == "transform"),
+            )
+        });
+        if let Some((Some(from), Some(to))) = places {
+            if to < from {
+                self.move_effect(target, from, to)?;
+            }
+        }
+        let location = self.resolve_effect(&uuid)?;
+        if let Some(effect) = self.mixer.effect_at_mut(location) {
+            for (name, value) in changed {
+                let kept = effect.params.values.get(&name).is_some_and(|now| goes_on(now, &value));
+                if kept {
+                    effect.params.set(&name, value);
+                }
+            }
+        }
+        Ok(uuid)
     }
 
     /// Post-construction wiring every new shader deck needs before it joins a
@@ -2060,6 +2176,23 @@ impl AnalyzerCommands for VardaApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A setting goes from one frame to another when it is of the kind the
+    /// other has — and a saved choice or switch that came back a plain
+    /// number (a frame whose shader was not there) goes on as one.
+    #[test]
+    fn a_frames_setting_goes_on_another_of_its_kind() {
+        let colour = ParamValue::Color([0.0, 1.0, 0.0, 1.0]);
+        assert!(goes_on(&ParamValue::Float(0.86), &ParamValue::Float(0.7)));
+        assert!(goes_on(&ParamValue::Long(0), &ParamValue::Long(3)));
+        assert!(goes_on(&ParamValue::Long(0), &ParamValue::Float(3.0)), "a saved choice");
+        assert!(goes_on(&ParamValue::Bool(false), &ParamValue::Float(1.0)), "a saved switch");
+        assert!(goes_on(&ParamValue::Bool(false), &ParamValue::Bool(true)));
+        assert!(goes_on(&colour, &colour));
+        assert!(!goes_on(&ParamValue::Float(0.5), &colour), "no colour for a number");
+        assert!(!goes_on(&colour, &ParamValue::Float(0.5)), "no number for a colour");
+        assert!(!goes_on(&ParamValue::Float(0.5), &ParamValue::Long(2)), "no choice for a size");
+    }
 
     fn headless_app() -> Option<super::super::VardaApp> {
         let gpu = crate::renderer::context::GpuContext::new_headless().ok()?;

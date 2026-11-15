@@ -2306,6 +2306,9 @@ impl VardaApp {
                 };
                 wire_id(self.set_layer_mask(&deck_uuid, mask))
             }
+            EngineCommand::SetLayerFrame { deck_uuid, frame } => {
+                wire_id(self.set_layer_frame(&deck_uuid, frame.as_deref()))
+            }
             EngineCommand::SetEffectParam {
                 effect_uuid,
                 name,

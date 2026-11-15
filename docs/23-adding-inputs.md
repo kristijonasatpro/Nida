@@ -324,11 +324,11 @@ from the Generators:
 
 | Mood | Looks |
 |---|---|
-| Tech | Hex field, Node network, Circuit grid |
-| Cyber | Data streaks |
-| Warm | Sunset waves, Drifting bokeh |
-| Calm | Aurora, Silk ribbons |
-| Colours | Gradient, Vignette plate (a plain colour is **Colour**) |
+| Tech | Hex field, Node network, Circuit grid, Plexus wave, Dot horizon, Dot globe, Light fibres, Rising tiles |
+| Cyber | Data streaks, Grid floor, Radar sweep, Hex tunnel |
+| Warm | Sunset waves, Drifting bokeh, Embers, Light rays, Stage curtain |
+| Calm | Aurora, Silk ribbons, Caustics, Flowing lines, Far ridges, Ink in water |
+| Colours | Gradient, Vignette plate, Colour fields, Halftone (a plain colour is **Colour**) |
 
 Each look has the same few controls, in Input Settings (Gradient and
 Vignette plate have their own: angle, style, edge darkening):

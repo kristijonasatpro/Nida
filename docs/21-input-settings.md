@@ -137,6 +137,41 @@ The border runs round what the crop keeps, just inside its edge. Its sizes
 are pixels of a 1080-line picture whatever the resolution, measured before
 Transform, so a picture shrunk to a third shows a 6 px border as 2 px.
 
+### Frame
+
+**Frame** puts the layer's picture in a moving frame, as stream overlays
+do — a slide, a PowerPoint or a camera in a HUD frame, a tech panel, an art
+deco border. Pick one from the list (**None** takes it away): the frame
+holds the picture, scaled into its window; cuts it to the frame's own shape
+(cut corners cut the picture's corners too); and draws its lines and lights
+round it, clear everywhere else, so what is under the layer shows there — a
+Broadcast background as the input's bottom layer makes the whole stage.
+
+The frame belongs to the layer: drag or resize the layer and picture and
+frame go together, and the channel's **Layout** templates (Side by side,
+PiP…) place framed layers as any other — slides in one frame, the speaker
+in another. Its settings are under the list:
+
+- **Shape** — the window's shape: **As the picture**, or 16:9, 4:3, 1:1,
+  9:16 — a square or upright speaker box without Crop.
+- **Fill the frame** — off, the whole picture shows inside the window
+  (nothing of a slide is lost; where the shapes differ, the rest of the
+  window is clear); on, the picture fills the frame's shape, its edges cut.
+- **Size** — how much of the layer the window takes; the room left is for
+  the frame's marks outside it (ticks, fans, traces, tabs), which are as
+  large as that room allows and go when there is none.
+- **Speed** (0 stands still), **Line weight**, **Glow**, and the
+  **Palette** of the Broadcast backgrounds — or **Custom**, with the Main
+  and Accent colours below it.
+
+Another frame picked in its place keeps the settings changed on the first.
+The frame wraps the layer's whole picture — not what Crop keeps: for a
+cropped speaker use the frame's Shape. Over the API:
+`{"SetLayerFrame": {"deck_uuid": "…", "frame": "frame_hud"}}` to
+`POST /api/command` (`"frame": null` takes it away); `GET
+/api/state/registry` lists them under `frames`, and the frame's settings are
+set as any effect's.
+
 ### Masks
 
 Every effect but Crop and Transform — a colour change, a key, a blur — has a

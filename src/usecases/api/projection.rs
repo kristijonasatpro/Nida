@@ -330,6 +330,7 @@ pub(crate) mod tests {
                 generators: vec![("Sine".into(), 0)],
                 broadcast: vec![],
                 filters: vec![("Blur".into(), 0)],
+                frames: vec![],
                 shader_count: 2,
             },
             midi: MidiSnapshot {

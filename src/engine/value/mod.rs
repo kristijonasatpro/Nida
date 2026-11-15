@@ -12,6 +12,7 @@
 pub mod camera;
 pub mod detect;
 pub mod dome;
+pub mod frame;
 pub mod led;
 pub mod lower_third;
 pub mod text;

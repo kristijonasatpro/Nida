@@ -1824,6 +1824,19 @@ pub enum EngineCommand {
         deck_uuid: String,
         mask: Option<crate::engine::value::mask::EffectMask>,
     },
+    /// Put a layer's picture in a frame: a `frame_*` filter (`frames` in
+    /// `GET /api/state/registry`) that holds the picture — scaled into its
+    /// window, cut to its shape, a moving outline round it — in place of
+    /// the frame the layer has, keeping what was changed on that one;
+    /// `None` takes the frame away. The frame runs before the layer's
+    /// Transform, so the layer is moved and scaled frame and all. Answered
+    /// with the UUID of the frame's effect (its settings are set as any
+    /// effect's), empty once the layer has none.
+    SetLayerFrame {
+        deck_uuid: String,
+        #[serde(default)]
+        frame: Option<String>,
+    },
     ResetGeneratorParamsToDefaults {
         deck_uuid: String,
     },

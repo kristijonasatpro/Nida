@@ -223,7 +223,7 @@ fn each_look_keeps_to_broadcast_brightness() {
         return;
     };
     let looks = looks();
-    assert!(looks.len() >= 10, "the broadcast looks: {}", looks.len());
+    assert!(looks.len() >= 27, "the broadcast looks: {}", looks.len());
     for path in &looks {
         let name = path
             .file_stem()

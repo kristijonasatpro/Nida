@@ -799,14 +799,27 @@ pub struct BroadcastLook {
     pub index: usize,
 }
 
+/// A frame: a filter that holds a layer's picture (see
+/// `shaders/frame_*.fs`, `EngineCommand::SetLayerFrame`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FrameLook {
+    /// Its shader, as `SetLayerFrame` names it.
+    pub name: String,
+    /// As the operator reads it: "HUD frame".
+    pub title: String,
+}
+
 #[derive(Clone, Serialize)]
 pub struct RegistrySnapshot {
     /// Generator shaders: (name, index) — the Broadcast backgrounds too.
     pub generators: Vec<(String, usize)>,
     /// The Broadcast backgrounds, by mood: also among `generators`.
     pub broadcast: Vec<BroadcastLook>,
-    /// Filter shaders: (name, index)
+    /// Filter shaders: (name, index) — all but the frames and a layer's
+    /// own mask, which Input Settings set.
     pub filters: Vec<(String, usize)>,
+    /// The frames a layer's picture can be put in, by title.
+    pub frames: Vec<FrameLook>,
     /// Total shader count
     pub shader_count: usize,
 }
@@ -1610,6 +1623,7 @@ mod tests {
                 generators: vec![],
                 broadcast: vec![],
                 filters: vec![],
+                frames: vec![],
                 shader_count: 0,
             },
             midi: MidiSnapshot {
@@ -1718,6 +1732,7 @@ mod tests {
                 generators: vec![("Sine".into(), 0)],
                 broadcast: vec![],
                 filters: vec![],
+                frames: vec![],
                 shader_count: 1,
             },
             midi: MidiSnapshot {
