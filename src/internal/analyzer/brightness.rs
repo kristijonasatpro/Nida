@@ -28,6 +28,9 @@ impl BrightnessAnalyzer {
 }
 
 impl Analyzer for BrightnessAnalyzer {
+    fn frame_size(&self) -> Option<u32> {
+        Some(256)
+    }
     fn analyzer_type(&self) -> &'static str {
         "brightness"
     }
@@ -164,7 +167,7 @@ mod tests {
 
     fn make_input(width: u32, height: u32, r: u8, g: u8, b: u8) -> AnalyzerInput {
         AnalyzerInput {
-            frame: make_frame(width, height, r, g, b, 255),
+            frame: std::sync::Arc::new(make_frame(width, height, r, g, b, 255)),
             width,
             height,
             timestamp: Instant::now(),
