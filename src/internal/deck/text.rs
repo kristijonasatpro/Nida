@@ -1,0 +1,1449 @@
+//! A text input: lines typed in, drawn in a font with an optional box,
+//! outline and shadow, placed by one of nine spots, faded in and out. Drawn
+//! as one picture on a thread of its own whenever its text or look changes —
+//! the picture before stays on air until the new one is ready, so an edit
+//! live shows at once, without a flash — and placed each frame for next to
+//! nothing. It can be sent to buses too, drawn over what each shows in the
+//! part its screens show, laid out for that part (see
+//! [`Text::set_target_frames`]).
+
+use std::fmt::Write as _;
+use std::sync::{mpsc, Arc};
+use std::time::Instant;
+
+use crate::engine::value::text::{TextAlign, TextLook, TextSettings, TextSnapshot};
+use crate::renderer::blit::BlitPipeline;
+use crate::renderer::GpuContext;
+
+use super::lower_third::{Params, Placer};
+use super::Stand;
+
+/// What a drawing is of: whatever changes it.
+#[derive(Debug, Clone, PartialEq)]
+struct Spec {
+    text: String,
+    look: TextLook,
+    frame: (u32, u32),
+}
+
+/// A drawing: its picture (none when there is nothing to draw), or that
+/// it could not be drawn — the picture on air then stays.
+type Drawing = Result<Option<image::RgbaImage>, ()>;
+
+/// A batch drawn: each frame's drawing.
+type Painted = Vec<(Spec, Drawing)>;
+
+/// The thread the drawings are made on, a batch — every frame it is shown
+/// at — at a time.
+struct Painter {
+    jobs: Option<mpsc::Sender<Vec<Spec>>>,
+    done: mpsc::Receiver<Painted>,
+    done_here: Option<Painted>,
+}
+
+impl Painter {
+    fn start() -> Self {
+        let (jobs_tx, jobs_rx) = mpsc::channel::<Vec<Spec>>();
+        let (done_tx, done) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("text-paint".into())
+            .spawn(move || {
+                let fonts = super::svg::system_fonts();
+                while let Ok(mut batch) = jobs_rx.recv() {
+                    // Only the latest is worth drawing: typing sends many.
+                    while let Ok(newer) = jobs_rx.try_recv() {
+                        batch = newer;
+                    }
+                    let drawn = batch
+                        .into_iter()
+                        .map(|spec| {
+                            let drawing = draw(&spec, &fonts);
+                            (spec, drawing)
+                        })
+                        .collect();
+                    if done_tx.send(drawn).is_err() {
+                        break;
+                    }
+                }
+            });
+        let jobs = match spawned {
+            Ok(_) => Some(jobs_tx),
+            Err(e) => {
+                log::warn!("Text drawing thread not started, drawing in the frame: {e}");
+                None
+            }
+        };
+        Self {
+            jobs,
+            done,
+            done_here: None,
+        }
+    }
+
+    fn ask(&mut self, batch: Vec<Spec>) {
+        let unsent = match &self.jobs {
+            Some(jobs) => jobs.send(batch).err().map(|mpsc::SendError(batch)| batch),
+            None => Some(batch),
+        };
+        if let Some(batch) = unsent {
+            let fonts = super::svg::system_fonts();
+            self.done_here = Some(
+                batch
+                    .into_iter()
+                    .map(|spec| {
+                        let drawing = draw(&spec, &fonts);
+                        (spec, drawing)
+                    })
+                    .collect(),
+            );
+        }
+    }
+
+    fn take(&mut self) -> Option<Painted> {
+        let mut latest = self.done_here.take();
+        while let Ok(painted) = self.done.try_recv() {
+            latest = Some(painted);
+        }
+        latest
+    }
+}
+
+/// A drawing on the GPU, and the frame it was laid out for: bound for its
+/// own deck's picture, and for drawing over a bus's with placement
+/// settings of its own.
+struct Face {
+    texture: wgpu::Texture,
+    size: (u32, u32),
+    frame: (u32, u32),
+    bind_group: wgpu::BindGroup,
+    over: wgpu::BindGroup,
+    over_params: wgpu::Buffer,
+}
+
+pub struct Text {
+    context: GpuContext,
+    settings: TextSettings,
+    frame: (u32, u32),
+    blit: BlitPipeline,
+    placer: Placer,
+    /// A drawing for each frame it is shown at.
+    faces: Vec<Face>,
+    /// The frame of the drawing it shows itself: its own, or — just after
+    /// a resize, until the new one is in — the one before, scaled.
+    main_frame: Option<(u32, u32)>,
+    /// The other frames it is drawn for: the parts of the buses it is sent
+    /// to that their screens show.
+    target_frames: Vec<(u32, u32)>,
+    /// What its own drawing on the GPU is of, and what was last asked for.
+    drawn: Option<Spec>,
+    asked: Option<Vec<Spec>>,
+    painter: Painter,
+    /// Latest completed drawing per frame, including failures and empty text.
+    completed: Vec<(Spec, Option<String>)>,
+    /// How far shown (0 hidden, 1 shown) when `since`, and toward which.
+    fade_from: f32,
+    since: Instant,
+    /// Which drawing its own is: another number each time one is put — a
+    /// same-size one is written into the texture it has (see
+    /// `Text::still`).
+    put_serial: u64,
+}
+
+impl Text {
+    /// A text input, shown as its settings say.
+    ///
+    /// # Errors
+    ///
+    /// When the pipeline that places it cannot be made.
+    pub fn new(
+        context: &GpuContext,
+        settings: TextSettings,
+        frame: (u32, u32),
+    ) -> anyhow::Result<Self> {
+        let settings = settings.normalized();
+        let shown = if settings.visible { 1.0 } else { 0.0 };
+        Ok(Self {
+            context: context.clone(),
+            settings,
+            frame: (frame.0.max(1), frame.1.max(1)),
+            blit: BlitPipeline::new(&context.device, context.compositing_format)?,
+            placer: Placer::new(&context.device, context.compositing_format),
+            faces: Vec::new(),
+            main_frame: None,
+            target_frames: Vec::new(),
+            drawn: None,
+            asked: None,
+            painter: Painter::start(),
+            completed: Vec::new(),
+            fade_from: shown,
+            since: Instant::now(),
+            put_serial: super::next_drawing(),
+        })
+    }
+
+    pub fn settings(&self) -> &TextSettings {
+        &self.settings
+    }
+
+    /// New text, look or visibility: drawn again (the picture before stays
+    /// until the new one is ready); shown or hidden, faded from where it is.
+    pub fn set_settings(&mut self, settings: TextSettings) {
+        let settings = settings.normalized();
+        if settings.visible != self.settings.visible
+            || settings.fade_secs.to_bits() != self.settings.fade_secs.to_bits()
+        {
+            // From where it is now, by the time it had: a fade time changed
+            // part way (or after) never jumps it.
+            self.fade_from = self.shown(Instant::now());
+            self.since = Instant::now();
+        }
+        self.settings = settings;
+    }
+
+    pub fn snapshot(&self) -> TextSnapshot {
+        let frames = self.frames();
+        let current = |frame| {
+            self.completed.iter().find(|(done, _)| {
+                done.frame == frame
+                    && done.text == self.settings.text
+                    && done.look == self.settings.look
+            })
+        };
+        let pending = frames.iter().any(|frame| current(*frame).is_none());
+        let error = frames
+            .iter()
+            .find_map(|frame| current(*frame).and_then(|(_, error)| error.clone()));
+        TextSnapshot {
+            settings: self.settings.clone(),
+            pending,
+            error,
+        }
+    }
+
+    /// How far shown `now`: 0 hidden, 1 shown.
+    fn shown(&self, now: Instant) -> f32 {
+        let to = if self.settings.visible { 1.0 } else { 0.0 };
+        let secs = self.settings.fade_secs;
+        if secs <= 0.0 {
+            return to;
+        }
+        let p = ((now - self.since).as_secs_f32() / secs).clamp(0.0, 1.0);
+        // Smooth at both ends.
+        let p = p * p * (3.0 - 2.0 * p);
+        self.fade_from + (to - self.fade_from) * p
+    }
+
+    /// Every frame it is drawn for: its own, and those of the buses' parts.
+    fn frames(&self) -> Vec<(u32, u32)> {
+        let mut frames = vec![self.frame];
+        for frame in &self.target_frames {
+            if !frames.contains(frame) {
+                frames.push(*frame);
+            }
+        }
+        frames
+    }
+
+    /// The drawings wanted now: its text and look, at every frame.
+    fn wanted(&self) -> Vec<Spec> {
+        self.frames()
+            .into_iter()
+            .map(|frame| Spec {
+                text: self.settings.text.clone(),
+                look: self.settings.look.clone(),
+                frame,
+            })
+            .collect()
+    }
+
+    /// The sizes of the parts of the buses it is sent to (their screens'
+    /// parts, in master pixels): drawn for each too, laid out for it (see
+    /// [`Self::render_over`]).
+    pub fn set_target_frames(&mut self, frames: &[(u32, u32)]) {
+        self.target_frames = frames
+            .iter()
+            .map(|(w, h)| ((*w).max(1), (*h).max(1)))
+            .collect();
+    }
+
+    /// Whether it is drawn for buses too (see [`Self::set_target_frames`]).
+    pub fn has_target_frames(&self) -> bool {
+        !self.target_frames.is_empty()
+    }
+
+    /// Whether anything of it shows now: shown or fading, a drawing ready.
+    pub fn shows(&self) -> bool {
+        self.shown(Instant::now()) > 0.0 && !self.faces.is_empty()
+    }
+
+    /// Hidden, and faded out: its frame is clear, and stays so until
+    /// `set_settings` shows it — so its channel need not be drawn (see
+    /// `Channel::blank`).
+    pub fn is_off(&self) -> bool {
+        !self.settings.visible && self.shown(Instant::now()) <= 0.0
+    }
+
+    /// What its frame shows while it stands still; none while it fades.
+    /// Hidden, or with no drawing: clear. Shown: its drawing as placed —
+    /// exactly what `render` draws, which then is the same every frame, so
+    /// its deck keeps the frame it has (see `Deck::still_frame`).
+    pub(super) fn still(&self) -> Option<Stand> {
+        let now = Instant::now();
+        let secs = self.settings.fade_secs;
+        // Within its fade time: taken for fading, though it may be where
+        // it was — a frame drawn later than this is as far on or further.
+        if secs > 0.0 && (now - self.since).as_secs_f32() < secs {
+            return None;
+        }
+        let shown = self.shown(now);
+        let Some(face) = self.main_face().filter(|_| shown > 0.0) else {
+            return Some(Stand::Clear);
+        };
+        let (scale, offset) = self.placement(face);
+        let placed = [shown, scale[0], scale[1], offset[0], offset[1]];
+        Some(Stand::Drawing {
+            serial: self.put_serial,
+            placed: bytemuck::bytes_of(&placed).to_vec(),
+        })
+    }
+
+    /// Each frame: the drawings asked for if they changed, and taken when
+    /// back.
+    pub fn tick(&mut self) {
+        let wanted = self.wanted();
+        self.completed
+            .retain(|(done, _)| wanted.iter().any(|spec| spec.frame == done.frame));
+        if self.asked.as_ref() != Some(&wanted) {
+            self.painter.ask(wanted.clone());
+            self.asked = Some(wanted);
+        }
+        if let Some(painted) = self.painter.take() {
+            // Shown as they come: the painter draws in the order asked,
+            // skipping to the latest, so each drawing back is newer than
+            // the one on air. Edits made faster than a drawing takes show
+            // one after another, not only once they stop.
+            for (spec, drawing) in painted {
+                self.put(spec, drawing);
+            }
+        }
+    }
+
+    /// A drawing on the GPU, for its frame; drawings for frames no longer
+    /// shown let go.
+    fn put(&mut self, spec: Spec, drawing: Drawing) {
+        let frame = spec.frame;
+        let frames = self.frames();
+        if !frames.contains(&frame) {
+            return;
+        }
+        // Whatever comes of it, what it shows may be another picture.
+        self.put_serial = super::next_drawing();
+        self.completed.retain(|(done, _)| done.frame != frame);
+        let error = drawing.as_ref().err().map(|()| {
+            format!(
+                "Text could not be drawn at {}×{}. Any previous picture is retained. \
+                 Try a smaller size or check the log.",
+                frame.0, frame.1
+            )
+        });
+        self.completed.push((spec.clone(), error));
+        let Ok(image) = drawing else {
+            // Not drawn: the picture before stays on air — after a resize
+            // too, scaled, until one is drawn.
+            if frame == self.frame {
+                self.drawn = Some(spec);
+            }
+            return;
+        };
+        if let Some(image) = image {
+            if let Some(face) = self
+                .faces
+                .iter()
+                .find(|face| face.frame == frame && face.size == image.dimensions())
+            {
+                self.context.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &face.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &image,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * face.size.0),
+                        rows_per_image: Some(face.size.1),
+                    },
+                    wgpu::Extent3d {
+                        width: face.size.0,
+                        height: face.size.1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                if frame == self.frame {
+                    self.main_frame = Some(frame);
+                    self.drawn = Some(spec);
+                }
+                let main = self.main_frame;
+                self.faces
+                    .retain(|f| frames.contains(&f.frame) || Some(f.frame) == main);
+                return;
+            }
+            self.faces.retain(|f| f.frame != frame);
+            let (texture, view) = super::source::upload_image_texture(&self.context, &image);
+            let over_params = Placer::params(&self.context.device);
+            self.faces.push(Face {
+                texture,
+                size: image.dimensions(),
+                frame,
+                bind_group: self.blit.create_bind_group(&self.context.device, &view),
+                over: self
+                    .placer
+                    .bind(&self.context.device, &view, &view, &over_params),
+                over_params,
+            });
+        } else {
+            self.faces.retain(|face| face.frame != frame);
+        }
+        if frame == self.frame {
+            self.main_frame = Some(frame);
+            self.drawn = Some(spec);
+        }
+        let main = self.main_frame;
+        self.faces
+            .retain(|f| frames.contains(&f.frame) || Some(f.frame) == main);
+    }
+
+    /// The drawing it shows itself, if any.
+    fn main_face(&self) -> Option<&Face> {
+        let frame = self.main_frame?;
+        self.faces.iter().find(|f| f.frame == frame)
+    }
+
+    /// Draw it in `pass` — over a bus's picture — in the area `area` (x, y,
+    /// width, height in the target's pixels), laid out for that area's
+    /// frame, as far shown as it is; blended over what is there. True when
+    /// anything of it was drawn.
+    pub fn render_over(&self, pass: &mut wgpu::RenderPass<'_>, area: (u32, u32, u32, u32)) -> bool {
+        let frame = (area.2.max(1), area.3.max(1));
+        let shown = self.shown(Instant::now());
+        let Some(face) = self.faces.iter().find(|f| f.frame == frame) else {
+            return false;
+        };
+        if shown <= 0.0 {
+            return false;
+        }
+        let (uv_scale, uv_offset) = self.placement(face);
+        #[allow(clippy::cast_precision_loss)]
+        let params = Params {
+            uv_scale,
+            uv_offset,
+            plate_alpha: 0.0,
+            text_alpha: shown,
+            reveal: 1.0,
+            from_right: 0,
+            width: face.size.0 as f32,
+            text_reveal: 1.0,
+            text_uv_offset: uv_offset,
+        };
+        self.context
+            .queue
+            .write_buffer(&face.over_params, 0, bytemuck::bytes_of(&params));
+        #[allow(clippy::cast_precision_loss)]
+        pass.set_viewport(
+            area.0 as f32,
+            area.1 as f32,
+            frame.0 as f32,
+            frame.1 as f32,
+            0.0,
+            1.0,
+        );
+        pass.set_pipeline(&self.placer.over);
+        pass.set_bind_group(0, &face.over, &[]);
+        pass.draw(0..3, 0..1);
+        true
+    }
+
+    /// Draw the frame: clear, and the text as far as it is shown.
+    pub fn render(&self, cmd_buffers: &mut Vec<wgpu::CommandBuffer>, output: &wgpu::TextureView) {
+        let mut encoder =
+            self.context
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Text Encoder"),
+                });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Text Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: output,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let shown = self.shown(Instant::now());
+            if let (Some(face), true) = (self.main_face(), shown > 0.0) {
+                let (scale, offset) = self.placement(face);
+                self.blit
+                    .set_uv_transform(&self.context.queue, shown, scale, offset);
+                self.blit.render(&mut pass, &face.bind_group);
+            }
+        }
+        cmd_buffers.push(encoder.finish());
+    }
+
+    /// The UV transform that puts the drawing at its spot, at its own size
+    /// — in the frame it was laid out for, so one drawn before a resize is
+    /// scaled to the new frame until it is drawn again.
+    #[allow(clippy::cast_precision_loss)]
+    fn placement(&self, face: &Face) -> ([f32; 2], [f32; 2]) {
+        let frame = (face.frame.0.max(1) as f32, face.frame.1.max(1) as f32);
+        let size = (face.size.0.max(1) as f32, face.size.1.max(1) as f32);
+        let look = &self.settings.look;
+        let (x, y) = look.anchor.place(size, frame, look.margin * frame.1);
+        (
+            [frame.0 / size.0, frame.1 / size.1],
+            [-x / size.0, -y / size.1],
+        )
+    }
+
+    /// The master's size changed: drawn again to suit.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.frame = (width.max(1), height.max(1));
+    }
+
+    /// Wait (a while) for the drawing wanted now, for tests: true once it is
+    /// on the GPU.
+    pub fn wait_drawn(&mut self, timeout: std::time::Duration) -> bool {
+        let until = Instant::now() + timeout;
+        while Instant::now() < until {
+            self.tick();
+            let own = self.wanted().into_iter().find(|s| s.frame == self.frame);
+            if self.drawn.is_some() && self.drawn == own {
+                return self.main_face().is_some();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+}
+
+// ── Drawing ─────────────────────────────────────────────────────────
+
+/// A line's ink, from its baseline.
+#[derive(Clone, Copy)]
+struct Ink {
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+}
+
+/// The largest side a drawing may have.
+const MOST_PIXELS: f32 = 8192.0;
+
+/// Lay out and draw `spec`'s lines: none when there is nothing to draw;
+/// too big for a picture, made smaller until it fits. The box, then the
+/// shadow, then the lines, each over what is under it.
+fn draw(spec: &Spec, fonts: &Arc<usvg::fontdb::Database>) -> Drawing {
+    #[allow(clippy::cast_precision_loss)]
+    let px = (spec.look.size * spec.frame.1 as f32).max(4.0);
+    let Some(mut laid) = layout(spec, px, fonts) else {
+        return Ok(None);
+    };
+    let largest = laid.width.max(laid.height);
+    if largest > MOST_PIXELS {
+        laid = layout(spec, px * MOST_PIXELS / largest * 0.97, fonts).ok_or(())?;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (wide, high) = (laid.width.ceil() as u32, laid.height.ceil() as u32);
+    if wide == 0 || high == 0 || wide > 8192 || high > 8192 {
+        log::warn!("Text not drawn: {wide}×{high} is too big");
+        return Err(());
+    }
+    let options = usvg::Options {
+        fontdb: fonts.clone(),
+        ..Default::default()
+    };
+    // Drawn over what is in `picture`.
+    let paint = |body: &str, picture: &mut resvg::tiny_skia::Pixmap| -> Result<(), ()> {
+        let svg = format!("{}{body}</svg>", laid.head);
+        let tree = usvg::Tree::from_str(&svg, &options).map_err(|e| {
+            log::warn!("Text not drawn: {e}");
+        })?;
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::identity(),
+            &mut picture.as_mut(),
+        );
+        Ok(())
+    };
+    let mut picture = resvg::tiny_skia::Pixmap::new(wide, high).ok_or(())?;
+    if !laid.boxed.is_empty() {
+        paint(&laid.boxed, &mut picture)?;
+    }
+    if let Some((letters, blur, opacity)) = laid.shadow.as_ref().filter(|(_, blur, _)| *blur < 2.0)
+    {
+        // A small blur, of small letters: SVG's, resvg drawing it its own
+        // way below two pixels — and soon, the picture being small.
+        paint(
+            &format!(
+                r#"<filter id="soft" filterUnits="userSpaceOnUse" x="0" y="0" width="{wide}" height="{high}"><feGaussianBlur stdDeviation="{blur}"/></filter><g filter="url(#soft)" opacity="{opacity}">{letters}</g>"#
+            ),
+            &mut picture,
+        )?;
+    } else if let Some((letters, blur, opacity)) = &laid.shadow {
+        // The letters drawn alone, their coverage blurred here: an SVG blur
+        // of a big picture took ten times what the rest of it does.
+        let mut drawn = resvg::tiny_skia::Pixmap::new(wide, high).ok_or(())?;
+        paint(letters, &mut drawn)?;
+        let mut alpha: Vec<u8> = drawn.pixels().iter().map(|p| p.alpha()).collect();
+        blur_alpha(&mut alpha, wide as usize, high as usize, *blur);
+        for (px, a) in drawn.pixels_mut().iter_mut().zip(alpha) {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let a = (f32::from(a) * opacity).round().clamp(0.0, 255.0) as u8;
+            *px = resvg::tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, a).ok_or(())?;
+        }
+        picture.draw_pixmap(
+            0,
+            0,
+            drawn.as_ref(),
+            &resvg::tiny_skia::PixmapPaint::default(),
+            resvg::tiny_skia::Transform::identity(),
+            None,
+        );
+    }
+    paint(&laid.texts, &mut picture)?;
+    let mut rgba = image::RgbaImage::new(wide, high);
+    for (dst, src) in rgba.pixels_mut().zip(picture.pixels()) {
+        let c = src.demultiply();
+        *dst = image::Rgba([c.red(), c.green(), c.blue(), c.alpha()]);
+    }
+    Ok(Some(rgba))
+}
+
+/// How many box blurs make a Gaussian one (as resvg's does).
+const BLUR_STEPS: usize = 5;
+
+/// The box sizes whose blurs, one after another, come close to a Gaussian
+/// blur of `sigma` (Kutskir's way, as resvg does).
+fn box_sizes(sigma: f32) -> [usize; BLUR_STEPS] {
+    if sigma <= 0.0 {
+        return [1; BLUR_STEPS];
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let n = BLUR_STEPS as f32;
+    let ideal = (12.0 * sigma * sigma / n).sqrt() + 1.0;
+    #[allow(clippy::cast_possible_truncation)]
+    let mut lower = ideal.floor() as i32;
+    if lower % 2 == 0 {
+        lower -= 1;
+    }
+    let upper = lower + 2;
+    #[allow(clippy::cast_precision_loss)]
+    let l = lower as f32;
+    let m = ((12.0 * sigma * sigma - n * l * l - 4.0 * n * l - 3.0 * n) / (-4.0 * l - 4.0)).round();
+    let mut sizes = [0; BLUR_STEPS];
+    for (i, size) in sizes.iter_mut().enumerate() {
+        #[allow(clippy::cast_precision_loss)]
+        let chosen = if (i as f32) < m { lower } else { upper };
+        *size = usize::try_from(chosen.max(1)).unwrap_or(1);
+    }
+    sizes
+}
+
+/// Rounded to the nearest whole number, halves to even (as resvg rounds).
+fn round_even(x: f32) -> f32 {
+    (x + 12_582_912.0) - 12_582_912.0
+}
+
+/// `alpha` (a `wide` × `high` coverage, a byte a pixel) blurred as SVG's
+/// Gaussian blur of `sigma` is by resvg: box blurs down, then across, each
+/// rounded to bytes, past the edges clear. Rows at a time, so it reads the
+/// memory in order.
+fn blur_alpha(alpha: &mut [u8], wide: usize, high: usize, sigma: f32) {
+    if wide == 0 || high == 0 {
+        return;
+    }
+    let mut other = vec![0u8; alpha.len()];
+    for size in box_sizes(sigma) {
+        let radius = (size - 1) / 2;
+        if radius == 0 {
+            continue;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let scale = 1.0 / (2 * radius + 1) as f32;
+        // Down: each column's sum over the rows within reach, kept for a
+        // whole row at a time.
+        let mut sums = vec![0i32; wide];
+        for row in alpha.chunks_exact(wide).take(radius.min(high - 1) + 1) {
+            for (sum, a) in sums.iter_mut().zip(row) {
+                *sum += i32::from(*a);
+            }
+        }
+        for y in 0..high {
+            for (out, sum) in other[y * wide..(y + 1) * wide].iter_mut().zip(&sums) {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    clippy::cast_precision_loss
+                )]
+                {
+                    *out = round_even(*sum as f32 * scale) as u8;
+                }
+            }
+            if y + radius + 1 < high {
+                let add = &alpha[(y + radius + 1) * wide..(y + radius + 2) * wide];
+                for (sum, a) in sums.iter_mut().zip(add) {
+                    *sum += i32::from(*a);
+                }
+            }
+            if y >= radius {
+                let gone = &alpha[(y - radius) * wide..(y - radius + 1) * wide];
+                for (sum, a) in sums.iter_mut().zip(gone) {
+                    *sum -= i32::from(*a);
+                }
+            }
+        }
+        // Across.
+        for (src, dst) in other.chunks_exact(wide).zip(alpha.chunks_exact_mut(wide)) {
+            let mut sum: i32 = src
+                .iter()
+                .take(radius.min(wide - 1) + 1)
+                .map(|a| i32::from(*a))
+                .sum();
+            for x in 0..wide {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    clippy::cast_precision_loss
+                )]
+                {
+                    dst[x] = round_even(sum as f32 * scale) as u8;
+                }
+                if x + radius + 1 < wide {
+                    sum += i32::from(src[x + radius + 1]);
+                }
+                if x >= radius {
+                    sum -= i32::from(src[x - radius]);
+                }
+            }
+        }
+    }
+}
+
+/// The lines laid out, ready to draw: SVG pieces at the picture's size.
+struct Laid {
+    width: f32,
+    height: f32,
+    /// The SVG's opening tag.
+    head: String,
+    /// The box behind the lines; empty for none.
+    boxed: String,
+    /// The lines in their colours.
+    texts: String,
+    /// The shadow, if any: the lines in black, moved by its drop; its blur
+    /// (a standard deviation, in pixels) and how solid it is.
+    shadow: Option<(String, f32, f32)>,
+}
+
+/// The lines laid out at font size `px`; none when there is nothing to draw.
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+fn layout(spec: &Spec, px: f32, fonts: &Arc<usvg::fontdb::Database>) -> Option<Laid> {
+    let look = &spec.look;
+    let lines: Vec<&str> = spec.text.lines().map(str::trim_end).collect();
+    if lines.iter().all(|l| l.trim().is_empty()) {
+        return None;
+    }
+    // Lines a step apart, from baseline to baseline, whatever is typed;
+    // the room above the first and below the last as tall as the tallest
+    // letters and deepest tails can be — or a line's own ink, if it
+    // reaches further (Ǻ).
+    let probe = measure("ŽĄÁÉjgyąęų|", px, look, fonts).unwrap_or(Ink {
+        left: 0.0,
+        top: -0.95 * px,
+        width: px,
+        height: 1.2 * px,
+    });
+    let step = px * look.spacing;
+    let inks: Vec<Option<Ink>> = lines
+        .iter()
+        .map(|l| {
+            (!l.trim().is_empty())
+                .then(|| measure(l, px, look, fonts))
+                .flatten()
+        })
+        .collect();
+    let last = (lines.len() - 1) as f32 * step;
+    let top = inks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, ink)| ink.map(|ink| i as f32 * step + ink.top))
+        .fold(probe.top, f32::min);
+    let bottom = inks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, ink)| ink.map(|ink| i as f32 * step + ink.top + ink.height))
+        .fold(last + probe.top + probe.height, f32::max);
+    let widest = inks.iter().flatten().map(|i| i.width).fold(0.0, f32::max);
+    let stroke = look.outline * px;
+    let boxed_on = look.box_opacity > 0.0;
+    let shadow_on = look.shadow_opacity > 0.0;
+    let blur = 0.06 * px;
+    let drop = 0.05 * px;
+    // Room round the letters: the box's padding, and what the outline and
+    // the shadow reach past them.
+    let pad = if boxed_on { look.box_padding * px } else { 0.0 }
+        + stroke
+        + if shadow_on { drop + 3.0 * blur } else { 0.0 }
+        + 2.0;
+    let width = widest + 2.0 * pad;
+    let height = bottom - top + 2.0 * pad;
+
+    let mut head = String::new();
+    let _ = write!(
+        head,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{wide}" height="{high}" viewBox="0 0 {wide} {high}">"#,
+        wide = width.ceil(),
+        high = height.ceil(),
+    );
+    let mut boxed = String::new();
+    if boxed_on {
+        let _ = write!(
+            boxed,
+            r#"<rect width="{}" height="{}" rx="{r}" fill="{}" fill-opacity="{}"/>"#,
+            width.ceil(),
+            height.ceil(),
+            hex(look.box_colour),
+            look.box_opacity,
+            r = look.box_radius * px,
+        );
+    }
+    let mut texts = String::new();
+    for (i, (line, ink)) in lines.iter().zip(&inks).enumerate() {
+        let Some(ink) = ink else { continue };
+        // Lined up by their ink, not their advance: side bearings don't
+        // pull a line off its edge.
+        let left = match look.align {
+            TextAlign::Left => pad,
+            TextAlign::Centre => (width - ink.width) / 2.0,
+            TextAlign::Right => width - pad - ink.width,
+        } - ink.left;
+        let baseline = pad - top + i as f32 * step;
+        let _ = write!(
+            texts,
+            r#"<text x="{left}" y="{baseline}" {}>{}</text>"#,
+            attributes(look, px),
+            escape(line)
+        );
+    }
+    let shadow = shadow_on.then(|| {
+        // The shadow's letters black, their own fill and stroke left out.
+        let letters = format!(
+            r##"<g transform="translate({drop} {drop})" fill="#000000" stroke="#000000">{}</g>"##,
+            texts
+                .replace(&format!(r#"fill="{}""#, hex(look.colour)), "")
+                .replace(&format!(r#"stroke="{}""#, hex(look.outline_colour)), ""),
+        );
+        (letters, blur, look.shadow_opacity)
+    });
+    Some(Laid {
+        width,
+        height,
+        head,
+        boxed,
+        texts,
+        shadow,
+    })
+}
+
+/// The ink of `text` set at `size`: none if no glyph of it could be drawn.
+fn measure(
+    text: &str,
+    size: f32,
+    look: &TextLook,
+    fonts: &Arc<usvg::fontdb::Database>,
+) -> Option<Ink> {
+    let room = size * 4.0;
+    #[allow(clippy::cast_precision_loss)]
+    let wide = size * (text.chars().count() as f32 + 2.0) * 1.5;
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{wide}" height="{h}"><text x="0" y="{room}" {}>{}</text></svg>"#,
+        attributes(look, size),
+        escape(text),
+        h = room * 2.0,
+    );
+    let options = usvg::Options {
+        fontdb: fonts.clone(),
+        ..Default::default()
+    };
+    let tree = usvg::Tree::from_str(&svg, &options).ok()?;
+    let text_node = tree.root().children().iter().find_map(|node| match node {
+        usvg::Node::Text(text) => Some(text),
+        _ => None,
+    })?;
+    let glyphs = text_node.flattened();
+    if !glyphs.has_children() {
+        return None;
+    }
+    let bounds = glyphs.abs_bounding_box();
+    (bounds.width() > 0.0 && bounds.height() > 0.0).then(|| Ink {
+        left: bounds.left(),
+        top: bounds.top() - room,
+        width: bounds.width(),
+        height: bounds.height(),
+    })
+}
+
+/// A `<text>`'s font, fill and outline.
+fn attributes(look: &TextLook, size: f32) -> String {
+    let mut out = format!(
+        r#"font-family="'{}', sans-serif" font-size="{size}" font-weight="{}" font-style="{}" fill="{}""#,
+        escape(&look.font.replace('\'', "")),
+        if look.bold { "bold" } else { "normal" },
+        if look.italic { "italic" } else { "normal" },
+        hex(look.colour),
+    );
+    let stroke = look.outline * size;
+    if stroke > 0.0 {
+        // Twice as wide, half under the fill: the outline is all outside.
+        let _ = write!(
+            out,
+            r#" stroke="{}" stroke-width="{}" stroke-linejoin="round" paint-order="stroke""#,
+            hex(look.outline_colour),
+            stroke * 2.0,
+        );
+    }
+    out
+}
+
+fn hex(c: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+}
+
+/// `text` safe in SVG: its markup escaped, and control characters — which
+/// XML cannot hold, and would leave the whole drawing undrawn — left out (a
+/// tab a space).
+fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\t' => out.push(' '),
+            c if c.is_control() => {}
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_texture_reuse_and_error_recovery() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            assert!(
+                std::env::var_os("VARDA_REQUIRE_GPU").is_none(),
+                "required GPU unavailable"
+            );
+            return;
+        };
+        let mut text = Text::new(&gpu, TextSettings::default(), (640, 360)).unwrap();
+        assert!(text.snapshot().pending);
+        let initial = text.wanted().remove(0);
+        let image = image::RgbaImage::from_pixel(4, 3, image::Rgba([255, 0, 0, 128]));
+        text.put(initial.clone(), Ok(Some(image.clone())));
+        let texture = text.main_face().unwrap().texture.clone();
+        assert!(!text.snapshot().pending);
+        text.set_settings(TextSettings {
+            text: "Edited".into(),
+            ..TextSettings::default()
+        });
+        assert!(text.snapshot().pending);
+        let edited = text.wanted().remove(0);
+        text.put(edited.clone(), Err(()));
+        assert!(!text.snapshot().pending);
+        assert!(text.snapshot().error.as_ref().unwrap().contains("640×360"));
+        assert_eq!(text.main_face().unwrap().texture, texture);
+        text.put(edited.clone(), Ok(Some(image)));
+        assert!(text.snapshot().error.is_none());
+        assert_eq!(
+            text.main_face().unwrap().texture,
+            texture,
+            "same size reuses GPU texture and bindings"
+        );
+        text.put(edited.clone(), Ok(Some(image::RgbaImage::new(5, 3))));
+        assert_ne!(
+            text.main_face().unwrap().texture,
+            texture,
+            "size changes replace texture"
+        );
+        text.put(edited, Ok(None));
+        assert!(
+            text.main_face().is_none(),
+            "empty text clears the previous picture"
+        );
+    }
+
+    /// The input drawn into a fresh `w` × `h` target and read back, as
+    /// linear RGBA per pixel.
+    fn rendered_face(gpu: &GpuContext, text: &Text, w: u32, h: u32) -> Vec<[f32; 4]> {
+        assert_eq!(gpu.compositing_format, wgpu::TextureFormat::Rgba16Float);
+        let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("text test target"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: gpu.compositing_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let mut cmds = Vec::new();
+        text.render(&mut cmds, &target.create_view(&wgpu::TextureViewDescriptor::default()));
+        let row = (w * 8).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("text test readback"),
+            size: u64::from(row * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            target.size(),
+        );
+        cmds.push(encoder.finish());
+        gpu.submit(cmds);
+        let (tx, rx) = mpsc::channel();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().expect("mapped").expect("mapped");
+        let data = buffer.slice(..).get_mapped_range().expect("mapped range");
+        let channel = |at: usize| half::f16::from_le_bytes([data[at], data[at + 1]]).to_f32();
+        (0..h as usize)
+            .flat_map(|y| (0..w as usize).map(move |x| (y, x)))
+            .map(|(y, x)| {
+                let at = y * row as usize + x * 8;
+                [channel(at), channel(at + 2), channel(at + 4), channel(at + 6)]
+            })
+            .collect()
+    }
+
+    /// A redraw at the same size reuses the GPU texture: what goes on air
+    /// must be the new drawing, not the one before.
+    #[test]
+    fn same_size_redraw_shows_the_new_pixels() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            assert!(
+                std::env::var_os("VARDA_REQUIRE_GPU").is_none(),
+                "required GPU unavailable"
+            );
+            return;
+        };
+        let (w, h) = (64, 36);
+        let mut text = Text::new(&gpu, TextSettings::default(), (w, h)).unwrap();
+        let spec = text.wanted().remove(0);
+        let count = |pixels: &[[f32; 4]], red: bool| {
+            pixels
+                .iter()
+                .filter(|p| {
+                    let (on, off) = if red { (p[0], p[1]) } else { (p[1], p[0]) };
+                    on > 0.5 && off < 0.1
+                })
+                .count()
+        };
+        let red = image::RgbaImage::from_pixel(8, 4, image::Rgba([255, 0, 0, 255]));
+        text.put(spec.clone(), Ok(Some(red)));
+        let texture = text.main_face().unwrap().texture.clone();
+        let before = rendered_face(&gpu, &text, w, h);
+        assert!(count(&before, true) > 0, "the first drawing is on air");
+        assert_eq!(count(&before, false), 0);
+
+        let green = image::RgbaImage::from_pixel(8, 4, image::Rgba([0, 255, 0, 255]));
+        text.put(spec, Ok(Some(green)));
+        assert_eq!(text.main_face().unwrap().texture, texture, "texture reused");
+        let after = rendered_face(&gpu, &text, w, h);
+        assert_eq!(count(&after, true), 0, "nothing of the old drawing is left");
+        assert_eq!(
+            count(&after, false),
+            count(&before, true),
+            "the new drawing is on air, where the old one was"
+        );
+    }
+
+    #[test]
+    fn text_error_status_tracks_target_frames_and_current_edits() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            assert!(
+                std::env::var_os("VARDA_REQUIRE_GPU").is_none(),
+                "required GPU unavailable"
+            );
+            return;
+        };
+        let mut text = Text::new(&gpu, TextSettings::default(), (640, 360)).unwrap();
+        text.set_target_frames(&[(320, 180)]);
+        let wanted = text.wanted();
+        text.put(wanted[0].clone(), Ok(None));
+        assert!(text.snapshot().pending, "target still pending");
+        text.put(wanted[1].clone(), Err(()));
+        assert!(!text.snapshot().pending);
+        assert!(text.snapshot().error.unwrap().contains("320×180"));
+        text.set_settings(TextSettings {
+            text: "New edit".into(),
+            ..TextSettings::default()
+        });
+        assert!(text.snapshot().pending);
+        assert!(
+            text.snapshot().error.is_none(),
+            "old edit failures are not reported for new text"
+        );
+        text.set_target_frames(&[]);
+        text.put(text.wanted().remove(0), Ok(None));
+        assert!(!text.snapshot().pending);
+        assert!(
+            text.snapshot().error.is_none(),
+            "removed target failures do not persist"
+        );
+    }
+
+    fn spec(text: &str) -> Spec {
+        Spec {
+            text: text.into(),
+            look: TextLook::default(),
+            frame: (1920, 1080),
+        }
+    }
+
+    fn rendered(svg: &str, fonts: &Arc<usvg::fontdb::Database>, wide: u32, high: u32) -> Vec<u8> {
+        let options = usvg::Options {
+            fontdb: fonts.clone(),
+            ..Default::default()
+        };
+        let tree = usvg::Tree::from_str(svg, &options).expect("svg");
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(wide, high).expect("pixmap");
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::identity(),
+            &mut pixmap.as_mut(),
+        );
+        pixmap.data().to_vec()
+    }
+
+    /// The shadow blurred here draws as SVG's Gaussian blur of the same
+    /// letters does (resvg's), a narrow line's too — box, shadow and lines
+    /// together, within a step or two of a byte — and in a fraction of the
+    /// time.
+    #[test]
+    fn the_shadow_blurred_here_matches_svgs_blur() {
+        let fonts = super::super::svg::system_fonts();
+        for (text, boxed, size) in [
+            ("PERTRAUKA\nTęsiame 14:00", 0.7, 0.08),
+            ("i", 0.0, 0.08),
+            ("Ž\nj", 0.4, 0.08),
+            // Small: a blur under two pixels, which resvg draws its own way.
+            ("PERTRAUKA\nTęsiame 14:00", 0.0, 0.02),
+        ] {
+            let look = TextLook {
+                shadow_opacity: 0.8,
+                box_opacity: boxed,
+                size,
+                ..TextLook::default()
+            };
+            let s = Spec {
+                text: text.into(),
+                look,
+                frame: (1920, 1080),
+            };
+            let px = s.look.size * 1080.0;
+            let laid = layout(&s, px, &fonts).expect("laid out");
+            let (wide, high) = (laid.width.ceil() as u32, laid.height.ceil() as u32);
+            let (letters, blur, opacity) = laid.shadow.clone().expect("a shadow");
+            // As it was drawn before: the blur an SVG filter, over the picture.
+            let reference = format!(
+                r#"{}{}<filter id="soft" filterUnits="userSpaceOnUse" x="-{w}" y="-{h}" width="{w3}" height="{h3}"><feGaussianBlur stdDeviation="{blur}"/></filter><g filter="url(#soft)" opacity="{opacity}">{letters}</g>{}</svg>"#,
+                laid.head,
+                laid.boxed,
+                laid.texts,
+                w = laid.width,
+                h = laid.height,
+                w3 = 3.0 * laid.width,
+                h3 = 3.0 * laid.height,
+            );
+            let t = Instant::now();
+            let before = rendered(&reference, &fonts, wide, high);
+            let slow = t.elapsed();
+            let t = Instant::now();
+            let now = draw(&s, &fonts).expect("drawn").expect("a picture");
+            let fast = t.elapsed();
+            // Both premultiplied, so a near-clear pixel's colour counts little.
+            let mut most = 0u8;
+            for (p, q) in now.pixels().zip(before.as_chunks::<4>().0) {
+                let a = u16::from(p[3]);
+                for c in 0..3 {
+                    let pre = u8::try_from(u16::from(p[c]) * a / 255).unwrap_or(255);
+                    most = most.max(pre.abs_diff(q[c]));
+                }
+                most = most.max(p[3].abs_diff(q[3]));
+            }
+            println!("{text:?}: {wide}x{high}, differs by at most {most}; {fast:?} vs {slow:?}");
+            assert!(most <= 3, "{text:?}: differs by {most}");
+        }
+    }
+
+    /// Resized, and the new size's drawing failed: the picture before stays
+    /// on air, scaled, not lost.
+    #[test]
+    fn a_failed_drawing_after_a_resize_keeps_the_picture() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            return;
+        };
+        let settings = TextSettings {
+            text: "PERTRAUKA".into(),
+            ..TextSettings::default()
+        };
+        let mut text = Text::new(&gpu, settings, (640, 360)).expect("text");
+        assert!(text.wait_drawn(std::time::Duration::from_secs(10)), "drawn");
+        text.resize(1280, 720);
+        let spec = text
+            .wanted()
+            .into_iter()
+            .find(|s| s.frame == (1280, 720))
+            .expect("the new size wanted");
+        text.put(spec, Err(()));
+        assert_eq!(
+            text.main_face().map(|f| f.frame),
+            Some((640, 360)),
+            "the picture before kept"
+        );
+    }
+
+    /// Typed faster than a drawing takes: the picture keeps up as drawings
+    /// come back, not held on the first until the typing stops.
+    #[test]
+    fn typing_faster_than_drawing_still_shows_as_it_goes() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            return;
+        };
+        let mut settings = TextSettings {
+            text: "PERTRAUKA 0".into(),
+            ..TextSettings::default()
+        };
+        let mut text = Text::new(&gpu, settings.clone(), (640, 360)).expect("text");
+        assert!(text.wait_drawn(std::time::Duration::from_secs(10)), "drawn");
+        let first = text.drawn.clone();
+        // A new text every 2 ms for a second and a half; each drawing takes
+        // longer.
+        let mut shown = Vec::new();
+        let until = Instant::now() + std::time::Duration::from_millis(1500);
+        let mut n = 0;
+        while Instant::now() < until {
+            n += 1;
+            settings.text = format!("PERTRAUKA {n}");
+            text.set_settings(settings.clone());
+            text.tick();
+            if text.drawn != first && shown.last() != Some(&text.drawn) {
+                shown.push(text.drawn.clone());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            shown.len() >= 2,
+            "drawings shown while typing: {} (of {n} edits)",
+            shown.len()
+        );
+    }
+
+    /// Two lines draw taller than one, as wide as the wider; the letters
+    /// have ink; nothing typed draws nothing.
+    #[test]
+    fn lines_lay_out_and_draw() {
+        let fonts = super::super::svg::system_fonts();
+        let one = draw(&spec("PERTRAUKA"), &fonts)
+            .expect("drawn")
+            .expect("a picture");
+        let two = draw(&spec("PERTRAUKA\nTęsiame 14:00"), &fonts)
+            .expect("drawn")
+            .expect("a picture");
+        assert!(
+            two.height() > one.height() + 50,
+            "{} vs {}",
+            two.height(),
+            one.height()
+        );
+        assert!(two.width() >= one.width());
+        assert!(one.pixels().any(|p| p[3] > 200));
+        assert!(matches!(draw(&spec("  \n "), &fonts), Ok(None)));
+    }
+
+    /// A line far too long for one picture is drawn smaller, not dropped;
+    /// a capital with a mark over it (Ǻ) is not cut at the top.
+    #[test]
+    fn a_long_line_is_drawn_smaller_and_marks_are_not_cut() {
+        let fonts = super::super::svg::system_fonts();
+        let long = draw(&spec(&"W".repeat(400)), &fonts)
+            .expect("drawn")
+            .expect("a picture");
+        assert!(long.width() <= 8192);
+        let mut s = spec("Ǻ");
+        s.look.shadow_opacity = 0.0;
+        let img = draw(&s, &fonts).expect("drawn").expect("a picture");
+        let top_ink = (0..img.width())
+            .filter(|x| img.get_pixel(*x, 0)[3] > 16)
+            .count();
+        assert_eq!(top_ink, 0, "the mark reaches the top edge: cut");
+        assert!(img.pixels().any(|p| p[3] > 200));
+    }
+
+    /// A control character in the text (one pasted, or sent over the API)
+    /// is left out, the line still drawn — not the whole drawing lost.
+    #[test]
+    fn a_control_character_is_left_out() {
+        let fonts = super::super::svg::system_fonts();
+        let img = draw(&spec("Session\u{c}14:00"), &fonts)
+            .expect("drawn")
+            .expect("a picture");
+        assert!(img.pixels().filter(|p| p[3] > 200).count() > 200);
+    }
+
+    /// Left, centre and right put a short line under a long one at its left,
+    /// middle and right.
+    #[test]
+    fn a_short_line_lines_up_as_asked() {
+        let fonts = super::super::svg::system_fonts();
+        let ink_middle = |align: TextAlign| {
+            let mut s = spec("Ilgesnė pirma eilutė\nTrumpa");
+            s.look.align = align;
+            s.look.shadow_opacity = 0.0;
+            let img = draw(&s, &fonts).expect("drawn").expect("a picture");
+            let (w, h) = img.dimensions();
+            // The second line's ink, across.
+            let xs: Vec<u32> = (h * 6 / 10..h)
+                .flat_map(|y| (0..w).map(move |x| (x, y)))
+                .filter(|(x, y)| img.get_pixel(*x, *y)[3] > 128)
+                .map(|(x, _)| x)
+                .collect();
+            let (min, max) = (
+                *xs.iter().min().expect("ink"),
+                *xs.iter().max().expect("ink"),
+            );
+            (min + max) as f32 / 2.0 / w as f32
+        };
+        let (l, c, r) = (
+            ink_middle(TextAlign::Left),
+            ink_middle(TextAlign::Centre),
+            ink_middle(TextAlign::Right),
+        );
+        assert!(l < 0.4 && (c - 0.5).abs() < 0.05 && r > 0.6, "{l} {c} {r}");
+    }
+
+    /// Off (`is_off`) is hidden and faded out: at once with no fade time, or
+    /// once the fade has run. Never while it fades out, nor while shown —
+    /// even from nothing, at the start of a fade in.
+    #[test]
+    fn off_is_hidden_and_faded_out() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            return;
+        };
+        let mut text = Text::new(&gpu, TextSettings::default(), (640, 360)).expect("text");
+        let now = Instant::now();
+        // A fade begun an hour from now stands where it begins; one begun
+        // ten seconds ago is done.
+        let begins = now + std::time::Duration::from_secs(3600);
+        let done = now
+            .checked_sub(std::time::Duration::from_secs(10))
+            .expect("the machine up ten seconds");
+        assert!(!text.is_off(), "shown");
+        text.settings.visible = false;
+        text.settings.fade_secs = 0.0;
+        assert!(text.is_off(), "hidden, with no fade time");
+        text.settings.fade_secs = 5.0;
+        text.fade_from = 1.0;
+        text.since = begins;
+        assert!(!text.is_off(), "fading out");
+        text.since = done;
+        assert!(text.is_off(), "faded out");
+        text.settings.visible = true;
+        text.fade_from = 0.0;
+        text.since = begins;
+        assert!(!text.is_off(), "coming in from nothing");
+    }
+
+    /// What stands still (`still`): clear with no drawing, or hidden and
+    /// faded out; none within its fade time; shown, its drawing as placed —
+    /// the same from frame to frame, another when it is drawn again (though
+    /// into the texture it has) or put elsewhere.
+    #[test]
+    fn a_text_standing_still_is_its_drawing_as_placed() {
+        let Ok(gpu) = GpuContext::new_headless() else {
+            return;
+        };
+        let mut text = Text::new(&gpu, TextSettings::default(), (640, 360)).expect("text");
+        let now = Instant::now();
+        // A fade begun an hour from now stands where it begins; one begun
+        // ten seconds ago is done.
+        let begins = now + std::time::Duration::from_secs(3600);
+        let done = now
+            .checked_sub(std::time::Duration::from_secs(10))
+            .expect("the machine up ten seconds");
+        text.since = done;
+        assert_eq!(text.still(), Some(Stand::Clear), "shown, with no drawing");
+        let spec = text.wanted().remove(0);
+        let red = image::RgbaImage::from_pixel(8, 4, image::Rgba([255, 0, 0, 255]));
+        text.put(spec.clone(), Ok(Some(red)));
+        let stands = text.still();
+        assert!(matches!(stands, Some(Stand::Drawing { .. })), "{stands:?}");
+        assert_eq!(text.still(), stands, "the same from frame to frame");
+        // As big as the one before: written into the texture it has.
+        let green = image::RgbaImage::from_pixel(8, 4, image::Rgba([0, 255, 0, 255]));
+        text.put(spec, Ok(Some(green)));
+        let redrawn = text.still();
+        assert!(matches!(redrawn, Some(Stand::Drawing { .. })), "{redrawn:?}");
+        assert_ne!(redrawn, stands, "drawn again, where it was");
+        text.settings.look.anchor = crate::engine::value::timer::Anchor::TopLeft;
+        let placed = text.still();
+        assert!(matches!(placed, Some(Stand::Drawing { .. })), "{placed:?}");
+        assert_ne!(placed, redrawn, "put elsewhere");
+        text.since = begins;
+        assert_eq!(text.still(), None, "within its fade time");
+        text.settings.visible = false;
+        text.fade_from = 1.0;
+        assert_eq!(text.still(), None, "fading out");
+        text.since = done;
+        assert_eq!(text.still(), Some(Stand::Clear), "hidden and faded out");
+        text.settings.fade_secs = 0.0;
+        text.since = begins;
+        assert_eq!(text.still(), Some(Stand::Clear), "hidden, with no fade time");
+    }
+}

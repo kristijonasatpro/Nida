@@ -6,7 +6,7 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
 #[derive(Deserialize, ToSchema)]
@@ -21,7 +21,7 @@ pub struct AssignSurfaceBody {
     pub surface_uuid: String,
 }
 
-#[utoipa::path(post, path = "/api/outputs", responses((status = 200, body = CommandResult)), tag = "Outputs")]
+#[utoipa::path(post, path = "/api/outputs", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Outputs")]
 pub async fn create(State(s): State<SharedState>) -> impl IntoResponse {
     match s.send_command(EngineCommand::CreateOutput).await {
         Ok(r) => command_response(r),
@@ -29,7 +29,7 @@ pub async fn create(State(s): State<SharedState>) -> impl IntoResponse {
     }
 }
 
-#[utoipa::path(delete, path = "/api/outputs/{output_uuid}", params(("output_uuid" = String, Path, description = "Output UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Output not found")), tag = "Outputs")]
+#[utoipa::path(delete, path = "/api/outputs/{output_uuid}", params(("output_uuid" = String, Path, description = "Output UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Output not found")), tag = "Outputs")]
 pub async fn close(
     State(s): State<SharedState>,
     Path(output_uuid): Path<String>,
@@ -43,7 +43,7 @@ pub async fn close(
     }
 }
 
-#[utoipa::path(put, path = "/api/outputs/{output_uuid}/display", params(("output_uuid" = String, Path, description = "Output UUID")), request_body = SetDisplayBody, responses((status = 200, body = CommandResult), (status = 404, description = "Output not found")), tag = "Outputs")]
+#[utoipa::path(put, path = "/api/outputs/{output_uuid}/display", params(("output_uuid" = String, Path, description = "Output UUID")), request_body = SetDisplayBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Output not found")), tag = "Outputs")]
 pub async fn set_display(
     State(s): State<SharedState>,
     Path(output_uuid): Path<String>,
@@ -61,7 +61,7 @@ pub async fn set_display(
     }
 }
 
-#[utoipa::path(post, path = "/api/outputs/{output_uuid}/surfaces", params(("output_uuid" = String, Path, description = "Output UUID")), request_body = AssignSurfaceBody, responses((status = 200, body = CommandResult), (status = 404, description = "Output or surface not found")), tag = "Outputs")]
+#[utoipa::path(post, path = "/api/outputs/{output_uuid}/surfaces", params(("output_uuid" = String, Path, description = "Output UUID")), request_body = AssignSurfaceBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Output or surface not found")), tag = "Outputs")]
 pub async fn assign_surface(
     State(s): State<SharedState>,
     Path(output_uuid): Path<String>,
@@ -79,7 +79,7 @@ pub async fn assign_surface(
     }
 }
 
-#[utoipa::path(delete, path = "/api/outputs/{output_uuid}/surfaces/{surface_uuid}", params(("output_uuid" = String, Path, description = "Output UUID"), ("surface_uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Output or surface assignment not found")), tag = "Outputs")]
+#[utoipa::path(delete, path = "/api/outputs/{output_uuid}/surfaces/{surface_uuid}", params(("output_uuid" = String, Path, description = "Output UUID"), ("surface_uuid" = String, Path, description = "Surface UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Output or surface assignment not found")), tag = "Outputs")]
 pub async fn unassign_surface(
     State(s): State<SharedState>,
     Path((output_uuid, surface_uuid)): Path<(String, String)>,
@@ -104,7 +104,7 @@ pub struct CreateHeadlessBody {
     pub target: crate::renderer::context::OutputTarget,
 }
 
-#[utoipa::path(post, path = "/api/outputs/headless", request_body = CreateHeadlessBody, responses((status = 200, body = CommandResult)), tag = "Outputs")]
+#[utoipa::path(post, path = "/api/outputs/headless", request_body = CreateHeadlessBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Outputs")]
 pub async fn create_headless(
     State(s): State<SharedState>,
     Json(b): Json<CreateHeadlessBody>,
@@ -117,7 +117,7 @@ pub async fn create_headless(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/outputs/{output_uuid}/start", params(("output_uuid" = String, Path, description = "Output UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Output not found")), tag = "Outputs")]
+#[utoipa::path(post, path = "/api/outputs/{output_uuid}/start", params(("output_uuid" = String, Path, description = "Output UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Output not found")), tag = "Outputs")]
 pub async fn start(
     State(s): State<SharedState>,
     Path(output_uuid): Path<String>,
@@ -130,7 +130,7 @@ pub async fn start(
         Err(m) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
     }
 }
-#[utoipa::path(post, path = "/api/outputs/{output_uuid}/stop", params(("output_uuid" = String, Path, description = "Output UUID")), responses((status = 200, body = CommandResult), (status = 404, description = "Output not found")), tag = "Outputs")]
+#[utoipa::path(post, path = "/api/outputs/{output_uuid}/stop", params(("output_uuid" = String, Path, description = "Output UUID")), responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Output not found")), tag = "Outputs")]
 pub async fn stop(
     State(s): State<SharedState>,
     Path(output_uuid): Path<String>,
@@ -149,7 +149,7 @@ pub struct SetCalibrationModeBody {
     pub mode: crate::renderer::context::CalibrationMode,
 }
 
-#[utoipa::path(put, path = "/api/outputs/{output_uuid}/calibration", params(("output_uuid" = String, Path, description = "Output UUID")), request_body = SetCalibrationModeBody, responses((status = 200, body = CommandResult), (status = 404, description = "Output not found")), tag = "Outputs")]
+#[utoipa::path(put, path = "/api/outputs/{output_uuid}/calibration", params(("output_uuid" = String, Path, description = "Output UUID")), request_body = SetCalibrationModeBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Output not found")), tag = "Outputs")]
 pub async fn set_calibration_mode(
     State(s): State<SharedState>,
     Path(output_uuid): Path<String>,
@@ -175,7 +175,7 @@ pub struct SetOutputTargetBody {
     pub target: crate::renderer::context::OutputTarget,
 }
 
-#[utoipa::path(put, path = "/api/outputs/{output_uuid}/target", params(("output_uuid" = String, Path, description = "Output UUID")), request_body = SetOutputTargetBody, responses((status = 200, body = CommandResult), (status = 404, description = "Output not found")), tag = "Outputs")]
+#[utoipa::path(put, path = "/api/outputs/{output_uuid}/target", params(("output_uuid" = String, Path, description = "Output UUID")), request_body = SetOutputTargetBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Output not found")), tag = "Outputs")]
 pub async fn set_target(
     State(s): State<SharedState>,
     Path(output_uuid): Path<String>,
@@ -198,7 +198,7 @@ pub async fn set_target(
     path = "/api/outputs/{output_uuid}/presentation",
     params(("output_uuid" = String, Path, description = "Output UUID")),
     request_body = crate::engine::value::render::PresentationRequest,
-    responses((status = 200, body = CommandResult), (status = 404, description = "Output not found")),
+    responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Output not found")),
     tag = "Outputs"
 )]
 pub async fn set_presentation(
@@ -231,7 +231,7 @@ pub struct SetOutputSourceBody {
     params(("output_uuid" = String, Path, description = "Output UUID")),
     request_body = SetOutputSourceBody,
     responses(
-        (status = 200, body = CommandResult),
+        (status = 200, body = crate::usecases::api::ApiReply),
         (status = 400, description = "Not Master or a bus, or the output is a window"),
         (status = 404, description = "Output or bus not found")
     ),
@@ -267,7 +267,7 @@ pub struct SetEdgeBlendBody {
     path = "/api/outputs/{output_uuid}/edge-blend",
     params(("output_uuid" = String, Path, description = "Output UUID")),
     request_body = SetEdgeBlendBody,
-    responses((status = 200, body = CommandResult), (status = 404, description = "Output not found")),
+    responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Output not found")),
     tag = "Outputs"
 )]
 pub async fn set_edge_blend(
@@ -298,7 +298,7 @@ pub struct SetEdgeBlendModeBody {
     path = "/api/outputs/{output_uuid}/edge-blend-mode",
     params(("output_uuid" = String, Path, description = "Output UUID")),
     request_body = SetEdgeBlendModeBody,
-    responses((status = 200, body = CommandResult), (status = 404, description = "Output not found")),
+    responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "Output not found")),
     tag = "Outputs"
 )]
 pub async fn set_edge_blend_mode(
@@ -334,7 +334,7 @@ pub struct CreateLedOutputBody {
     path = "/api/outputs/led",
     request_body = CreateLedOutputBody,
     responses(
-        (status = 200, body = CommandResult),
+        (status = 200, body = crate::usecases::api::ApiReply),
         (status = 400, description = "A screen of no size, too many screens, or a bus that does not exist")
     ),
     tag = "Outputs"
@@ -367,7 +367,7 @@ pub struct SetOutputLedBody {
     params(("output_uuid" = String, Path, description = "Output UUID")),
     request_body = SetOutputLedBody,
     responses(
-        (status = 200, body = CommandResult),
+        (status = 200, body = crate::usecases::api::ApiReply),
         (status = 400, description = "A screen of no size, too many screens, or a bus that does not exist"),
         (status = 404, description = "Output not found")
     ),
@@ -398,7 +398,7 @@ pub async fn set_led(
         ("screen_uuid" = String, Path, description = "LED screen UUID")
     ),
     responses(
-        (status = 200, body = CommandResult),
+        (status = 200, body = crate::usecases::api::ApiReply),
         (status = 404, description = "Output, LED feed or screen not found")
     ),
     tag = "Outputs"
@@ -428,7 +428,7 @@ pub struct ScreenNameBody {
     pub name: Option<String>,
 }
 
-#[utoipa::path(put, path = "/api/screens/name", request_body = ScreenNameBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such screen connected")), tag = "Outputs")]
+#[utoipa::path(put, path = "/api/screens/name", request_body = ScreenNameBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such screen connected")), tag = "Outputs")]
 pub async fn set_screen_name(
     State(s): State<SharedState>,
     Json(b): Json<ScreenNameBody>,
@@ -445,7 +445,7 @@ pub async fn set_screen_name(
     }
 }
 
-#[utoipa::path(post, path = "/api/screens/identify", responses((status = 200, body = CommandResult)), tag = "Outputs")]
+#[utoipa::path(post, path = "/api/screens/identify", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Outputs")]
 pub async fn identify_screens(State(s): State<SharedState>) -> impl IntoResponse {
     match s.send_command(EngineCommand::IdentifyScreens).await {
         Ok(r) => command_response(r),

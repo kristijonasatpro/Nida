@@ -35,6 +35,13 @@ pub struct ShaderRegistry {
     /// collisions (built-in, then workdir, then any extra override dirs).
     library_paths: Vec<PathBuf>,
 
+    /// The show's own shader folder, one at a time (see
+    /// [`Self::set_show_library`]), and its place among the libraries: after
+    /// the built-in ones, before the user's and `--shader-dir`'s, which win a
+    /// name over it.
+    show_library: Option<PathBuf>,
+    show_slot: usize,
+
     /// File watcher (kept alive to maintain watch)
     #[allow(dead_code)]
     watcher: Option<notify::RecommendedWatcher>,
@@ -51,6 +58,8 @@ impl ShaderRegistry {
             path_to_name: HashMap::new(),
             name_to_paths: HashMap::new(),
             library_paths: Vec::new(),
+            show_library: None,
+            show_slot: 0,
             watcher: None,
             change_receiver: None,
         }
@@ -80,6 +89,15 @@ impl ShaderRegistry {
         // which arrive absolute, line up with library paths for precedence).
         let path = path.canonicalize().unwrap_or(path);
 
+        if self.show_library.as_ref() == Some(&path) {
+            // The show's own folder asked for as a library of its own (a
+            // --shader-dir): that it is now, last as such, kept whatever
+            // show opens.
+            self.library_paths.retain(|lib| *lib != path);
+            self.library_paths.push(path);
+            self.show_library = None;
+            return Ok(());
+        }
         if self.library_paths.contains(&path) {
             log::debug!("Shader library already registered: {}", path.display());
             return Ok(());
@@ -87,6 +105,44 @@ impl ShaderRegistry {
 
         self.library_paths.push(path);
         Ok(())
+    }
+
+    /// The show's own folder goes here among the libraries: after those
+    /// added so far (see [`Self::set_show_library`]).
+    pub fn mark_show_slot(&mut self) {
+        self.show_slot = self.library_paths.len();
+    }
+
+    /// Make `path` the show's own shader library — when it is a folder — in
+    /// the show's place, in place of the show before's: left there, a shader
+    /// of the show before stood in for this one's of the same name. Watched,
+    /// when watching, the one before no longer. Whether the libraries
+    /// changed; the shaders follow at the next [`Self::scan`].
+    pub fn set_show_library(&mut self, path: &Path) -> bool {
+        let new = path
+            .is_dir()
+            .then(|| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+        if new == self.show_library {
+            return false;
+        }
+        if let Some(old) = self.show_library.take() {
+            self.library_paths.retain(|lib| *lib != old);
+            if let Some(watcher) = &mut self.watcher {
+                let _ = watcher.unwatch(&old);
+            }
+        }
+        // A folder already a library of its own (a --shader-dir) stays that.
+        if let Some(new) = new.filter(|new| !self.library_paths.contains(new)) {
+            let at = self.show_slot.min(self.library_paths.len());
+            self.library_paths.insert(at, new.clone());
+            if let Some(watcher) = &mut self.watcher {
+                if let Err(e) = watcher.watch(&new, RecursiveMode::Recursive) {
+                    log::warn!("Show shaders not watched: {}: {e}", new.display());
+                }
+            }
+            self.show_library = Some(new);
+        }
+        true
     }
 
     /// Scan all library paths for ISF shaders

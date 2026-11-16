@@ -33,10 +33,129 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// A test RTMP server and what it wrote. A test that fails says, as it
+/// unwinds, what became of its server — "Connection refused" alone does not
+/// tell a server that was late from one that was gone.
+struct Server {
+    child: Child,
+    port: u16,
+    said: PathBuf,
+    started: Instant,
+}
+
+impl std::ops::Deref for Server {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for Server {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+/// Who listens on `port` now, asked without connecting — the port may be
+/// another test's by now, and its server takes one connection. Given three
+/// seconds: a failing test's report must not wait on it.
+fn listening_on(port: u16) -> String {
+    let spawned = Command::new("lsof")
+        .args(["-nPl", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut lsof = match spawned {
+        Ok(lsof) => lsof,
+        Err(e) => return format!("not to be asked ({e})"),
+    };
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        match lsof.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(e) => return format!("not to be asked ({e})"),
+        }
+        if Instant::now() >= until {
+            let _ = lsof.kill();
+            let _ = lsof.wait();
+            return "not to be asked (lsof did not end in 3 s)".to_string();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let Ok(found) = lsof.wait_with_output() else {
+        return "not to be asked (lsof's answer could not be read)".to_string();
+    };
+    let lines: Vec<String> = String::from_utf8_lossy(&found.stdout)
+        .lines()
+        .skip(1)
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    let status = found.status;
+    let complaint = String::from_utf8_lossy(&found.stderr);
+    let complaint = complaint.trim();
+    if !lines.is_empty() {
+        lines.join(" | ")
+    } else if status.code() == Some(1) && complaint.is_empty() {
+        // lsof's way of saying it found nothing.
+        "no one".to_string()
+    } else {
+        format!("not to be asked (lsof: {status}; {complaint})")
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        let (port, pid) = (self.port, self.child.id());
+        let age = self.started.elapsed().as_secs_f32();
+        let process = match self.child.try_wait() {
+            Ok(Some(status)) => format!("gone ({status})"),
+            Ok(None) => "running".to_string(),
+            Err(e) => format!("not to be asked ({e})"),
+        };
+        let said = std::fs::read_to_string(&self.said).unwrap_or_default();
+        let said = if said.trim().is_empty() {
+            "nothing"
+        } else {
+            said.trim()
+        };
+        let listening = listening_on(port);
+        // Written the way the test's own output is, so it is kept with it;
+        // a write that fails must not take the test's own message with it.
+        let _ = std::panic::catch_unwind(|| {
+            eprintln!(
+                "test RTMP server on port {port} (pid {pid}), started {age:.1} s ago: \
+                 {process}; listening on the port: {listening}; it wrote: {said}"
+            );
+        });
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+thread_local! {
+    /// When this test's thread first said something.
+    static FIRST_NOTE: Instant = Instant::now();
+}
+
+/// A line of the test's own course, with its time: shown with a failing
+/// test's output only, it says how long each step before the failure took.
+fn note(what: &str) {
+    let at = FIRST_NOTE.with(Instant::elapsed).as_secs_f32();
+    eprintln!("[{at:6.1} s] {what}");
+}
+
 /// An RTMP server taking one publisher on `port`, app `live`, stream `key`,
-/// writing what it receives to `out`.
-fn rtmp_server(port: u16, key: &str, out: &Path) -> Child {
-    Command::new("ffmpeg")
+/// writing what it receives to `out` and what it has to say beside it.
+fn rtmp_server(port: u16, key: &str, out: &Path) -> Server {
+    note(&format!("test RTMP server on port {port} started"));
+    let said = out.with_extension("server.log");
+    let errors = std::fs::File::create(&said).expect("the test RTMP server's log");
+    let child = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y", "-listen", "1"])
         .args(["-timeout", "30", "-f", "flv", "-i"])
         .arg(format!("rtmp://127.0.0.1:{port}/live/{key}"))
@@ -44,9 +163,15 @@ fn rtmp_server(port: u16, key: &str, out: &Path) -> Child {
         .arg(out)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(errors))
         .spawn()
-        .expect("spawn the test RTMP server")
+        .expect("spawn the test RTMP server");
+    Server {
+        child,
+        port,
+        said,
+        started: Instant::now(),
+    }
 }
 
 fn settings(destinations: Vec<StreamDestination>) -> StreamSettings {
@@ -54,7 +179,9 @@ fn settings(destinations: Vec<StreamDestination>) -> StreamSettings {
     s.options.width = 320;
     s.options.height = 180;
     s.options.video_kbps = 800;
+    note("choosing the encoder");
     s.options.encoder = StreamEncoder::preferred();
+    note("the encoder chosen");
     s.destinations = destinations;
     s.normalized()
 }
@@ -72,6 +199,7 @@ fn dest(port: u16, key: &str) -> StreamDestination {
 /// Feed frames in real time for `secs`, calling `each` after every frame.
 fn feed(enc: &mut FfmpegSubprocess, secs: f32, mut each: impl FnMut(&FfmpegSubprocess) -> bool) {
     // Noise, new every frame, so the encoder spends its bit rate.
+    note(&format!("feeding for up to {secs} s"));
     let mut frame = vec![0u8; 320 * 180 * 4];
     let mut seed = 0x2545_f491_u32;
     let start = Instant::now();
@@ -279,8 +407,7 @@ fn send_cmd(app: &mut VardaApp, cmd: EngineCommand) -> CommandResult {
     let tx = app.command_sender();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     tx.send((cmd, Some(reply_tx))).unwrap();
-    app.process_commands();
-    reply_rx.blocking_recv().unwrap()
+    varda::testing::reply_of(app, reply_rx)
 }
 
 #[allow(clippy::needless_pass_by_value)] // Takes the reply straight from `send_cmd`.

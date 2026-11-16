@@ -98,6 +98,8 @@ pub(crate) fn build_ui_data(
                     let screen_capture = d.screen_capture.as_ref().map(|s| ScreenCaptureUI {
                         target_label: s.target_label.clone(),
                         is_display: s.is_display,
+                        target_uuid: s.target_uuid.clone(),
+                        kept_by_name: s.kept_by_name,
                         rate: s.rate_norm,
                         rate_fps: s.rate_fps,
                         crop: s.crop,
@@ -123,10 +125,20 @@ pub(crate) fn build_ui_data(
                         screen_capture,
                         tap,
                         playlist: d.playlist.clone(),
+                        slides: d.slides.clone(),
                         timer: d.timer.clone(),
+                        lower_third: d.lower_third.clone(),
+                        text: d.text.clone(),
+                        presentation: d.presentation.clone(),
+                        presenter_of: d.presenter_of.clone(),
+                        presenter_layout: d.presenter_layout,
+                        offline: d.offline.clone(),
                         camera_colour: d.camera_colour,
                         camera_profile: d.camera_profile.clone(),
                         camera_lowest_latency: d.camera_lowest_latency,
+                        camera_signal: d.camera_signal.clone(),
+                        camera_id: d.camera_id,
+                        camera_mode: d.camera_mode,
                         is_html_interactive: d.is_html_interactive,
                         opacity: d.opacity,
                         effective_opacity: d.effective_opacity,
@@ -153,12 +165,25 @@ pub(crate) fn build_ui_data(
             ChannelUIInfo {
                 ch_idx: ch.idx,
                 uuid: ch.uuid.clone(),
-                name: ch.name.clone(),
+                name: shown_channel_name(&ch.name, ch.idx),
+                unnamed: crate::mixer::is_default_channel_name(&ch.name),
                 opacity: ch.opacity,
                 blend_mode: ch.blend_mode,
                 decks,
                 effects,
                 overlay: ch.overlay,
+                color: ch.color.map(|[r, g, b]| egui::Color32::from_rgb(r, g, b)),
+                on_air: ch.on_air.as_deref().map(|at| {
+                    if at == "main" {
+                        "Main".to_string()
+                    } else {
+                        engine
+                            .buses
+                            .iter()
+                            .find(|bus| bus.uuid == at)
+                            .map_or_else(|| at.to_string(), |bus| bus.name.clone())
+                    }
+                }),
             }
         })
         .collect();
@@ -460,6 +485,8 @@ pub(crate) fn build_ui_data(
             label: m.label.clone(),
             model: m.model.clone(),
             given_name: m.given_name.clone(),
+            identity: m.identity.clone(),
+            main: m.main,
         })
         .collect();
 
@@ -578,7 +605,9 @@ pub(crate) fn build_ui_data(
         .collect();
     UIData {
         generators: engine.registry.generators,
+        broadcast: engine.registry.broadcast,
         filters: engine.registry.filters,
+        frames: engine.registry.frames,
         effect_masks,
         shader_count: engine.registry.shader_count,
         channels,
@@ -593,6 +622,7 @@ pub(crate) fn build_ui_data(
         channel_preview_textures: channel_preview_textures.clone(),
         output_preview_textures: output_preview_textures.clone(),
         main_output_texture,
+        preview_monitor_texture: None,
         notifications,
         crossfader: engine.mixer.crossfader,
         auto_crossfade_active: engine.mixer.auto_crossfade_active,
@@ -610,6 +640,8 @@ pub(crate) fn build_ui_data(
             .as_ref()
             .map(|t| format!("{t}")),
         keymap_bindings: app.input.keymap.bindings.clone(),
+        // The control window's own (see the runner): the Mac's clicker.
+        clicker: crate::clicker::ClickerStatus::default(),
         transition_names: engine.mixer.transition_names,
         active_transition_name: engine.mixer.active_transition_name,
         // UI layout/selection state — owned by the UI consumer, not the engine
@@ -679,6 +711,8 @@ pub(crate) fn build_ui_data(
         cameras: engine.cameras.devices,
         camera_modes: engine.cameras.modes,
         camera_access_denied: engine.cameras.access_denied,
+        cameras_with_own_sound: engine.cameras.with_own_sound.clone(),
+        cameras_following_signal: engine.cameras.following_signal.clone(),
         camera_video_effects: engine.cameras.video_effects.clone(),
         depth_sensors: engine.depth_sensors.devices,
         capture_targets: engine.screen_capture.targets,
@@ -792,6 +826,9 @@ pub(crate) fn build_ui_data(
             .gpu_busy()
             .unwrap_or_else(|| app.mixer_ref().gpu_utilization()),
         gpu_utilization_measured: app.frame_stats.system_monitor.gpu_busy().is_some(),
+        late_frames: late_frames(&app.frame_stats.intervals, app.target_fps()),
+        nida_gpu: app.frame_stats.system_monitor.nida_gpu(),
+        nida_ram: app.frame_stats.system_monitor.nida_ram(),
         cpu_usage: app.frame_stats.system_monitor.cpu_usage(),
         ram_used: app.frame_stats.system_monitor.ram_used(),
         ram_total: app.frame_stats.system_monitor.ram_total(),
@@ -812,10 +849,12 @@ pub(crate) fn build_ui_data(
         render_width: app.render_width(),
         render_height: app.render_height(),
         render_auto: app.render_auto(),
+        render_hint: engine.render.hint.clone(),
         max_render_dimension: app.max_render_dimension(),
         target_fps: app.target_fps(),
         frames_in_flight: app.frames_in_flight(),
         control_screen_rate: app.control_screen_rate(),
+        night_shift_off: app.night_shift_off(),
         // Populated by UIRunner after build (history/pending loads live on runner, not app)
         can_undo: false,
         can_redo: false,
@@ -838,6 +877,38 @@ pub(crate) fn build_ui_data(
 }
 
 // ── Snapshot → UI type helpers ──────────────────────────────────────
+
+/// How many frames of the last five seconds started more than half a
+/// frame late, from the milliseconds between the last frames' starts
+/// (`intervals`, the latest last) — a screen showing every frame showed
+/// the one before twice. The rule of the API's `pacing.late_frames`, over
+/// five seconds whatever the rate: `intervals` holds a count of frames (ten
+/// seconds of them at 30 fps, two and a half at 120), so only the last five
+/// seconds are counted, and a history shorter than that (but a second at
+/// least) is counted as if it went on as it is for five. None uncapped
+/// (`target_fps` 0: no frame is due at any time); the gap after a pause (a
+/// launch, a dialog: a second or more) is not a frame.
+fn late_frames(intervals: &std::collections::VecDeque<f32>, target_fps: u32) -> u32 {
+    const OVER_MS: f32 = 5000.0;
+    if target_fps == 0 {
+        return 0;
+    }
+    let frame_ms = 1000.0 / target_fps as f32;
+    let (mut covered, mut late) = (0.0_f32, 0.0_f32);
+    for ms in intervals.iter().rev() {
+        if covered >= OVER_MS {
+            break;
+        }
+        covered += ms;
+        if *ms < 1000.0 && *ms > frame_ms * 1.5 {
+            late += 1.0;
+        }
+    }
+    if (1000.0..OVER_MS).contains(&covered) {
+        late = late * OVER_MS / covered;
+    }
+    late.round() as u32
+}
 
 /// A channel's frame rate as its motion shows it: the slowest of its visible
 /// layers that moves, from each layer's `(fps, still)`. A still image is drawn
@@ -865,6 +936,7 @@ fn params_snapshot_to_ui(snap: &ShaderParamsSnapshot) -> ShaderParamsUI {
                 value: p.value,
                 min: p.min,
                 max: p.max,
+                choices: p.choices.clone(),
             })
             .collect(),
     }
@@ -873,7 +945,10 @@ fn params_snapshot_to_ui(snap: &ShaderParamsSnapshot) -> ShaderParamsUI {
 fn effect_snapshot_to_ui(snap: &EffectSnapshot) -> EffectInfo {
     (
         snap.uuid.clone(),
-        snap.name.clone(),
+        match snap.offline {
+            Some(_) => format!("⚠ {} — offline", snap.name),
+            None => snap.name.clone(),
+        },
         snap.enabled,
         params_snapshot_to_ui(&snap.params),
     )
@@ -882,13 +957,15 @@ fn effect_snapshot_to_ui(snap: &EffectSnapshot) -> EffectInfo {
 /// Scan `.varda/luts/` for available LUT files (.cube, .3dl).
 fn list_available_luts(workspace: &crate::persistence::Workspace) -> Vec<String> {
     let dir = workspace.luts_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    // As last found: asked in every control-window frame, never of the disk
+    // here (see `file_facts`).
+    let Some(Some(names)) = crate::file_facts::folder(&dir) else {
         return vec![];
     };
-    let mut files: Vec<String> = entries
-        .filter_map(std::result::Result::ok)
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
+    let mut files: Vec<String> = names
+        .iter()
+        .cloned()
+        .filter_map(|name| {
             let is_lut = std::path::Path::new(&name).extension().is_some_and(|ext| {
                 ext.eq_ignore_ascii_case("cube") || ext.eq_ignore_ascii_case("3dl")
             });
@@ -903,9 +980,112 @@ fn list_available_luts(workspace: &crate::persistence::Workspace) -> Vec<String>
     files
 }
 
+/// What a channel is called in the UI: its name, or — never named, still
+/// "Ch 25" as it was made — "Input 8", by where it is in the Inputs row.
+fn shown_channel_name(name: &str, idx: usize) -> String {
+    if crate::mixer::is_default_channel_name(name) {
+        format!("Input {}", idx + 1)
+    } else {
+        name.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::channel_fps;
+    /// Frames started more than half a frame late are counted, against the
+    /// show's own rate; the gap after a pause is not one, and uncapped none.
+    #[test]
+    fn late_frames_are_those_started_more_than_half_a_frame_late() {
+        use std::collections::VecDeque;
+        // Oldest first: a late frame more than five seconds ago, then 299
+        // on time, then two late ones (25.1 and 100 ms) among the latest.
+        let mut long = vec![33.4_f32];
+        long.extend([16.7_f32; 299]);
+        long.extend([24.9, 25.1, 16.7, 100.0, 16.7]);
+        let long: VecDeque<f32> = long.into();
+        assert_eq!(super::late_frames(&long, 60), 2, "the last five seconds' alone");
+        assert_eq!(super::late_frames(&long, 30), 1, "100 ms alone, at 30");
+        assert_eq!(super::late_frames(&long, 0), 0, "uncapped");
+        // 150 frames at 120 fps are a second and a quarter: two late ones
+        // there are eight in five seconds.
+        let mut short = vec![8.33_f32; 148];
+        short.extend([20.0, 20.0]);
+        assert_eq!(super::late_frames(&short.into(), 120), 8, "as if it went on for five");
+        // The gap after a pause is not a late frame.
+        let paused: VecDeque<f32> = [16.7, 2500.0, 1000.0, 16.7].into();
+        assert_eq!(super::late_frames(&paused, 60), 0, "a pause");
+        assert_eq!(super::late_frames(&VecDeque::new(), 60), 0);
+    }
+
+    use super::{channel_fps, shown_channel_name};
+
+    /// A channel never named is called by where it is in the Inputs row,
+    /// not by the count of channels ever made; one named keeps its name.
+    #[test]
+    fn a_channel_never_named_is_called_by_its_number() {
+        assert_eq!(shown_channel_name("Ch 25", 7), "Input 8");
+        assert_eq!(shown_channel_name("Ch 0", 0), "Input 1");
+        assert_eq!(shown_channel_name("1_Forward_Momentum", 8), "1_Forward_Momentum");
+        assert_eq!(shown_channel_name("Ch A", 0), "Ch A");
+    }
+
+    /// The UI's inputs, made from the app: one never named is called by its
+    /// number there, one named by its name.
+    #[test]
+    fn the_uis_inputs_are_called_by_their_numbers_when_never_named() {
+        use crate::engine::traits::*;
+        let Some(gpu) = crate::renderer::context::GpuContext::new_headless().ok() else {
+            return;
+        };
+        let Ok(mut app) = crate::app::VardaApp::new(gpu, &crate::testing::headless_config())
+        else {
+            return;
+        };
+        app.add_channel().unwrap();
+        let made: Vec<(usize, String)> = app
+            .mixer_ref()
+            .channels()
+            .iter()
+            .enumerate()
+            .map(|(i, ch)| (i, ch.name.clone()))
+            .collect();
+        assert!(made.iter().any(|(_, n)| crate::mixer::is_default_channel_name(n)), "{made:?}");
+        let none = std::collections::HashMap::new();
+        let data = super::build_ui_data(
+            &app,
+            &crate::usecases::ui::UILayoutState::default(),
+            &std::collections::HashMap::new(),
+            &none,
+            &std::collections::HashMap::new(),
+            None,
+        );
+        for ((i, name), ch) in made.iter().zip(&data.channels) {
+            let want = if crate::mixer::is_default_channel_name(name) {
+                format!("Input {}", i + 1)
+            } else {
+                name.clone()
+            };
+            assert_eq!(ch.name, want, "{name} at {i}");
+            assert_eq!(ch.unnamed, crate::mixer::is_default_channel_name(name), "{name}");
+        }
+    }
+
+    /// Number and name, as a tile shows them; one never named, its number.
+    #[test]
+    fn an_input_is_numbered_as_its_tile() {
+        let mut ch = crate::usecases::ui::UIData::test_fixture().channels.remove(0);
+        ch.ch_idx = 8;
+        ch.name = "1_Forward_Momentum_pertrauka".into();
+        assert_eq!(ch.number(), 9);
+        assert_eq!(ch.numbered(), "9  1_Forward_Momentum_pertrauka");
+        ch.ch_idx = 7;
+        ch.name = shown_channel_name("Ch 25", 7);
+        ch.unnamed = true;
+        assert_eq!(ch.numbered(), "8  Input");
+        // One named "Input 8" by hand keeps it.
+        ch.unnamed = false;
+        assert_eq!(ch.numbered(), "8  Input 8");
+    }
 
     #[test]
     fn a_channel_runs_at_its_slowest_moving_layer_and_a_still_does_not_count() {

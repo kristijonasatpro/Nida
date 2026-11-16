@@ -42,10 +42,11 @@ use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
     kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_ConstantBitRate,
     kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxKeyFrameInterval,
-    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTCompressionPropertyKey_ProfileLevel,
-    kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_TransferFunction,
-    kVTCompressionPropertyKey_YCbCrMatrix, kVTProfileLevel_H264_High_AutoLevel,
-    kVTProfileLevel_HEVC_Main_AutoLevel,
+    kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+    kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
+    kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
+    kVTCompressionPropertyKey_TransferFunction, kVTCompressionPropertyKey_YCbCrMatrix,
+    kVTProfileLevel_H264_High_AutoLevel, kVTProfileLevel_HEVC_Main_AutoLevel,
     kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, VTCompressionSession,
     VTEncodeInfoFlags, VTSessionSetProperty,
 };
@@ -134,6 +135,28 @@ impl Shared {
     }
 }
 
+/// How the engine is asked to work: [`Tuning::default`] for a stream and a
+/// recording; others to measure it (see `vt_bench`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Tuning {
+    /// The frame rate the engine is told to expect; none, not told — as
+    /// ffmpeg's encoder does. Told 60 at 4K, macOS spreads one session over
+    /// both of a Max chip's engines, and two at once — a stream and a
+    /// recording — held each other to about 41 fps each on an M5 Max (OBS
+    /// the same), where ffmpeg's untold sessions ran at 73 each.
+    pub expected_fps: Option<u32>,
+}
+
+/// Where [`VtEncoder::encode`] spent its time on a frame: getting a frame
+/// buffer from the engine's pool, copying the picture into it, and handing
+/// it to the engine.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Stages {
+    pub pool: std::time::Duration,
+    pub copy: std::time::Duration,
+    pub call: std::time::Duration,
+}
+
 /// One stream's encoder on the media engine. Used from one thread — the
 /// stream's writer — which hands it frames and changes its rate between them.
 pub struct VtEncoder {
@@ -152,6 +175,8 @@ pub struct VtEncoder {
     /// Frames submitted so far.
     submitted: u64,
     finished: bool,
+    /// The last frame's (see [`Stages`]).
+    stages: Stages,
 }
 
 // SAFETY: the session and its pool are CoreFoundation objects the media
@@ -174,11 +199,36 @@ impl VtEncoder {
     /// the stream needs.
     pub fn new(
         codec: VideoCodec,
+        size: (u32, u32),
+        fps: u32,
+        rate: (u32, bool),
+        keyframe_secs: u32,
+        out: Sender<Encoded>,
+    ) -> anyhow::Result<Self> {
+        Self::tuned(
+            codec,
+            size,
+            fps,
+            rate,
+            keyframe_secs,
+            out,
+            Tuning::default(),
+        )
+    }
+
+    /// [`Self::new`], the engine asked to work as `tuning` says.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub fn tuned(
+        codec: VideoCodec,
         (width, height): (u32, u32),
         fps: u32,
         (kbps, constant): (u32, bool),
         keyframe_secs: u32,
         out: Sender<Encoded>,
+        tuning: Tuning,
     ) -> anyhow::Result<Self> {
         let w = i32::try_from(width).context("frame too wide")?;
         let h = i32::try_from(height).context("frame too tall")?;
@@ -238,7 +288,17 @@ impl VtEncoder {
         };
         // SAFETY: a session made by `create`, which returns it retained.
         let session = unsafe { CFRetained::from_raw(raw) };
-        let constant = configure(&session, codec, fps, keyframe_secs, (kbps, constant))?;
+        let expected = tuning
+            .expected_fps
+            .map(|fps| i32::try_from(fps).context("frame rate too high"))
+            .transpose()?;
+        let constant = configure(
+            &session,
+            codec,
+            (fps, expected),
+            keyframe_secs,
+            (kbps, constant),
+        )?;
         // Made by the session once it is prepared.
         // SAFETY: a valid session.
         let pool = unsafe { session.pixel_buffer_pool() }
@@ -254,7 +314,35 @@ impl VtEncoder {
             constant,
             submitted: 0,
             finished: false,
+            stages: Stages::default(),
         })
+    }
+
+    /// Ask the engine to put speed before quality — by default it does the
+    /// reverse, as Apple documents.
+    ///
+    /// # Errors
+    ///
+    /// When the engine refuses it.
+    pub fn prioritize_speed(&mut self) -> anyhow::Result<()> {
+        let on: &CFType = CFBoolean::new(true);
+        // SAFETY: a valid session; the key's value is a CFBoolean.
+        let status = unsafe {
+            VTSessionSetProperty(
+                &self.session,
+                kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
+                Some(on),
+            )
+        };
+        if status != 0 {
+            bail!("the media engine would not put speed first ({status})");
+        }
+        Ok(())
+    }
+
+    /// Where the last frame's [`Self::encode`] spent its time.
+    pub fn last_stages(&self) -> Stages {
+        self.stages
     }
 
     /// Change the rate while live: the frames after this come out at `kbps`.
@@ -307,6 +395,7 @@ impl VtEncoder {
         if nv12.len() != w * h * 3 / 2 {
             bail!("an NV12 frame of {} bytes for {w}x{h}", nv12.len());
         }
+        let began = std::time::Instant::now();
         let mut raw: *mut CVPixelBuffer = std::ptr::null_mut();
         // SAFETY: a valid pool; `raw` receives a retained buffer.
         let status =
@@ -316,6 +405,7 @@ impl VtEncoder {
         };
         // SAFETY: made by the pool, retained for us.
         let buffer = unsafe { CFRetained::from_raw(raw) };
+        let pooled = std::time::Instant::now();
         // SAFETY: the buffer is locked while its planes are written, each row
         // within the plane's own stride; the planes are as the pool made them,
         // NV12 at this size.
@@ -340,6 +430,7 @@ impl VtEncoder {
             }
             CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags(0));
         }
+        let copied = std::time::Instant::now();
         let at = i64::try_from(slot).context("too many frames")?;
         // SAFETY: CMTime's constructor.
         let (at, length) = unsafe { (CMTime::new(at, self.fps), CMTime::new(1, self.fps)) };
@@ -357,6 +448,11 @@ impl VtEncoder {
             )
         };
         self.submitted += 1;
+        self.stages = Stages {
+            pool: pooled - began,
+            copy: copied - pooled,
+            call: copied.elapsed(),
+        };
         if status != 0 {
             // No callback comes for a frame the engine refused.
             self.shared
@@ -405,16 +501,15 @@ impl Drop for VtEncoder {
 fn configure(
     session: &VTCompressionSession,
     codec: VideoCodec,
-    fps: i32,
+    (fps, expected): (i32, Option<i32>),
     keyframe_secs: u32,
     (kbps, constant): (u32, bool),
 ) -> anyhow::Result<bool> {
     let keyframe_secs = keyframe_secs.max(1);
     let gop = CFNumber::new_i64(i64::from(fps) * i64::from(keyframe_secs));
     let gop_secs = CFNumber::new_f64(f64::from(keyframe_secs));
-    let rate = CFNumber::new_i32(fps);
     // SAFETY: VideoToolbox's and CoreVideo's constant keys and values.
-    let settings: [(&str, &CFString, &CFType); 9] = unsafe {
+    let settings: [(&str, &CFString, &CFType); 8] = unsafe {
         [
             ("real time", kVTCompressionPropertyKey_RealTime, CFBoolean::new(true)),
             (
@@ -437,7 +532,6 @@ fn configure(
                 kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
                 &gop_secs,
             ),
-            ("frame rate", kVTCompressionPropertyKey_ExpectedFrameRate, &rate),
             // The GPU's NV12 is BT.709, as the stream says it is.
             (
                 "primaries",
@@ -461,6 +555,21 @@ fn configure(
         let status = unsafe { VTSessionSetProperty(session, key, Some(value)) };
         if status != 0 {
             bail!("the media engine refused the {name} setting ({status})");
+        }
+    }
+    // The rate to expect, only when asked (see `Tuning::expected_fps`).
+    if let Some(expected) = expected {
+        let rate = CFNumber::new_i32(expected);
+        // SAFETY: a valid session; the key's value is a CFNumber.
+        let status = unsafe {
+            VTSessionSetProperty(
+                session,
+                kVTCompressionPropertyKey_ExpectedFrameRate,
+                Some(&rate),
+            )
+        };
+        if status != 0 {
+            bail!("the media engine refused the frame rate setting ({status})");
         }
     }
     let constant = set_rate(session, kbps, constant, true)?;

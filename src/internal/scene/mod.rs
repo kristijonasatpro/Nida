@@ -78,6 +78,12 @@ pub struct SceneConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub free_control_screen: bool,
 
+    /// Night Shift left alone while an output is on a screen: Nida does not
+    /// keep it off (see `crate::night_shift`). Absent — the default — when
+    /// it does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub free_night_shift: bool,
+
     /// Tonemap mode (defaults to Bypass if absent)
     #[serde(default)]
     pub tonemap_mode: crate::renderer::tonemap::TonemapMode,
@@ -226,6 +232,10 @@ pub struct ChannelConfig {
     /// taken to it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub overlay: bool,
+
+    /// The colour the operator gave it; left out, the one its place gives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 3]>,
 
     #[serde(default)]
     pub decks: Vec<DeckConfig>,
@@ -623,6 +633,15 @@ pub enum SourceConfig {
         exclude_varda: Option<bool>,
         #[serde(default)]
         scaling_mode: crate::deck::ScalingMode,
+        /// A PowerPoint input's deck file: the window is PowerPoint's show of
+        /// it, found again when the show is opened (see `crate::presentation`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presentation: Option<crate::presentation::PresentationConfig>,
+        /// What the input was last named after, as it was listed then (see
+        /// `crate::deck::ScreenCaptureState::listed_as`). Absent in a show
+        /// saved before 0.9.9 (see `persistence::restore_deck`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        listed_as: Option<String>,
     },
     /// Varda's own program or a channel composite, re-entered as a source.
     /// See spec/program-tap.md.
@@ -640,6 +659,27 @@ pub enum SourceConfig {
         #[serde(default)]
         scaling_mode: crate::deck::ScalingMode,
     },
+    /// A conference's presentations in running order, one on at a time:
+    /// the talk on when saved (`live`) is started again where it was.
+    Slides {
+        #[serde(default)]
+        talks: Vec<crate::engine::value::slides::Talk>,
+        #[serde(default)]
+        settings: crate::engine::value::slides::SlidesSettings,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live: Option<String>,
+        /// The talk picked to come next, by hand.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<String>,
+        /// The talk on, when it had been taken out of the list: its record,
+        /// and the place it had in the list.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live_talk: Option<Box<crate::engine::value::slides::Talk>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live_at: Option<usize>,
+        #[serde(default)]
+        scaling_mode: crate::deck::ScalingMode,
+    },
     /// A count down, count to a time, count up or the time of day, drawn as
     /// text over clear.
     Timer {
@@ -649,6 +689,26 @@ pub enum SourceConfig {
         /// comes back paused there.
         #[serde(default)]
         elapsed: f64,
+    },
+    /// Lines of text and how they look.
+    Text {
+        #[serde(default)]
+        settings: crate::engine::value::text::TextSettings,
+    },
+    /// A lower third: its rows, cue and look; it comes back off air.
+    LowerThird {
+        #[serde(default)]
+        settings: crate::engine::value::lower_third::LowerThirdSettings,
+    },
+    /// A presenter view of the PowerPoint input whose layer (deck UUID) it
+    /// follows, laid out as `layout` has it (left out when as a new one).
+    Presenter {
+        follows: String,
+        #[serde(
+            default,
+            skip_serializing_if = "crate::engine::value::presentation::PresenterLayout::is_default"
+        )]
+        layout: crate::engine::value::presentation::PresenterLayout,
     },
 }
 
@@ -687,14 +747,23 @@ fn default_capture_rate() -> f32 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CaptureTargetConfig {
-    Display { name: String },
+    Display {
+        /// As it was listed when last captured: "Display 2".
+        name: String,
+        /// The display's own identity (see `CaptureTargetInfo::uuid`), what
+        /// it is found by when the show opens: its name is its place among
+        /// the screens plugged in, another once one more is. None in a show
+        /// saved before it was kept, or written by hand.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uuid: Option<String>,
+    },
     Window { app: String, title: String },
 }
 
 impl CaptureTargetConfig {
     pub fn label(&self) -> String {
         match self {
-            Self::Display { name } => name.clone(),
+            Self::Display { name, .. } => name.clone(),
             Self::Window { app, title } if title.is_empty() => app.clone(),
             Self::Window { app, title } => format!("{app} — {title}"),
         }
@@ -711,8 +780,9 @@ impl From<&crate::screen_capture::backend::TargetIdentity> for CaptureTargetConf
     fn from(id: &crate::screen_capture::backend::TargetIdentity) -> Self {
         use crate::screen_capture::backend::TargetIdentity;
         match id {
-            TargetIdentity::Display { label } => Self::Display {
+            TargetIdentity::Display { label, uuid } => Self::Display {
                 name: label.clone(),
+                uuid: uuid.clone(),
             },
             TargetIdentity::Window { app, title } => Self::Window {
                 app: app.clone(),
@@ -725,8 +795,9 @@ impl From<&crate::screen_capture::backend::TargetIdentity> for CaptureTargetConf
 impl From<&CaptureTargetConfig> for crate::screen_capture::backend::TargetIdentity {
     fn from(cfg: &CaptureTargetConfig) -> Self {
         match cfg {
-            CaptureTargetConfig::Display { name } => Self::Display {
+            CaptureTargetConfig::Display { name, uuid } => Self::Display {
                 label: name.clone(),
+                uuid: uuid.clone(),
             },
             CaptureTargetConfig::Window { app, title } => Self::Window {
                 app: app.clone(),
@@ -853,7 +924,7 @@ impl EffectConfig {
     pub fn of(effect: &crate::deck::Effect) -> Self {
         Self {
             uuid: effect.uuid().to_owned(),
-            path: effect.shader.file_path.clone().unwrap_or_default(),
+            path: effect.saved_path().to_owned(),
             enabled: effect.enabled,
             params: effect.params.values.clone(),
             mask: effect.mask.clone(),
@@ -933,6 +1004,11 @@ pub enum OutputTargetConfig {
         mode: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         full_range: bool,
+        #[serde(
+            default = "crate::engine::value::render::follows_show",
+            skip_serializing_if = "crate::engine::value::render::is_true"
+        )]
+        follow_show: bool,
     },
 }
 
@@ -1182,10 +1258,17 @@ impl SourceConfig {
                 }
             }
             SourceConfig::ScreenCapture {
-                target, rate, crop, ..
+                target,
+                rate,
+                crop,
+                presentation,
+                ..
             } => {
+                if presentation.as_ref().is_some_and(|p| p.path.trim().is_empty()) {
+                    errors.push(format!("{prefix}: PowerPoint input has no file"));
+                }
                 match target {
-                    CaptureTargetConfig::Display { name } if name.trim().is_empty() => {
+                    CaptureTargetConfig::Display { name, .. } if name.trim().is_empty() => {
                         errors.push(format!("{prefix}: capture display name is empty"));
                     }
                     CaptureTargetConfig::Window { app, title } => {
@@ -1227,7 +1310,30 @@ impl SourceConfig {
             }
             // A missing file is skipped as the list plays, not refused here;
             // a timer's settings out of range are brought into it.
-            SourceConfig::Playlist { .. } | SourceConfig::Timer { .. } => {}
+            SourceConfig::Playlist { .. }
+            | SourceConfig::Timer { .. }
+            | SourceConfig::LowerThird { .. }
+            | SourceConfig::Text { .. } => {}
+            // A missing file is said in the panel; two talks may not share
+            // one id, or one would be lost.
+            SourceConfig::Slides { talks, .. } => {
+                let mut seen = std::collections::HashSet::new();
+                for talk in talks {
+                    if talk.id.trim().is_empty() || !seen.insert(talk.id.as_str()) {
+                        errors.push(format!(
+                            "{prefix}: talk id '{}' is empty or used twice",
+                            talk.id
+                        ));
+                    }
+                }
+            }
+            SourceConfig::Presenter { follows, .. } => {
+                if follows.trim().is_empty() {
+                    errors.push(format!(
+                        "{prefix}: presenter view follows no PowerPoint input"
+                    ));
+                }
+            }
         }
         errors
     }
@@ -1421,6 +1527,42 @@ impl SceneConfig {
 mod tests {
     use super::*;
 
+    // ── Screen capture ───────────────────────────────────────────────
+
+    /// A captured display is saved with its own identity beside its name,
+    /// and comes back with it; a show saved before, by the name alone, still
+    /// opens and is written back as it was.
+    #[test]
+    fn a_captured_display_is_saved_with_its_identity() {
+        use crate::screen_capture::backend::TargetIdentity;
+        let kept = TargetIdentity::Display {
+            label: "Display 2".into(),
+            uuid: Some("37D8832A-2D66-02CA-B9F7-8F30A301B230".into()),
+        };
+        let saved = serde_json::to_value(CaptureTargetConfig::from(&kept)).expect("serialize");
+        assert_eq!(
+            saved,
+            serde_json::json!({
+                "kind": "display",
+                "name": "Display 2",
+                "uuid": "37D8832A-2D66-02CA-B9F7-8F30A301B230"
+            })
+        );
+        let back: CaptureTargetConfig = serde_json::from_value(saved).expect("deserialize");
+        assert_eq!(TargetIdentity::from(&back), kept);
+
+        let old = serde_json::json!({ "kind": "display", "name": "Display 1" });
+        let back: CaptureTargetConfig = serde_json::from_value(old.clone()).expect("an old show");
+        assert_eq!(
+            TargetIdentity::from(&back),
+            TargetIdentity::Display {
+                label: "Display 1".into(),
+                uuid: None
+            }
+        );
+        assert_eq!(serde_json::to_value(&back).expect("serialize"), old);
+    }
+
     // ── Program / channel tap ────────────────────────────────────────
 
     /// Both tap variants have to survive a save/load cycle unchanged, since a
@@ -1509,6 +1651,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -1528,6 +1671,7 @@ mod tests {
             version: 2,
             channels: vec![ChannelConfig {
                 overlay: false,
+                color: None,
                 uuid: crate::deck::generate_short_uuid(),
                 name: "Ch 0".into(),
                 opacity: 1.0,
@@ -1566,6 +1710,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -1608,6 +1753,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -1892,6 +2038,23 @@ mod tests {
         assert!(scene.active_transition.is_none());
     }
 
+    /// Night Shift kept off for the outputs is the default, left out of the
+    /// file; a show that lets it be says so, and opens that way.
+    #[test]
+    fn night_shift_left_alone_is_kept_with_the_show() {
+        let scene: SceneConfig = serde_json::from_str(r#"{"version": 2}"#).unwrap();
+        assert!(!scene.free_night_shift, "an older show keeps it off");
+        let json = serde_json::to_string(&scene).unwrap();
+        assert!(!json.contains("free_night_shift"), "the default unwritten");
+        let free = SceneConfig {
+            free_night_shift: true,
+            ..scene
+        };
+        let json = serde_json::to_string(&free).unwrap();
+        let restored: SceneConfig = serde_json::from_str(&json).unwrap();
+        assert!(restored.free_night_shift);
+    }
+
     #[test]
     fn deck_config_defaults() {
         let json = r#"{"source": {"type": "SolidColor", "color": [1,0,0,1]}}"#;
@@ -2043,6 +2206,7 @@ mod tests {
             version: 2,
             channels: vec![ChannelConfig {
                 overlay: false,
+                color: None,
                 uuid: crate::deck::generate_short_uuid(),
                 name: "Test Ch".into(),
                 opacity: 0.9,
@@ -2062,6 +2226,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -2087,6 +2252,7 @@ mod tests {
             version: 2,
             channels: vec![ChannelConfig {
                 overlay: false,
+                color: None,
                 uuid: crate::deck::generate_short_uuid(),
                 name: "Ch 0".into(),
                 opacity: 1.0,
@@ -2125,6 +2291,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -2150,6 +2317,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -2178,6 +2346,7 @@ mod tests {
             render_resolution_auto: false,
             frames_in_flight: None,
             free_control_screen: false,
+            free_night_shift: false,
             tonemap_mode: crate::renderer::tonemap::TonemapMode::default(),
             active_lut: None,
             arrangement: None,
@@ -2192,6 +2361,7 @@ mod tests {
     fn validate_channel_opacity_out_of_range() {
         let ch = ChannelConfig {
             overlay: false,
+            color: None,
             uuid: crate::deck::generate_short_uuid(),
             name: "Bad".into(),
             opacity: 2.0,

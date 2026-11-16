@@ -13,7 +13,7 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::macros::{ButtonBehavior, MacroCurve, MacroKind, TriggerAction};
 use crate::usecases::api::{command_response, SharedState};
 
@@ -80,7 +80,7 @@ pub struct MacroModulationBody {
     pub amount: f32,
 }
 
-#[utoipa::path(post, path = "/api/macros", request_body = AddMacroBody, responses((status = 200, body = CommandResult)), tag = "Macros")]
+#[utoipa::path(post, path = "/api/macros", request_body = AddMacroBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Macros")]
 pub async fn add_macro(
     State(state): State<SharedState>,
     Json(body): Json<AddMacroBody>,
@@ -94,7 +94,7 @@ pub async fn add_macro(
     }
 }
 
-#[utoipa::path(delete, path = "/api/macros/{uuid}", params(("uuid" = String, Path, description = "Macro UUID")), responses((status = 200, body = CommandResult)), tag = "Macros")]
+#[utoipa::path(delete, path = "/api/macros/{uuid}", params(("uuid" = String, Path, description = "Macro UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Macros")]
 pub async fn remove_macro(
     State(state): State<SharedState>,
     Path(uuid): Path<String>,
@@ -108,7 +108,7 @@ pub async fn remove_macro(
     }
 }
 
-#[utoipa::path(put, path = "/api/macros/{uuid}/name", params(("uuid" = String, Path, description = "Macro UUID")), request_body = RenameMacroBody, responses((status = 200, body = CommandResult)), tag = "Macros")]
+#[utoipa::path(put, path = "/api/macros/{uuid}/name", params(("uuid" = String, Path, description = "Macro UUID")), request_body = RenameMacroBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Macros")]
 pub async fn rename_macro(
     State(state): State<SharedState>,
     Path(uuid): Path<String>,
@@ -126,7 +126,7 @@ pub async fn rename_macro(
     }
 }
 
-#[utoipa::path(put, path = "/api/macros/{uuid}/kind", params(("uuid" = String, Path, description = "Macro UUID")), request_body = MacroKindBody, responses((status = 200, body = CommandResult)), tag = "Macros")]
+#[utoipa::path(put, path = "/api/macros/{uuid}/kind", params(("uuid" = String, Path, description = "Macro UUID")), request_body = MacroKindBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Macros")]
 pub async fn set_kind(
     State(state): State<SharedState>,
     Path(uuid): Path<String>,
@@ -144,7 +144,7 @@ pub async fn set_kind(
     }
 }
 
-#[utoipa::path(put, path = "/api/macros/{uuid}/value", params(("uuid" = String, Path, description = "Macro UUID")), request_body = MacroValueBody, responses((status = 200, body = CommandResult)), tag = "Macros")]
+#[utoipa::path(put, path = "/api/macros/{uuid}/value", params(("uuid" = String, Path, description = "Macro UUID")), request_body = MacroValueBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Macros")]
 pub async fn set_value(
     State(state): State<SharedState>,
     Path(uuid): Path<String>,
@@ -162,7 +162,7 @@ pub async fn set_value(
     }
 }
 
-#[utoipa::path(post, path = "/api/macros/{uuid}/targets", params(("uuid" = String, Path, description = "Macro UUID")), request_body = AddMacroTargetBody, responses((status = 200, body = CommandResult)), tag = "Macros")]
+#[utoipa::path(post, path = "/api/macros/{uuid}/targets", params(("uuid" = String, Path, description = "Macro UUID")), request_body = AddMacroTargetBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Macros")]
 pub async fn add_target(
     State(state): State<SharedState>,
     Path(uuid): Path<String>,
@@ -180,7 +180,7 @@ pub async fn add_target(
     }
 }
 
-#[utoipa::path(delete, path = "/api/macros/{uuid}/targets/{target_idx}", params(("uuid" = String, Path, description = "Macro UUID"), ("target_idx" = usize, Path, description = "Zero-based target index")), responses((status = 200, body = CommandResult)), tag = "Macros")]
+#[utoipa::path(delete, path = "/api/macros/{uuid}/targets/{target_idx}", params(("uuid" = String, Path, description = "Macro UUID"), ("target_idx" = usize, Path, description = "Zero-based target index")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Macros")]
 pub async fn remove_target(
     State(state): State<SharedState>,
     Path((uuid, target_idx)): Path<(String, usize)>,
@@ -194,7 +194,7 @@ pub async fn remove_target(
     }
 }
 
-#[utoipa::path(put, path = "/api/macros/{uuid}/targets/{target_idx}", params(("uuid" = String, Path, description = "Macro UUID"), ("target_idx" = usize, Path, description = "Zero-based target index")), request_body = UpdateMacroTargetBody, responses((status = 200, body = CommandResult)), tag = "Macros")]
+#[utoipa::path(put, path = "/api/macros/{uuid}/targets/{target_idx}", params(("uuid" = String, Path, description = "Macro UUID"), ("target_idx" = usize, Path, description = "Zero-based target index")), request_body = UpdateMacroTargetBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Macros")]
 pub async fn update_target(
     State(state): State<SharedState>,
     Path((uuid, target_idx)): Path<(String, usize)>,
@@ -219,7 +219,7 @@ pub async fn update_target(
 /// Drive a Knob/Fader macro's value from a modulation source. The source adds a
 /// signed offset to the macro's manual set point each frame, re-fanning to all
 /// targets. Mirrors the modulation control in the macro detail panel.
-#[utoipa::path(put, path = "/api/macros/{uuid}/modulation", params(("uuid" = String, Path, description = "Macro UUID")), request_body = MacroModulationBody, responses((status = 200, body = CommandResult)), tag = "Macros")]
+#[utoipa::path(put, path = "/api/macros/{uuid}/modulation", params(("uuid" = String, Path, description = "Macro UUID")), request_body = MacroModulationBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Macros")]
 pub async fn assign_modulation(
     State(state): State<SharedState>,
     Path(uuid): Path<String>,
@@ -239,7 +239,7 @@ pub async fn assign_modulation(
 }
 
 /// Remove all modulation driving this macro's value.
-#[utoipa::path(delete, path = "/api/macros/{uuid}/modulation", params(("uuid" = String, Path, description = "Macro UUID")), responses((status = 200, body = CommandResult)), tag = "Macros")]
+#[utoipa::path(delete, path = "/api/macros/{uuid}/modulation", params(("uuid" = String, Path, description = "Macro UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Macros")]
 pub async fn clear_modulation(
     State(state): State<SharedState>,
     Path(uuid): Path<String>,
@@ -257,7 +257,7 @@ pub async fn clear_modulation(
 
 /// Remove only one modulation source from this macro's value, leaving any other
 /// sources intact. Mirrors the per-assignment delete in the macro detail panel.
-#[utoipa::path(delete, path = "/api/macros/{uuid}/modulation/{source_id}", params(("uuid" = String, Path, description = "Macro UUID"), ("source_id" = String, Path, description = "Modulation source UUID")), responses((status = 200, body = CommandResult)), tag = "Macros")]
+#[utoipa::path(delete, path = "/api/macros/{uuid}/modulation/{source_id}", params(("uuid" = String, Path, description = "Macro UUID"), ("source_id" = String, Path, description = "Modulation source UUID")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Macros")]
 pub async fn clear_modulation_source(
     State(state): State<SharedState>,
     Path((uuid, source_id)): Path<(String, String)>,
@@ -274,7 +274,7 @@ pub async fn clear_modulation_source(
     }
 }
 
-#[utoipa::path(put, path = "/api/macros/{uuid}/button/behavior", params(("uuid" = String, Path, description = "Macro UUID")), request_body = ButtonBehaviorBody, responses((status = 200, body = CommandResult)), tag = "Macros")]
+#[utoipa::path(put, path = "/api/macros/{uuid}/button/behavior", params(("uuid" = String, Path, description = "Macro UUID")), request_body = ButtonBehaviorBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Macros")]
 pub async fn set_button_behavior(
     State(state): State<SharedState>,
     Path(uuid): Path<String>,
@@ -292,7 +292,7 @@ pub async fn set_button_behavior(
     }
 }
 
-#[utoipa::path(put, path = "/api/macros/{uuid}/button/triggers", params(("uuid" = String, Path, description = "Macro UUID")), request_body = TriggersBody, responses((status = 200, body = CommandResult)), tag = "Macros")]
+#[utoipa::path(put, path = "/api/macros/{uuid}/button/triggers", params(("uuid" = String, Path, description = "Macro UUID")), request_body = TriggersBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Macros")]
 pub async fn set_triggers(
     State(state): State<SharedState>,
     Path(uuid): Path<String>,

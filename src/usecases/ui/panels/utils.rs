@@ -218,7 +218,7 @@ pub(super) fn render_effect_drag_ghost(
 /// maximum hue separation for any channel count. Each subdivision "ring" gets a
 /// distinct saturation/lightness style so nearby hues in later rings still look
 /// clearly different (vivid-dark vs pastel vs saturated, etc.).
-pub(super) fn channel_color(ch_idx: usize) -> egui::Color32 {
+pub(crate) fn channel_color(ch_idx: usize) -> egui::Color32 {
     const HUE_OFFSET: f32 = 0.76; // start at purple to match original Ch 0
 
     // Saturation/lightness per ring — strongly varied so same-region hues differ

@@ -380,11 +380,115 @@ fn a_deck_hidden_under_one_covering_the_frame_is_not_rendered() {
     render_once(&mut ch, &gpu);
     assert_eq!(ch.active_deck_count, 1, "only the covering deck renders");
     assert_eq!(ch.composited_deck_count, 1);
+    assert_eq!(
+        ch.thumbnails_drawn, 1,
+        "but the covered one once, whole, for its thumbnail"
+    );
+    render_once(&mut ch, &gpu);
+    assert_eq!(ch.thumbnails_drawn, 0, "and not again at once");
 
     // Uncovered, it renders again.
     ch.decks[1].opacity = 0.5;
     render_once(&mut ch, &gpu);
     assert_eq!(ch.active_deck_count, 2);
+}
+
+/// A covered deck's thumbnail is drawn again now and then — a clip or a
+/// generator under a full-screen picture moves on — each covered deck on a
+/// frame of its own; a hidden (muted) one is not drawn for it.
+#[test]
+fn a_covered_decks_thumbnail_is_kept_up_now_and_then() {
+    let gpu = headless_gpu();
+    let mut ch = test_channel(&gpu, "Test");
+    for color in [
+        [1.0, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+    ] {
+        add_solid_deck(&mut ch, &gpu, color);
+    }
+    render_once(&mut ch, &gpu);
+    assert_eq!(ch.thumbnails_drawn, 1, "one covered one a frame");
+    render_once(&mut ch, &gpu);
+    assert_eq!(ch.thumbnails_drawn, 1, "then the other");
+    let mut most = 0;
+    let mut drawn = 0;
+    for _ in 0..super::THUMBNAIL_FRAMES {
+        render_once(&mut ch, &gpu);
+        most = most.max(ch.thumbnails_drawn);
+        drawn += ch.thumbnails_drawn;
+    }
+    assert_eq!(
+        drawn,
+        2,
+        "each once more in {} frames",
+        super::THUMBNAIL_FRAMES
+    );
+    assert_eq!(most, 1, "on frames of their own");
+
+    ch.decks[0].mute = true;
+    for _ in 0..super::THUMBNAIL_FRAMES {
+        render_once(&mut ch, &gpu);
+        drawn += ch.thumbnails_drawn;
+    }
+    assert_eq!(drawn, 3, "the hidden one is not drawn");
+}
+
+/// Covered decks take turns for their thumbnails, a deck never drawn first:
+/// each is drawn again within about `THUMBNAIL_FRAMES` frames — or as many
+/// frames as there are of them — none left out, however many.
+#[test]
+fn covered_thumbnails_take_turns() {
+    let mut turn = 0;
+    assert_eq!(
+        super::thumbnail_pick(&[1, 2, 3], Some(3), 7, &mut turn, true),
+        Some(3),
+        "an undrawn one first, whatever the budget"
+    );
+    for count in [1_usize, 2, 7, 120, 140] {
+        let covered: Vec<usize> = (0..count).collect();
+        let mut last = vec![0_u64; count];
+        let mut longest = 0;
+        for clock in 1..=20_000_u64 {
+            if let Some(i) = super::thumbnail_pick(&covered, None, clock, &mut turn, false) {
+                longest = longest.max(clock - last[i]);
+                last[i] = clock;
+            }
+        }
+        for &drawn in &last {
+            longest = longest.max(20_000 - drawn);
+        }
+        let bound = super::THUMBNAIL_FRAMES.max(count as u64) * 2;
+        assert!(longest <= bound, "{count}: {longest} frames between draws");
+    }
+}
+
+/// Many pictures dropped at once under a full-screen one are drawn for
+/// their thumbnails one a frame, not all in one; and again once a resize has
+/// made their textures anew, empty.
+#[test]
+fn covered_decks_are_drawn_for_their_thumbnails_one_a_frame() {
+    let gpu = headless_gpu();
+    let mut ch = test_channel(&gpu, "Test");
+    for _ in 0..5 {
+        add_solid_deck(&mut ch, &gpu, [1.0, 0.0, 0.0, 1.0]);
+    }
+    let undrawn = |ch: &Channel| {
+        ch.decks[..4]
+            .iter()
+            .filter(|s| s.drawn != Some(s.deck.texture_generation()))
+            .count()
+    };
+    for left in (0..4).rev() {
+        render_once(&mut ch, &gpu);
+        assert_eq!(ch.thumbnails_drawn, 1);
+        assert_eq!(undrawn(&ch), left);
+    }
+
+    ch.resize(&gpu, 32, 32);
+    assert_eq!(undrawn(&ch), 4, "the new textures are empty");
+    render_once(&mut ch, &gpu);
+    assert_eq!(undrawn(&ch), 3, "drawn again, one a frame");
 }
 
 #[test]
@@ -755,4 +859,156 @@ fn decks_run_over_a_frames_time_only_together() {
     assert!(!super::decks_over_budget([1500.0; 10], 60), "15 ms of 16.7");
     assert!(super::decks_over_budget([1500.0; 12], 60), "18 ms of 16.7");
     assert!(!super::decks_over_budget([50_000.0], 0), "uncapped: no budget");
+}
+
+// ── One render pass for the blend unit's decks (merge_layer_passes) ──────
+
+/// The composite read back as its raw half-float words, rows unpadded.
+fn composite_bits(gpu: &GpuContext, ch: &Channel) -> Vec<u16> {
+    let texture = &ch.composite_texture;
+    let (w, h) = (texture.width(), texture.height());
+    let row =
+        (w * 8).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("composite bits"),
+        size: u64::from(row * h),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row),
+                rows_per_image: Some(h),
+            },
+        },
+        texture.size(),
+    );
+    gpu.submit([encoder.finish()]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+    rx.recv().expect("mapped").expect("mapped");
+    let data = buffer.slice(..).get_mapped_range().expect("mapped range");
+    (0..h as usize)
+        .flat_map(|y| {
+            let at = y * row as usize;
+            let (words, _) = data[at..at + w as usize * 8].as_chunks::<2>();
+            words.iter().map(|b| u16::from_le_bytes(*b)).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A deck of `color`, composited by `blend` at `opacity`.
+fn add_layer(ch: &mut Channel, gpu: &GpuContext, color: [f32; 4], blend: BlendMode, opacity: f32) {
+    let (w, h) = (ch.composite_texture.width(), ch.composite_texture.height());
+    let deck = crate::deck::Deck::new_solid_color(gpu, color, w, h).expect("solid deck");
+    let at = ch.add_deck(deck);
+    ch.decks[at].blend_mode = blend;
+    ch.decks[at].opacity = opacity;
+}
+
+/// The same decks (`build`) in a channel of `w × h` drawn with the blend
+/// unit's decks in one pass and each in a pass of its own: both pictures,
+/// bit for bit, and the passes each took.
+fn merged_and_apart(
+    gpu: &GpuContext,
+    (w, h): (u32, u32),
+    build: impl Fn(&mut Channel, &GpuContext),
+) -> ((Vec<u16>, u32), (Vec<u16>, u32)) {
+    let drawn = |merge: bool| {
+        let mut ch = Channel::new("Layers".to_string(), gpu, w, h).expect("channel");
+        build(&mut ch, gpu);
+        ch.merge_layer_passes = merge;
+        render_once(&mut ch, gpu);
+        (composite_bits(gpu, &ch), ch.layer_passes)
+    };
+    (drawn(true), drawn(false))
+}
+
+/// Normal, Add and Screen decks over a first one: one pass, the same
+/// picture to the bit as a pass a deck.
+#[test]
+fn the_blend_units_decks_in_one_pass_draw_the_same_picture() {
+    let gpu = headless_gpu();
+    let ((merged, merged_passes), (apart, apart_passes)) =
+        merged_and_apart(&gpu, (64, 36), |ch, gpu| {
+            add_layer(ch, gpu, [0.2, 0.4, 0.6, 1.0], BlendMode::Normal, 1.0);
+            add_layer(ch, gpu, [1.0, 0.2, 0.0, 0.6], BlendMode::Add, 0.7);
+            add_layer(ch, gpu, [0.0, 0.5, 1.0, 0.4], BlendMode::Screen, 0.9);
+            add_layer(ch, gpu, [0.3, 0.3, 0.3, 0.5], BlendMode::Normal, 0.5);
+            add_layer(ch, gpu, [2.5, 0.1, 0.7, 0.35], BlendMode::Add, 0.6);
+        });
+    assert_eq!(apart_passes, 5);
+    assert_eq!(merged_passes, 1, "one pass for all five");
+    assert!(merged == apart, "the same picture, bit for bit");
+}
+
+/// A blend mode the shader computes reads the composite so far: the pass
+/// ends before it, and starts again after.
+#[test]
+fn a_shader_blend_ends_the_pass_and_the_picture_stays_the_same() {
+    let gpu = headless_gpu();
+    let ((merged, merged_passes), (apart, apart_passes)) =
+        merged_and_apart(&gpu, (64, 36), |ch, gpu| {
+            add_layer(ch, gpu, [0.9, 0.8, 0.1, 1.0], BlendMode::Normal, 1.0);
+            add_layer(ch, gpu, [0.1, 0.2, 0.9, 0.5], BlendMode::Normal, 0.8);
+            add_layer(ch, gpu, [0.5, 0.9, 0.2, 0.8], BlendMode::Multiply, 0.8);
+            add_layer(ch, gpu, [0.4, 0.0, 0.3, 0.5], BlendMode::Add, 0.6);
+            add_layer(ch, gpu, [0.0, 0.7, 0.2, 0.4], BlendMode::Screen, 0.9);
+        });
+    assert_eq!(apart_passes, 4, "the blend unit's four, a pass each");
+    assert_eq!(merged_passes, 2, "two before the Multiply, two after");
+    assert!(merged == apart, "the same picture, bit for bit");
+}
+
+/// Decks drawn only in strips (a 4:3 picture covers the middle) and then
+/// decks drawn whole, in one pass: a deck drawn whole draws everywhere, not
+/// only in the strip the deck before it left the scissor on.
+#[test]
+fn a_deck_drawn_whole_after_strips_draws_everywhere_in_one_pass() {
+    let gpu = headless_gpu();
+    let dir = tempfile::tempdir().unwrap();
+    let picture = dir.path().join("four-three.png");
+    image::RgbaImage::from_fn(48, 36, |x, y| {
+        image::Rgba([(x * 5) as u8, (y * 7) as u8, 128, 255])
+    })
+    .save(&picture)
+    .unwrap();
+    let ((merged, merged_passes), (apart, _)) = merged_and_apart(&gpu, (64, 36), |ch, gpu| {
+        add_layer(ch, gpu, [0.2, 0.4, 0.6, 1.0], BlendMode::Normal, 1.0);
+        add_layer(ch, gpu, [1.0, 0.2, 0.0, 0.6], BlendMode::Add, 0.7);
+        let deck = crate::deck::Deck::new_from_image(gpu, &picture, 64, 36).expect("picture");
+        ch.add_deck(deck);
+        add_layer(ch, gpu, [0.0, 0.5, 1.0, 0.4], BlendMode::Screen, 0.9);
+    });
+    assert_eq!(merged_passes, 1);
+    assert!(merged == apart, "the same picture, bit for bit");
+}
+
+/// More decks than the ring's first sixteen slots, all in one pass: each
+/// keeps its own params.
+#[test]
+fn twenty_decks_in_one_pass_keep_their_own_params() {
+    let gpu = headless_gpu();
+    let ((merged, merged_passes), (apart, apart_passes)) =
+        merged_and_apart(&gpu, (32, 18), |ch, gpu| {
+            add_layer(ch, gpu, [0.05, 0.05, 0.05, 1.0], BlendMode::Normal, 1.0);
+            for n in 0..19_u8 {
+                let v = f32::from(n) / 19.0;
+                let blend = [BlendMode::Normal, BlendMode::Add, BlendMode::Screen][usize::from(n % 3)];
+                add_layer(ch, gpu, [v, 1.0 - v, 0.5 * v, 0.3], blend, 0.2 + 0.04 * v);
+            }
+        });
+    assert_eq!(apart_passes, 20);
+    assert_eq!(merged_passes, 1);
+    assert!(merged == apart, "the same picture, bit for bit");
 }

@@ -11,6 +11,8 @@ doc-valid-idents = [
     "XWayland",
     "DeckLink",
     "UltraStudio",
+    "PowerPoint",
+    "AppleScript",
     "..",
 ]
 

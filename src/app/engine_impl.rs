@@ -25,6 +25,40 @@ use anyhow::{Context as _, Result};
 /// Effects every new deck starts with, in chain order. See `add_default_effects`.
 const DEFAULT_DECK_EFFECTS: [&str; 2] = ["crop", "transform"];
 
+/// Whether a setting `value`, taken from one frame, goes on another whose
+/// own is `now`: of the same kind — or a number for a choice or a switch,
+/// which is kept as one (`ShaderParams::set`). A frame whose shader is
+/// not there has its saved choices as plain numbers (a saved show has one
+/// kind of number); a colour never goes where a number is.
+fn goes_on(now: &ParamValue, value: &ParamValue) -> bool {
+    matches!(
+        (now, value),
+        (ParamValue::Float(_), ParamValue::Float(_))
+            | (ParamValue::Long(_), ParamValue::Long(_) | ParamValue::Float(_))
+            | (
+                ParamValue::Bool(_),
+                ParamValue::Bool(_) | ParamValue::Long(_) | ParamValue::Float(_)
+            )
+            | (ParamValue::Color(_), ParamValue::Color(_))
+            | (ParamValue::Point2D(_), ParamValue::Point2D(_))
+    )
+}
+
+/// Whether two settings of an effect are the same: numbers to a hair.
+fn same_setting(a: &ParamValue, b: &ParamValue) -> bool {
+    let near = |x: f32, y: f32| (x - y).abs() < 1e-6;
+    match (a, b) {
+        (ParamValue::Float(x), ParamValue::Float(y)) => near(*x, *y),
+        (ParamValue::Bool(x), ParamValue::Bool(y)) => x == y,
+        (ParamValue::Long(x), ParamValue::Long(y)) => x == y,
+        (ParamValue::Color(x), ParamValue::Color(y)) => x.iter().zip(y).all(|(x, y)| near(*x, *y)),
+        (ParamValue::Point2D(x), ParamValue::Point2D(y)) => {
+            x.iter().zip(y).all(|(x, y)| near(*x, *y))
+        }
+        _ => false,
+    }
+}
+
 /// Sanitize a float to the 0.0..=1.0 range with a fallback for NaN/Inf.
 /// Used at every command boundary that accepts a unit-range float.
 #[inline]
@@ -84,6 +118,88 @@ impl VardaApp {
             })
     }
 
+    /// Put the layer `deck_uuid`'s picture in the frame `frame` — a
+    /// `frame_*` filter (see [`crate::engine::value::frame`]) — in place of
+    /// the frame it has, or with `None` take its frame away (see
+    /// [`EngineCommand::SetLayerFrame`]): the UUID of the frame's effect,
+    /// empty once the layer has none.
+    ///
+    /// The frame runs before the layer's Transform, so the layer is moved
+    /// and scaled frame and all (after it, it would be a frame round the
+    /// whole picture's place). A frame put in another's place keeps the
+    /// settings changed on that one — its size, shape, colours — where it
+    /// has the same; what was left as it came is the new frame's own.
+    ///
+    /// [`EngineCommand::SetLayerFrame`]: crate::engine::EngineCommand::SetLayerFrame
+    pub(crate) fn set_layer_frame(&mut self, deck_uuid: &str, frame: Option<&str>) -> Result<String> {
+        use crate::engine::value::frame::is_frame;
+        let (ch, dk) = self.resolve_deck(deck_uuid)?;
+        if let Some(name) = frame {
+            // Asked before the old frame goes: a name that is no frame
+            // leaves the layer as it was.
+            let known = is_frame(name) && self.registry.filters().iter().any(|s| s.name() == name);
+            if !known {
+                anyhow::bail!("'{name}' is not a frame: GET /api/state/registry lists them (`frames`)");
+            }
+        }
+        // The frames it has — one, unless a show was put together by hand —
+        // and what was changed on the first of them. By the name each was
+        // saved under: one whose shader is not there (a show from a newer
+        // Nida) is a frame still, to be taken away or given up for another.
+        let mut had: Vec<String> = Vec::new();
+        let mut changed: Vec<(String, ParamValue)> = Vec::new();
+        if let Some(slot) = self.mixer.channels().get(ch).and_then(|c| c.decks.get(dk)) {
+            for effect in slot.deck.effects.iter().filter(|e| is_frame(&e.name())) {
+                if had.is_empty() {
+                    for (name, value) in &effect.params.values {
+                        let as_it_came = effect.params.definitions.get(name).map(ParamValue::from_isf_input);
+                        if !as_it_came.is_some_and(|came| same_setting(&came, value)) {
+                            changed.push((name.clone(), *value));
+                        }
+                    }
+                }
+                had.push(effect.uuid().to_owned());
+            }
+        }
+        // The new frame is made before the old one goes: one that cannot be
+        // built leaves the layer in the frame it had.
+        let target = EffectTarget::Deck(deck_uuid.to_string());
+        let made = match frame {
+            Some(name) => Some(self.add_effect(target.clone(), name)?),
+            None => None,
+        };
+        for uuid in &had {
+            self.remove_effect(uuid)?;
+        }
+        let Some(uuid) = made else {
+            return Ok(String::new());
+        };
+        // Added last (before the layer's own mask): moved to just before
+        // the layer's Transform.
+        let places = self.mixer.channels().get(ch).and_then(|c| c.decks.get(dk)).map(|slot| {
+            let effects = &slot.deck.effects;
+            (
+                effects.iter().position(|e| e.uuid() == uuid),
+                effects.iter().position(|e| e.shader.name() == "transform"),
+            )
+        });
+        if let Some((Some(from), Some(to))) = places {
+            if to < from {
+                self.move_effect(target, from, to)?;
+            }
+        }
+        let location = self.resolve_effect(&uuid)?;
+        if let Some(effect) = self.mixer.effect_at_mut(location) {
+            for (name, value) in changed {
+                let kept = effect.params.values.get(&name).is_some_and(|now| goes_on(now, &value));
+                if kept {
+                    effect.params.set(&name, value);
+                }
+            }
+        }
+        Ok(uuid)
+    }
+
     /// Post-construction wiring every new shader deck needs before it joins a
     /// channel: start its CPU analyzers and acquire any device its
     /// `PREPROCESSORS` block requires.
@@ -123,18 +239,47 @@ impl VardaApp {
     /// duplicate keeps exactly the chain it was saved with. Best effort — a
     /// shader library without one of these leaves it out rather than failing
     /// the deck.
-    pub(crate) fn add_default_effects(&self, deck: &mut Deck) {
-        let filters = self.registry.filters();
-        for name in DEFAULT_DECK_EFFECTS {
-            let Some(shader) = filters.iter().find(|s| s.name() == name) else {
+    pub(crate) fn add_default_effects(&mut self, deck: &mut Deck) {
+        let started = std::time::Instant::now();
+        let defaults = {
+            let filters = self.registry.filters();
+            DEFAULT_DECK_EFFECTS.map(|name| {
+                (
+                    name,
+                    filters
+                        .iter()
+                        .find(|shader| shader.name() == name)
+                        .map(|shader| (*shader).clone()),
+                )
+            })
+        };
+        for (name, shader) in defaults {
+            let Some(shader) = shader else {
                 log::warn!("Default effect '{name}' is not in the shader library");
                 continue;
             };
-            match Effect::new(&self.context, (*shader).clone()) {
+            let effect_started = std::time::Instant::now();
+            // Identity defaults expose their controls at once. Their compiler
+            // and driver work belongs on the existing bounded effect workers,
+            // just as when an operator adds an effect manually.
+            // A saturated worker queue must not silently lose either default.
+            let effect = self.load_effect(shader.clone()).or_else(|error| {
+                log::warn!("Default effect queue unavailable ({error}); building {name} directly");
+                Effect::new(&self.context, shader)
+            });
+            match effect {
                 Ok(effect) => deck.add_effect(effect),
                 Err(e) => log::warn!("Default effect '{name}' could not be built: {e}"),
             }
+            log::debug!(
+                "[SOURCE LOAD] Default effect {name} admitted: {:.1} ms",
+                effect_started.elapsed().as_secs_f64() * 1000.0
+            );
         }
+        log::debug!(
+            "[SOURCE LOAD] Default effects total: {:.1} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
     /// Acquire the depth sensor a shader's `PREPROCESSORS` block requires.
@@ -306,12 +451,24 @@ impl MixerCommands for VardaApp {
             .iter()
             .find(|d| d.id == camera_id)
             .map_or_else(|| format!("Camera {camera_id}"), |d| d.name.clone());
-        let (src_w, src_h) =
-            self.camera_manager
+        // Open already — another input shows it — it shows at once. Else it
+        // starts in the background, and the deck waits for it, black, as a
+        // show's camera not plugged in does (see `reconcile_cameras`):
+        // starting takes macOS a moment — up to `OPEN_WAIT` for a device
+        // that hangs — and the outputs drew nothing while the show waited.
+        let open = self.camera_manager.is_active(camera_id);
+        let (bound, (src_w, src_h)) = if open {
+            let size = self
+                .camera_manager
                 .open_camera(camera_id, &self.context.device, mode)?;
+            (camera_id, size)
+        } else {
+            let size = mode.map_or((1920, 1080), |m| (m.width, m.height));
+            (crate::camera::UNBOUND_CAMERA, size)
+        };
         let mut deck = Deck::new_from_camera(
             &self.context,
-            camera_id,
+            bound,
             &cam_name,
             src_w,
             src_h,
@@ -322,6 +479,17 @@ impl MixerCommands for VardaApp {
         deck.camera_device = self.camera_manager.unique_id(camera_id).map(str::to_string);
         self.read_as_its_camera_is(&mut deck);
         let uuid = deck.uuid().to_string();
+        if !open {
+            // What fails before the camera starts (not there, no access)
+            // fails the add, nothing left behind.
+            // At the format its other layers have (see `read_as_its_camera_is`).
+            self.camera_manager.open_in_background(
+                camera_id,
+                deck.camera_mode,
+                vec![uuid.clone()],
+                true,
+            )?;
+        }
         self.add_default_effects(&mut deck);
         let ch = self
             .mixer
@@ -350,35 +518,43 @@ impl MixerCommands for VardaApp {
                     target.label()
                 )
             })?;
+        // A display is kept by its own identity, not only the name it was
+        // picked by (see `TargetIdentity::bound_to`).
+        let identity = identity.bound_to(&info);
 
-        // Default the capture-time downscale to the largest deck-sized frame
-        // that keeps the target's own shape. Without a cap a 4K display would
-        // move 33 MB per frame only to be scaled down immediately after; without
-        // the shape, a window narrower than the stage would arrive pre-squashed
-        // and the deck's scaling mode would have nothing left to do.
+        // Capped at the show's size: a 4K display in a 1080p show is not moved
+        // at 33 MB a frame only to be scaled down after. The cap is a bound —
+        // the capture fits the target's pixels within it, in the target's own
+        // shape — so it is the show's size itself, not the target's fitted
+        // into it: the target's size is in points, and on a Retina or scaled
+        // display that fit halved the picture (a 4K screen "looks like
+        // 1920×1080" came at 1920×1080 into a 4K show, blurred).
         // See spec/screen-capture.md § Performance.
         let config = crate::screen_capture::backend::CaptureConfig {
-            scale_to: options.scale_to.or_else(|| {
-                Some(crate::screen_capture::resample::fit_within(
-                    info.width,
-                    info.height,
-                    self.render_width,
-                    self.render_height,
-                ))
-            }),
+            scale_to: options
+                .scale_to
+                .or(Some((self.render_width, self.render_height))),
             ..options
         };
         let (capture_id, src_w, src_h) = self
             .screen_capture_manager
             .open(&info, config.clone(), &self.context.device)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // A screen or window another input captures already is shared as it
+        // runs: this input shows and saves the rate, crop and cursor it is
+        // captured with, not those asked for it. Those were never sent —
+        // until its first change of anything sent its settings whole, and
+        // wrote over the other input's crop.
+        let config = self.as_its_capture_runs(capture_id, config);
         let mut deck = Deck::new_from_screen_capture(
             &self.context,
             crate::deck::ScreenCaptureState {
                 capture_id,
                 identity,
                 config,
-                config_dirty: false,
+                given: Vec::new(),
+                listed_as: Some(info.label.clone()),
+                presentation: None,
             },
             &info.label,
             src_w,
@@ -450,6 +626,103 @@ impl MixerCommands for VardaApp {
         Ok(())
     }
 
+    fn set_screen_capture_target(
+        &mut self,
+        deck_uuid: &str,
+        target: &crate::scene::CaptureTargetConfig,
+    ) -> Result<()> {
+        use crate::screen_capture::backend::TargetIdentity;
+        use crate::screen_capture::UNBOUND_CAPTURE_ID;
+        let (ch, dk) = self.resolve_deck(deck_uuid)?;
+        let deck = &self.mixer.channels()[ch].decks[dk].deck;
+        let state = deck
+            .screen_capture
+            .as_ref()
+            .context("Deck is not a screen capture: it has no screen or window to pick")?;
+        // Its window is its show's, found once PowerPoint plays it.
+        anyhow::ensure!(
+            state.presentation.is_none(),
+            "A PowerPoint input captures its own show's window"
+        );
+        let identity = TargetIdentity::from(target);
+        let info = self
+            .screen_capture_manager
+            .find_target(&identity)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "No capture target matches '{}' — rescan and try again",
+                    target.label()
+                )
+            })?;
+        // Picked now: a display is kept by its own identity from here on
+        // (see `TargetIdentity::bound_to`).
+        let identity = identity.bound_to(&info);
+        // Its settings stay (see `CaptureConfig::repointed`).
+        let mut config = state.config.clone().repointed(&state.identity, &info);
+        config.scale_to = config
+            .scale_to
+            .or(Some((self.render_width, self.render_height)));
+        let held = state.capture_id;
+        let pending = state.given.clone();
+        // Named after what it captured, it is named after what it captures
+        // now; a name given it stays. What it was named after is kept with
+        // it (`ScreenCaptureState::listed_as`): a window's input whose app
+        // is closed has nothing else to hold its name against — the show
+        // keeps the window by its app's bundle id, not by what the app is
+        // called — and a name that only reads as a capture's may be a
+        // preset's ("🖥 Slides"). An input with no such record, of a show
+        // saved before 0.9.9, is held against what it captures, as before:
+        // a window's, its app closed, then keeps its name — nothing tells
+        // it from one given it.
+        let named_after_its_target = deck.source_name().strip_prefix("🖥 ").is_some_and(|name| {
+            state.listed_as.as_deref() == Some(name)
+                || name == crate::scene::CaptureTargetConfig::from(&state.identity).label()
+                || self.screen_capture_manager.label(held) == Some(name)
+        });
+        let (capture_id, width, height) = self
+            .screen_capture_manager
+            .open(&info, config.clone(), &self.context.device)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // A capture another input already runs is shared as that one set it
+        // — what is on air does not change under it — and this input shows
+        // and saves what it runs with. Its own, picked again, keeps its own.
+        let its_own = capture_id == held;
+        let config = if its_own {
+            config
+        } else {
+            self.as_its_capture_runs(capture_id, config)
+        };
+        let deck = &mut self.mixer.channels_mut()[ch].decks[dk].deck;
+        deck.rebind_screen_capture(capture_id, identity, config, width, height);
+        // Its own: what it was given this frame and has not yet sent down
+        // still is to be. Another's has nothing of this input's to be
+        // given: one running already is shared as it runs — sent all the
+        // same, this input's settings wrote over a crop an input of that
+        // capture had set the same frame — and one opened new was opened as
+        // this input is set.
+        if let Some(state) = deck.screen_capture.as_mut().filter(|_| its_own) {
+            state.given = pending;
+        }
+        if named_after_its_target {
+            deck.set_source_name(format!("🖥 {}", info.label));
+            // And that is what it is named after from here on.
+            if let Some(state) = deck.screen_capture.as_mut() {
+                state.listed_as = Some(info.label.clone());
+            }
+        }
+        // The one it held, let go: when that is the one opened — its own
+        // screen picked again — the holder just counted for it.
+        if held != UNBOUND_CAPTURE_ID {
+            self.screen_capture_manager.release(held);
+        }
+        log::info!(
+            "Screen capture deck {deck_uuid} now captures '{}'",
+            info.label
+        );
+        Ok(())
+    }
+
     fn add_depth_sensor_deck(
         &mut self,
         channel_uuid: &str,
@@ -492,6 +765,8 @@ impl MixerCommands for VardaApp {
 
     fn remove_deck(&mut self, deck_uuid: &str) -> Result<()> {
         let (channel_idx, deck_idx) = self.resolve_deck(deck_uuid)?;
+        let was_powerpoint = self.powerpoint_decks().iter().any(|d| d == deck_uuid);
+        let was_slides = self.slides_decks().iter().any(|d| d == deck_uuid);
         // Release external resources before removal. The held identifiers are
         // read out first so the mixer borrow ends before the managers are
         // touched.
@@ -552,6 +827,30 @@ impl MixerCommands for VardaApp {
         // A lane is where this deck sits in show time, so it leaves with the
         // deck. See /spec/arrangement.md § A lane is a deck.
         self.drop_lane(deck_uuid);
+        // PowerPoint's sound is every PowerPoint input's: tied to this one,
+        // it goes to one still there rather than with it.
+        let other = self
+            .powerpoint_decks()
+            .into_iter()
+            .find(|d| d != deck_uuid)
+            .filter(|_| was_powerpoint);
+        if let Some(other) = other {
+            self.audio_mix.retie_app_inputs(
+                crate::presentation::powerpoint::POWERPOINT_ID,
+                deck_uuid,
+                &other,
+            );
+        }
+        // Web talks' sound is every Slides input's, so too.
+        let other = self
+            .slides_decks()
+            .into_iter()
+            .find(|d| d != deck_uuid)
+            .filter(|_| was_slides);
+        if let Some(other) = other {
+            self.audio_mix
+                .retie_app_inputs(crate::audio::app_sound::WEB_TALKS, deck_uuid, &other);
+        }
         // So does a camera's sound, added with it.
         self.audio_mix.remove_inputs_of_deck(deck_uuid);
         Ok(())
@@ -1536,6 +1835,7 @@ impl OutputQueries for VardaApp {
                 let facts = &self.output.screen_facts;
                 let labels =
                     super::screens::labels(&keys, facts, &self.output.screen_names, &sizes);
+                let main = crate::presentation::screens::main_display();
                 keys.into_iter()
                     .zip(labels)
                     .enumerate()
@@ -1552,6 +1852,10 @@ impl OutputQueries for VardaApp {
                                 .and_then(|f| self.output.screen_names.get(&f.identity))
                                 .map(str::to_string),
                             refresh_hz: fact.and_then(|f| f.refresh_hz),
+                            identity: fact.map(|f| f.identity.clone()).unwrap_or_default(),
+                            main: fact
+                                .and_then(|f| f.display_id)
+                                .is_some_and(|d| Some(d) == main),
                         }
                     })
                     .collect()
@@ -1906,10 +2210,188 @@ impl AnalyzerCommands for VardaApp {
 mod tests {
     use super::*;
 
+    /// A setting goes from one frame to another when it is of the kind the
+    /// other has — and a saved choice or switch that came back a plain
+    /// number (a frame whose shader was not there) goes on as one.
+    #[test]
+    fn a_frames_setting_goes_on_another_of_its_kind() {
+        let colour = ParamValue::Color([0.0, 1.0, 0.0, 1.0]);
+        assert!(goes_on(&ParamValue::Float(0.86), &ParamValue::Float(0.7)));
+        assert!(goes_on(&ParamValue::Long(0), &ParamValue::Long(3)));
+        assert!(goes_on(&ParamValue::Long(0), &ParamValue::Float(3.0)), "a saved choice");
+        assert!(goes_on(&ParamValue::Bool(false), &ParamValue::Float(1.0)), "a saved switch");
+        assert!(goes_on(&ParamValue::Bool(false), &ParamValue::Bool(true)));
+        assert!(goes_on(&colour, &colour));
+        assert!(!goes_on(&ParamValue::Float(0.5), &colour), "no colour for a number");
+        assert!(!goes_on(&colour, &ParamValue::Float(0.5)), "no number for a colour");
+        assert!(!goes_on(&ParamValue::Float(0.5), &ParamValue::Long(2)), "no choice for a size");
+    }
+
     fn headless_app() -> Option<super::super::VardaApp> {
         let gpu = crate::renderer::context::GpuContext::new_headless().ok()?;
         let config = crate::testing::headless_config();
         super::super::VardaApp::new(gpu, &config).ok()
+    }
+
+    /// A camera that takes the OS 600 ms to start, then captures until told
+    /// to stop.
+    fn slow_to_start(
+        _: &crate::camera::CameraDeviceInfo,
+        _: Option<crate::camera::CameraMode>,
+        _: &std::sync::Arc<crate::camera::Sink>,
+        stop: &std::sync::atomic::AtomicBool,
+        opened: &std::sync::mpsc::Sender<Result<crate::camera::CameraMode>>,
+    ) {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let _ = opened.send(Ok(crate::camera::CameraMode {
+            width: 64,
+            height: 36,
+            fps: 60,
+        }));
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A camera input added in a show takes its camera when the OS has
+    /// started it, the show going on meanwhile: it waited for it, every
+    /// output still for as long as that took.
+    #[test]
+    fn a_camera_slow_to_start_never_holds_up_the_show() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        app.camera_manager =
+            crate::camera::CameraManager::with_devices(&[("a", "ATEM")], slow_to_start);
+        let id = app.camera_manager.devices()[0].id;
+        let channel = channel_uuid(&app, 0);
+        let asked = std::time::Instant::now();
+        let uuid = app.add_camera_deck(&channel, id, None).expect("added");
+        let took = asked.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(300),
+            "the show waited {took:?}"
+        );
+        let deck = |app: &super::super::VardaApp| {
+            let (ch, dk) = app.mixer.find_deck_by_uuid(&uuid).expect("the input");
+            app.mixer.channels()[ch].decks[dk].deck.camera_id()
+        };
+        assert_eq!(deck(&app), Some(crate::camera::UNBOUND_CAMERA), "waits");
+        let start = std::time::Instant::now();
+        while deck(&app) != Some(id) && start.elapsed() < std::time::Duration::from_secs(3) {
+            let frame = std::time::Instant::now();
+            app.reconcile_cameras();
+            let took = frame.elapsed();
+            assert!(
+                took < std::time::Duration::from_millis(100),
+                "a frame waited {took:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(deck(&app), Some(id), "shows its camera once it runs");
+        assert!(app.camera_manager.is_active(id));
+    }
+
+    /// A camera started for a new layer opens at the format its other
+    /// layers have, which the new layer takes.
+    #[test]
+    fn a_camera_started_for_a_new_layer_opens_at_its_layers_format() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        app.camera_manager =
+            crate::camera::CameraManager::with_devices(&[("a", "ATEM")], slow_to_start);
+        let id = app.camera_manager.devices()[0].id;
+        let fifty = Some(crate::camera::CameraMode {
+            width: 1920,
+            height: 1080,
+            fps: 50,
+        });
+        // A layer of the show, waiting for its camera at 50p.
+        let mut waiting = crate::deck::Deck::new_from_camera(
+            &app.context,
+            crate::camera::UNBOUND_CAMERA,
+            "ATEM",
+            1920,
+            1080,
+            64,
+            64,
+        )
+        .expect("a camera layer");
+        waiting.camera_device = Some("a".into());
+        waiting.camera_mode = fifty;
+        app.mixer.channels_mut()[0].add_deck(waiting);
+        let channel = channel_uuid(&app, 0);
+        let added = app.add_camera_deck(&channel, id, None).expect("added");
+        let (ch, dk) = app.mixer.find_deck_by_uuid(&added).expect("the layer");
+        assert_eq!(app.mixer.channels()[ch].decks[dk].deck.camera_mode, fifty);
+        assert_eq!(app.camera_manager.opening_mode(id), fifty);
+    }
+
+    /// A format chosen for a camera input still starting reaches its
+    /// capture: it opens again at it as soon as it has started.
+    #[test]
+    fn a_format_chosen_while_the_camera_starts_reaches_it() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        app.camera_manager =
+            crate::camera::CameraManager::with_devices(&[("a", "ATEM")], slow_to_start);
+        let id = app.camera_manager.devices()[0].id;
+        let channel = channel_uuid(&app, 0);
+        let uuid = app.add_camera_deck(&channel, id, None).expect("added");
+        assert!(app.camera_manager.is_opening(id), "still starting");
+        let fifty = Some(crate::camera::CameraMode {
+            width: 1920,
+            height: 1080,
+            fps: 50,
+        });
+        let set = crate::engine::EngineCommand::SetCameraMode {
+            deck_uuid: uuid,
+            mode: fifty,
+        };
+        assert!(matches!(
+            app.execute_command(set),
+            crate::engine::CommandResult::Ok
+        ));
+        assert_eq!(app.camera_manager.take_asked_mode(id), Some(fifty));
+    }
+
+    /// A camera layer added with its own sound has that sound in the mixer,
+    /// as the layer's: switched with it (Audio Auto), named after the camera.
+    #[test]
+    fn a_camera_layer_added_with_its_sound_has_it_in_the_mixer() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        app.camera_manager =
+            crate::camera::CameraManager::with_devices(&[("a", "ATEM")], slow_to_start);
+        let id = app.camera_manager.devices()[0].id;
+        let channel = channel_uuid(&app, 0);
+        let added = app.execute_command(crate::engine::EngineCommand::AddCameraDeck {
+            channel_uuid: channel,
+            camera_id: id,
+            mode: None,
+            audio: Some(crate::engine::InputAudio {
+                device: "Blackmagic Design".into(),
+                left: 0,
+                right: 1,
+            }),
+        });
+        let crate::engine::CommandResult::OkWithId { uuid } = added else {
+            panic!("expected the layer, got {added:?}");
+        };
+        let input = app
+            .audio_mix
+            .config()
+            .inputs
+            .iter()
+            .find(|i| i.deck.as_deref() == Some(uuid.as_str()))
+            .expect("its sound, as the layer's");
+        assert_eq!(
+            (input.device.as_str(), input.name.as_str()),
+            ("Blackmagic Design", "ATEM")
+        );
     }
 
     fn channel_uuid(app: &super::super::VardaApp, idx: usize) -> String {

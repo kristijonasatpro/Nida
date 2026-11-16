@@ -192,6 +192,7 @@ unsafe extern "system" fn monitor_proc(
             width: (r.right - r.left).max(0) as u32,
             height: (r.bottom - r.top).max(0) as u32,
             is_varda: false,
+            uuid: None,
         });
     }
     BOOL::from(true)
@@ -269,6 +270,7 @@ unsafe fn describe_window(hwnd: HWND, our_pid: u32) -> Option<CaptureTargetInfo>
         width: width as u32,
         height: height as u32,
         is_varda: pid == our_pid,
+        uuid: None,
     })
 }
 

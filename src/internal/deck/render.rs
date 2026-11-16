@@ -26,6 +26,13 @@ pub(crate) struct Framing<'a> {
     /// The deck's own frame, as its render scale makes it: the picture
     /// drawn at this size, then shown at the master's, as the deck is.
     pub size: (u32, u32),
+    /// The source's own size.
+    pub source_size: (u32, u32),
+    /// The deck draws it into its frame through the placed pass too (its
+    /// crop or Transform folded in, see `Deck::fold`): else through the
+    /// blit, which scales a source not at the frame's size its own way —
+    /// bicubic up, box filtered down (`scaled_sample.wgsl`).
+    pub folded: bool,
 }
 
 /// The effects the pass drawing a deck's source does too (see
@@ -147,6 +154,9 @@ fn accumulate_phase_times(
                     .unwrap_or(1.0);
             }
             accumulators[pi.index] += dt * rate * pi.scale;
+            if let Some(wrap) = pi.wrap.filter(|w| *w > 0.0) {
+                accumulators[pi.index] = accumulators[pi.index].rem_euclid(wrap);
+            }
         }
     }
 }
@@ -178,6 +188,7 @@ impl Deck {
                     let height = handle.height;
                     staging.upload(&frame.color_data, texture, width, height, encoder);
                     handle.recycle(frame);
+                    self.frames_uploaded += 1;
                 }
             }
             DeckSource::HapVideo {
@@ -210,10 +221,15 @@ impl Deck {
                         }
                     }
                     handle.recycle(frame);
+                    self.frames_uploaded += 1;
                 }
             }
             DeckSource::Playlist(list) => list.tick(encoder),
+            DeckSource::Slides(slides) => slides.tick(encoder),
             DeckSource::Timer(timer) => timer.tick(),
+            DeckSource::LowerThird(lower) => lower.tick(),
+            DeckSource::Text(text) => text.tick(),
+            DeckSource::Presenter(presenter) => presenter.tick(),
             _ => {}
         }
         Ok(())
@@ -236,6 +252,7 @@ impl Deck {
                 }
             }
             DeckSource::Playlist(list) => list.for_each_deck_mut(Deck::request_video_remap),
+            DeckSource::Slides(slides) => slides.for_each_deck_mut(Deck::request_video_remap),
             _ => {}
         }
     }
@@ -350,6 +367,11 @@ impl Deck {
         // frame's picture in its texture.
         let still = self.still_frame(modulation);
         if still.is_some() && still == self.rendered_still {
+            // A clip between two of its frames is shown all the same: its
+            // rate reads the show's, as it did drawn every frame.
+            if still.as_ref().is_some_and(super::StillFrame::in_parts) {
+                self.count_frame_shown();
+            }
             return Ok(());
         }
 
@@ -357,7 +379,9 @@ impl Deck {
         let result = {
             let scope = context.errors.scope(&format!("deck {}", self.uuid));
             // A still image is drawn whole: it is kept until its settings
-            // change, whatever comes to cover or uncover it meanwhile.
+            // change, whatever comes to cover or uncover it meanwhile. A
+            // clip's frame, kept till its next, is drawn where it shows, as
+            // before.
             let result = self.render_with_prefix_inner(
                 context,
                 audio_data,
@@ -365,7 +389,7 @@ impl Deck {
                 param_prefix,
                 cmd_buffers,
                 gpu_timing,
-                still.is_none(),
+                still.as_ref().is_none_or(super::StillFrame::in_parts),
             );
             match scope.faulted() {
                 Some(message) => Err(message),
@@ -438,14 +462,7 @@ impl Deck {
         let time = self.render_time;
         self.frame_count += 1;
 
-        // Derive per-deck FPS from wall-clock render interval (for UI display only)
-        let now = Instant::now();
-        let wall_dt = (now - self.last_frame_time).as_secs_f32();
-        self.last_frame_time = now;
-        if wall_dt > 0.0 && wall_dt < 1.0 {
-            let instant_fps = 1.0 / wall_dt;
-            self.fps_smoothed = 0.1 * instant_fps + 0.9 * self.fps_smoothed;
-        }
+        self.count_frame_shown();
 
         // Accumulate generator phase times using the fixed dt
         accumulate_phase_times(
@@ -754,6 +771,34 @@ impl Deck {
                 }
                 cmd_buffers.push(encoder.finish());
             }
+            // Its input not opened: nothing to draw, so clear.
+            DeckSource::Offline(_) => {
+                let mut encoder =
+                    context
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Offline Clear Encoder"),
+                        });
+                {
+                    let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Offline Clear Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: generator_target,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                }
+                cmd_buffers.push(encoder.finish());
+            }
             DeckSource::ExternalSource {
                 kind,
                 blit_pipeline,
@@ -765,10 +810,22 @@ impl Deck {
                 // DepthSensor decks were already reprojected above via the
                 // point-cloud pass; the plain blit only applies to flat sources.
                 if !matches!(kind, ExternalSourceKind::DepthSensor(_)) {
-                    if let (Some(ext_view), Some(fold)) = (&self.external_source_view, &folded) {
+                    // As it is placed: a capture centred, as it comes fitted.
+                    let (placed_width, placed_height) = super::placed_size(
+                        *scaling_mode,
+                        (*source_width, *source_height),
+                        self.screen_capture.as_ref(),
+                    );
+                    // A capture's picture as it was coded, where it has
+                    // that view: filtered so, made light after.
+                    let read = super::source_read(
+                        self.external_source_view.as_ref(),
+                        self.external_source_coded_view.as_ref(),
+                    );
+                    if let (Some((ext_view, coded)), Some(fold)) = (read, &folded) {
                         let (uv_scale, uv_offset) = scaling_mode.compute_uv_transform(
-                            *source_width,
-                            *source_height,
+                            placed_width,
+                            placed_height,
                             self.master_size.0,
                             self.master_size.1,
                         );
@@ -781,6 +838,7 @@ impl Deck {
                             crop: fold.crop,
                             premultiplied: matches!(kind, ExternalSourceKind::Tap),
                             over_black: fold.over_black,
+                            coded,
                         };
                         let pipeline = self.placed.get_or_insert_with(|| {
                             crate::renderer::placed_picture::PlacedPicturePipeline::new(
@@ -801,15 +859,15 @@ impl Deck {
                         );
                         let all = Pixels::all(frame.0, frame.1).count().max(1);
                         self.drawn_share = (drawn as f64 / all as f64) as f32;
-                    } else if let Some(ext_view) = &self.external_source_view {
+                    } else if let Some((ext_view, coded)) = read {
                         Self::blit_external_source(
                             context,
                             blit_pipeline,
                             blit_pipeline_over_black,
                             self.transparent,
                             ext_view,
-                            *source_width,
-                            *source_height,
+                            placed_width,
+                            placed_height,
                             // The master: Center means native size on air.
                             self.master_size.0,
                             self.master_size.1,
@@ -820,6 +878,7 @@ impl Deck {
                             source_within,
                             // Nida's own pictures, composited premultiplied.
                             matches!(kind, ExternalSourceKind::Tap),
+                            coded,
                         );
                     }
                 }
@@ -936,7 +995,23 @@ impl Deck {
                     generator_target,
                 );
             }
+            DeckSource::Slides(slides) => {
+                slides.render(
+                    audio_data,
+                    modulation,
+                    param_prefix,
+                    cmd_buffers,
+                    generator_target,
+                );
+            }
             DeckSource::Timer(timer) => timer.render(cmd_buffers, generator_target),
+            DeckSource::LowerThird(lower) => lower.render(cmd_buffers, generator_target),
+            DeckSource::Text(text) => text.render(cmd_buffers, generator_target),
+            DeckSource::Presenter(presenter) => presenter.render(
+                cmd_buffers,
+                generator_target,
+                (self.texture.width(), self.texture.height()),
+            ),
         }
 
         // Apply effect chain (ping-pong between textures)
@@ -1065,7 +1140,12 @@ impl Deck {
             DeckSource::SolidColor { .. }
             | DeckSource::ComputeShader { .. }
             | DeckSource::Playlist(_)
-            | DeckSource::Timer(_) => false,
+            | DeckSource::Slides(_)
+            | DeckSource::Timer(_)
+            | DeckSource::LowerThird(_)
+            | DeckSource::Text(_)
+            | DeckSource::Presenter(_)
+            | DeckSource::Offline(_) => false,
         };
         if !source_in_parts {
             plan[0] = None;
@@ -1099,6 +1179,12 @@ impl Deck {
     /// anything that moves — video, generators, cameras — each was a
     /// full-frame pass per frame, ~130 MB at 4K.
     fn drawn_effects(&self, modulation: &ModulationEngine) -> Vec<usize> {
+        // An offline input draws nothing at all: an effect that fills the
+        // frame — feedback trails, a colour wash — would cover the layers
+        // under it with its clear picture.
+        if matches!(self.source, DeckSource::Offline(_)) {
+            return Vec::new();
+        }
         self.effects
             .iter()
             .enumerate()
@@ -1164,13 +1250,56 @@ impl Deck {
                 | ExternalSourceKind::Rtmp(_)
         ) && super::fills_the_frame(
             *scaling_mode,
-            (*source_width, *source_height),
+            super::placed_size(
+                *scaling_mode,
+                (*source_width, *source_height),
+                self.screen_capture.as_ref(),
+            ),
             self.master_size,
         );
         if matches!(kind, ExternalSourceKind::DepthSensor(_)) {
             return Err("a depth sensor's picture, drawn in 3D");
         }
         Ok(if self.transparent || opaque { 0.0 } else { 1.0 })
+    }
+
+    /// The screen or window capture this input shows, and how big it draws
+    /// it in the show's frame (see `capture_drawn_as`): by its scaling mode,
+    /// and by its Transform's scale where the pass drawing the capture does
+    /// that too (see [`Self::fold`]) — the zoom is then taken from the
+    /// capture's own pixels. Any other Transform enlarges the deck's frame,
+    /// into which the capture is drawn as its mode has it.
+    ///
+    /// None: not a capture, one not there, or a PowerPoint show's — sized
+    /// by its presentation.
+    pub fn capture_drawn(
+        &self,
+        modulation: &ModulationEngine,
+    ) -> Option<(
+        crate::screen_capture::CaptureId,
+        crate::screen_capture::backend::Drawn,
+    )> {
+        let DeckSource::ExternalSource {
+            kind: ExternalSourceKind::ScreenCapture(id),
+            scaling_mode,
+            ..
+        } = &self.source
+        else {
+            return None;
+        };
+        let its_shows = self
+            .screen_capture
+            .as_ref()
+            .is_some_and(|state| state.presentation.is_some());
+        if *id == crate::screen_capture::UNBOUND_CAPTURE_ID || its_shows {
+            return None;
+        }
+        let zoom = self
+            .source_draws()
+            .ok()
+            .and_then(|_| self.foldable(&self.drawn_effects(modulation), modulation))
+            .map_or([1.0; 2], |fold| fold.scale);
+        Some((*id, super::capture_drawn_as(*scaling_mode, zoom)))
     }
 
     /// This deck's whole picture as one placed draw of its live source — the
@@ -1205,12 +1334,23 @@ impl Deck {
             }
             (fold.crop, fold.pos, fold.scale, fold.flip)
         };
-        // As the deck fits it: the master's size, where Center is native.
+        // As the deck fits it: the master's size, where Center is native —
+        // a capture's, as it comes fitted.
+        let (placed_width, placed_height) = super::placed_size(
+            *scaling_mode,
+            (*source_width, *source_height),
+            self.screen_capture.as_ref(),
+        );
         let (uv_scale, uv_offset) = scaling_mode.compute_uv_transform(
-            *source_width,
-            *source_height,
+            placed_width,
+            placed_height,
             self.master_size.0,
             self.master_size.1,
+        );
+        // The view the deck itself draws from, read as it reads it.
+        let read = super::source_read(
+            self.external_source_view.as_ref(),
+            self.external_source_coded_view.as_ref(),
         );
         Ok(Framing {
             placed: crate::renderer::placed_picture::Placed {
@@ -1222,10 +1362,26 @@ impl Deck {
                 crop,
                 premultiplied: matches!(kind, ExternalSourceKind::Tap),
                 over_black,
+                coded: read.is_some_and(|(_, coded)| coded),
             },
-            source: self.external_source_view.as_ref(),
+            source: read.map(|(view, _)| view),
             size: (self.texture.width(), self.texture.height()),
+            source_size: (*source_width, *source_height),
+            folded: !drawn.is_empty(),
         })
+    }
+
+    /// A new picture of the deck shown: its rate (`fps`, for the UI) from
+    /// the time since the last — drawn into its frame, or straight onto its
+    /// input from its source (see `Channel::direct_layers`).
+    pub(crate) fn count_frame_shown(&mut self) {
+        let now = Instant::now();
+        let wall_dt = (now - self.last_frame_time).as_secs_f32();
+        self.last_frame_time = now;
+        if wall_dt > 0.0 && wall_dt < 1.0 {
+            let instant_fps = 1.0 / wall_dt;
+            self.fps_smoothed = 0.1 * instant_fps + 0.9 * self.fps_smoothed;
+        }
     }
 
     /// Upload analyzer texture data into preprocessor slots.
@@ -1697,6 +1853,7 @@ impl Deck {
         cmd_buffers: &mut Vec<wgpu::CommandBuffer>,
         within: Option<&[Pixels]>,
         premultiplied: bool,
+        coded: bool,
     ) {
         // Flagged transparent → REPLACE over a transparent clear, preserving the
         // source's straight alpha (and leaving letterbox transparent). Default →
@@ -1722,7 +1879,14 @@ impl Deck {
             target_width,
             target_height,
         );
-        pipeline.set_uv_transform_of(&context.queue, 1.0, uv_scale, uv_offset, premultiplied);
+        pipeline.set_uv_transform_of(
+            &context.queue,
+            1.0,
+            uv_scale,
+            uv_offset,
+            premultiplied,
+            coded,
+        );
 
         let bind_group = pipeline.create_bind_group(&context.device, source_view);
         let mut encoder = context
@@ -1762,6 +1926,12 @@ impl Deck {
             DeckSource::Playlist(list) => list.resize(width, height),
             // Its numbers are sized and placed against the master.
             DeckSource::Timer(timer) => timer.resize(width, height),
+            DeckSource::LowerThird(lower) => lower.resize(width, height),
+            DeckSource::Text(text) => text.resize(width, height),
+            // So is a presenter view's panel.
+            DeckSource::Presenter(presenter) => presenter.resize(width, height),
+            // So are a Slides layer's talks.
+            DeckSource::Slides(slides) => slides.resize(width, height),
             // A tap shows a channel's picture or the master's, the master's
             // size now: left at the old one, it would fit the new picture as
             // if it were that size — bars round it, or cut off.
@@ -1780,6 +1950,7 @@ impl Deck {
         // Fresh textures are empty, whatever their size: a still image must
         // render into them again.
         self.rendered_still = None;
+        self.texture_generation = self.texture_generation.wrapping_add(1);
         // Include COPY_DST so compute shader decks survive resize
         let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
@@ -1819,6 +1990,35 @@ impl Deck {
         self.texture_b_view = self
             .texture_b
             .create_view(&wgpu::TextureViewDescriptor::default());
+        // A shader's pass buffers follow the deck's size too. Made once, at
+        // the size the deck was made, they kept it through a change of render
+        // size or of the show's size: a bokeh at Half still drew its discs at
+        // half the full size, and a show taken from 4K to 1080p kept them at
+        // 4K's. Left as they are while their size holds, so a persistent
+        // pass keeps what it has gathered.
+        if let DeckSource::Shader {
+            passes,
+            pass_buffers,
+            ..
+        } = &mut self.source
+        {
+            let stale = passes.iter().any(|pass| {
+                pass.target
+                    .as_ref()
+                    .and_then(|target| pass_buffers.get(target))
+                    .is_some_and(|buffer| {
+                        let size = buffer.texture_a.size();
+                        (size.width, size.height)
+                            != (
+                                Self::parse_size_expression(pass.width.as_deref(), width),
+                                Self::parse_size_expression(pass.height.as_deref(), height),
+                            )
+                    })
+            });
+            if stale {
+                *pass_buffers = Self::make_pass_buffers(context, passes, width, height);
+            }
+        }
         self.rerasterize_svg(context, width, height);
     }
 
@@ -1863,6 +2063,30 @@ impl Deck {
         *texture_view = new_view;
         *source_width = raster_w;
         *source_height = raster_h;
+    }
+
+    /// Show `rgba` in place of a picture deck's image — a PDF talk's page
+    /// — at its own size, fitted as the deck fits it. Nothing for any other
+    /// deck.
+    pub fn replace_picture(&mut self, context: &GpuContext, rgba: &image::RgbaImage) {
+        self.rendered_still = None;
+        if let DeckSource::Image {
+            texture,
+            texture_view,
+            source_width,
+            source_height,
+            opaque,
+            svg,
+            ..
+        } = &mut self.source
+        {
+            let (new_texture, new_view) = super::source::upload_image_texture(context, rgba);
+            *texture = new_texture;
+            *texture_view = new_view;
+            (*source_width, *source_height) = rgba.dimensions();
+            *opaque = rgba.pixels().all(|p| p[3] == u8::MAX);
+            *svg = None;
+        }
     }
 
     /// Get the final output texture view (after effect chain)
@@ -1932,6 +2156,7 @@ mod tests {
             index,
             scale,
             multiply_by: Vec::new(),
+            wrap: None,
         }
     }
 
@@ -1995,6 +2220,29 @@ mod tests {
             "deck0",
         );
         assert!((accum[0] - 0.4).abs() < 1e-5);
+    }
+
+    /// A phase with a wrap is kept below it, starting again from 0 — where a
+    /// growing float would lose its precision hours into a show.
+    #[test]
+    fn a_wrapped_phase_starts_again_from_zero() {
+        let isf_inputs = vec![float_input("speed", 1.0, 0.0, 5.0)];
+        let mut params = ShaderParams::from_inputs(&isf_inputs);
+        let modulation = no_modulation();
+        let mut acc = [9.95_f32, 0.0, 0.0, 0.0];
+        let inputs = [PhaseInput {
+            wrap: Some(10.0),
+            ..phase("speed", 0, 1.0)
+        }];
+        accumulate_phase_times(
+            &mut acc,
+            0.1,
+            Some(&inputs),
+            &mut params,
+            &modulation,
+            "deck0",
+        );
+        assert!((acc[0] - 0.05).abs() < 1e-4, "{}", acc[0]);
     }
 
     #[test]
@@ -2341,6 +2589,43 @@ mod tests {
         assert!((accum[0] - 0.5).abs() < 1e-5, "got {}", accum[0]);
     }
 
+    // ── An offline input draws nothing ───────────────────────────────
+
+    /// An offline input runs none of its effects: one that fills the frame
+    /// would cover the layers under it with its clear picture.
+    #[test]
+    fn an_offline_input_runs_none_of_its_effects() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        let invert = || {
+            let shader = crate::isf::ISFShader::from_file(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/invert.fs"),
+            )
+            .unwrap();
+            crate::deck::Effect::new_with_format(&gpu, shader, gpu.compositing_format).unwrap()
+        };
+        let mut online =
+            crate::deck::Deck::new_solid_color(&gpu, [1.0, 0.0, 0.0, 1.0], 64, 64).unwrap();
+        online.effects.push(invert());
+        assert_eq!(online.drawn_effects(&no_modulation()), vec![0]);
+
+        let mut offline = crate::deck::Deck::new_offline(
+            &gpu,
+            "logo".into(),
+            crate::scene::SourceConfig::Image {
+                path: "/gone/logo.png".into(),
+                scaling_mode: ScalingMode::default(),
+            },
+            "not found".into(),
+            64,
+            64,
+        );
+        offline.effects.push(invert());
+        assert!(offline.drawn_effects(&no_modulation()).is_empty());
+    }
+
     // ── Offensive: zero-size texture guard on resize ─────────────────
 
     #[test]
@@ -2364,6 +2649,60 @@ mod tests {
 
         // Normal resize still works
         deck.resize(&gpu, 128, 128);
+    }
+
+    /// A shader's pass buffers follow its deck's size: through a render size
+    /// of Half, and through a change of the show's size. They were made once
+    /// and kept that size, so a bokeh at Half still drew its discs at the
+    /// full size's half.
+    #[test]
+    fn a_shaders_pass_buffers_follow_its_decks_size() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        let shader = crate::isf::ISFShader::from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/broadcast_bokeh.fs"),
+        )
+        .unwrap();
+        let mut deck = crate::deck::Deck::new(&gpu, shader, 400, 200).unwrap();
+        let soft = |deck: &crate::deck::Deck| match &deck.source {
+            DeckSource::Shader { pass_buffers, .. } => {
+                let size = pass_buffers["soft"].texture_a.size();
+                (size.width, size.height)
+            }
+            _ => panic!("a shader deck"),
+        };
+        // "$WIDTH/2" × "$HEIGHT/2" of the deck.
+        assert_eq!(soft(&deck), (200, 100));
+        deck.set_render_scale(&gpu, crate::deck::DeckRenderScale::Half);
+        assert_eq!(soft(&deck), (100, 50));
+        deck.resize(&gpu, 800, 400);
+        assert_eq!(soft(&deck), (200, 100));
+        deck.set_render_scale(&gpu, crate::deck::DeckRenderScale::Full);
+        assert_eq!(soft(&deck), (400, 200));
+    }
+
+    /// A pass buffer whose size holds through a resize is kept: what a
+    /// persistent pass has gathered is not thrown away for nothing.
+    #[test]
+    fn a_pass_buffer_of_the_same_size_is_kept() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        let shader = crate::isf::ISFShader::from_file(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/broadcast_bokeh.fs"),
+        )
+        .unwrap();
+        let mut deck = crate::deck::Deck::new(&gpu, shader, 400, 200).unwrap();
+        let soft = |deck: &crate::deck::Deck| match &deck.source {
+            DeckSource::Shader { pass_buffers, .. } => pass_buffers["soft"].texture_a.clone(),
+            _ => panic!("a shader deck"),
+        };
+        let before = soft(&deck);
+        deck.resize(&gpu, 400, 200);
+        assert!(before == soft(&deck), "the same buffer, not a new one");
     }
 
     // ── SVG image decks rasterize against the master resolution ──────

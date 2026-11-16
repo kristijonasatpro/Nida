@@ -29,10 +29,14 @@ Each output can send video over NDI to other applications and machines on the ne
 3. Enter a sender name (e.g., "Nida Main")
 4. The NDI stream is discoverable by any NDI-compatible application on the LAN
 
-With a loaded NDI 6 runtime, a 10-bit request sends P216 with Rec.709 limited-range conversion.
+With a loaded NDI 6 runtime, a 10-bit request sends P216 with Rec.709 limited-range conversion —
+the same picture as 8-bit and as the windows, in finer steps.
 Older runtimes use UYVY and show a fallback reason. Receiver software should request its best or
 highest-quality color mode to avoid converting P216 back to 8-bit. 8-bit UYVY is sent at video
 levels (16–235) in Rec.709, or Rec.601 below 720 lines, as NDI receivers read it.
+
+A stopped NDI output stays on the network as a source that sends nothing; close the output, or
+give it another sender name, and the old source goes.
 
 An NDI output carries an audio-mixer bus with its picture — Master when it is made. Change it
 under **Audio** in the output's settings, even while it runs, or choose **None (silent)**.
@@ -337,10 +341,13 @@ Select a capture deck to get its controls in the deck detail panel (bottom bar):
 
 | Control | Parameter path | Notes |
 |---|---|---|
+| **Screen** / **Window** | — (`PUT /api/decks/<deck_uuid>/screen/target`) | What the input captures: pick another screen or window from the list — or its own again — and the input keeps its rate, crop, effects and place in the show (of a screen or window another input shows already, the rate, crop and cursor are that capture's: see below). **Refresh** looks again for the screens and windows there are. Not offered for a PowerPoint input, whose window is its show's |
 | **Rate** | `deck/<deck_uuid>/capture/rate` | 1 to 120 fps. Defaults to 30 |
 | **Crop** X / Y / W / H | `deck/<deck_uuid>/capture/crop_x` (`_y`, `_w`, `_h`) | Normalized 0 to 1 within the target, with a **Reset** button |
 | **Cursor** | `deck/<deck_uuid>/capture/cursor` | Include the mouse pointer. Fixed when the capture opens on Wayland, and not available on X11 |
 | **Exclude Nida** | `deck/<deck_uuid>/capture/exclude_varda` | Omit Nida's own windows. Offered for display targets only, since for a window target it would do nothing. macOS only, see below |
+
+A screen or window is captured once however many inputs show it, so **Rate**, **Crop**, **Cursor** and **Exclude Nida** are its inputs' in common: set one on any of them and all of them show and save it. An input added of a screen another input captures already — or pointed at it — takes the settings that capture runs with, not its own. To show two parts of one screen, leave the capture whole and cut each input with its own **Crop** ([Input Settings](21-input-settings.md) → **Position**).
 
 Every one of these is a real parameter path, so all of them are MIDI-learnable, OSC-addressable, and macro-drivable. They are not modulation targets: a parameter path makes a value writable on demand, while a modulation target is re-evaluated every frame, which each parameter has to opt into. Shader inputs, opacity, macro values, and [video playback](05-modulation.md#video-playback) do; the capture parameters do not, yet. A macro bridges the gap in the meantime: assign the modulator to a macro, and point the macro at the capture path. See [Parameter Paths](06-control-surfaces.md#parameter-paths).
 
@@ -362,9 +369,13 @@ Capturing a screen still costs macOS itself: measured on a MacBook Pro, a 1080p 
 
 ### Persistence
 
-Capture decks are saved in `scene.json` by **name**: a display's name, or a window's application and title. Platform handles such as CoreGraphics display ids and window numbers are ephemeral across reboots and are never written to disk.
+Capture decks are saved in `scene.json` in a form that survives a restart. A **window** is saved by its application and title. A **display** is saved by its own identity — the UUID macOS keeps for it — beside the name it was listed under: "Display 1" and "Display 2" are only the screens' places in macOS's list, and plugging in one more screen can renumber them. The saved screen is found whatever number it has now. Platform handles such as CoreGraphics display ids and window numbers are ephemeral across reboots and are never written to disk.
 
-If the target is missing when a scene loads, the deck is **restored unbound** rather than dropped. It renders black and logs a warning, and the deck detail panel tells you so. Losing a deck along with its effect chain, opacity, and MIDI mappings because an app happened to be closed would be a bad way to start a show, so the deck survives and you repoint it.
+If the saved screen is not plugged in — or the show was made on another computer — the screen now listed under the saved name is captured in its place, and the log says so; the show keeps the saved screen and finds it again once it is back.
+
+A show saved by a Nida before 0.9.9 has the name only, and which screen had that name when the show was made is not recorded: a capture box plugged in since may be "Display 1" today, and the show's own screen "Display 2". Such an input goes on **by its number** — it shows whichever screen has that number now, and the show goes on saving the number alone, so opening and closing it never makes the wrong screen permanent. Nida says so when the show opens (a warning, once, where there is more than one screen), and the input's settings say **Kept by its number** under the **Screen** list. Check each such input, and pick its screen in that list — the one it shows already, if that is the right one: from then on it is kept as that screen itself.
+
+If the target is missing when a scene loads, the deck is **restored unbound** rather than dropped. It renders black and logs a warning, and the deck detail panel tells you so. It keeps the name the show has for it; one the show has no name for is named after what it was to capture. Losing a deck along with its effect chain, opacity, and MIDI mappings because an app happened to be closed would be a bad way to start a show, so the deck survives and you repoint it: reopen the app or plug the screen back in, or pick another in the input's **Screen** / **Window** list. An input still named after what it captured is then named after the one picked; a name of its own — a preset's — stays.
 
 ### API
 
@@ -373,10 +384,11 @@ If the target is missing when a scene loads, the deck is **restored unbound** ra
 curl -X POST http://localhost:8080/api/devices/screen/scan
 curl http://localhost:8080/api/library/screen
 
-# Capture a whole display
+# Capture a whole display, by the name the scan lists it under — or, with
+# its "uuid" from the scan beside the name, that screen whatever its number
 curl -X POST http://localhost:8080/api/channels/<ch_uuid>/decks/screen \
   -H "Content-Type: application/json" \
-  -d '{"target": {"kind": "display", "name": "Built-in Retina Display"}}'
+  -d '{"target": {"kind": "display", "name": "Display 1"}}'
 
 # Capture one window, cropped to its top-left quadrant at 24 fps
 curl -X POST http://localhost:8080/api/channels/<ch_uuid>/decks/screen \
@@ -385,7 +397,15 @@ curl -X POST http://localhost:8080/api/channels/<ch_uuid>/decks/screen \
        "rate": 24,
        "crop": {"x": 0.0, "y": 0.0, "w": 0.5, "h": 0.5},
        "show_cursor": true}'
+
+# Point an input there already at another screen or window — or at its own
+# again, which keeps a display a show had by its number as that screen itself
+curl -X PUT http://localhost:8080/api/decks/<deck_uuid>/screen/target \
+  -H "Content-Type: application/json" \
+  -d '{"target": {"kind": "display", "name": "Display 2"}}'
 ```
+
+Each capture deck in `GET /api/state` says what it is kept by: `screen_capture.target_uuid` is its display's identity, and `screen_capture.kept_by_name` is true for a display the show has by its number alone.
 
 `GET /api/state/screen_capture` reports the permission state, the backend in use, whether capture is available at all, and the number of live sessions.
 

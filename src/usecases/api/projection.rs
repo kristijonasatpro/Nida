@@ -19,12 +19,14 @@ use utoipa::ToSchema;
 /// panicking writer, or [`StateReadError::NotInitialized`] if the engine has not
 /// published a snapshot yet.
 pub fn read_state(
-    engine_state: &std::sync::RwLock<Option<EngineState>>,
-) -> Result<EngineState, StateReadError> {
-    let guard = engine_state
+    engine_state: &crate::engine::types::PublishedState,
+) -> Result<std::sync::Arc<EngineState>, StateReadError> {
+    // The pointer only, under the lock: what is read from it is read after.
+    let state = engine_state
         .read()
-        .map_err(|_| StateReadError::LockPoisoned)?;
-    guard.clone().ok_or(StateReadError::NotInitialized)
+        .map_err(|_| StateReadError::LockPoisoned)?
+        .clone();
+    state.ok_or(StateReadError::NotInitialized)
 }
 
 /// Errors when reading engine state.
@@ -180,6 +182,8 @@ pub(crate) mod tests {
                 main: crate::mixer::MainSnapshot::default(),
                 channels: vec![ChannelSnapshot {
                     overlay: false,
+                    on_air: None,
+                    color: None,
                     idx: 0,
                     uuid: "ch-001".into(),
                     name: "Channel A".into(),
@@ -198,9 +202,19 @@ pub(crate) mod tests {
                         screen_capture: None,
                         tap: None,
                         playlist: None,
+                        slides: None,
                         timer: None,
+                        lower_third: None,
+                        text: None,
+                        presentation: None,
+                        presenter_of: None,
+                        presenter_layout: None,
+                        offline: None,
                         camera_colour: None,
                         camera_lowest_latency: None,
+                        camera_signal: None,
+                        camera_id: None,
+                        camera_mode: None,
                         camera_profile: None,
                         opacity: 1.0,
                         effective_opacity: 1.0,
@@ -308,11 +322,15 @@ pub(crate) mod tests {
                     model: None,
                     given_name: None,
                     refresh_hz: None,
+                    identity: "HDMI-1".into(),
+                    main: true,
                 }],
             },
             registry: RegistrySnapshot {
                 generators: vec![("Sine".into(), 0)],
+                broadcast: vec![],
                 filters: vec![("Blur".into(), 0)],
+                frames: vec![],
                 shader_count: 2,
             },
             midi: MidiSnapshot {
@@ -325,6 +343,8 @@ pub(crate) mod tests {
                 devices: vec![("FaceTime".into(), 0u32)],
                 modes: vec![],
                 access_denied: false,
+                with_own_sound: Vec::new(),
+                following_signal: Vec::new(),
                 video_effects: Vec::new(),
             },
             depth_sensors: crate::engine::DepthSensorSnapshot { devices: vec![] },
@@ -350,6 +370,12 @@ pub(crate) mod tests {
             fps: 60.0,
             frame_count: 100,
             target_fps: 60,
+            render: crate::engine::types::RenderSnapshot {
+                width: 1920,
+                height: 1080,
+                auto: false,
+                hint: None,
+            },
             pacing: crate::engine::PacingSnapshot::default(),
             ndi_sources: vec!["OBS".into()],
             ndi_available: true,
@@ -376,7 +402,7 @@ pub(crate) mod tests {
     #[test]
     fn test_read_state_returns_clone() {
         let state = make_test_state();
-        let lock = std::sync::RwLock::new(Some(state));
+        let lock = std::sync::RwLock::new(Some(std::sync::Arc::new(state)));
         let result = read_state(&lock).unwrap();
         assert!((result.fps - 60.0).abs() < 1e-5);
     }

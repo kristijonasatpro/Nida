@@ -588,6 +588,17 @@ impl TimecodeManager {
             return;
         }
         let channel = usize::from(input.channel.min(channels - 1));
+        // A decoder made for another rate — the device back from an unplug
+        // at another one — is made afresh: it measured bits in the old
+        // rate's samples and read 24 fps LTC as 25.
+        let rate = f64::from(sample_rate);
+        if self
+            .decoder
+            .as_ref()
+            .is_some_and(|d| (d.sample_rate() - rate).abs() > 0.5)
+        {
+            self.decoder = None;
+        }
         let decoder = self.decoder.get_or_insert_with(|| {
             let mut decoder = ltc::LtcDecoder::new(f64::from(sample_rate));
             decoder.set_rate_override(input.rate);
@@ -1049,6 +1060,33 @@ mod tests {
         manager.update(now);
 
         assert!(manager.inputs().is_empty(), "it is not our master");
+    }
+
+    /// The LTC device back from an unplug at another sample rate is read at
+    /// its own: the decoder made for the old rate measured its bits in the
+    /// wrong samples and read 24 fps as 25.
+    #[test]
+    fn ltc_at_another_sample_rate_is_read_at_its_own() {
+        let mut manager = TimecodeManager::new();
+        manager.set_ltc_input(Some(LtcInput {
+            source_id: 3,
+            channel: 0,
+            rate: None,
+        }));
+        let first = TimecodeFrame::new(0, 5, 0, 0, TimecodeRate::Fps24);
+        let now = Instant::now();
+        let at_48k = ltc::encode::run(first, 8, 48_000.0, 0.5);
+        manager.ingest_pcm(3, &at_48k, 1, 48_000, now);
+        let back = first.plus_frames(240);
+        let at_44k = ltc::encode::run(back, 16, 44_100.0, 0.5);
+        manager.ingest_pcm(3, &at_44k, 1, 44_100, now);
+        manager.update(now);
+        assert_eq!(manager.state().rate, TimecodeRate::Fps24);
+        assert!(
+            (manager.state().position - 310.0).abs() < 1.0,
+            "ten seconds on, got {}",
+            manager.state().position
+        );
     }
 
     /// A patch is a pair of a device and a channel, and a mono input has only

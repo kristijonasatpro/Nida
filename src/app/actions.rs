@@ -73,6 +73,15 @@ impl VardaApp {
                 EngineCommand::AddInput { .. } => Some("Input not added"),
                 EngineCommand::StartRecording => Some("Recording not started"),
                 EngineCommand::StartStream => Some("Stream not started"),
+                // The input stays on what it showed: a window closed since
+                // it was listed, a screen macOS will not let be captured.
+                EngineCommand::SetScreenCaptureTarget { target, .. } => {
+                    Some(if target.is_display() {
+                        "Screen not picked"
+                    } else {
+                        "Window not picked"
+                    })
+                }
                 // A step not taken says so itself, wherever the press came
                 // from; these are the window's alone to say.
                 EngineCommand::AddRundownStep { .. } => Some("Step not added"),
@@ -84,7 +93,10 @@ impl VardaApp {
                 | EngineCommand::SetRundownMain { .. }
                 | EngineCommand::SetRundownOverlay { .. }
                 | EngineCommand::SetRundownPlay { .. }
+                | EngineCommand::SetRundownUntilNext { .. }
+                | EngineCommand::SetRundownTimer { .. }
                 | EngineCommand::SetRundownThen { .. }
+                | EngineCommand::SetRundownAt { .. }
                 | EngineCommand::CaptureRundownStep { .. }
                 | EngineCommand::SetRundownNext { .. }
                 | EngineCommand::SetRundownFade { .. } => Some("Step not changed"),
@@ -219,6 +231,11 @@ pub(crate) fn command_is_deck_add(cmd: &EngineCommand) -> bool {
             | EngineCommand::AddHtmlDeck { .. }
             | EngineCommand::AddPlaylistDeck { .. }
             | EngineCommand::AddTimerDeck { .. }
+            | EngineCommand::AddLowerThirdDeck { .. }
+            | EngineCommand::AddTextDeck { .. }
+            | EngineCommand::AddPresentationDeck { .. }
+            | EngineCommand::AddPresenterDeck { .. }
+            | EngineCommand::AddSlidesDeck { .. }
     )
 }
 
@@ -256,6 +273,7 @@ mod tests {
                 channel_uuid: ch(),
                 camera_id: 0,
                 mode: None,
+                audio: None,
             },
             EngineCommand::AddDepthSensorDeck {
                 channel_uuid: ch(),
@@ -300,8 +318,29 @@ mod tests {
                 channel_uuid: ch(),
                 settings: None,
             },
+            EngineCommand::AddLowerThirdDeck {
+                channel_uuid: ch(),
+                settings: None,
+            },
+            EngineCommand::AddTextDeck {
+                channel_uuid: ch(),
+                settings: None,
+            },
+            EngineCommand::AddPresentationDeck {
+                channel_uuid: ch(),
+                path: "/talk.pptx".into(),
+            },
+            EngineCommand::AddPresenterDeck {
+                channel_uuid: ch(),
+                deck_uuid: "d1".into(),
+            },
+            EngineCommand::AddSlidesDeck {
+                channel_uuid: ch(),
+                paths: Vec::new(),
+                settings: None,
+            },
         ];
-        assert_eq!(deck_adds.len(), 15, "expected 15 deck-add variants");
+        assert_eq!(deck_adds.len(), 20, "expected 20 deck-add variants");
         for cmd in &deck_adds {
             assert!(command_is_deck_add(cmd), "not recognized: {cmd:?}");
         }

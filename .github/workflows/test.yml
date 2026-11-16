@@ -60,6 +60,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential cmake pkg-config \
+            ffmpeg \
             libvulkan-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libavdevice-dev \
             libsrt-gnutls-dev \
@@ -73,6 +74,13 @@ jobs:
           # the linker needs for -lfreenect is missing.
           test -e /usr/lib/x86_64-linux-gnu/libfreenect.so \
             || { echo "::error::libfreenect-dev did not provide libfreenect.so"; exit 1; }
+
+      # The audio-header and sound-only tests create media with these tools;
+      # the development libraries above do not install the executables.
+      - name: Verify FFmpeg tools
+        run: |
+          ffmpeg -version
+          ffprobe -version
 
       # GitHub runners have no GPU. lavapipe (Mesa's software Vulkan
       # implementation) provides the headless adapter that the render, engine,

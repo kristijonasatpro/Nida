@@ -128,7 +128,7 @@ impl Effect {
 
     /// True only when this effect can contribute to the current picture.
     pub fn is_active(&self) -> bool {
-        self.enabled && self.pipeline.is_some()
+        self.enabled && self.offline().is_none() && self.pipeline.is_some()
     }
 
     /// Install only resources. Edits, bypass, masks, UUID and chain position
@@ -148,6 +148,7 @@ impl Effect {
             Ok(ready) => {
                 self.pipeline = ready.pipeline;
                 self.pass_buffers = ready.pass_buffers;
+                self.pass_uniform_buffers = ready.pass_uniform_buffers;
                 self.imported_textures = ready.imported_textures;
                 self.preprocessor_textures = ready.preprocessor_textures;
                 self.build = EffectBuild::Ready;

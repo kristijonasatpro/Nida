@@ -22,20 +22,24 @@ pub enum ShowAction {
 }
 
 /// Where a new deck goes: a channel, and the deck in it that it goes
-/// before — `None` for the end. Both by UUID, since a load can outlive the
-/// positions it was aimed at.
+/// before — `None` for the end — or behind its layers. By UUID, since a load
+/// can outlive the positions it was aimed at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeckPlace {
     pub channel_uuid: String,
     pub before_deck_uuid: Option<String>,
+    /// Behind the channel's layers as they are when it lands, instead —
+    /// what it shows, on air perhaps, stays.
+    pub back: bool,
 }
 
 impl DeckPlace {
-    /// The end of a channel.
-    pub fn end_of(channel_uuid: impl Into<String>) -> Self {
+    /// Behind a channel's layers.
+    pub fn back_of(channel_uuid: impl Into<String>) -> Self {
         Self {
             channel_uuid: channel_uuid.into(),
             before_deck_uuid: None,
+            back: true,
         }
     }
 }
@@ -73,11 +77,17 @@ pub struct UISession {
     /// Files dropped in from Finder, each batch with where it goes, in the
     /// order they were dropped.
     pub files_to_add: Vec<(DeckPlace, Vec<std::path::PathBuf>)>,
+    /// Files dropped where no channel is, in the order they were dropped:
+    /// an input each.
+    pub files_as_inputs: Vec<std::path::PathBuf>,
     /// Open a folder picker for where recordings go (outside the frame, like
     /// the file dialogs).
     pub choose_record_folder: bool,
     /// Show a file in Finder (or the system's file manager).
     pub reveal_file: Option<std::path::PathBuf>,
+    /// What the Presentations panel asks of the clicker (see
+    /// `crate::clicker`): its device is the Mac's, not the show's.
+    pub clicker_ask: Option<crate::clicker::ClickerAsk>,
     /// Notifications to put away, by id (see `Notification::id`).
     pub notifications_to_dismiss: Vec<u64>,
     /// Info notifications to push (e.g. "Copied URL to clipboard")
@@ -179,6 +189,12 @@ pub struct UISession {
     /// collapse a continuous drag into a single undo step (snapshot on gesture
     /// start, suppressed while held).
     pub gesture_active: bool,
+    /// Channels whose pictures this frame shows big or under the pointer —
+    /// an Input Settings window's, the tile hovered: drawn at the show's
+    /// rate, not a tile's. By UUID: commands this frame may move them.
+    pub shown_full: Vec<String>,
+    /// The Preview monitor was drawn this frame.
+    pub preview_monitor_shown: bool,
 }
 
 impl Default for UISession {
@@ -196,8 +212,10 @@ impl UISession {
             open_image_dialog_for_new_inputs: false,
             open_video_dialog_for_new_inputs: false,
             files_to_add: Vec::new(),
+            files_as_inputs: Vec::new(),
             choose_record_folder: false,
             reveal_file: None,
+            clicker_ask: None,
             notifications_to_dismiss: Vec::new(),
             info_notifications: Vec::new(),
             midi_learn_toggle: false,
@@ -239,6 +257,8 @@ impl UISession {
             undo_requested: false,
             redo_requested: false,
             gesture_active: false,
+            shown_full: Vec::new(),
+            preview_monitor_shown: false,
         }
     }
 }

@@ -2759,6 +2759,70 @@ fn master_tap_shows_the_previous_frame() {
     );
 }
 
+/// The red in a master tap's picture after two frames (as in
+/// `master_tap_shows_the_previous_frame`: 1 once frame 2 has drawn it), its
+/// deck's cost set after the first to six frames' time — what a first draw
+/// that slow leaves — and the mixer drawing slow decks less often as
+/// `less_often` says, or as a new mixer does.
+fn tap_after_a_slow_first_draw(ctx: &GpuContext, less_often: Option<bool>) -> f32 {
+    let mut mixer = new_mixer(ctx);
+    if let Some(less_often) = less_often {
+        mixer.slow_layers_less_often = less_often;
+    }
+    let tap = Deck::new_from_tap(ctx, varda::deck::TapSource::MasterProgram, "tap", W, H)
+        .expect("tap deck");
+    mixer.decks_shown_alone = vec![tap.uuid().to_string()];
+    mixer.channel_mut(0).unwrap().add_deck(tap);
+    let red = Deck::new_solid_color(ctx, [1.0, 0.0, 0.0, 1.0], W, H).expect("solid deck");
+    mixer.channel_mut(0).unwrap().add_deck(red);
+    mixer.set_crossfader(0.0);
+
+    render_frame_with_taps(ctx, &mut mixer);
+    mixer.channel_mut(0).unwrap().decks[0].render_cost_us = 100_000.0;
+    render_frame_with_taps(ctx, &mut mixer);
+    center(&read_texture(
+        ctx,
+        &mixer.channel(0).unwrap().decks[0].deck.texture,
+        W,
+        H,
+    ))[0]
+}
+
+/// A deck on Auto that costs more than its share of a frame's time is left
+/// undrawn between its draws while the decks together run over that time
+/// (see `Mixer::slow_layers_less_often`): at six frames' time, not drawn on
+/// the frame after.
+#[test]
+fn a_slow_deck_on_auto_is_drawn_less_often_when_frames_run_late() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    assert_lo(
+        tap_after_a_slow_first_draw(&ctx, Some(true)),
+        "a deck six frames slow is not drawn the frame after",
+    );
+    assert_hi(
+        tap_after_a_slow_first_draw(&ctx, Some(false)),
+        "with that off it is drawn every frame",
+    );
+}
+
+/// A test's mixer draws a deck on Auto every frame, however slow: its frames
+/// are drawn back to back, and what a draw takes there says how busy the
+/// machine is with the other tests. (`master_tap_shows_the_previous_frame`'s
+/// tap, its first draw taking 10 ms or more on a loaded machine, was left
+/// undrawn on frame 2.)
+#[test]
+fn a_tests_mixer_draws_a_slow_deck_every_frame() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    assert_hi(
+        tap_after_a_slow_first_draw(&ctx, None),
+        "drawn on frame 2, whatever frame 1 cost",
+    );
+}
+
 /// A deck tapping the channel it lives in is a legitimate and commonly wanted
 /// feedback configuration. At partial opacity it must converge rather than
 /// producing NaN or infinity in the `Rgba16Float` target.

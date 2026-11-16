@@ -256,6 +256,17 @@ impl VardaApp {
             Ok(idx) => idx,
             Err(e) => return e.into(),
         };
+        // Without the browser (a build without `html`, or it turned off) a
+        // page would be an empty layer, added without a word: refused, and
+        // why said. A show holding one still opens, its layer empty.
+        if !self.external_io.html_manager.is_available() {
+            return CommandResult::Err {
+                code: ErrorCode::InvalidInput,
+                message: "Web pages are not in this build of Nida (it has no browser): show the \
+                          page with Desktop Capture, or use a picture"
+                    .into(),
+            };
+        }
         match self.external_io.html_manager.start_render(
             url,
             self.render_width,

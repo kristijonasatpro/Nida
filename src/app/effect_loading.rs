@@ -7,6 +7,11 @@ use crate::isf::ISFShader;
 
 impl VardaApp {
     pub(super) fn load_effect(&mut self, shader: ISFShader) -> anyhow::Result<Effect> {
+        // A layer mask must be installed atomically: bypass while compiling
+        // would briefly expose pixels the operator has explicitly hidden.
+        if shader.name() == crate::engine::value::mask::LAYER_MASK_EFFECT {
+            return Effect::new(&self.context, shader);
+        }
         if self.effect_loader.is_none() {
             self.effect_loader = Some(crate::deck::loading::EffectLoader::new(&self.context)?);
         }
@@ -121,6 +126,101 @@ mod tests {
             .unwrap();
         let bytes = buffer.slice(..).get_mapped_range().unwrap();
         std::array::from_fn(|i| u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]))
+    }
+
+    #[test]
+    fn default_effect_compilation_does_not_hold_up_a_new_source() {
+        let gpu = match crate::renderer::GpuContext::new_headless() {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                assert!(std::env::var_os("VARDA_REQUIRE_GPU").is_none(), "{error}");
+                return;
+            }
+        };
+        let mut app = VardaApp::new(gpu.clone(), &crate::testing::headless_config()).unwrap();
+        app.mixer.resize(&gpu, 64, 64);
+        let channel = app.mixer.channels()[0].uuid().to_string();
+        let (release, gate) = crossbeam_channel::bounded::<()>(2);
+        let (entered, started) = crossbeam_channel::unbounded();
+        app.effect_loader = Some(
+            crate::deck::loading::EffectLoader::with_builder(move |shader, format| {
+                entered.send(shader.name())?;
+                gate.recv()?;
+                Effect::new_with_format(&gpu, shader, format)
+            })
+            .unwrap(),
+        );
+        app.add_solid_color_deck(&channel, [0.0, 0.0, 1.0, 1.0])
+            .unwrap();
+        let mut names = [
+            started.recv_timeout(Duration::from_secs(5)).unwrap(),
+            started.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ];
+        names.sort();
+        assert_eq!(names, ["crop", "transform"]);
+        // Masks stay atomic even while both background workers are blocked.
+        let mask_shader = app
+            .registry
+            .filters()
+            .iter()
+            .find(|shader| shader.name() == crate::engine::value::mask::LAYER_MASK_EFFECT)
+            .unwrap()
+            .clone()
+            .clone();
+        let mask = app.load_effect(mask_shader).unwrap();
+        assert_eq!(mask.load_state(), EffectLoadState::Ready);
+        let effects = &mut app.mixer.channels_mut()[0].decks[0].deck.effects;
+        assert_eq!(
+            effects
+                .iter()
+                .map(|effect| effect.shader.name())
+                .collect::<Vec<_>>(),
+            ["crop", "transform"]
+        );
+        assert!(effects
+            .iter()
+            .all(|effect| matches!(effect.load_state(), EffectLoadState::Building)));
+        let ids: Vec<_> = effects
+            .iter()
+            .map(|effect| effect.uuid().to_string())
+            .collect();
+        effects[1].params.set("scale", ParamValue::Float(0.75));
+        effects[0].enabled = false;
+        app.render_mixer_frame();
+        let pixel = channel_pixel(&app);
+        assert!(
+            pixel[2] > 0 && pixel[0] == 0,
+            "the source must draw while both compilers are blocked: {pixel:?}"
+        );
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            app.poll_effect_loading();
+            let effects = &app.mixer.channels()[0].decks[0].deck.effects;
+            if effects
+                .iter()
+                .all(|effect| matches!(effect.load_state(), EffectLoadState::Ready))
+            {
+                assert_eq!(
+                    effects
+                        .iter()
+                        .map(|effect| effect.uuid().to_string())
+                        .collect::<Vec<_>>(),
+                    ids
+                );
+                assert!(!effects[0].enabled);
+                assert!(
+                    matches!(effects[1].params.values["scale"], ParamValue::Float(value) if (value - 0.75).abs() < 1e-6)
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "defaults did not finish building"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

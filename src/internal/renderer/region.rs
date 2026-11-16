@@ -260,6 +260,21 @@ pub fn draw_within(pass: &mut wgpu::RenderPass<'_>, within: Option<&[Pixels]>) {
     }
 }
 
+/// [`draw_within`] in a pass other draws share, on a `width × height`
+/// target: `None` first sets the scissor back to the whole target, so the
+/// draw does not inherit the rectangle the draw before it left set.
+pub fn draw_within_shared(
+    pass: &mut wgpu::RenderPass<'_>,
+    within: Option<&[Pixels]>,
+    width: u32,
+    height: u32,
+) {
+    if within.is_none() {
+        pass.set_scissor_rect(0, 0, width, height);
+    }
+    draw_within(pass, within);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

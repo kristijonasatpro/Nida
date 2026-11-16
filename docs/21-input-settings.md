@@ -31,14 +31,17 @@ whatever it is editing.
 ## Layers
 
 Down the left: the channel's **result** (every layer composited), then the
-channel itself, then its layers. They are numbered as vMix numbers them —
-**Layer 1 at the back**, each higher one drawn over it.
+channel itself, then its layers, listed as Premiere lists its tracks: **the
+layer in front at the top**, Layer 1 at the back at the bottom, each higher
+one drawn over it. Every list of a channel's layers — the Channels panel, the
+Layers panel's rows, the chips on its tile — puts the layer in front first.
+Files dropped together keep their order: the first is in front.
 
 | On a layer's row | |
 |---|---|
 | Click | Edit this layer |
 | ☑ | Shown — untick to hide it, keeping all its settings |
-| ⏶ ⏷ | Swap with the layer before / after it |
+| ⏶ ⏷ | Move up, in front of the layer above it / down, behind the layer below it |
 | 🗑 | Delete the layer |
 | Right-click | Take this layer alone to Main or a bus, **Copy position** / **Paste position**, copy, paste |
 
@@ -66,10 +69,11 @@ saved with it gone) draws nothing, its border and effects included.
 ## A layer
 
 The right side shows a **preview** — the layer alone, the channel, the Main
-output or any screen. **Drag** the picture to move it; **Shift-drag** or
-**scroll** to resize it; **Reset position & size** puts it back. The outline
-shows what shows of the picture — what the crop keeps — even when its edges
-are transparent.
+output or any screen. **Drag** the picture to move it. To resize it, **drag a
+corner** of its outline — the opposite corner stays where it is, and the
+pointer changes over a corner — or **Shift-drag** or **scroll**; **Reset
+position & size** puts it back. The outline shows what shows of the picture —
+what the crop keeps — even when its edges are transparent.
 
 **Snapping**, as Apple's apps line things up: a dragged layer's edges and
 centre snap to the frame's edges and middle and to the other layers' edges and
@@ -133,6 +137,72 @@ The border runs round what the crop keeps, just inside its edge. Its sizes
 are pixels of a 1080-line picture whatever the resolution, measured before
 Transform, so a picture shrunk to a third shows a 6 px border as 2 px.
 
+### Frame
+
+**Frame** puts the layer's picture in a moving frame, as stream overlays
+do — a slide, a PowerPoint or a camera in a HUD frame, a neon outline, an
+overlay with a tab for a name. Pick one from the list (**None** takes it
+away). The frame's window is the whole picture, a light going round it:
+most frames are drawn over the picture's edge and leave the picture as it
+is; some (HUD lines, Stepped neon, Neon ring) start with the picture made
+a little smaller, inside the frame.
+
+There are twelve. **HUD frame** is a picture of a frame — gunmetal,
+screws, light strips. The others are drawn of lines of light: **HUD
+lines**, **Neon double**, **Two-tone neon**, **Stepped neon**, **Neon
+arrows**, **White neon**, **Flare**, **Electric**, **Silver deco**,
+**Stream overlay** (a solid band, with a dark tab above its bottom edge
+for a name) and **Neon ring** (the picture in a circle).
+
+The frame belongs to the layer: drag or resize the layer and picture and
+frame go together, and the channel's **Layout** templates (Side by side,
+PiP…) place framed layers as any other — slides in one frame, the speaker
+in another. It holds what shows of the layer's picture, and finds that
+itself, each frame: what **Crop** keeps — crop the layer and the frame
+closes round the part that is left — and as much of a picture cropped in
+the input it is repeated from (🔁), or of a picture that does not fill its
+layer. A layer with nothing showing has no frame either. Its settings are
+under the list:
+
+- **Size** — how much of the picture's place the frame's window takes. 1,
+  as it comes, is all of it; smaller, frame and picture shrink toward the
+  middle and the layer is clear round them, so what is under it shows — a
+  Broadcast background as the input's bottom layer makes the whole stage.
+- **Shape** — the window's shape: **As the picture**, or 16:9, 4:3, 1:1,
+  9:16 — a square or upright speaker box without Crop. Beside a window
+  narrower than the picture the layer is clear.
+- **Fill the frame** — where the window's shape is not the picture's: off,
+  the whole picture shows inside the window (nothing of a slide is lost;
+  the HUD frame backs the room left with black, a line frame leaves it
+  clear); on, the picture covers the window, its edges cut.
+- **Picture inside the frame** — off, the picture fills the window and the
+  frame lies over its edge: the HUD frame's band hides the picture's
+  outermost few per cent, and a line frame covers what is outside its
+  outline. On, the picture is made smaller to fit inside the frame — the
+  HUD frame's opening, or a line frame's outline, cut to its shape — so
+  nothing of a slide is under the frame. HUD lines and Stepped neon start
+  with it on; the Neon ring with it and Fill the frame on.
+- **Backing** (the line frames) — the dark plate outside the frame's
+  outline, behind its lines and marks, which makes the frame a thing that
+  holds the picture. At 0 there is none: the picture shows there dimmed —
+  or, the picture inside the frame, nothing does, and what is under the
+  layer shows (as the Neon ring starts).
+- **Frame colour** — the colour of the lines, or of the HUD frame's
+  lights; the frames of two colours have a **Second colour**. **Frame
+  size** — how thick the lines, or the HUD frame's band, are. **Marks**
+  (HUD lines) — the band of marks above and below its outline; 0 for none.
+- **Animation** — the light: **A light going round**, **Two lights going
+  round**, **Two lights, opposite ways**, **Three lights going round**,
+  **Breathing**, or **Still** for none — with its **Light colour**,
+  **Light size** and **Glow**. **Speed** is how fast it all moves; 0
+  stands still.
+
+Another frame picked in its place keeps the settings changed on the first.
+Over the API: `{"SetLayerFrame": {"deck_uuid": "…", "frame": "frame_hud"}}`
+to `POST /api/command` (`"frame": null` takes it away); `GET
+/api/state/registry` lists them under `frames`, and the frame's settings are
+set as any effect's.
+
 ### Masks
 
 Every effect but Crop and Transform — a colour change, a key, a blur — has a
@@ -182,6 +252,49 @@ buttons light up once there is something of theirs to paste.
 Crop, Border and Transform each have a **Reset**, and so has every colour,
 key and other effect. **Reset all** on the Position tab puts crop, border,
 transform, opacity and blend back to how a new layer starts.
+
+### Reset input
+
+A camera or capture layer's right-click menu (a layer row, a deck card or an
+input's deck) has **Reset input**, as vMix's Reset: the device is closed and
+opened again — found afresh, in another USB port too, its formats read
+again — at the format chosen, and the sound taken with it is opened again.
+Its inputs keep its last picture for the moment it takes. The other layers
+on that camera take it too: they share its capture. Use it
+when a capture box's picture or sound has stuck after its source changed.
+
+### What a camera sends
+
+Under **📹 Camera picture**, a camera layer shows its **Signal** as its
+pictures say: size, the rate they come at, pixel format, colour matrix and
+the range they are read in — `1920×1200 · 60.00 fps · yuvs · BT.709 · video
+range` for a Magewell. Two things are pointed out when they do not match:
+
+- **Darks well below video black** in a picture read as video range: the
+  source may send full range (an ATEM's USB picture does), its shadows
+  crushed and whites clipped — **Read as Full** sets Colour range to Full.
+  Check against a black and a white in its picture: some cameras put a
+  little of their dark detail below video black.
+- **Frames at another rate** than the camera was opened for, by more than
+  2% — a source sending 50 fps to a camera opened for 60: **Use 1920×1080
+  50p** (the format of its size nearest the rate its frames come at, when
+  the camera offers one) opens it again at that; or set the source to the
+  camera's rate.
+
+`GET /api/state` has it for each camera layer as `camera_signal`.
+
+### Format
+
+**Format**, under the camera's picture, is the size and rate the camera is
+opened at: **Best**, or any it offers, as when adding it. Changed, the
+camera is closed and opened again at it — its inputs keep its last picture
+for the moment that takes — and every layer on that camera takes it: they
+share its capture. A layer added later on that camera takes it too. It is
+kept with the show; it is not a step **Undo** takes back.
+
+Over the API: `SetCameraMode` with the layer's `deck_uuid` and a `mode` from
+`GET /api/state/cameras` (`{"width":1920,"height":1080,"fps":50}`), or no
+`mode` for its best.
 
 ## The whole channel
 

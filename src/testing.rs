@@ -73,9 +73,38 @@ pub fn headless_config() -> crate::app::AppConfig {
         // hundreds of prompts — which on macOS can also stop unrelated
         // permission requests from being presented at all.
         "--no-camera",
+        // Never PowerPoint itself: a test plays a stand-in (see
+        // `crate::presentation::fake`).
+        "--no-powerpoint",
         "--workspace",
         &temp_workspace(),
     ])
+}
+
+/// The reply to a command sent over `app`'s bus, frames run until it comes:
+/// some come a frame or more later — a clip or picture is made on a thread
+/// of its own and put in on a later frame (see `app::media_adds`).
+///
+/// # Panics
+///
+/// When no reply comes within thirty seconds, or the reply is dropped.
+pub fn reply_of(
+    app: &mut crate::app::VardaApp,
+    mut reply: tokio::sync::oneshot::Receiver<crate::engine::CommandResult>,
+) -> crate::engine::CommandResult {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        app.process_commands();
+        match reply.try_recv() {
+            Ok(result) => return result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                if std::time::Instant::now() < until =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) => panic!("no reply to the command: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]

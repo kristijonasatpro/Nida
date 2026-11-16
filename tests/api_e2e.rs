@@ -21,6 +21,14 @@ mod common;
 /// published once at setup; tests that need to verify state mutations after API
 /// calls should re-read from the shared `engine_state` arc.
 fn setup() -> Option<axum::Router> {
+    setup_seeing().map(|(router, _)| router)
+}
+
+/// As `setup`, with the commands the routes send, in order.
+fn setup_seeing() -> Option<(
+    axum::Router,
+    std::sync::mpsc::Receiver<varda::engine::EngineCommand>,
+)> {
     let gpu = common::headless_gpu()?;
     let config = varda::testing::headless_config();
     // Once a GPU exists, a construction failure is a bug, not a reason to skip.
@@ -39,8 +47,11 @@ fn setup() -> Option<axum::Router> {
     let (proxy_tx, mut proxy_rx) =
         tokio::sync::mpsc::unbounded_channel::<varda::engine::CommandEnvelope>();
 
+    let (seen, sent) = std::sync::mpsc::channel();
     tokio::spawn(async move {
-        while let Some((_cmd, reply_tx)) = proxy_rx.recv().await {
+        while let Some((cmd, reply_tx)) = proxy_rx.recv().await {
+            // Nobody listening (`setup`): the reply is all that matters.
+            let _ = seen.send(cmd);
             if let Some(tx) = reply_tx {
                 let _ = tx.send(CommandResult::Ok);
             }
@@ -52,7 +63,7 @@ fn setup() -> Option<axum::Router> {
         engine_state: state_reader,
     };
     let router = varda::usecases::api::runner::build_router(shared);
-    Some(router)
+    Some((router, sent))
 }
 
 async fn get_json(app: axum::Router, path: &str) -> (StatusCode, serde_json::Value) {
@@ -152,6 +163,244 @@ async fn state_reflects_real_engine() {
     assert_eq!(status, StatusCode::OK);
     let channels = json["mixer"]["channels"].as_array().unwrap();
     assert_eq!(channels.len(), 2);
+}
+
+/// `PUT /api/compositor` sends the engine the switches given, and leaves out
+/// the rest.
+#[tokio::test]
+async fn set_compositor_via_api_sends_the_switches_given() {
+    let Some((app, sent)) = setup_seeing() else {
+        return;
+    };
+    let (status, _) = put_json(
+        app,
+        "/api/compositor",
+        serde_json::json!({"slow_layers_less_often": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sent = sent.try_recv().expect("a command sent");
+    assert!(
+        matches!(
+            sent,
+            varda::engine::EngineCommand::SetCompositor {
+                direct_layers: None,
+                merge_layer_passes: None,
+                slow_layers_less_often: Some(false),
+                skip_blank_channels: None,
+                keep_still_text: None,
+                merge_main_passes: None,
+                pass_main_through: None,
+                keep_still_clips: None,
+                keep_still_inputs: None,
+            }
+        ),
+        "{sent:?}"
+    );
+}
+
+/// `PUT /api/compositor` with leaving blank inputs undrawn alone sends that
+/// switch alone.
+#[tokio::test]
+async fn set_compositor_via_api_sends_skip_blank_channels() {
+    let Some((app, sent)) = setup_seeing() else {
+        return;
+    };
+    let (status, _) = put_json(
+        app,
+        "/api/compositor",
+        serde_json::json!({"skip_blank_channels": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sent = sent.try_recv().expect("a command sent");
+    assert!(
+        matches!(
+            sent,
+            varda::engine::EngineCommand::SetCompositor {
+                direct_layers: None,
+                merge_layer_passes: None,
+                slow_layers_less_often: None,
+                skip_blank_channels: Some(false),
+                keep_still_text: None,
+                merge_main_passes: None,
+                pass_main_through: None,
+                keep_still_clips: None,
+                keep_still_inputs: None,
+            }
+        ),
+        "{sent:?}"
+    );
+}
+
+/// `PUT /api/compositor` with keeping a still lower third's or text's
+/// frame alone sends that switch alone.
+#[tokio::test]
+async fn set_compositor_via_api_sends_keep_still_text() {
+    let Some((app, sent)) = setup_seeing() else {
+        return;
+    };
+    let (status, _) = put_json(
+        app,
+        "/api/compositor",
+        serde_json::json!({"keep_still_text": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sent = sent.try_recv().expect("a command sent");
+    assert!(
+        matches!(
+            sent,
+            varda::engine::EngineCommand::SetCompositor {
+                direct_layers: None,
+                merge_layer_passes: None,
+                slow_layers_less_often: None,
+                skip_blank_channels: None,
+                keep_still_text: Some(false),
+                merge_main_passes: None,
+                pass_main_through: None,
+                keep_still_clips: None,
+                keep_still_inputs: None,
+            }
+        ),
+        "{sent:?}"
+    );
+}
+
+/// `PUT /api/compositor` with drawing Main's layers in one pass alone sends
+/// that switch alone.
+#[tokio::test]
+async fn set_compositor_via_api_sends_merge_main_passes() {
+    let Some((app, sent)) = setup_seeing() else {
+        return;
+    };
+    let (status, _) = put_json(
+        app,
+        "/api/compositor",
+        serde_json::json!({"merge_main_passes": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sent = sent.try_recv().expect("a command sent");
+    assert!(
+        matches!(
+            sent,
+            varda::engine::EngineCommand::SetCompositor {
+                direct_layers: None,
+                merge_layer_passes: None,
+                slow_layers_less_often: None,
+                skip_blank_channels: None,
+                keep_still_text: None,
+                merge_main_passes: Some(false),
+                pass_main_through: None,
+                keep_still_clips: None,
+                keep_still_inputs: None,
+            }
+        ),
+        "{sent:?}"
+    );
+}
+
+/// `PUT /api/compositor` with giving Main out as its one input's picture
+/// alone sends that switch alone.
+#[tokio::test]
+async fn set_compositor_via_api_sends_pass_main_through() {
+    let Some((app, sent)) = setup_seeing() else {
+        return;
+    };
+    let (status, _) = put_json(
+        app,
+        "/api/compositor",
+        serde_json::json!({"pass_main_through": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sent = sent.try_recv().expect("a command sent");
+    assert!(
+        matches!(
+            sent,
+            varda::engine::EngineCommand::SetCompositor {
+                direct_layers: None,
+                merge_layer_passes: None,
+                slow_layers_less_often: None,
+                skip_blank_channels: None,
+                keep_still_text: None,
+                merge_main_passes: None,
+                pass_main_through: Some(false),
+                keep_still_clips: None,
+                keep_still_inputs: None,
+            }
+        ),
+        "{sent:?}"
+    );
+}
+
+/// `PUT /api/compositor` with keeping a clip's frame between two of its
+/// frames alone sends that switch alone.
+#[tokio::test]
+async fn set_compositor_via_api_sends_keep_still_clips() {
+    let Some((app, sent)) = setup_seeing() else {
+        return;
+    };
+    let (status, _) = put_json(
+        app,
+        "/api/compositor",
+        serde_json::json!({"keep_still_clips": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sent = sent.try_recv().expect("a command sent");
+    assert!(
+        matches!(
+            sent,
+            varda::engine::EngineCommand::SetCompositor {
+                direct_layers: None,
+                merge_layer_passes: None,
+                slow_layers_less_often: None,
+                skip_blank_channels: None,
+                keep_still_text: None,
+                merge_main_passes: None,
+                pass_main_through: None,
+                keep_still_clips: Some(false),
+                keep_still_inputs: None,
+            }
+        ),
+        "{sent:?}"
+    );
+}
+
+/// `PUT /api/compositor` with keeping an input's picture while nothing in
+/// it changes alone sends that switch alone.
+#[tokio::test]
+async fn set_compositor_via_api_sends_keep_still_inputs() {
+    let Some((app, sent)) = setup_seeing() else {
+        return;
+    };
+    let (status, _) = put_json(
+        app,
+        "/api/compositor",
+        serde_json::json!({"keep_still_inputs": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sent = sent.try_recv().expect("a command sent");
+    assert!(
+        matches!(
+            sent,
+            varda::engine::EngineCommand::SetCompositor {
+                direct_layers: None,
+                merge_layer_passes: None,
+                slow_layers_less_often: None,
+                skip_blank_channels: None,
+                keep_still_text: None,
+                merge_main_passes: None,
+                pass_main_through: None,
+                keep_still_clips: None,
+                keep_still_inputs: Some(false),
+            }
+        ),
+        "{sent:?}"
+    );
 }
 
 #[tokio::test]

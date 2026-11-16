@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
 async fn dispatch(state: &SharedState, cmd: EngineCommand) -> axum::response::Response {
@@ -18,8 +18,9 @@ async fn dispatch(state: &SharedState, cmd: EngineCommand) -> axum::response::Re
 
 #[utoipa::path(get, path = "/api/record", responses((status = 200, body = crate::record::RecordSnapshot), (status = 503, description = "Engine not yet initialized")), tag = "Record")]
 pub async fn get_record(State(state): State<SharedState>) -> impl IntoResponse {
-    match state.engine_state.read() {
-        Ok(guard) => match guard.as_ref() {
+    // The pointer only, under the lock (see `PublishedState`).
+    match state.engine_state.read().map(|guard| guard.clone()) {
+        Ok(published) => match published {
             Some(engine_state) => Json(engine_state.record.clone()).into_response(),
             None => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -31,7 +32,7 @@ pub async fn get_record(State(state): State<SharedState>) -> impl IntoResponse {
     }
 }
 
-#[utoipa::path(put, path = "/api/record/options", request_body = crate::record::RecordOptions, responses((status = 200, body = CommandResult), (status = 400, description = "Only the source can change while recording")), tag = "Record")]
+#[utoipa::path(put, path = "/api/record/options", request_body = crate::record::RecordOptions, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "Only the source can change while recording")), tag = "Record")]
 pub async fn set_options(
     State(s): State<SharedState>,
     Json(options): Json<crate::record::RecordOptions>,
@@ -39,12 +40,12 @@ pub async fn set_options(
     dispatch(&s, EngineCommand::SetRecordOptions { options }).await
 }
 
-#[utoipa::path(post, path = "/api/record/start", responses((status = 200, body = CommandResult)), tag = "Record")]
+#[utoipa::path(post, path = "/api/record/start", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Record")]
 pub async fn start(State(s): State<SharedState>) -> impl IntoResponse {
     dispatch(&s, EngineCommand::StartRecording).await
 }
 
-#[utoipa::path(post, path = "/api/record/stop", responses((status = 200, body = CommandResult)), tag = "Record")]
+#[utoipa::path(post, path = "/api/record/stop", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Record")]
 pub async fn stop(State(s): State<SharedState>) -> impl IntoResponse {
     dispatch(&s, EngineCommand::StopRecording).await
 }

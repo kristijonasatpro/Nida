@@ -23,7 +23,7 @@ With --sources, it also makes the archive the GPL asks to be offered beside
 the DMG: the exact source Homebrew built each bundled package from (patches
 and resources too), the formula that built it, and its install receipt.
 
-Usage: bundle-macos-libs.py APP --min-macos 15.7.9 [--identifier ID]
+Usage: bundle-macos-libs.py APP --min-macos 15.8.1 [--identifier ID]
          [--origin nida=target/release/varda] [--origin ffmpeg=PATH]
          [--cargo-args "--no-default-features --features screen-capture"]
          [--version 0.9.0 --sources Nida-0.9.0-third-party-source.tar.gz]
@@ -39,6 +39,13 @@ import sys
 import tarfile
 import tempfile
 import urllib.parse
+
+# Who signs: NIDA_SIGN_IDENTITY, a code-signing certificate in the keychain,
+# or ad hoc. macOS keeps what an app may use — camera, microphone, screen —
+# by its signature: ad hoc, each build is a new app and asks again; signed
+# by the same certificate every time, it asks once (the kits built on the
+# mini use "Nida Local Signing").
+SIGN = os.environ.get("NIDA_SIGN_IDENTITY") or "-"
 import urllib.request
 from pathlib import Path
 
@@ -192,12 +199,12 @@ def bundle(app, min_macos, identifier, origins):
 
     # Signed again, inside out: libraries, the other programs, the app.
     for file in sorted(frameworks.iterdir()):
-        run("codesign", "--force", "--sign", "-", str(file))
+        run("codesign", "--force", "--sign", SIGN, str(file))
     main = macos / "nida"
     for program in programs:
         if program != main:
-            run("codesign", "--force", "--sign", "-", str(program))
-    run("codesign", "--force", "--sign", "-", "--identifier", identifier, str(app))
+            run("codesign", "--force", "--sign", SIGN, str(program))
+    run("codesign", "--force", "--sign", SIGN, "--identifier", identifier, str(app))
 
     check(app, min_macos)
     return named
@@ -666,8 +673,13 @@ def sources(packages, in_app, head, installs, tar_path, version):
     env = dict(os.environ, HOMEBREW_CACHE=str(cache), HOMEBREW_NO_AUTO_UPDATE="1",
                HOMEBREW_API_AUTO_UPDATE_SECS="1000000")
     pinned = [f"{TAP[0]}/{TAP[1]}/{name}" for name in sorted(packages)]
+    # Homebrew 7 loads formulae of a tap that is not its own only once the
+    # tap is trusted (`brew trust`); the trust goes again with the tap.
+    trusts = "trust" in run("brew", "commands", "--quiet").split()
     try:
         (tap / "Formula").mkdir(parents=True)
+        if trusts:
+            run("brew", "trust", "--tap", "/".join(TAP), env=env)
         for name, ruby in recipes.items():
             # What only official taps may say: how Homebrew bumps versions,
             # nothing about what a formula builds or fetches.
@@ -678,6 +690,8 @@ def sources(packages, in_app, head, installs, tar_path, version):
         mains = {name: Path(run("brew", "--cache", "--build-from-source", "--formula", f, env=env).strip())
                  for name, f in zip(sorted(packages), pinned)}
     finally:
+        if trusts:
+            subprocess.run(["brew", "untrust", "--tap", "/".join(TAP)], capture_output=True, env=env)
         shutil.rmtree(tap.parent, ignore_errors=True)
 
     for name in sorted(packages):
@@ -760,7 +774,7 @@ def main():
     crates = rust_licences(app, args.cargo_args) if args.cargo_args is not None else 0
     shader_credits(app)
     # The licence files went in after signing: sign the app again over them.
-    run("codesign", "--force", "--sign", "-", "--identifier", args.identifier, str(app))
+    run("codesign", "--force", "--sign", SIGN, "--identifier", args.identifier, str(app))
     run("codesign", "--verify", "--deep", "--strict", str(app))
     if args.sources:
         sources(with_build_interfaces(packages), set(packages), head, installs, args.sources, args.version)

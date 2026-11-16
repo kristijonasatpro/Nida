@@ -20,9 +20,16 @@ on the effect, are exposed as `load_state` in snapshots and generate a notice.
 Worker-local wgpu error scopes keep build validation errors out of the live
 renderer's GPU quarantine mechanism.
 
-This slice covers interactive additions from the library. Show restoration,
-effect paste/duplication, source loading and transition loading keep their
-existing construction paths. It does not preload unused library effects.
+New sources also reserve their identity Crop and Transform effects on these
+workers, exposing controls immediately while the source can already draw.
+If queue admission fails, these two defaults build directly so a busy queue
+does not silently remove framing controls. A blocked-worker regression checks
+source rendering and preservation of edits, bypass and UUIDs on completion.
+
+Layer-mask carriers build synchronously so applying a mask remains atomic;
+there is no unmasked interval while a carrier compiles. Show restoration,
+effect paste/duplication and transition loading keep their existing paths.
+This does not preload unused library effects.
 
 ## Validation
 

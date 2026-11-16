@@ -323,6 +323,8 @@ impl std::fmt::Display for DeckRenderFps {
 // ── DeckSlot ───────────────────────────────────────────────────────
 
 /// A deck slot in a channel with compositing properties
+// Solo, mute, the arrangement's hold and drawn-onto are separate switches.
+#[allow(clippy::struct_excessive_bools)]
 pub struct DeckSlot {
     pub deck: Deck,
     pub opacity: f32,
@@ -340,6 +342,10 @@ pub struct DeckSlot {
     pub render_cost_us: f32,
     /// Frame counter for skip logic
     pub skip_counter: u32,
+    /// The deck's textures (see [`Deck::texture_generation`]) last drawn
+    /// into. Nothing of a covered deck shows, so it is not drawn — but until
+    /// its textures have been, its thumbnail is black.
+    pub drawn: Option<u32>,
     /// GPU-measured render cost in microseconds (EMA, 0 = no data yet)
     pub gpu_render_cost_us: f32,
     /// True while the arrangement is driving this deck, which suspends its
@@ -351,6 +357,15 @@ pub struct DeckSlot {
     /// Recomputed every frame alongside `arrangement_authority`, never
     /// persisted. See /spec/deck-residency.md.
     pub source_demand: SourceDemand,
+    /// Drawn last frame straight onto the composite from its source (see
+    /// `Channel::direct_layers`): its own frame was not drawn then, so it is
+    /// drawn the frame it is not, whatever its own rate.
+    pub drawn_onto: bool,
+    /// Its frame was drawn to be left clear (see `Channel::settle_blank`):
+    /// the frames the deck had rendered when it was
+    /// (`Deck::rendered_frames`). Still that many, the frame is as it was
+    /// left; never drawn so, or drawn since, `None` or another count.
+    pub left_clear: Option<u32>,
 }
 
 impl DeckSlot {
@@ -367,9 +382,12 @@ impl DeckSlot {
             render_fps: DeckRenderFps::default(),
             render_cost_us: 0.0,
             skip_counter: 0,
+            drawn: None,
             gpu_render_cost_us: 0.0,
             arrangement_authority: false,
             source_demand: SourceDemand::default(),
+            drawn_onto: false,
+            left_clear: None,
         }
     }
 
@@ -451,6 +469,10 @@ pub struct Channel {
     /// instead of being taken to Main itself.
     pub overlay: bool,
 
+    /// The colour the operator gave it, to find it at a glance: its tile,
+    /// its switcher buttons. `None` is the colour it gets by its place.
+    pub color: Option<[u8; 3]>,
+
     /// Composite output texture (all decks blended together)
     pub composite_texture: wgpu::Texture,
     pub composite_view: wgpu::TextureView,
@@ -487,9 +509,20 @@ pub struct Channel {
     /// drawn only now and then (a tile, see `Mixer::tile_previews`): handed
     /// to its next draw, so what runs on time keeps real time.
     pub dt_owed: f32,
+    /// Its decks' auto-transitions ticked by the mixer this frame (a channel
+    /// drawn as a tile is ticked every frame, drawn or not): its render does
+    /// not tick them again.
+    pub transitions_ticked: bool,
     /// Decks blended into the composite last frame — fewer than the active
     /// ones when a deck covering the frame hides those below it.
     pub composited_deck_count: usize,
+    /// Covered decks drawn last frame for their thumbnails alone.
+    pub thumbnails_drawn: usize,
+    /// Frames rendered, which says when a covered deck's thumbnail is drawn
+    /// again.
+    thumbnail_clock: u64,
+    /// Whose turn it is among the covered decks, for that.
+    thumbnail_turn: usize,
     /// Decks shown on their own somewhere — alone on Main or a bus, or being
     /// edited — by UUID, set by the mixer each frame. A deck hidden under one
     /// that covers the frame still renders when it is one of these.
@@ -501,10 +534,107 @@ pub struct Channel {
     /// another, none only in parts — set by the mixer each frame for a
     /// channel in a merge, whose layers move and uncover one another.
     pub draw_every_deck: bool,
+    /// Draw the first deck and each following one the blend unit composites
+    /// (Normal, Add, Screen) in one render pass, which loads and stores the
+    /// composite once — not once a deck: ~130 MB a deck at 4K. Off draws each
+    /// in a pass of its own, as before, for comparing the two.
+    pub merge_layer_passes: bool,
+    /// Render passes the last deck compositing took (tests).
+    pub(crate) layer_passes: u32,
+    /// Draw a layer that is only its live source placed — a camera, a
+    /// screen, another channel's picture (a tap), cropped, moved, scaled —
+    /// straight onto the composite from that source, instead of into a frame
+    /// of its own the composite then reads: at 4K ~130 MB written and read
+    /// again a layer each frame (see `PlacedOnto`). Set by the mixer each
+    /// frame; off draws every layer into its own frame, as before, for
+    /// comparing the two.
+    pub direct_layers: bool,
+    /// Keep a lower third or a text standing still — on air or off, shown
+    /// or hidden, nothing of it moving — as it is drawn, as a still image
+    /// is kept (see `Deck::still_frame`). Set by the mixer each frame; off
+    /// draws it every frame, as before, for comparing the two.
+    pub keep_still_text: bool,
+    /// Keep a clip's frame while the clip gives no new one — paused, held
+    /// on its last, or between two of its frames in a show running faster
+    /// (see `Deck::still_frame`). Set by the mixer each frame; off draws it
+    /// every frame, as before, for comparing the two.
+    pub keep_still_clips: bool,
+    /// Keep the picture put together while nothing it is made of changes —
+    /// the same layers, each the same frame of its deck or the same picture
+    /// of its source, placed, levelled and blended the same, no effect on
+    /// the channel, no layer in a transition (see `Kept`): a still picture,
+    /// a clip paused, a window captured that stands still were put
+    /// together again every frame, at 4K some 130 MB read and written a
+    /// layer. And a layer that draws its own frame of a live source whose
+    /// picture is told — another input, a capture — keeps that frame while
+    /// the picture is the same (see `Deck::still_frame`): drawn again every
+    /// frame, it had its input put together again with it. Set by the
+    /// mixer each frame; off does both, as before, for comparing the two.
+    pub keep_still_inputs: bool,
+    /// What the composite holds was put together from, where that can be
+    /// told; `None` otherwise, and it is put together again.
+    kept: Option<Kept>,
+    /// Frames the picture was kept as it was (tests).
+    pub(crate) frames_kept: u32,
+    /// Which picture `composite_view` holds: another number each time it is
+    /// put together anew, made anew (a resize) or changed for the other
+    /// (the tap's swap), no two the same anywhere (`crate::deck::next_picture`).
+    /// The same from one frame to the next, the picture is the same: an
+    /// input that shows this one through a tap, standing still otherwise,
+    /// keeps what it has put together (see `Deck::tapped_picture`).
+    picture: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Decks whose thumbnails the control window drew last frame, by UUID,
+    /// set by the mixer each frame: they draw their own frames, which the
+    /// thumbnails show.
+    pub previewed: Vec<String>,
+    /// Layers drawn straight onto the composite, made the first time one is.
+    placed_onto: Option<crate::renderer::placed_picture::PlacedOnto>,
+    /// Layers drawn straight onto the composite the last time it was put
+    /// together (tests).
+    pub drawn_onto: usize,
     /// Some deck, here or in another channel, shows this channel's picture
     /// (a tap); set by the mixer each frame. It must render then, whatever
     /// its own level on the mix.
     pub tapped: bool,
+    /// Its picture is clear and nothing here shows anything (see
+    /// [`Self::blank`]): drawn so once, the mixer does not draw it again,
+    /// nor layer it on Main, until something here shows. True only while
+    /// `composite_texture` is clear all over: whatever writes the composite
+    /// — a render, a resize, the tap's swap — takes it back.
+    pub(crate) blank_drawn: bool,
+    /// Draw this frame to leave it so: every deck drawn, whatever its rate,
+    /// and the composite cleared. Set by the mixer for the one frame.
+    pub(crate) settle_blank: bool,
+}
+
+/// How often a covered deck — nothing of it showing — is drawn anyway for
+/// its thumbnail: every this many frames, two seconds at 60.
+const THUMBNAIL_FRAMES: u64 = 120;
+
+/// The covered deck — of `covered`, by index — to draw this frame for its
+/// thumbnail: the first whose textures are `undrawn`, else, while the frame
+/// is within budget, the next in `turn`, one every `THUMBNAIL_FRAMES` /
+/// covered frames — so each is drawn again about every `THUMBNAIL_FRAMES`
+/// frames (every `covered.len()`, with more of them), none left out.
+fn thumbnail_pick(
+    covered: &[usize],
+    undrawn: Option<usize>,
+    clock: u64,
+    turn: &mut usize,
+    over_budget: bool,
+) -> Option<usize> {
+    if undrawn.is_some() {
+        return undrawn;
+    }
+    if covered.is_empty() || over_budget {
+        return None;
+    }
+    let every = (THUMBNAIL_FRAMES / covered.len() as u64).max(1);
+    if !clock.is_multiple_of(every) {
+        return None;
+    }
+    *turn = turn.wrapping_add(1);
+    Some(covered[*turn % covered.len()])
 }
 
 /// How a deck takes part in its channel's picture this frame.
@@ -566,6 +696,7 @@ impl Channel {
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
             overlay: false,
+            color: None,
             composite_texture,
             composite_view,
             effect_ping_texture,
@@ -579,12 +710,46 @@ impl Channel {
             render_time_ms: 0.0,
             active_deck_count: 0,
             dt_owed: 0.0,
+            transitions_ticked: false,
             composited_deck_count: 0,
+            thumbnails_drawn: 0,
+            thumbnail_clock: 0,
+            thumbnail_turn: 0,
             shown_alone: Vec::new(),
             draw_visible_parts: true,
             draw_every_deck: false,
+            merge_layer_passes: true,
+            layer_passes: 0,
+            direct_layers: true,
+            keep_still_text: true,
+            keep_still_clips: true,
+            keep_still_inputs: true,
+            kept: None,
+            frames_kept: 0,
+            picture: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::deck::next_picture(),
+            )),
+            previewed: Vec::new(),
+            placed_onto: None,
+            drawn_onto: 0,
             tapped: false,
+            blank_drawn: false,
+            settle_blank: false,
         })
+    }
+
+    /// The number of the picture `composite_view` holds, as it stands at
+    /// any moment (see the field): handed to the decks that show it.
+    pub(crate) fn picture(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.picture)
+    }
+
+    /// From here on `composite_view` holds another picture.
+    fn another_picture(&self) {
+        self.picture.store(
+            crate::deck::next_picture(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Previous frame's composite, or `None` when nothing taps this channel
@@ -617,6 +782,9 @@ impl Channel {
             std::mem::swap(&mut self.composite_texture, &mut tex);
             std::mem::swap(&mut self.composite_view, &mut view);
             self.tap_prev = Some((tex, view));
+            // The other picture now: not the one left clear.
+            self.blank_drawn = false;
+            self.another_picture();
         }
     }
 
@@ -667,6 +835,13 @@ impl Channel {
         self.insert_deck_slot_before(DeckSlot::new(deck), before)
     }
 
+    /// Add a deck at `at` in the stack — 0 the back — or at the end.
+    pub fn insert_deck_at(&mut self, deck: Deck, at: usize) -> usize {
+        let at = at.min(self.decks.len());
+        self.decks.insert(at, DeckSlot::new(deck));
+        at
+    }
+
     /// Get number of decks
     /// Frames this channel has been drawn.
     pub fn frames_drawn(&self) -> u32 {
@@ -701,6 +876,17 @@ impl Channel {
             slot.deck
                 .set_video_suspended(!slot.source_demand.wants_frames());
             if !slot.source_demand.wants_frames() {
+                // A lower third or text sent to buses still comes and goes
+                // there, its deck idle or not.
+                if let Some(lower) = slot.deck.lower_third_mut() {
+                    if lower.has_target_frames() {
+                        lower.tick();
+                    }
+                } else if let Some(text) = slot.deck.text_mut() {
+                    if text.has_target_frames() {
+                        text.tick();
+                    }
+                }
                 continue;
             }
             slot.deck.set_video_output_fps(target_fps);
@@ -717,6 +903,49 @@ impl Channel {
         for slot in &mut self.decks {
             slot.deck.request_video_remap();
         }
+    }
+
+    /// Whether a render draws this deck's own frame: shown here — not
+    /// muted, not left out by a solo, not faded out — or on its own
+    /// somewhere (`shown_alone`).
+    fn draws(&self, slot: &DeckSlot, any_solo: bool) -> bool {
+        self.shown_alone.iter().any(|s| s == slot.deck.uuid())
+            || (!slot.mute && (!any_solo || slot.solo) && slot.opacity > 0.0)
+    }
+
+    /// Nothing here shows anything, nor will until something is told to:
+    /// every deck a render would draw shows nothing (`Deck::shows_nothing` —
+    /// a lower third that is off, a text hidden), no deck is in a timed
+    /// sequence, and no effect of the channel's runs. Its picture is then
+    /// clear, frame after frame: the mixer draws it so once and leaves it
+    /// (see `blank_drawn`). An overlay input holding a lower third is this
+    /// most of a show.
+    pub(crate) fn blank(&self, modulation: &ModulationEngine) -> bool {
+        if self
+            .effects
+            .iter()
+            .any(|effect| effect.enabled && effect.offline().is_none())
+        {
+            return false;
+        }
+        let any_solo = self.decks.iter().any(|slot| slot.solo);
+        self.decks.iter().all(|slot| {
+            !slot.auto_transition.as_ref().is_some_and(|at| at.enabled)
+                && (!self.draws(slot, any_solo) || slot.deck.shows_nothing(modulation))
+        })
+    }
+
+    /// Drawn blank, and left so: its picture is clear (`blank_drawn`), and
+    /// every deck a render would draw now was drawn the frame that left it
+    /// so and not since (`DeckSlot::left_clear`) — a render now would write
+    /// nothing that is not there already. Asked of a channel that is `blank`.
+    pub(crate) fn left_blank(&self) -> bool {
+        let any_solo = self.decks.iter().any(|slot| slot.solo);
+        self.blank_drawn
+            && self.decks.iter().all(|slot| {
+                !self.draws(slot, any_solo)
+                    || slot.left_clear == Some(slot.deck.rendered_frames())
+            })
     }
 
     /// How a deck is composited this frame: `None` when it is not (muted,
@@ -754,6 +983,64 @@ impl Channel {
     /// that covers the whole frame (opaque, Normal, at full opacity), by
     /// index. Transitioning decks are drawn over everything, so they are
     /// never hidden, and neither is a deck shown on its own somewhere.
+    /// The decks drawn straight onto the composite this frame from their
+    /// live source (see [`Self::direct_layers`]), by index: each one's placed
+    /// picture and the source. Only a deck that is that and nothing more
+    /// (`Deck::framing`), drawn at the composite's size, composited in its
+    /// place by the blend unit, whose own frame nothing else reads — not
+    /// shown alone, its thumbnail not on screen, its channel not in a merge.
+    fn direct_draws(
+        &self,
+        any_solo: bool,
+        hidden: &std::collections::HashSet<usize>,
+        modulation: &ModulationEngine,
+        target_fps: u32,
+    ) -> std::collections::HashMap<usize, (crate::renderer::placed_picture::Placed, wgpu::TextureView)>
+    {
+        if !self.direct_layers || self.draw_every_deck {
+            return std::collections::HashMap::new();
+        }
+        let size = (
+            self.composite_texture.width(),
+            self.composite_texture.height(),
+        );
+        self.decks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                // Drawn at a rate of its own, it holds its picture between:
+                // drawn from its live source it would move every frame.
+                let held = matches!(
+                    slot.render_fps,
+                    DeckRenderFps::Fixed(fps) if fps > 0 && target_fps / fps > 1
+                );
+                if held
+                    || hidden.contains(&idx)
+                    || !matches!(
+                        slot.blend_mode,
+                        BlendMode::Normal | BlendMode::Add | BlendMode::Screen
+                    )
+                    || self.composite_role(idx, any_solo) != Some(CompositeRole::Steady)
+                {
+                    return None;
+                }
+                let uuid = slot.deck.uuid();
+                if self.shown_alone.iter().chain(&self.previewed).any(|s| s == uuid) {
+                    return None;
+                }
+                let framing = slot.deck.framing(modulation).ok()?;
+                // Drawn as its own frame would hold it: at the composite's
+                // size, and through the placed pass as the deck draws it —
+                // or a source at the frame's own size (a tap), which the
+                // deck's blit draws texel for pixel.
+                if framing.size != size || !(framing.folded || framing.source_size == size) {
+                    return None;
+                }
+                Some((idx, (framing.placed, framing.source?.clone())))
+            })
+            .collect()
+    }
+
     fn hidden_decks(
         &self,
         deck_indices: &[usize],
@@ -808,11 +1095,17 @@ impl Channel {
                 continue;
             }
             let slot = &self.decks[idx];
-            if !covers.is_empty() && !self.shown_alone.iter().any(|s| s == slot.deck.uuid()) {
+            let uuid = slot.deck.uuid();
+            if !covers.is_empty() && !self.shown_alone.iter().any(|s| s == uuid) {
                 let shows = covers
                     .iter()
                     .fold(vec![all], |left, cover| region::subtract(&left, cover));
-                if shows.len() <= region::MAX_PARTS {
+                // Its thumbnail on screen, a deck partly covered is drawn
+                // whole: what shows of it there is all of it. Covered
+                // altogether, it is drawn for its thumbnail now and then,
+                // as any covered deck is (Codex).
+                let previewed = self.previewed.iter().any(|s| s == uuid);
+                if (shows.is_empty() || !previewed) && shows.len() <= region::MAX_PARTS {
                     parts.insert(idx, shows);
                 }
             }
@@ -873,10 +1166,18 @@ impl Channel {
         }
 
         let render_start = std::time::Instant::now();
+        // Whatever this render writes, the picture is not one left clear —
+        // unless it is drawn to be (`settle_blank`), which the end says.
+        self.blank_drawn = false;
+        let settle = std::mem::take(&mut self.settle_blank);
 
-        // Tick auto-transition state before rendering
-        let bpm = audio_data.bpm.map(f64::from);
-        self.tick_auto_transitions(f64::from(dt), bpm);
+        // Tick auto-transition state before rendering — unless the mixer has
+        // ticked it every frame itself (a channel drawn only now and then, as
+        // a tile: the time it saved up is not one step of a sequence).
+        if !std::mem::take(&mut self.transitions_ticked) {
+            let bpm = audio_data.bpm.map(f64::from);
+            self.tick_auto_transitions(f64::from(dt), bpm);
+        }
 
         // Sort decks by z-index
         let mut deck_indices: Vec<usize> = (0..self.decks.len()).collect();
@@ -922,6 +1223,7 @@ impl Channel {
             self.composite_texture.width(),
             self.composite_texture.height(),
         );
+        let direct = self.direct_draws(any_solo, &hidden, modulation, target_fps);
 
         // Render each deck to its texture (skip muted, non-solo'd, zero-opacity)
         // Done decks still render — they serve as visible background for transitioning decks above.
@@ -930,9 +1232,54 @@ impl Channel {
         let mut cmd_buffers: Vec<wgpu::CommandBuffer> = Vec::new();
         let mut active_count: u32 = 0;
         let mut per_deck_timings: Vec<(String, u128, bool)> = Vec::new(); // (name, us, skipped)
+
+        // Nothing of a covered deck shows, but its thumbnail does: one is
+        // drawn whole each frame at most — pictures dropped under a
+        // full-screen one stayed black in the lists until selected; fifty
+        // dropped at once cost a frame each (see `thumbnail_pick`).
+        let covered: Vec<usize> = (0..self.decks.len())
+            .filter(|&i| hidden.contains(&i) || parts.get(&i).is_some_and(Vec::is_empty))
+            .filter(|&i| !self.decks[i].mute && self.decks[i].opacity > 0.0)
+            .collect();
+        let undrawn = covered.iter().copied().find(|&i| {
+            let slot = &self.decks[i];
+            slot.drawn != Some(slot.deck.texture_generation())
+        });
+        self.thumbnail_clock = self.thumbnail_clock.wrapping_add(1);
+        let thumbnail = thumbnail_pick(
+            &covered,
+            undrawn,
+            self.thumbnail_clock,
+            &mut self.thumbnail_turn,
+            frame_over_budget,
+        );
+        let mut thumbnails = 0;
         for (deck_idx, slot) in self.decks.iter_mut().enumerate() {
+            slot.deck.set_keep_still_text(self.keep_still_text);
+            slot.deck.set_keep_still_clips(self.keep_still_clips);
+            slot.deck.set_keep_still_sources(self.keep_still_inputs);
             let shows = parts.get(&deck_idx);
             if hidden.contains(&deck_idx) || shows.is_some_and(Vec::is_empty) {
+                if thumbnail == Some(deck_idx) {
+                    slot.deck.set_visible(None);
+                    slot.deck.set_render_dt(if target_fps > 0 {
+                        1.0 / target_fps as f32
+                    } else {
+                        dt
+                    });
+                    // Not timed: the budget counts what is drawn every frame.
+                    let param_prefix = slot.deck.param_prefix().to_owned();
+                    slot.deck.render_with_prefix(
+                        context,
+                        audio_data,
+                        modulation,
+                        &param_prefix,
+                        &mut cmd_buffers,
+                        None,
+                    )?;
+                    slot.drawn = Some(slot.deck.texture_generation());
+                    thumbnails += 1;
+                }
                 continue;
             }
             slot.deck.set_visible(shows.map(|rects| {
@@ -948,6 +1295,22 @@ impl Channel {
             if alone || (!slot.mute && (!any_solo || slot.solo) && slot.opacity > 0.0) {
                 active_count += 1;
                 slot.skip_counter += 1;
+                // Drawn onto the composite from its source, below: its own
+                // frame is not drawn.
+                if direct.contains_key(&deck_idx) {
+                    slot.drawn_onto = true;
+                    slot.deck.count_frame_shown();
+                    // Its own frame costs nothing now: what it cost is no
+                    // longer counted against the frame's time (see
+                    // `decks_over_budget`); its draw is the composite's.
+                    slot.render_cost_us = 0.0;
+                    slot.gpu_render_cost_us = 0.0;
+                    per_deck_timings.push((slot.deck.source_name().to_owned(), 0, false));
+                    continue;
+                }
+                // Drawn onto the composite last frame, its own frame is a
+                // frame or more old: drawn now, whatever its rate.
+                let was_onto = std::mem::take(&mut slot.drawn_onto);
 
                 // Determine if this deck should render this frame
                 let should_render = match slot.render_fps {
@@ -965,9 +1328,14 @@ impl Channel {
                     DeckRenderFps::Fixed(_) => true, // Fixed(0) or uncapped target = always render
                 };
                 // A frame showing a part the last render left undrawn cannot
-                // reuse it; nor can a merge, which moves the deck about.
-                let should_render =
-                    should_render || slot.deck.shows_undrawn_part() || self.draw_every_deck;
+                // reuse it; nor can a merge, which moves the deck about; nor
+                // the frame that leaves its channel clear — every deck is
+                // drawn then, to be left so.
+                let should_render = was_onto
+                    || should_render
+                    || slot.deck.shows_undrawn_part()
+                    || self.draw_every_deck
+                    || settle;
 
                 if should_render {
                     // Set the fixed time step so the shader TIME uniform advances
@@ -988,6 +1356,7 @@ impl Channel {
                     };
 
                     let param_prefix = slot.deck.param_prefix().to_owned();
+                    let frames_before = slot.deck.rendered_frames();
                     let t_single = std::time::Instant::now();
                     slot.deck.render_with_prefix(
                         context,
@@ -997,9 +1366,33 @@ impl Channel {
                         &mut cmd_buffers,
                         gpu_timing,
                     )?;
+                    slot.drawn = Some(slot.deck.texture_generation());
+                    // Drawn to be left so (see `settle_blank`).
+                    if settle {
+                        slot.left_clear = Some(slot.deck.rendered_frames());
+                    }
                     let elapsed_us = t_single.elapsed().as_micros() as f32;
-                    // Update EMA render cost (α = 0.2 for responsive adaptation)
-                    if slot.render_cost_us > 0.0 {
+                    // Nothing of it was drawn: the frame it has is this
+                    // frame's (a picture standing still, a clip between two
+                    // of its frames), or it is kept from the GPU after a
+                    // fault — one raised in this very draw too: what it
+                    // encoded was taken back, its time stamps with it,
+                    // though the draw was counted.
+                    let undrawn = slot.deck.gpu_error().is_some()
+                        || slot.deck.rendered_frames() == frames_before;
+                    if undrawn {
+                        // No time stamp was written, so the pair handed out
+                        // is given back — read all the same, it would be
+                        // another draw's time, set against the moment this
+                        // took — and it costs nothing now, as one drawn
+                        // straight onto its input costs nothing.
+                        if let Some(t) = timing.as_mut().filter(|_| gpu_timing.is_some()) {
+                            t.release_last();
+                        }
+                        slot.render_cost_us = 0.0;
+                        slot.gpu_render_cost_us = 0.0;
+                    } else if slot.render_cost_us > 0.0 {
+                        // Update EMA render cost (α = 0.2 for responsive adaptation)
                         slot.render_cost_us = 0.2 * elapsed_us + 0.8 * slot.render_cost_us;
                     } else {
                         slot.render_cost_us = elapsed_us; // first sample
@@ -1013,9 +1406,30 @@ impl Channel {
                     // Skipped — stale texture reuse, compositing still includes this deck
                     per_deck_timings.push((slot.deck.source_name().to_owned(), 0, true));
                 }
+            } else if std::mem::take(&mut slot.drawn_onto) {
+                // Drawn onto the composite from its source and now not shown
+                // here — muted, faded out, left out by a solo — its own frame,
+                // which its thumbnail shows, is drawn once: else it is what it
+                // was before it was drawn onto the composite, or nothing.
+                slot.deck.set_render_dt(if target_fps > 0 {
+                    1.0 / target_fps as f32
+                } else {
+                    dt
+                });
+                let param_prefix = slot.deck.param_prefix().to_owned();
+                slot.deck.render_with_prefix(
+                    context,
+                    audio_data,
+                    modulation,
+                    &param_prefix,
+                    &mut cmd_buffers,
+                    None,
+                )?;
+                slot.drawn = Some(slot.deck.texture_generation());
             }
         }
         self.active_deck_count = active_count;
+        self.thumbnails_drawn = thumbnails;
         let deck_render_us = t_deck_render.elapsed().as_micros();
         // Batch submit all deck renders at once.
         // Drain any prefix command buffers (e.g. video upload copies) and
@@ -1034,6 +1448,8 @@ impl Channel {
         // Collect render info for visible decks, including transition phase
         let deck_composite_info: Vec<DeckCompositeInfo> = deck_indices
             .iter()
+            // Drawn to be left clear: no deck put on the picture.
+            .filter(|_| !settle)
             .filter_map(|&idx| {
                 let transition_progress = match self.composite_role(idx, any_solo)? {
                     CompositeRole::Steady => None,
@@ -1081,6 +1497,63 @@ impl Channel {
             non_transitioning.into_iter().chain(transitioning).collect();
         self.composited_deck_count = ordered.len();
 
+        // What the picture is put together from this frame, where that can
+        // be told (see `Kept`). The same as the composite holds, it is this
+        // frame's picture already: every deck that had to draw has drawn,
+        // above, and nothing is put together again.
+        let recipe = if self.keep_still_inputs
+            && !settle
+            && self.tap_prev.is_none()
+            && !self
+                .effects
+                .iter()
+                .any(|effect| effect.enabled && effect.offline().is_none())
+        {
+            ordered
+                .iter()
+                .map(|info| {
+                    if info.transition_progress.is_some() {
+                        return None;
+                    }
+                    let deck = &self.decks[info.deck_idx].deck;
+                    let picture = match direct.get(&info.deck_idx) {
+                        Some((placed, _)) => KeptPicture::Source {
+                            placed: *placed,
+                            picture: deck.source_picture()?,
+                        },
+                        None => KeptPicture::Frame {
+                            generation: deck.texture_generation(),
+                            drawn: deck.rendered_frames(),
+                        },
+                    };
+                    Some(KeptLayer {
+                        deck: deck.instance(),
+                        blend_mode: info.blend_mode,
+                        opacity: info.opacity.to_bits(),
+                        within: info.within.clone(),
+                        picture,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(|layers| Kept {
+                    merged: self.merge_layer_passes,
+                    layers,
+                })
+        } else {
+            None
+        };
+        if recipe.is_some() && recipe == self.kept {
+            self.frames_kept = self.frames_kept.wrapping_add(1);
+            self.frame_count += 1;
+            let raw_ms = render_start.elapsed().as_secs_f32() * 1000.0;
+            self.render_time_ms = 0.1 * raw_ms + 0.9 * self.render_time_ms;
+            return Ok(());
+        }
+        // Being put together anew: what it holds is not known till it is,
+        // and whatever shows it has another picture to show.
+        self.kept = None;
+        self.another_picture();
+
         // Composite all decks to the composite texture.
         // Per-draw params are written into a persistent ring buffer (one slot per
         // deck) so all command buffers can batch into a single queue.submit().
@@ -1104,8 +1577,41 @@ impl Channel {
         let mut bind_group_count: u32 = 0;
         let mut copy_encode_us: u128 = 0;
         let mut bind_group_us: u128 = 0;
+        // Draws waiting to go out together in one render pass (see
+        // `merge_layer_passes`), and whether that pass clears the composite.
+        let mut layers = LayerBatch::default();
+        let size = (width, height);
+        if !direct.is_empty() {
+            let onto = self.placed_onto.get_or_insert_with(|| {
+                crate::renderer::placed_picture::PlacedOnto::new(
+                    &context.device,
+                    context.compositing_format,
+                )
+            });
+            onto.ensure_slots(&context.device, direct.len());
+        }
+        let mut onto_slot = 0;
 
         for (i, info) in ordered.iter().enumerate() {
+            // A step that reads the composite so far (a snapshot for a shader
+            // blend or transition) or draws it in a pass of its own: the
+            // draws waiting go out first, in order.
+            let blend_unit = info.transition_progress.is_none()
+                && (i == 0
+                    || matches!(
+                        info.blend_mode,
+                        BlendMode::Normal | BlendMode::Add | BlendMode::Screen
+                    ));
+            if !blend_unit || !self.merge_layer_passes {
+                layers.flush(
+                    context,
+                    &self.composite_view,
+                    [&self.blit_pipeline, &self.add_pipeline, &self.screen_pipeline],
+                    self.placed_onto.as_ref(),
+                    size,
+                    &mut composite_cmds,
+                );
+            }
             let slot = &mut self.decks[info.deck_idx];
 
             // Check if this deck is transitioning with a shader
@@ -1265,6 +1771,43 @@ impl Channel {
                 continue;
             }
 
+            // A layer that is only its source placed, drawn onto the
+            // composite from that source (see `direct_layers`).
+            if let (Some((placed, source)), Some(onto)) =
+                (direct.get(&info.deck_idx), self.placed_onto.as_ref())
+            {
+                use crate::renderer::placed_picture::Onto;
+                let (blend, how) = match info.blend_mode {
+                    _ if i == 0 => (BlendMode::Normal, Onto::Normal),
+                    BlendMode::Add => (BlendMode::Add, Onto::Add),
+                    BlendMode::Screen => (BlendMode::Screen, Onto::Screen),
+                    _ => (BlendMode::Normal, Onto::Normal),
+                };
+                let draw = onto.prepare(
+                    &context.device,
+                    &context.queue,
+                    onto_slot,
+                    placed,
+                    source,
+                    size,
+                    info.within.as_deref(),
+                    info.opacity,
+                    how,
+                );
+                onto_slot += 1;
+                bind_group_count += 1;
+                // The first deck over a clear, as below.
+                if i == 0 {
+                    layers.clears = true;
+                }
+                layers.draws.push(LayerDraw {
+                    blend,
+                    how: LayerHow::Onto(draw),
+                    within: None,
+                });
+                continue;
+            }
+
             // Normal compositing
             if i == 0 {
                 // First deck: simple blit with per-draw params
@@ -1284,38 +1827,14 @@ impl Channel {
                 );
                 bind_group_us += t_bg.elapsed().as_micros();
                 bind_group_count += 1;
-                let mut encoder =
-                    context
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("Channel Composite Encoder (first)"),
-                        });
-                {
-                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("Channel Composite Pass (first)"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &self.composite_view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-                    // Where it does not show, a deck over it covers the
-                    // clear.
-                    self.blit_pipeline.render_at_slot_within(
-                        &mut render_pass,
-                        &bind_group,
-                        info.within.as_deref(),
-                    );
-                }
-                composite_cmds.push(encoder.finish());
+                // Over a clear; where it does not show, a deck over it
+                // covers the clear.
+                layers.clears = true;
+                layers.draws.push(LayerDraw {
+                    blend: BlendMode::Normal,
+                    how: LayerHow::Blit(bind_group),
+                    within: info.within.clone(),
+                });
             } else if let Some(pipeline) = match info.blend_mode {
                 BlendMode::Normal => Some(&self.blit_pipeline),
                 BlendMode::Add => Some(&self.add_pipeline),
@@ -1340,14 +1859,15 @@ impl Channel {
                     pipeline.write_params_slot_premultiplying(&context.queue, i, info.opacity);
                 }
                 bind_group_count += 1;
-                composite_cmds.push(pipeline.blend_onto_within(
-                    &context.device,
-                    &slot.deck.texture_view,
-                    &self.composite_view,
-                    i,
-                    "Channel Composite (blend unit)",
-                    info.within.as_deref(),
-                ));
+                layers.draws.push(LayerDraw {
+                    blend: info.blend_mode,
+                    how: LayerHow::Blit(pipeline.create_ring_bind_group(
+                        &context.device,
+                        &slot.deck.texture_view,
+                        i,
+                    )),
+                    within: info.within.clone(),
+                });
             } else {
                 // Subsequent decks: snapshot composite → ping, blend src + ping → composite
                 let t_copy = std::time::Instant::now();
@@ -1422,6 +1942,16 @@ impl Channel {
                 composite_cmds.push(encoder.finish());
             }
         }
+        layers.flush(
+            context,
+            &self.composite_view,
+            [&self.blit_pipeline, &self.add_pipeline, &self.screen_pipeline],
+            self.placed_onto.as_ref(),
+            size,
+            &mut composite_cmds,
+        );
+        self.layer_passes = layers.passes;
+        self.drawn_onto = onto_slot;
         let composite_encode_us = t_composite.elapsed().as_micros();
 
         // Batch submit all channel composite commands at once
@@ -1536,6 +2066,10 @@ impl Channel {
         let effects_us = t_effects.elapsed().as_micros();
 
         self.frame_count += 1;
+        // Drawn to be left clear, it is: every deck drawn, nothing put
+        // together (see `blank_drawn`).
+        self.blank_drawn = settle;
+        self.kept = recipe;
 
         // Update smoothed render time (EMA, α = 0.1)
         let raw_ms = render_start.elapsed().as_secs_f32() * 1000.0;
@@ -1586,6 +2120,10 @@ impl Channel {
 
     /// Resize the channel's textures
     pub fn resize(&mut self, context: &GpuContext, width: u32, height: u32) {
+        // A new picture, not yet drawn: not one left clear.
+        self.blank_drawn = false;
+        self.kept = None;
+        self.another_picture();
         self.composite_texture = context.create_compositing_texture(width, height);
         self.composite_view = self
             .composite_texture
@@ -1848,6 +2386,151 @@ pub(crate) fn decks_over_budget(estimated_us: impl IntoIterator<Item = f32>, tar
     #[allow(clippy::cast_precision_loss)]
     let frame_us = 1_000_000.0 / target_fps as f32;
     estimated_us.into_iter().sum::<f32>() > frame_us
+}
+
+/// What a channel's picture was last put together from (see
+/// `Channel::keep_still_inputs`): its layers from the bottom up, each as it
+/// was drawn onto the composite. The same again, the composite holds this
+/// frame's picture already.
+#[derive(Debug, Clone, PartialEq)]
+struct Kept {
+    /// In one pass, or one a layer (`merge_layer_passes`): the same picture
+    /// either way, put together again all the same when the switch is
+    /// turned, for comparing the two.
+    merged: bool,
+    layers: Vec<KeptLayer>,
+}
+
+/// One layer of a channel's picture as it was last put together (see
+/// `Kept`).
+#[derive(Debug, Clone, PartialEq)]
+struct KeptLayer {
+    /// Which deck (`Deck::instance`: not its UUID, which a deck made anew
+    /// in its place has too).
+    deck: u64,
+    blend_mode: BlendMode,
+    /// Its level, as bits.
+    opacity: u32,
+    /// The parts of the composite it shows in, when not all of it.
+    within: Option<Vec<Pixels>>,
+    picture: KeptPicture,
+}
+
+/// What a layer was drawn from (see `KeptLayer`).
+#[derive(Debug, Clone, PartialEq)]
+enum KeptPicture {
+    /// Its deck's own frame: which textures (`Deck::texture_generation`)
+    /// and which drawing of them (`Deck::rendered_frames` — one more each
+    /// time the deck draws; a deck keeping its frame draws nothing).
+    Frame { generation: u32, drawn: u32 },
+    /// Its live source, placed (see `Channel::direct_layers`): where, and
+    /// which picture the source held (`Deck::source_picture`).
+    Source {
+        placed: crate::renderer::placed_picture::Placed,
+        picture: u64,
+    },
+}
+
+/// One deck drawn onto a channel's composite by the GPU's blend unit: the
+/// pipeline of `blend` (Normal for the first deck, whatever its mode), its
+/// params already written to its own ring slot, through `within`.
+struct LayerDraw {
+    blend: BlendMode,
+    how: LayerHow,
+    within: Option<Vec<Pixels>>,
+}
+
+/// How a layer is drawn onto the composite: its own frame through the
+/// composite's pipeline for its blend, or its source placed (see
+/// `Channel::direct_layers`).
+enum LayerHow {
+    Blit(wgpu::BindGroup),
+    Onto(crate::renderer::placed_picture::OntoDraw),
+}
+
+/// Draws waiting to go out in one render pass, in order; `clears` when the
+/// first is the channel's first deck, drawn over a transparent clear.
+#[derive(Default)]
+struct LayerBatch {
+    draws: Vec<LayerDraw>,
+    clears: bool,
+    /// Passes drawn so far.
+    passes: u32,
+}
+
+impl LayerBatch {
+    /// Draw what is waiting onto `target` (of `size`) in one render pass —
+    /// the Normal, Add and Screen pipelines in that order in `pipelines` —
+    /// and start afresh. The composite is loaded, or cleared for a batch
+    /// that starts with the first deck, and stored once at the end.
+    fn flush(
+        &mut self,
+        context: &GpuContext,
+        target: &wgpu::TextureView,
+        pipelines: [&BlitPipeline; 3],
+        onto: Option<&crate::renderer::placed_picture::PlacedOnto>,
+        size: (u32, u32),
+        cmds: &mut Vec<wgpu::CommandBuffer>,
+    ) {
+        if self.draws.is_empty() {
+            return;
+        }
+        let (label, load) = if self.clears {
+            (
+                "Channel Composite Pass (first)",
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            )
+        } else {
+            ("Channel Composite (blend unit)", wgpu::LoadOp::Load)
+        };
+        let mut encoder = context
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            for draw in &self.draws {
+                match &draw.how {
+                    LayerHow::Blit(bind_group) => {
+                        let pipeline = match draw.blend {
+                            BlendMode::Add => pipelines[1],
+                            BlendMode::Screen => pipelines[2],
+                            _ => pipelines[0],
+                        };
+                        pipeline.render_at_slot_within_shared(
+                            &mut pass,
+                            bind_group,
+                            draw.within.as_deref(),
+                            size,
+                        );
+                    }
+                    LayerHow::Onto(placed) => {
+                        if let Some(onto) = onto {
+                            onto.draw(&mut pass, placed);
+                        }
+                    }
+                }
+            }
+        }
+        cmds.push(encoder.finish());
+        self.draws.clear();
+        self.clears = false;
+        self.passes += 1;
+    }
 }
 
 #[cfg(test)]

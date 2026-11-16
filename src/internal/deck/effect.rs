@@ -164,6 +164,28 @@ impl Effect {
             );
         }
 
+        // A filter that makes its targets anew each frame has its passes
+        // drawn in their turn (see `apply_passes`): a uniform buffer for each.
+        let in_turn = num_passes > 0
+            && passes
+                .iter()
+                .all(|pass| pass.target.is_none() || !pass.persistent.unwrap_or(false));
+        let pass_uniform_buffers = if in_turn {
+            passes
+                .iter()
+                .map(|_| {
+                    context.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Effect Pass Uniforms"),
+                        size: std::mem::size_of::<ISFUniforms>() as u64,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Initialize parameters from shader inputs
         let inputs = shader.metadata.inputs.as_deref().unwrap_or(&[]);
         let params = ShaderParams::from_inputs(inputs);
@@ -188,10 +210,13 @@ impl Effect {
             preprocessor_textures,
             phase_accumulators: [0.0; 4],
             phase_inputs_config,
+            pass_uniform_buffers,
             runs: 0,
             pointwise,
             mask: None,
             mask_pass: None,
+            show_path: None,
+            offline: None,
         })
     }
 
@@ -217,11 +242,52 @@ impl Effect {
             preprocessor_textures: Vec::new(),
             phase_accumulators: [0.0; 4],
             phase_inputs_config,
+            pass_uniform_buffers: Vec::new(),
             runs: 0,
             pointwise,
             mask: None,
             mask_pass: None,
+            show_path: None,
+            offline: None,
         }
+    }
+
+    /// Why its shader could not be loaded, when the effect is kept offline.
+    pub fn offline(&self) -> Option<&str> {
+        self.offline.as_deref()
+    }
+
+    /// Kept offline, as saved, for `why`.
+    pub(crate) fn set_offline(&mut self, why: String) {
+        self.offline = Some(why);
+    }
+
+    /// The effect's name: its shader's, or — kept offline — the missing
+    /// shader file's.
+    pub fn name(&self) -> String {
+        match (&self.offline, &self.show_path) {
+            (Some(_), Some(path)) => std::path::Path::new(path).file_stem().map_or_else(
+                || self.shader.name(),
+                |stem| stem.to_string_lossy().into_owned(),
+            ),
+            _ => self.shader.name(),
+        }
+    }
+
+    /// The shader's path as a save writes it: the file this effect was made
+    /// from, or the show's own when this copy's shader of the same name
+    /// stood in for a file gone — written back as it was, so the Nida that
+    /// has the file there still finds it.
+    pub fn saved_path(&self) -> &str {
+        self.show_path
+            .as_deref()
+            .or(self.shader.file_path.as_deref())
+            .unwrap_or_default()
+    }
+
+    /// Keep `path`, the show's, as the one [`Effect::saved_path`] gives.
+    pub(crate) fn keep_show_path(&mut self, path: String) {
+        self.show_path = Some(path);
     }
 
     /// Frames this effect has been run on a deck. Neutral crop and transform
@@ -316,6 +382,18 @@ impl Effect {
     /// the whole layer.
     pub(crate) fn is_idle_layer_mask(&self) -> bool {
         self.mask.is_none() && self.shader.name() == crate::engine::value::mask::LAYER_MASK_EFFECT
+    }
+
+    /// Run on a clear frame it leaves it clear: a layer's mask with no
+    /// shape, which does nothing, or a crop or Transform that only places
+    /// the picture (`is_static_framing`) — but a crop with its border on,
+    /// which draws the border whatever is in the frame.
+    pub(crate) fn keeps_clear(&self, modulation: &crate::modulation::ModulationEngine) -> bool {
+        if self.is_idle_layer_mask() {
+            return true;
+        }
+        let bordered = self.shader.name() == "crop" && self.switch("border_mode") != Some(false);
+        self.is_static_framing(modulation) && !bordered
     }
 
     fn switch(&self, name: &str) -> Option<bool> {
@@ -738,7 +816,17 @@ impl Effect {
                 for _iter in 0..iterations {
                     let mut pass_uniforms = *uniforms;
                     pass_uniforms.pass_index = i32::try_from(pass_idx).unwrap_or(i32::MAX);
-                    pipeline.update_uniforms(&context.queue, &pass_uniforms);
+                    // Drawn in its turn, a pass has its uniforms in a buffer
+                    // of its own (see below).
+                    let own_uniforms = self.pass_uniform_buffers.get(pass_idx);
+                    match own_uniforms {
+                        Some(buffer) => context.queue.write_buffer(
+                            buffer,
+                            0,
+                            bytemuck::cast_slice(&[pass_uniforms]),
+                        ),
+                        None => pipeline.update_uniforms(&context.queue, &pass_uniforms),
+                    }
 
                     let pass_buffer_views: Vec<&wgpu::TextureView> = self
                         .passes
@@ -747,8 +835,9 @@ impl Effect {
                         .map(super::PassBuffer::read_view)
                         .collect();
 
-                    let bind_group = pipeline.create_bind_group(
+                    let bind_group = pipeline.create_bind_group_with_uniforms(
                         &context.device,
+                        own_uniforms.unwrap_or(&pipeline.uniform_buffer),
                         Some(input_view),
                         &pass_buffer_views,
                         &imported_views,
@@ -792,10 +881,23 @@ impl Effect {
                         render_pass.draw(0..3, 0..1);
                     }
 
-                    // Multipass intermediate passes MUST submit immediately —
-                    // update_uniforms() overwrites the same buffer each iteration,
-                    // so batching would cause all passes to see the last pass's data.
-                    context.submit(std::iter::once(encoder.finish()));
+                    if own_uniforms.is_some() {
+                        // In its turn, after what was drawn before it this
+                        // frame — the picture it reads. Submitted at once
+                        // (as below) it would run before that: it would read
+                        // the input as the frame before left it, which, the
+                        // deck's two textures taking turns, is the picture
+                        // of the effect after this one.
+                        cmd_buffers.push(encoder.finish());
+                    } else {
+                        // With the pipeline's one uniform buffer, a pass MUST
+                        // be submitted at once — update_uniforms() overwrites
+                        // that buffer each iteration, so batching would cause
+                        // all passes to see the last pass's data. A filter
+                        // with a target kept from frame to frame is left so,
+                        // reading its input as the frame before left it.
+                        context.submit(std::iter::once(encoder.finish()));
+                    }
 
                     if let Some(pb) = self.pass_buffers.get_mut(&target_name) {
                         pb.swap();

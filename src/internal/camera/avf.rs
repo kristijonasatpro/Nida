@@ -19,7 +19,7 @@
 #![allow(unsafe_code)]
 
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -55,7 +55,7 @@ use yuvutils_rs::{
     YuvPackedImage, YuvRange, YuvStandardMatrix,
 };
 
-use super::{Frame, Rate, Sink};
+use super::{Frame, Rate, SignalSeen, Sink};
 use crate::engine::value::camera::{CameraColour, CameraMatrix, CameraRange};
 
 const fn fourcc(code: [u8; 4]) -> u32 {
@@ -187,6 +187,17 @@ fn discovered() -> Retained<NSArray<AVCaptureDevice>> {
     }
 }
 
+/// The unique IDs of the cameras plugged in now called `name`.
+pub fn unique_ids_named(name: &str) -> Vec<String> {
+    autoreleasepool(|_| {
+        discovered()
+            .iter()
+            .filter(|device| unsafe { device.localizedName() }.to_string() == name)
+            .map(|device| unsafe { device.uniqueID() }.to_string())
+            .collect()
+    })
+}
+
 /// The rates a device plugged in offers now, found by its unique ID; `None`
 /// when it is not plugged in.
 pub fn rates_now(unique_id: &str) -> Option<Vec<Rate>> {
@@ -293,7 +304,13 @@ struct OutputIvars {
     name: String,
     /// Whether its frames have been described in the log.
     described: AtomicBool,
+    /// Frames come, counted to look at the signal every [`SIGNAL_EVERY`].
+    looks: AtomicU32,
 }
+
+/// Every how many frames the signal is looked at (see `Sink::note_signal`):
+/// four times a second at 60 fps, a sample of 2304 pixels each time.
+const SIGNAL_EVERY: u32 = 15;
 
 define_class!(
     // SAFETY:
@@ -329,6 +346,13 @@ define_class!(
                 }
             }
             let sink = &ivars.sink;
+            if ivars.looks.fetch_add(1, Ordering::Relaxed).is_multiple_of(SIGNAL_EVERY) {
+                if let Some(image) = unsafe { sample_buffer.image_buffer() } {
+                    if let Some((seen, sampled)) = unsafe { seen_signal(&image, colour) } {
+                        sink.note_signal(seen, sampled);
+                    }
+                }
+            }
             let mut data = sink.buffer();
             let fresh = data.capacity() == 0;
             match unsafe { picture(sample_buffer, &mut data, colour) } {
@@ -360,6 +384,7 @@ impl FrameOutput {
             sink,
             name,
             described: AtomicBool::new(false),
+            looks: AtomicU32::new(0),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -629,7 +654,7 @@ unsafe fn read_locked(
 /// A plane's rows without the padding at the end of each: the plane itself
 /// when it has none. yuvutils-rs refuses a padded chroma plane, or a padded
 /// 4:2:2 picture, outright; `None` for rows longer than their stride.
-fn tight(plane: &[u8], stride: usize, row: usize, rows: usize) -> Option<Cow<'_, [u8]>> {
+pub(super) fn tight(plane: &[u8], stride: usize, row: usize, rows: usize) -> Option<Cow<'_, [u8]>> {
     if row > stride || plane.len() < stride * rows {
         return None;
     }
@@ -699,6 +724,78 @@ unsafe fn describe(buffer: &CVPixelBuffer, colour: CameraColour) -> String {
         "'{}' {width}×{height}, matrix {matrix:?} ({matrix_note}), read as {range}",
         String::from_utf8_lossy(&code.to_be_bytes()),
     )
+}
+
+/// What a frame says of the signal (see `Sink::note_signal`): its size,
+/// pixel format, matrix and range as read with `colour`, and how much of its
+/// brightness is below video black (see `below_black`).
+///
+/// # Safety
+///
+/// `buffer` must be a live pixel buffer.
+unsafe fn seen_signal(
+    buffer: &CVPixelBuffer,
+    colour: CameraColour,
+) -> Option<(SignalSeen, (u32, u32))> {
+    let lock = CVPixelBufferLockFlags::ReadOnly;
+    if unsafe { CVPixelBufferLockBaseAddress(buffer, lock) } != 0 {
+        return None;
+    }
+    // Everything below reaches the unlock: no `?` past here.
+    let code = CVPixelBufferGetPixelFormatType(buffer);
+    let (width, height) = (
+        CVPixelBufferGetWidth(buffer),
+        CVPixelBufferGetHeight(buffer),
+    );
+    let said = unsafe { matrix_of(buffer, u32::try_from(height).unwrap_or(0)) };
+    let matrix = matrix_label(super::picture_matrix(colour, said));
+    let (base, stride, layout) = match code {
+        NV12_VIDEO | NV12_FULL => (
+            CVPixelBufferGetBaseAddressOfPlane(buffer, 0),
+            CVPixelBufferGetBytesPerRowOfPlane(buffer, 0),
+            Some((0, 1)),
+        ),
+        UYVY => (
+            CVPixelBufferGetBaseAddress(buffer),
+            CVPixelBufferGetBytesPerRow(buffer),
+            Some((1, 2)),
+        ),
+        YUYV => (
+            CVPixelBufferGetBaseAddress(buffer),
+            CVPixelBufferGetBytesPerRow(buffer),
+            Some((0, 2)),
+        ),
+        _ => (std::ptr::null_mut(), 0, None),
+    };
+    let sampled = match layout {
+        Some(layout) if !base.is_null() => {
+            let bytes = unsafe { std::slice::from_raw_parts(base.cast::<u8>(), stride * height) };
+            super::below_black(bytes, stride, (width, height), layout)
+        }
+        _ => (0, 0),
+    };
+    unsafe { CVPixelBufferUnlockBaseAddress(buffer, lock) };
+    let full_range = layout
+        .map(|_| super::picture_range(colour, range_said(code)) == yuvutils_rs::YuvRange::Full);
+    let seen = SignalSeen {
+        width: u32::try_from(width).unwrap_or(0),
+        height: u32::try_from(height).unwrap_or(0),
+        format: String::from_utf8_lossy(&code.to_be_bytes()).into_owned(),
+        matrix,
+        full_range,
+        ..SignalSeen::default()
+    };
+    Some((seen, sampled))
+}
+
+/// A colour matrix as the operator knows it: `BT.709`.
+pub(super) fn matrix_label(matrix: YuvStandardMatrix) -> String {
+    match matrix {
+        YuvStandardMatrix::Bt601 => "BT.601".into(),
+        YuvStandardMatrix::Bt709 => "BT.709".into(),
+        YuvStandardMatrix::Bt2020 => "BT.2020".into(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// The colour matrix a frame is tagged with — or, untagged, the one its

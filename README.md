@@ -55,7 +55,8 @@ vMix and Resolume are trademarks of their owners. Nida is not affiliated with or
   - the call's sound comes straight from the app;
   - the guest's camera and slides come in as window inputs;
   - Nida's programme goes back to the call as a camera — through the free NDI Virtual Input, OBS's Virtual Camera or a USB capture device;
-  - a bus made for the call (a mix-minus: everything but the call) keeps it from hearing itself.
+  - a bus made for the call (a mix-minus: everything but the call) keeps it from hearing itself;
+  - with the guest on the room's speakers, that bus can take the room's echo out of each microphone (WebRTC's echo canceller, on Apple silicon): a voice comes out much cleaner than steady music or noise.
 
 ### Running the show
 
@@ -64,6 +65,11 @@ vMix and Resolume are trademarks of their owners. Nida is not affiliated with or
 - **Playlists**, and a clip transport under Preview with in and out points.
 - **Screen layouts**: **Broadcast** (Preview and Program over the input tiles), **Classic** and **VJ**. Drag any panel and save your own.
 - **Long days**: the Mac and its displays stay awake while Nida runs, and a show's files are written in the background, so the outputs never wait for the disk.
+
+### Remote control, and an AI agent to set up the show
+
+- **Everything over HTTP.** Inputs and their layers, Main and its transitions, the buses and screens, the audio mixer, STREAM, REC, timers and the rundown all have HTTP routes, and `POST /api/command` takes any of the engine's commands; a WebSocket sends the state as it changes. A control panel, a script or another program can run the show. The [HTTP API chapter](docs/13-api.md) has the recipes for a show, and every route is described in [docs/api/openapi.json](docs/api/openapi.json) (OpenAPI 3), and at `http://localhost:8080/api/docs` while Nida runs.
+- **Your AI agent can set up a show.** Tell an AI agent that can run commands (a coding agent, say) what the event needs, and point it at the API: it can add the inputs, buses, stream destinations, recording and rundown, and save the show. See [Setting up a show with an AI agent](docs/13-api.md#setting-up-a-show-with-an-ai-agent). The API has no password, so keep Nida on a network you trust.
 
 ### Smooth, low-latency output
 
@@ -92,7 +98,7 @@ Or scan it with your phone:
 
 ### Download (macOS)
 
-[Releases](https://github.com/kristijonasatpro/Nida/releases) have `Nida-<version>-macOS-arm64.dmg`, for Macs with Apple silicon and macOS Sequoia 15.7.9 or later. Open it and drag Nida to Applications. Nida is not signed by Apple, so the first time macOS says it cannot check it: open **System Settings → Privacy & Security** and click **Open Anyway** next to Nida — once. For NDI, install the free NDI runtime from [ndi.video](https://ndi.video) — the NDI SDK for Apple, or `brew install --cask libndi`.
+[Releases](https://github.com/kristijonasatpro/Nida/releases) have `Nida-<version>-macOS-arm64.dmg`, for Macs with Apple silicon and macOS Sequoia 15.8.1 or later. Open it and drag Nida to Applications. Nida is not signed by Apple, so the first time macOS says it cannot check it: open **System Settings → Privacy & Security** and click **Open Anyway** next to Nida, once for each version you download; macOS may then ask again for the camera, microphone and screen recording. Nida's log is `~/Library/Logs/Nida/nida.log`. For NDI, install the free NDI runtime from [ndi.video](https://ndi.video) — the NDI SDK for Apple, or `brew install --cask libndi`.
 
 The app carries its own FFmpeg (built with GPL parts), so the download as a whole is under the GPL version 3; the licences of everything inside are in `Nida.app/Contents/Resources/licenses`, and the exact source of every library inside is `Nida-<version>-third-party-source.tar.gz` beside the DMG. Nida's source stays MIT. A few of Varda's shaders, adapted from works whose licence is non-commercial or not stated, are left out of the download (they are in the source). `scripts/ci/build-macos.sh` makes the DMG, and the release workflow runs it for every `v*` tag.
 
@@ -220,7 +226,7 @@ varda --shader-dir /media/usb/shaders --shader-dir /shows/festival-2026/shaders
 
 ## HTTP API
 
-The GUI and HTTP API are co-equal consumers of the same engine. The API runs on port 8080 (configurable with `--port`) alongside the GUI, or standalone in headless mode (`--headless`). Interactive docs at `/api/docs`, OpenAPI spec at `/api/openapi.json`. WebSocket at `/api/ws` streams state via JSON Patch (RFC 6902) deltas.
+The GUI and HTTP API are co-equal consumers of the same engine. The API runs on port 8080 (configurable with `--port`) alongside the GUI, or standalone in headless mode (`--headless`). Interactive docs at `/api/docs`, OpenAPI spec at `/api/openapi.json` (also in this repository as [docs/api/openapi.json](docs/api/openapi.json)). WebSocket at `/api/ws` streams state via JSON Patch (RFC 6902) deltas. The [manual's chapter](docs/13-api.md) has recipes for running a show and for setting one up with an AI agent.
 
 
 ## Contributing

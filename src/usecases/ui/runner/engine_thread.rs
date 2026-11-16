@@ -311,6 +311,8 @@ pub(super) struct EngineThread {
     /// Where the thread is in its loop (see [`Phase`]).
     phase: Arc<std::sync::atomic::AtomicU8>,
     started: Instant,
+    /// The monitors' frames, copied each engine frame (see `monitor_frames`).
+    monitors: super::monitor_frames::MonitorShare,
 }
 
 impl EngineThread {
@@ -327,12 +329,14 @@ impl EngineThread {
         let baton = Arc::new(Baton::new(app));
         let signal = Arc::new(Signal::default());
         let phase = Arc::new(std::sync::atomic::AtomicU8::new(Phase::Waiting as u8));
-        let engine = EngineLoop::new(
+        let monitors = super::monitor_frames::MonitorShare::default();
+        let mut engine = EngineLoop::new(
             Arc::clone(&signal),
             Arc::clone(&phase),
             gpu,
             Box::new(wake_ui),
         );
+        engine.monitors = Some(Arc::clone(&monitors));
         let handle = {
             let baton = Arc::clone(&baton);
             std::thread::Builder::new()
@@ -347,7 +351,13 @@ impl EngineThread {
             handle: Some(handle),
             phase,
             started: Instant::now(),
+            monitors,
         }
+    }
+
+    /// The monitors' frames, as the engine copies them.
+    pub(super) fn monitors(&self) -> &super::monitor_frames::MonitorShare {
+        &self.monitors
     }
 
     /// Whether the thread is still in its first seconds: loading the show and
@@ -474,6 +484,12 @@ struct EngineLoop {
     /// engine last said.
     frames_in_flight: u32,
     publish_counter: u32,
+    /// The target rate the display clock was last looked at for.
+    clock_checked_for: u32,
+    /// Where the monitors' frames go, when a control window shows them.
+    monitors: Option<super::monitor_frames::MonitorShare>,
+    /// Copies them, small (made on the first frame).
+    monitor_encoder: Option<super::preview::PreviewEncoder>,
 }
 
 impl EngineLoop {
@@ -499,7 +515,37 @@ impl EngineLoop {
             gpu_done: VecDeque::new(),
             frames_in_flight: 1,
             publish_counter: 0,
+            clock_checked_for: 0,
+            monitors: None,
+            monitor_encoder: None,
         }
+    }
+
+    /// Copy this frame's monitored pictures — the master, the cued input —
+    /// for the control window to step through (see `monitor_frames`).
+    fn capture_monitors(&mut self, varda: &VardaApp) {
+        let Some(share) = &self.monitors else {
+            return;
+        };
+        let context = varda.gpu_context();
+        let encoder = self
+            .monitor_encoder
+            .get_or_insert_with(|| super::preview::PreviewEncoder::new(&context.device));
+        let mixer = varda.mixer_ref();
+        super::monitor_frames::capture(share, encoder, context, |channel| match channel {
+            None => {
+                let texture = mixer.composite_texture();
+                Some((mixer.composite_view(), texture.width(), texture.height()))
+            }
+            Some(uuid) => {
+                let ch = mixer.channels().iter().find(|c| c.uuid() == uuid)?;
+                Some((
+                    &ch.composite_view,
+                    ch.composite_texture.width(),
+                    ch.composite_texture.height(),
+                ))
+            }
+        });
     }
 
     fn run(mut self, baton: &Baton) {
@@ -612,6 +658,10 @@ impl EngineLoop {
     /// inputs, the mixer, every output, and now and then the state.
     fn frame(&mut self, varda: &mut VardaApp, baton_wait: Duration, gpu_wait: Duration) {
         let target_fps = varda.target_fps();
+        // A screen's mode changed: its clock looked at again now.
+        if varda.take_clock_recheck() {
+            self.clock_checked = None;
+        }
         if target_fps > 0 {
             self.check_display_clock(varda, target_fps);
             self.report_frame_clock(varda, target_fps);
@@ -627,6 +677,7 @@ impl EngineLoop {
         // On the timer — no screen refresh a whole number of which makes
         // the rate, 50 fps on a 120 Hz screen, say — the frame's slot on the
         // timer's even cadence stands in for the refresh.
+        let clock_driven = refresh.is_some();
         let refresh_at = match refresh {
             Some(clock) => self.woken_by.take().or_else(|| clock.last_tick()),
             None if target_fps > 0 => self.cadence_anchor,
@@ -659,10 +710,24 @@ impl EngineLoop {
         varda.advance_frame_state();
         varda.frame_part("prepare", t.elapsed());
 
+        // The rate frames really come at now: the screen's refreshes, a
+        // frame every so many, while its clock runs — for a while after the
+        // target rate changes, the old one still (see `check_display_clock`)
+        // — else the target. Recordings and streams count frames by it.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // A frame rate.
+        let cadence = refresh
+            .filter(|clock| clock.every() > 0)
+            .map_or(target_fps, |clock| {
+                (clock.refresh_hz() / f64::from(clock.every())).round() as u32
+            });
+        varda.set_frame_cadence(Some(cadence));
         self.set_phase(Phase::Mixer);
         let t = Instant::now();
         varda.render_mixer_frame();
         varda.frame_part("mixer", t.elapsed());
+        let t = Instant::now();
+        self.capture_monitors(varda);
+        varda.frame_part("monitors", t.elapsed());
 
         self.set_phase(Phase::Outputs);
         let t = Instant::now();
@@ -691,7 +756,13 @@ impl EngineLoop {
         });
         self.gpu_done.push_back(done);
         self.frames_in_flight = varda.frames_in_flight();
-        self.cadence_anchor = next_cadence_anchor(self.cadence_anchor, target_fps, Instant::now());
+        // A frame a screen's refresh started sets the timer's cadence from
+        // its own time: advanced at the target rate meanwhile, the anchor ran
+        // ahead while the screen still gave the old rate, and the first
+        // timer frame after the clock was replaced was stamped up to a second
+        // and a half in the future — a recording padded the gap (Codex).
+        let base = if clock_driven { refresh_at } else { self.cadence_anchor };
+        self.cadence_anchor = next_cadence_anchor(base, target_fps, Instant::now());
     }
 
     /// Follow the refresh of the screen the show goes to — the first output
@@ -701,13 +772,11 @@ impl EngineLoop {
     /// are as the main thread last saw them.
     fn check_display_clock(&mut self, varda: &VardaApp, target_fps: u32) {
         let now = Instant::now();
-        if self
-            .clock_checked
-            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(2))
-        {
+        if !clock_check_due(self.clock_checked, self.clock_checked_for, target_fps, now) {
             return;
         }
         self.clock_checked = Some(now);
+        self.clock_checked_for = target_fps;
         let monitor = varda.clock_monitor().or_else(|| varda.control_monitor());
         let wanted = monitor.and_then(|m| {
             let hz = f64::from(m.refresh_rate_millihertz()?) / 1000.0;
@@ -756,6 +825,16 @@ impl EngineLoop {
     }
 }
 
+/// Whether the display clock is to be looked at again: every two seconds
+/// (an output opened, or moved to another screen) — and at once when the
+/// target rate has changed since. Kept on the old clock for up to two
+/// seconds, frames came at the old rate while each stepped the show's time
+/// by the new one: motion at double or half speed for a second and more on
+/// every output, and recordings with it (Max5 on the Studio, 60 to 30).
+fn clock_check_due(checked: Option<Instant>, checked_for: u32, target_fps: u32, now: Instant) -> bool {
+    checked_for != target_fps || checked.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(2))
+}
+
 /// The ideal start of the next frame on the timer, after a frame that ended
 /// `now`: one frame's time on from the last, keeping an even cadence — or
 /// at once, after a frame that overran its slot, and from there on.
@@ -773,6 +852,11 @@ pub(super) fn next_cadence_anchor(
     }
     let budget = Duration::from_secs_f64(1.0 / f64::from(target_fps));
     Some(match anchor {
+        // Far ahead of now — frames came faster than the target meanwhile,
+        // not a frame that ended early: from now, not from the future. (A
+        // backstop: frames a screen's refresh started set it from their own
+        // time.)
+        Some(anchor) if anchor > now + budget * 12 => now + budget,
         Some(anchor) if anchor + budget > now => anchor + budget,
         Some(_) => now,
         None => now + budget,
@@ -1013,6 +1097,17 @@ mod tests {
     }
 
     #[test]
+    fn a_new_target_rate_looks_at_the_display_clock_at_once() {
+        let now = Instant::now();
+        let just = now.checked_sub(Duration::from_millis(100)).unwrap();
+        assert!(!clock_check_due(Some(just), 60, 60, now), "looked at just now");
+        assert!(clock_check_due(Some(just), 60, 30, now), "the target changed: at once");
+        let long = now.checked_sub(Duration::from_secs(3)).unwrap();
+        assert!(clock_check_due(Some(long), 60, 60, now), "every two seconds");
+        assert!(clock_check_due(None, 0, 60, now), "never looked at");
+    }
+
+    #[test]
     fn the_cadence_keeps_even_steps_and_restarts_after_an_overrun() {
         let now = Instant::now();
         let budget = Duration::from_secs_f64(1.0 / 60.0);
@@ -1025,5 +1120,8 @@ mod tests {
         );
         let stale = now.checked_sub(budget * 10).unwrap();
         assert_eq!(next_cadence_anchor(Some(stale), 60, now), Some(now));
+        // Run far ahead (frames came faster than the target): from now.
+        let future = now + budget * 90;
+        assert_eq!(next_cadence_anchor(Some(future), 60, now), Some(now + budget));
     }
 }

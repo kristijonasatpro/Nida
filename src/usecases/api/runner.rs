@@ -4,12 +4,12 @@
 //! For windowed operation this runs alongside `UIRunner`.
 //! For headless operation this is the primary consumer.
 
-use crate::engine::{CommandEnvelope, EngineState};
+use crate::engine::CommandEnvelope;
 use crate::usecases::api::routes;
 use crate::usecases::api::SharedState;
 
 use axum::Router;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tower_http::cors::{Any, CorsLayer};
 use utoipa::OpenApi;
@@ -26,6 +26,7 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::system::set_resolution, routes::system::set_resolution_auto,
         routes::system::set_domemaster_resolution,
         routes::system::set_target_fps, routes::system::start_perf_profile,
+        routes::system::set_compositor,
         routes::system::set_clock_preference,
         routes::system::set_manual_bpm, routes::system::save_workspace,
         routes::system::load_workspace,
@@ -36,7 +37,8 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::system::scan_depth_sensors, routes::decks::add_depth_sensor_deck,
         // Screen Capture
         routes::system::scan_capture_targets, routes::system::request_screen_capture_permission,
-        routes::decks::add_screen_capture_deck, routes::library::screen_capture,
+        routes::decks::add_screen_capture_deck, routes::decks::set_screen_capture_target,
+        routes::library::screen_capture,
         routes::state::screen_capture,
         // Program / channel tap
         routes::decks::add_tap_deck, routes::decks::set_tap_source,
@@ -58,6 +60,7 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::channels::add_input,
         routes::channels::set_opacity, routes::channels::set_blend_mode,
         routes::channels::rename, routes::channels::move_channel,
+        routes::channels::set_color,
         // Decks
         routes::decks::add_shader_deck, routes::decks::remove_deck,
         routes::decks::set_opacity, routes::decks::set_blend_mode, routes::decks::set_layer_mask,
@@ -215,6 +218,10 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::audio_mix::create_bus, routes::audio_mix::delete_bus,
         routes::audio_mix::rename_bus, routes::audio_mix::set_bus_gain,
         routes::audio_mix::set_bus_mute, routes::audio_mix::set_bus_delay,
+        routes::audio_mix::set_bus_live, routes::audio_mix::set_bus_insert,
+        routes::audio_mix::set_bus_pre_fader, routes::audio_mix::set_bus_echo_room,
+        routes::audio_mix::set_bus_insert_bypass, routes::audio_mix::open_bus_insert,
+        routes::audio_mix::close_bus_insert,
         routes::audio_mix::set_bus_device, routes::audio_mix::create_input,
         routes::audio_mix::create_app_sound,
         routes::audio_mix::delete_input, routes::audio_mix::set_source_gain,
@@ -225,6 +232,13 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::audio_mix::rescan_devices, routes::audio_mix::set_solo,
         routes::audio_mix::set_monitor_device, routes::audio_mix::set_monitor_gain,
         routes::audio_mix::set_monitor_listen,
+        routes::audio_mix::set_source_low_cut, routes::audio_mix::set_source_leveler,
+        routes::audio_mix::set_source_gate, routes::audio_mix::set_source_eq,
+        routes::audio_mix::set_source_de_esser,
+        routes::audio_mix::set_source_compressor, routes::audio_mix::apply_speech_preset,
+        routes::audio_mix::set_bus_compressor, routes::audio_mix::set_bus_limiter,
+        routes::audio_mix::reset_bus_meters, routes::audio_mix::reset_source_meters,
+        routes::audio_mix::reset_bus_loudness,
         // Main
         routes::main_program::set_mode, routes::main_program::take,
         routes::main_program::set_fade_time, routes::main_program::set_transition,
@@ -235,7 +249,9 @@ use utoipa_swagger_ui::SwaggerUi;
         routes::rundown::duplicate_step, routes::rundown::rename_step,
         routes::rundown::move_step, routes::rundown::set_screen,
         routes::rundown::set_main, routes::rundown::set_overlay,
-        routes::rundown::set_play, routes::rundown::set_then,
+        routes::rundown::set_play, routes::rundown::set_until_next,
+        routes::rundown::set_timer, routes::rundown::set_then,
+        routes::rundown::set_at,
         routes::rundown::capture_step, routes::rundown::take_step,
         routes::rundown::go, routes::rundown::set_next,
         routes::rundown::hold, routes::rundown::set_fade_time,
@@ -437,6 +453,10 @@ pub fn build_router(shared: SharedState) -> Router {
             axum::routing::put(routes::channels::rename),
         )
         .route(
+            "/api/channels/{channel_uuid}/color",
+            axum::routing::put(routes::channels::set_color),
+        )
+        .route(
             "/api/channels/{channel_uuid}/move",
             axum::routing::put(routes::channels::move_channel),
         )
@@ -468,6 +488,10 @@ pub fn build_router(shared: SharedState) -> Router {
         .route(
             "/api/channels/{channel_uuid}/decks/screen",
             axum::routing::post(routes::decks::add_screen_capture_deck),
+        )
+        .route(
+            "/api/decks/{deck_uuid}/screen/target",
+            axum::routing::put(routes::decks::set_screen_capture_target),
         )
         .route(
             "/api/channels/{channel_uuid}/decks/tap",
@@ -1299,6 +1323,31 @@ pub fn build_router(shared: SharedState) -> Router {
             axum::routing::put(routes::audio_mix::set_bus_delay),
         )
         .route(
+            "/api/audio-buses/{bus_uuid}/live",
+            axum::routing::put(routes::audio_mix::set_bus_live),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/pre-fader",
+            axum::routing::put(routes::audio_mix::set_bus_pre_fader),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/echo-room",
+            axum::routing::put(routes::audio_mix::set_bus_echo_room),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/insert",
+            axum::routing::put(routes::audio_mix::set_bus_insert),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/insert/bypass",
+            axum::routing::put(routes::audio_mix::set_bus_insert_bypass),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/insert/window",
+            axum::routing::post(routes::audio_mix::open_bus_insert)
+                .delete(routes::audio_mix::close_bus_insert),
+        )
+        .route(
             "/api/audio-buses/{bus_uuid}/device",
             axum::routing::put(routes::audio_mix::set_bus_device),
         )
@@ -1341,6 +1390,54 @@ pub fn build_router(shared: SharedState) -> Router {
         .route(
             "/api/audio-sources/{source_uuid}/delay",
             axum::routing::put(routes::audio_mix::set_source_delay),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/low-cut",
+            axum::routing::put(routes::audio_mix::set_source_low_cut),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/gate",
+            axum::routing::put(routes::audio_mix::set_source_gate),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/eq",
+            axum::routing::put(routes::audio_mix::set_source_eq),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/de-esser",
+            axum::routing::put(routes::audio_mix::set_source_de_esser),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/leveler",
+            axum::routing::put(routes::audio_mix::set_source_leveler),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/compressor",
+            axum::routing::put(routes::audio_mix::set_source_compressor),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/speech-preset",
+            axum::routing::post(routes::audio_mix::apply_speech_preset),
+        )
+        .route(
+            "/api/audio-sources/{source_uuid}/meters/reset",
+            axum::routing::post(routes::audio_mix::reset_source_meters),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/compressor",
+            axum::routing::put(routes::audio_mix::set_bus_compressor),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/limiter",
+            axum::routing::put(routes::audio_mix::set_bus_limiter),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/meters/reset",
+            axum::routing::post(routes::audio_mix::reset_bus_meters),
+        )
+        .route(
+            "/api/audio-buses/{bus_uuid}/loudness/reset",
+            axum::routing::post(routes::audio_mix::reset_bus_loudness),
         )
         .route(
             "/api/outputs/{output_uuid}/audio-bus",
@@ -1429,8 +1526,20 @@ pub fn build_router(shared: SharedState) -> Router {
             axum::routing::put(routes::rundown::set_play),
         )
         .route(
+            "/api/rundown/steps/{step_uuid}/plays/{deck_uuid}/until-next",
+            axum::routing::put(routes::rundown::set_until_next),
+        )
+        .route(
+            "/api/rundown/steps/{step_uuid}/plays/{deck_uuid}/timer",
+            axum::routing::put(routes::rundown::set_timer),
+        )
+        .route(
             "/api/rundown/steps/{step_uuid}/then",
             axum::routing::put(routes::rundown::set_then),
+        )
+        .route(
+            "/api/rundown/steps/{step_uuid}/at",
+            axum::routing::put(routes::rundown::set_at),
         )
         .route(
             "/api/rundown/steps/{step_uuid}/capture",
@@ -1584,6 +1693,10 @@ pub fn build_router(shared: SharedState) -> Router {
             axum::routing::post(routes::system::start_perf_profile),
         )
         .route(
+            "/api/compositor",
+            axum::routing::put(routes::system::set_compositor),
+        )
+        .route(
             "/api/clock/preference",
             axum::routing::put(routes::system::set_clock_preference),
         )
@@ -1716,7 +1829,7 @@ impl ApiServerHandle {
 pub fn start(
     port: u16,
     command_tx: mpsc::UnboundedSender<CommandEnvelope>,
-    engine_state: Arc<RwLock<Option<EngineState>>>,
+    engine_state: Arc<crate::engine::types::PublishedState>,
 ) -> Option<ApiServerHandle> {
     let shared = SharedState {
         command_tx,
@@ -1786,6 +1899,21 @@ pub fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::RwLock;
+
+    /// What the window's notice that the API is off goes by (see the UI
+    /// runner's `finish_init`).
+    #[test]
+    fn a_port_in_use_leaves_the_api_off() {
+        let taken = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let started = start(
+            port,
+            mpsc::unbounded_channel().0,
+            Arc::new(RwLock::new(None)),
+        );
+        assert!(started.is_none(), "port {port} is taken");
+    }
 
     #[test]
     fn test_build_router_creates_valid_router() {

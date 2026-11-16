@@ -241,18 +241,25 @@ pub(super) fn render_gpu_popover(ui: &mut egui::Ui, data: &UIData) {
 
         let util = data.gpu_utilization;
         ui.label(egui::RichText::new("Utilization").strong().small());
-        let util_color = if util < 50.0 {
-            egui::Color32::from_rgb(100, 220, 100)
-        } else if util < 80.0 {
-            egui::Color32::from_rgb(220, 200, 60)
-        } else {
-            egui::Color32::from_rgb(220, 60, 60)
-        };
+        // Coloured as the figure in the top bar is: by whether the show
+        // keeps up, not by how busy the GPU is.
+        let util_color = super::monitoring::gpu_color(
+            util,
+            data.gpu_utilization_measured,
+            data.fps,
+            data.late_frames,
+            data.target_fps,
+        );
         ui.label(
             egui::RichText::new(format!("{util:.0}%"))
                 .color(util_color)
                 .monospace(),
-        );
+        )
+        .on_hover_text(if data.gpu_utilization_measured {
+            super::monitoring::GPU_NOT_A_LIMIT
+        } else {
+            super::monitoring::GPU_ESTIMATED
+        });
         ui.end_row();
     });
 }
@@ -731,6 +738,11 @@ pub(super) fn render_resolution_popover(ui: &mut egui::Ui, data: &UIData, action
     let current_w = data.render_width;
     let current_h = data.render_height;
 
+    if let Some(hint) = &data.render_hint {
+        render_hint(ui, hint, actions);
+        ui.separator();
+    }
+
     if ui
         .radio(data.render_auto, "Auto — match the output screens")
         .on_hover_text(
@@ -838,6 +850,49 @@ pub(super) fn render_resolution_popover(ui: &mut egui::Ui, data: &UIData, action
     );
 }
 
+/// A smaller size that is enough for every output, said and offered.
+fn render_hint(ui: &mut egui::Ui, hint: &crate::app::RenderHint, actions: &mut UIActions) {
+    let (w, h) = hint.size;
+    ui.label(
+        egui::RichText::new(format!("⬇ {w}×{h} is enough"))
+            .strong()
+            .color(egui::Color32::from_rgb(230, 170, 60)),
+    );
+    ui.label(
+        egui::RichText::new(format!(
+            "No screen, feed or recording with a size of its own shows more than \
+             {w}×{h} of the picture: at that size it is as sharp on them, with \
+             {}% of the pixels to draw.",
+            hint.pixels_pct
+        ))
+        .small(),
+    );
+    ui.label(
+        egui::RichText::new(
+            "A layer zoomed in shows less of its picture, and effects set in \
+             pixels — blur, pixelate — keep their pixels: check those after.",
+        )
+        .small()
+        .weak(),
+    );
+    if !hint.following.is_empty() {
+        ui.label(
+            egui::RichText::new(format!(
+                "{} follow the show's size: they would be {w}×{h} too, with less detail.",
+                hint.following.join(", ")
+            ))
+            .small()
+            .weak(),
+        );
+    }
+    if ui.button(format!("Use {w}×{h}")).clicked() {
+        actions.commands.push(EngineCommand::SetRenderResolution {
+            width: w,
+            height: h,
+        });
+    }
+}
+
 /// Render the target FPS popover (shown when clicking FPS target in the top bar).
 pub(super) fn render_target_fps_popover(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
     ui.set_min_width(180.0);
@@ -873,6 +928,28 @@ pub(super) fn render_target_fps_popover(ui: &mut egui::Ui, data: &UIData, action
     render_latency(ui, data, actions);
     #[cfg(target_os = "macos")]
     render_control_screen_rate(ui, data, actions);
+    #[cfg(target_os = "macos")]
+    render_night_shift_off(ui, data, actions);
+}
+
+/// Whether Nida keeps Night Shift off while an output is on a screen (see
+/// `crate::night_shift`).
+#[cfg(target_os = "macos")]
+fn render_night_shift_off(ui: &mut egui::Ui, data: &UIData, actions: &mut UIActions) {
+    let mut on = data.night_shift_off;
+    let changed = ui
+        .checkbox(&mut on, "Keep Night Shift off for the outputs")
+        .on_hover_text(
+            "macOS warms every screen with Night Shift, the outputs too, and lets no app \
+             leave one out. While an output is on a screen Nida turns it off (this screen too) \
+             and turns it back on afterwards, if it is due on then.",
+        )
+        .changed();
+    if changed {
+        actions
+            .commands
+            .push(EngineCommand::SetNightShiftOff { on });
+    }
 }
 
 /// Whether Nida sets the control window's screen to the show's rate while it

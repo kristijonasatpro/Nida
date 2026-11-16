@@ -92,6 +92,8 @@ pub enum Remedy {
     LowerLive,
     /// Nida is lowering it.
     Adapting,
+    /// Nida lowers it if the upload goes on falling behind: it has not yet.
+    WillAdapt,
     /// Nida has lowered it as far as it goes.
     AtFloor,
 }
@@ -104,12 +106,18 @@ impl Remedy {
                 "If it goes on, lower the Video bit rate in the Stream window: it changes while live."
             }
             Self::Adapting => "Nida is lowering the bit rate to fit.",
+            Self::WillAdapt => "Nida lowers the bit rate if it goes on.",
             Self::AtFloor => {
                 "The bit rate is as low as it goes, and the upload still cannot carry it."
             }
         }
     }
 }
+
+/// Bytes waiting to go below which a destination sending slower than real
+/// time is starved by the encoder, not held back by its upload: an upload
+/// too slow keeps the network buffer filling.
+const STARVED_BELOW: u64 = 256 * 1024;
 
 /// The encoder's output, sent on to every destination.
 pub struct Fanout {
@@ -313,8 +321,9 @@ impl Fanout {
             .iter()
             .map(|slot| {
                 slot.as_ref().map_or_else(DestinationStatus::off, |r| {
-                    let mut status = r.state.status(remedy);
-                    status.backlog_bytes = r.queued.load(Ordering::Relaxed) as u64;
+                    let queued = r.queued.load(Ordering::Relaxed) as u64;
+                    let mut status = r.state.status(remedy, queued);
+                    status.backlog_bytes = queued;
                     status
                 })
             })
@@ -689,7 +698,8 @@ impl RunnerState {
         counted
     }
 
-    fn status(&self, remedy: Remedy) -> DestinationStatus {
+    /// The destination's state, `queued` bytes waiting to be sent to it.
+    fn status(&self, remedy: Remedy, queued: u64) -> DestinationStatus {
         let now = Instant::now();
         let p = self.lock();
         let window: Vec<&(Instant, i64, u64)> = p
@@ -732,6 +742,20 @@ impl RunnerState {
                 DestinationState::Struggling,
                 Some(format!(
                     "The upload is too slow — parts of the stream are lost. {}",
+                    remedy.text()
+                )),
+            ),
+            // Nothing waiting to go: perhaps the stream itself comes too
+            // slowly — its encoder behind, which a lower bit rate would not
+            // help (a 4K60 recording beside a 4K60 stream, 2026-10-29) —
+            // perhaps the upload, its buffers outside Nida's queue: both
+            // said.
+            Phase::Running if slow && queued < STARVED_BELOW => (
+                DestinationState::Struggling,
+                Some(format!(
+                    "Sending slower than real time, with nothing waiting to go — the encoder \
+                     may not be keeping up (the Mac's media engine busy?), or the upload is \
+                     slow. {}",
                     remedy.text()
                 )),
             ),
@@ -830,7 +854,8 @@ fn supervise(
             attempt += 1;
             pause
         };
-        let line = outcome.map_or_else(|| "The sender stopped".into(), Stopped::into_line);
+        let line =
+            target.redact(&outcome.map_or_else(|| "The sender stopped".into(), Stopped::into_line));
         {
             let mut p = state.lock();
             p.phase = Phase::Waiting;
@@ -1188,7 +1213,7 @@ mod tests {
             .map(|i| (1000 + i * 500, 375_000 * i as u64))
             .collect();
         recent(&state, &reports);
-        let s = state.status(Remedy::LowerByHand);
+        let s = state.status(Remedy::LowerByHand, 0);
         assert_eq!(s.state, DestinationState::Live);
         assert!((s.kbps - 6000.0).abs() < 50.0, "{}", s.kbps);
     }
@@ -1199,9 +1224,31 @@ mod tests {
         // Stream time moves 250 ms per half second of wall time.
         let reports: Vec<(i64, u64)> = (0..7).map(|i| (1000 + i * 250, 100 * i as u64)).collect();
         recent(&state, &reports);
-        let s = state.status(Remedy::LowerByHand);
+        let s = state.status(Remedy::LowerByHand, 0);
         assert_eq!(s.state, DestinationState::Struggling);
         assert!(s.message.unwrap().contains("slower"));
+    }
+
+    /// Sending slower than real time with nothing waiting to go may be the
+    /// encoder behind — said beside the upload; with the network buffer
+    /// filling, it is the upload.
+    #[test]
+    fn slower_than_real_time_says_whether_the_encoder_or_the_upload() {
+        let state = RunnerState::default();
+        let reports: Vec<(i64, u64)> = (0..7).map(|i| (1000 + i * 250, 100 * i as u64)).collect();
+        recent(&state, &reports);
+        let starved = state.status(Remedy::Adapting, 0);
+        assert_eq!(starved.state, DestinationState::Struggling);
+        let said = starved.message.unwrap();
+        assert!(
+            said.contains("encoder") && !said.contains("upload is too slow"),
+            "{said}"
+        );
+        let held = state
+            .status(Remedy::Adapting, 4 * 1024 * 1024)
+            .message
+            .unwrap();
+        assert!(held.contains("upload is too slow"), "{held}");
     }
 
     #[test]
@@ -1211,7 +1258,7 @@ mod tests {
         progress(&state, 0, 1000, 0, base);
         progress(&state, 500, 1500, 10, base);
         assert_eq!(
-            state.status(Remedy::LowerByHand).state,
+            state.status(Remedy::LowerByHand, 0).state,
             DestinationState::Struggling,
             "no progress for 9 s"
         );
@@ -1221,10 +1268,13 @@ mod tests {
             &fresh,
             &[(1000, 0), (1500, 1), (2000, 2), (2500, 3), (3000, 4)],
         );
-        assert_eq!(fresh.status(Remedy::LowerByHand).state, DestinationState::Live);
+        assert_eq!(
+            fresh.status(Remedy::LowerByHand, 0).state,
+            DestinationState::Live
+        );
         fresh.note_drop(4096, 8_000_000);
         fresh.note_drop(1000, 8_000_000);
-        let s = fresh.status(Remedy::LowerByHand);
+        let s = fresh.status(Remedy::LowerByHand, 0);
         assert_eq!(s.state, DestinationState::Struggling);
         assert_eq!(s.dropped, 2);
         assert_eq!(s.dropped_bytes, 5096, "their bytes counted too");
@@ -1238,10 +1288,16 @@ mod tests {
     #[test]
     fn nothing_sent_yet_is_connecting_and_drops_then_do_not_count() {
         let state = RunnerState::default();
-        assert_eq!(state.status(Remedy::LowerByHand).state, DestinationState::Connecting);
+        assert_eq!(
+            state.status(Remedy::LowerByHand, 0).state,
+            DestinationState::Connecting
+        );
         state.note_drop(4096, 8_000_000);
         assert_eq!(
-            (state.status(Remedy::LowerByHand).dropped, state.status(Remedy::LowerByHand).dropped_bytes),
+            (
+                state.status(Remedy::LowerByHand, 0).dropped,
+                state.status(Remedy::LowerByHand, 0).dropped_bytes
+            ),
             (0, 0),
             "not the upload's fault before it is up"
         );
@@ -1413,6 +1469,7 @@ mod tests {
             url: "rtmp://127.0.0.1:1935/live/key".into(),
             args: Vec::new(),
             display: "rtmp://127.0.0.1:1935/live".into(),
+            secrets: Vec::new(),
         };
         let args: Vec<String> = sender_command(&target, 3_000_000)
             .get_args()
@@ -1610,12 +1667,17 @@ mod tests {
         let state = RunnerState::default();
         recent(&state, &[(1000, 0), (1500, 1), (2000, 2), (2500, 3), (3000, 4)]);
         state.note_drop(4096, 8_000_000);
-        let said = |remedy| state.status(remedy).message.unwrap_or_default();
+        let said = |remedy| state.status(remedy, 0).message.unwrap_or_default();
         assert!(said(Remedy::LowerByHand).contains("stop, lower the Video bit rate"));
         assert!(said(Remedy::LowerLive).contains("changes while live"));
         assert!(!said(Remedy::LowerLive).contains("stop"), "no need to stop");
         assert!(said(Remedy::Adapting).contains("Nida is lowering the bit rate"));
         assert!(said(Remedy::AtFloor).contains("as low as it goes"));
+        assert!(said(Remedy::WillAdapt).contains("if it goes on"));
+        assert!(
+            !said(Remedy::WillAdapt).contains("is lowering"),
+            "not lowering yet"
+        );
     }
 
     /// The AAC sequence headers in an FLV file, in order: each one's
@@ -1651,6 +1713,7 @@ mod tests {
             url: flv.to_string_lossy().into_owned(),
             args: Vec::new(),
             display: String::new(),
+            secrets: Vec::new(),
         };
         let sent = sender_command(&target, 1_000_000)
             .stdin(std::fs::File::open(&ts).unwrap())

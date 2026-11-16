@@ -237,6 +237,7 @@ pub fn enumerate() -> Result<Vec<CaptureTargetInfo>, CaptureError> {
             width: u32::from(monitor.width),
             height: u32::from(monitor.height),
             is_varda: false,
+            uuid: None,
         });
     }
 
@@ -274,6 +275,7 @@ pub fn enumerate() -> Result<Vec<CaptureTargetInfo>, CaptureError> {
             width: u32::from(geom.width),
             height: u32::from(geom.height),
             is_varda: window_pid(&conn, window) == Some(our_pid),
+            uuid: None,
         });
     }
 

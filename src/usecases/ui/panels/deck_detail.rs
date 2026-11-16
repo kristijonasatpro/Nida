@@ -5,7 +5,7 @@ use super::super::{
     PointCloudUI, ScreenCaptureUI, ShaderParamsUI, TapUI, UIActions, UIData,
 };
 use super::utils::{
-    channel_color, format_time, render_collapsed_column, render_effect_drag_ghost,
+    format_time, render_collapsed_column, render_effect_drag_ghost,
     render_effect_drag_handle, render_effect_drop_zone_row,
 };
 use crate::channel::DeckRenderFps;
@@ -348,8 +348,119 @@ fn render_tap_controls(
     );
 }
 
-/// Screen-capture controls for the selected deck: rate, crop, cursor, and
-/// (for display targets) Varda-window exclusion. See spec/screen-capture.md.
+/// What a screen capture layer captures, and the screens and windows it can
+/// be pointed at instead — or its own, picked again: a display a show saved
+/// by its name alone goes by that name, whichever screen has it, until then.
+fn render_capture_target(
+    ui: &mut egui::Ui,
+    deck: &DeckUIInfo,
+    capture: &ScreenCaptureUI,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
+    ui.horizontal(|ui| {
+        ui.label(if capture.is_display {
+            "Screen:"
+        } else {
+            "Window:"
+        });
+        let selected = if capture.bound {
+            capture.target_label.clone()
+        } else {
+            format!("{} (missing)", capture.target_label)
+        };
+        let mut chosen: Option<crate::scene::CaptureTargetConfig> = None;
+        egui::ComboBox::from_id_salt(("sel_deck_capture_target", &deck.uuid))
+            .selected_text(selected)
+            .width(180.0)
+            .show_ui(ui, |ui| {
+                for (heading, display) in [("Displays", true), ("Windows", false)] {
+                    let mut targets = data
+                        .capture_targets
+                        .iter()
+                        .filter(|t| (t.kind == "display") == display)
+                        .peekable();
+                    if targets.peek().is_none() {
+                        continue;
+                    }
+                    ui.label(egui::RichText::new(heading).small().weak());
+                    for target in targets {
+                        let current = is_captured(capture, target, &data.capture_targets);
+                        let text = if display {
+                            format!("{} — {}×{}", target.label, target.width, target.height)
+                        } else if target.is_varda {
+                            format!("{} (this app)", target.label)
+                        } else {
+                            target.label.clone()
+                        };
+                        if ui.selectable_label(current, text).clicked() {
+                            chosen = Some(super::add_input::capture_target(target));
+                        }
+                    }
+                }
+                if data.capture_targets.is_empty() {
+                    ui.label(egui::RichText::new("None found yet — press Refresh.").weak());
+                }
+            });
+        if ui
+            .small_button("Refresh")
+            .on_hover_text("Look again for the screens and windows there are")
+            .clicked()
+        {
+            actions.commands.push(EngineCommand::RescanCaptureTargets);
+        }
+        if let Some(target) = chosen {
+            actions.commands.push(EngineCommand::SetScreenCaptureTarget {
+                deck_uuid: deck.uuid.clone(),
+                target,
+            });
+        }
+    });
+    if capture.kept_by_name {
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 160, 60),
+            format!(
+                "Kept by its number: this shows whichever screen is {} now, and another once \
+                 the screens are numbered anew. Pick its screen above to keep that screen itself.",
+                capture.target_label
+            ),
+        );
+    }
+}
+
+/// Whether `target`, one of the `listed`, is what the input captures: its
+/// screen itself, where it is kept as itself — kept by its name alone, none
+/// is its own — or its window, as the show names it.
+fn is_captured(
+    capture: &ScreenCaptureUI,
+    target: &crate::engine::CaptureTargetSnapshot,
+    listed: &[crate::engine::CaptureTargetSnapshot],
+) -> bool {
+    let display = target.kind == "display";
+    if display != capture.is_display {
+        return false;
+    }
+    if !display {
+        return super::add_input::capture_target(target).label() == capture.target_label;
+    }
+    match (&capture.target_uuid, &target.uuid) {
+        // Two screens alike may share an identity: the one of its name then.
+        (Some(kept), Some(of_target)) => {
+            kept == of_target
+                && (target.label == capture.target_label
+                    || !listed.iter().any(|t| {
+                        t.uuid.as_ref() == Some(kept) && t.label == capture.target_label
+                    }))
+        }
+        // Where displays have no identity the name is all there is.
+        (None, None) => !capture.kept_by_name && target.label == capture.target_label,
+        _ => false,
+    }
+}
+
+/// Screen-capture controls for the selected deck: what it captures, rate,
+/// crop, cursor, and (for display targets) Varda-window exclusion. See
+/// spec/screen-capture.md.
 fn render_capture_controls(
     ui: &mut egui::Ui,
     deck: &DeckUIInfo,
@@ -371,12 +482,21 @@ fn render_capture_controls(
             .size(12.0),
     );
     if !capture.bound {
-        ui.colored_label(
-            egui::Color32::from_rgb(220, 160, 60),
-            "Target not found — showing black. Reopen the target and rescan.",
-        );
+        // A PowerPoint input's window is found by its show: what holds it up
+        // is the show's to say, not a target to reopen and rescan.
+        let why = match &deck.presentation {
+            Some(p) => p.message.clone().unwrap_or_else(|| {
+                "Black until PowerPoint plays the show and its window is found.".into()
+            }),
+            None => "Target not found — showing black. Reopen it, or pick another below.".into(),
+        };
+        ui.colored_label(egui::Color32::from_rgb(220, 160, 60), why);
     } else if !capture.connected {
         ui.colored_label(egui::Color32::GRAY, "Waiting for frames…");
+    }
+    // A PowerPoint input's window is its show's: there is none to pick.
+    if deck.presentation.is_none() {
+        render_capture_target(ui, deck, capture, data, actions);
     }
 
     ui.horizontal(|ui| {
@@ -491,6 +611,9 @@ fn render_camera_colour(
     ui.separator();
     ui.label(egui::RichText::new("📹 Camera picture").strong().size(12.0));
     let mut chosen = colour;
+    if let Some(signal) = &deck.camera_signal {
+        render_camera_signal(ui, signal, colour, &mut chosen);
+    }
     ui.horizontal(|ui| {
         let label = ui.label("Colour range:");
         egui::ComboBox::from_id_salt(("camera_range", &deck.uuid))
@@ -525,12 +648,153 @@ fn render_camera_colour(
     }
 }
 
-/// What the lowest latency costs, for a camera layer's switch.
-const LOWEST_LATENCY_HINT: &str = "Shows the camera's newest picture every frame: about a frame \
-     sooner, but motion judders whenever a picture comes late — about twice a second with a \
-     camera over USB. Off: every picture in turn, motion even.";
+/// What a camera sends, as its pictures say, and what to change when it
+/// does not match how it is read: darks below video black read as video
+/// range (a full-range source: shadows crushed, whites clipped), or frames
+/// coming at another rate than it was opened at.
+fn render_camera_signal(
+    ui: &mut egui::Ui,
+    signal: &crate::engine::value::camera::CameraSignal,
+    colour: crate::engine::value::camera::CameraColour,
+    chosen: &mut crate::engine::value::camera::CameraColour,
+) {
+    use crate::engine::value::camera::CameraRange;
+    let warn = egui::Color32::from_rgb(240, 180, 90);
+    ui.label(egui::RichText::new(format!("Signal: {}", signal.summary())).weak())
+        .on_hover_text("What the camera sends, as its pictures say");
+    if let Some(opened) = signal.opened_fps.filter(|o| *o >= 20.0) {
+        if signal.fps > 0.0 && signal.fps < opened * 0.6 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Only {:.1} of {opened:.0} frames a second arrive: its source may send \
+                     only that many; if it sends more, check its cable and USB port (on a \
+                     USB 2 link an HD capture cannot keep up)",
+                    signal.fps
+                ))
+                .color(warn),
+            );
+        }
+    }
+    if signal.looks_full_range() && colour.range != CameraRange::Full {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Its darks go well below video black: it may send full range, read as \
+                     video range — shadows crushed, whites clipped. Check against a black \
+                     and a white in its picture.",
+                )
+                .color(warn),
+            );
+            if ui
+                .button("Read as Full")
+                .on_hover_text("Colour range: Full")
+                .clicked()
+            {
+                chosen.range = CameraRange::Full;
+            }
+        });
+    }
+}
 
-/// A camera layer's latency: its newest picture every frame, or each in turn
+/// A camera layer's format: its best, or one of the sizes and rates its
+/// camera offers — changed, the camera opens again at it. Its frames coming
+/// at another rate than it was opened at, the format for theirs is offered.
+fn render_camera_format(
+    ui: &mut egui::Ui,
+    deck: &DeckUIInfo,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
+    use crate::engine::value::camera::CameraMode;
+    let Some(id) = deck.camera_id else {
+        return;
+    };
+    // A camera that takes the format coming in has none to choose: what
+    // comes in now is said.
+    if data.cameras_following_signal.contains(&id) {
+        ui.horizontal(|ui| {
+            ui.label("Format:");
+            let now = deck.camera_signal.as_ref().map_or_else(String::new, |s| {
+                format!(" — {}×{} at {:.2} fps now", s.width, s.height, s.fps)
+            });
+            ui.label(format!("follows the signal{now}"))
+                .on_hover_text("It takes the size and rate coming in, and changes with them");
+        });
+        return;
+    }
+    let modes: &[CameraMode] = data
+        .camera_modes
+        .iter()
+        .find(|(camera, _)| *camera == id)
+        .map_or(&[], |(_, modes)| modes.as_slice());
+    if modes.is_empty() {
+        return;
+    }
+    let best = crate::engine::value::camera::default_mode(modes);
+    let auto = best.map_or_else(|| "Best".to_string(), |m| format!("Best ({})", m.label()));
+    let mut chosen = deck.camera_mode;
+    ui.horizontal(|ui| {
+        let label = ui.label("Format:");
+        egui::ComboBox::from_id_salt(("camera_format", &deck.uuid))
+            .width(220.0)
+            .selected_text(chosen.map_or_else(|| auto.clone(), |m| m.label()))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut chosen, None, auto.clone());
+                for mode in modes {
+                    ui.selectable_value(&mut chosen, Some(*mode), mode.label());
+                }
+            })
+            .response
+            .labelled_by(label.id)
+            .on_hover_text("The size and rate the camera is opened at; changed, it opens again");
+    });
+    let other = deck
+        .camera_signal
+        .as_ref()
+        .and_then(|signal| Some((signal, signal.other_rate()?, signal.opened_fps?)));
+    if let Some((signal, rate, opened)) = other {
+        let theirs = modes
+            .iter()
+            .filter(|m| m.width == signal.width && m.height == signal.height)
+            .min_by(|a, b| {
+                (a.nominal_fps() - rate)
+                    .abs()
+                    .total_cmp(&(b.nominal_fps() - rate).abs())
+            })
+            .filter(|m| (m.nominal_fps() - rate).abs() < rate * 0.02);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Its frames come at {rate:.2} fps, though it was opened for {opened:.2}."
+                ))
+                .color(egui::Color32::from_rgb(240, 180, 90)),
+            );
+            if let Some(mode) = theirs {
+                if ui
+                    .button(format!("Use {}", mode.label()))
+                    .on_hover_text("Open the camera again at the rate its frames come at")
+                    .clicked()
+                {
+                    chosen = Some(*mode);
+                }
+            }
+        });
+    }
+    if chosen != deck.camera_mode {
+        actions.commands.push(EngineCommand::SetCameraMode {
+            deck_uuid: deck.uuid.clone(),
+            mode: chosen,
+        });
+    }
+}
+
+/// What the lowest latency costs, for a camera layer's switch.
+const LOWEST_LATENCY_HINT: &str = "Does not wait for the few pictures that come late: about a \
+     frame sooner, but motion judders whenever one comes — about twice a second with a camera \
+     over USB. A camera whose pictures come right as frames are drawn is held a frame to stay \
+     smooth. Off: every picture in turn, motion even.";
+
+/// A camera layer's latency: the lowest (see `FramePicker::set_newest`), or each in turn
 /// at the delay that keeps motion even. Every layer on the camera takes it
 /// (see `SetCameraLowestLatency`).
 fn render_camera_latency(ui: &mut egui::Ui, deck: &DeckUIInfo, on: bool, actions: &mut UIActions) {
@@ -676,7 +940,7 @@ pub(super) fn render_selected_deck_detail(
         return;
     };
 
-    let accent = channel_color(ch_idx);
+    let accent = ch.accent();
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(format!(
@@ -736,13 +1000,22 @@ pub(super) fn render_selected_deck_detail(
     // Horizontal columns: Preview | Generator | Effect 1 | Effect 2 | ... | Add Effect
     egui::ScrollArea::horizontal().id_salt("selected_deck_hscroll").show(ui, |ui| {
         ui.horizontal_top(|ui| {
-            // Column 0: the channel the deck is in, every layer composited —
-            // not the deck alone, so a change to any deck is judged against
-            // the result. The deck alone is in its Adjust window. Scales with
-            // the bottom bar's height, with the visible panel width as the
-            // other bound so an ultra-wide project cannot produce a column
-            // wider than the bar it sits in.
-            if let Some(&tex_id) = data.channel_preview_textures.get(&ch_idx) {
+            // Column 0: the deck picked, its own picture — the file, not the
+            // whole input it is in — else, with no picture of its own yet,
+            // the channel's, every layer composited. Scales with the bottom
+            // bar's height, with the visible panel width as the other bound
+            // so an ultra-wide project cannot produce a column wider than the
+            // bar it sits in.
+            let picture = data
+                .deck_preview_textures
+                .get(&deck.uuid)
+                .map(|&tex| (tex, deck.name.as_str()))
+                .or_else(|| {
+                    data.channel_preview_textures
+                        .get(&ch_idx)
+                        .map(|&tex| (tex, ch.name.as_str()))
+                });
+            if let Some((tex_id, name)) = picture {
                 let available_height = ui.available_height() - 12.0; // margin
                 let preview = super::utils::preview_size(
                     egui::vec2(
@@ -753,7 +1026,7 @@ pub(super) fn render_selected_deck_detail(
                     data.render_width,
                     data.render_height,
                 );
-                channel_result_preview(ui, tex_id, preview, &ch.name, accent);
+                channel_result_preview(ui, tex_id, preview, name, accent);
                 ui.separator();
             }
             render_take_frame(ui, &ch.uuid, data, actions);
@@ -827,6 +1100,22 @@ pub(super) fn render_selected_deck_detail(
                 ui.separator();
             }
 
+            // Column: an input that could not be opened, kept as saved
+            if let Some(ref why) = deck.offline {
+                egui::Frame::default()
+                    .inner_margin(6.0)
+                    .corner_radius(4.0)
+                    .fill(ui.visuals().faint_bg_color)
+                    .show(ui, |ui| {
+                        ui.set_min_width(200.0);
+                        ui.set_max_width(280.0);
+                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            render_offline_column(ui, why);
+                        });
+                    });
+                ui.separator();
+            }
+
             // Column: Video playback controls (only for video decks)
             if let Some(ref vp) = deck.video_playback {
                 egui::Frame::default()
@@ -843,6 +1132,22 @@ pub(super) fn render_selected_deck_detail(
                 ui.separator();
             }
 
+            // Column: a Slides input's talk on and what comes next
+            if let Some(ref slides) = deck.slides {
+                egui::Frame::default()
+                    .inner_margin(6.0)
+                    .corner_radius(4.0)
+                    .fill(ui.visuals().faint_bg_color)
+                    .show(ui, |ui| {
+                        ui.set_min_width(180.0);
+                        ui.set_max_width(280.0);
+                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            super::slides::render_deck_column(ui, data, deck, slides, actions);
+                        });
+                    });
+                ui.separator();
+            }
+
             // Column: a playlist's transport and list
             if let Some(ref list) = deck.playlist {
                 egui::Frame::default()
@@ -853,7 +1158,41 @@ pub(super) fn render_selected_deck_detail(
                         ui.set_min_width(160.0);
                         ui.set_max_width(240.0);
                         ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                            super::playlist::render_deck_column(ui, deck, list, actions);
+                            super::playlist::render_deck_column(ui, data, deck, list, actions);
+                        });
+                    });
+                ui.separator();
+            }
+
+            // Column: a PowerPoint show's steps, screen, notes and what comes next
+            if let Some(ref p) = deck.presentation {
+                egui::Frame::default()
+                    .inner_margin(6.0)
+                    .corner_radius(4.0)
+                    .fill(ui.visuals().faint_bg_color)
+                    .show(ui, |ui| {
+                        ui.set_min_width(180.0);
+                        ui.set_max_width(280.0);
+                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            super::presentation::render_deck_column(ui, data, deck, p, actions);
+                        });
+                    });
+                ui.separator();
+            }
+
+            // Column: a presenter view's show and its talk clock
+            if let Some(ref follows) = deck.presenter_of {
+                egui::Frame::default()
+                    .inner_margin(6.0)
+                    .corner_radius(4.0)
+                    .fill(ui.visuals().faint_bg_color)
+                    .show(ui, |ui| {
+                        ui.set_min_width(160.0);
+                        ui.set_max_width(240.0);
+                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            super::presentation::render_presenter_column(
+                                ui, data, deck, follows, actions,
+                            );
                         });
                     });
                 ui.separator();
@@ -1339,9 +1678,20 @@ pub(super) fn render_source_settings(
         render_capture_controls(ui, deck, capture, data, actions);
     }
 
+    // A text input's lines and look
+    if let Some(text) = &deck.text {
+        super::text::render_controls(ui, data, deck, text, actions);
+    }
+
+    // A lower third's names, list file and look
+    if let Some(lower) = &deck.lower_third {
+        super::lower_third::render_controls(ui, data, deck, lower, actions);
+    }
+
     // A camera's colour range and matrix, and what its picture is coded as
     if let Some(colour) = deck.camera_colour {
         render_camera_colour(ui, deck, colour, actions);
+        render_camera_format(ui, deck, data, actions);
     }
     if let Some(on) = deck.camera_lowest_latency {
         render_camera_latency(ui, deck, on, actions);
@@ -1435,6 +1785,79 @@ pub(super) fn render_source_settings(
 
 /// A generator deck's own parameters, and a Reset. `salt` keeps the widgets'
 /// ids apart where the same deck is drawn twice.
+fn linear_from_srgb(c: f32) -> f32 {
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn srgb_from_linear(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// The three colours of a look with a Palette (the Broadcast looks).
+const PALETTE_COLOURS: [&str; 3] = ["bg_colour", "main_colour", "accent_colour"];
+
+/// A colour picked on a look whose Palette is a preset — which would
+/// ignore it — switches the Palette to Custom, the other two colours
+/// starting as that preset's: only the colour picked changes.
+fn custom_when_a_colour_is_picked(deck: &DeckUIInfo, sent_before: usize, actions: &mut UIActions) {
+    let preset = deck.generator.params.iter().find_map(|p| match p.value {
+        ParamValue::Long(n) if p.name == "palette" && n != 0 => u8::try_from(n).ok(),
+        _ => None,
+    });
+    let Some(colours) = preset.and_then(crate::engine::value::lower_third::palette_srgb) else {
+        return;
+    };
+    let picked: Vec<&str> = actions.commands[sent_before..]
+        .iter()
+        .filter_map(|c| match c {
+            EngineCommand::SetGeneratorParam {
+                deck_uuid, name, ..
+            } if *deck_uuid == deck.uuid => PALETTE_COLOURS.iter().copied().find(|n| n == name),
+            _ => None,
+        })
+        .collect();
+    if picked.is_empty() {
+        return;
+    }
+    let set = |name: &str, value: ParamValue| EngineCommand::SetGeneratorParam {
+        deck_uuid: deck.uuid.clone(),
+        name: name.to_string(),
+        value,
+    };
+    // The background as the preset showed it: lifted toward its Main — a
+    // moving look's floor 5%, Vignette plate's plate 35% (in linear light);
+    // Custom shows the Background as picked, so it starts as that.
+    let lift = if deck.generator.shader_name.contains("vignette") {
+        0.35
+    } else if deck.generator.shader_name.contains("gradient") {
+        0.0
+    } else {
+        0.05
+    };
+    let unit = |c: [u8; 3]| c.map(|v| f32::from(v) / 255.0);
+    let [bg, main, accent] = colours.map(unit);
+    let shown_bg: [f32; 3] = std::array::from_fn(|i| {
+        srgb_from_linear(linear_from_srgb(bg[i]) * (1.0 - lift) + linear_from_srgb(main[i]) * lift)
+    });
+    // The preset's colours first, the one picked after them (it wins).
+    let mut seeded: Vec<EngineCommand> = vec![set("palette", ParamValue::Long(0))];
+    for (name, [r, g, b]) in PALETTE_COLOURS.iter().zip([shown_bg, main, accent]) {
+        if !picked.contains(name) {
+            seeded.push(set(name, ParamValue::Color([r, g, b, 1.0])));
+        }
+    }
+    actions.commands.splice(sent_before..sent_before, seeded);
+}
+
 pub(super) fn render_generator_params(
     ui: &mut egui::Ui,
     deck: &DeckUIInfo,
@@ -1453,6 +1876,7 @@ pub(super) fn render_generator_params(
         let deck_uuid_unassign = deck_uuid.clone();
         let deck_uuid_remove = deck_uuid.clone();
         let deck_uuid_automate = deck_uuid.clone();
+        let sent_before = actions.commands.len();
         widgets::render_params(
             ui,
             &gen_params.params,
@@ -1496,6 +1920,7 @@ pub(super) fn render_generator_params(
             &mut actions.session.keyboard_learn_select,
             data.keyboard_learn_target.as_deref(),
         );
+        custom_when_a_colour_is_picked(deck, sent_before, actions);
         ui.add_space(4.0);
         if ui.button("Reset").clicked() {
             actions
@@ -1510,6 +1935,25 @@ pub(super) fn render_generator_params(
 /// A video deck's playback: play/pause, the scrub bar, speed, loop, in and
 /// out points, and what decodes it — the Properties panel's Playback column
 /// and the input settings window's.
+/// An offline input: why, and that the show keeps it as saved until it can
+/// be opened again.
+fn render_offline_column(ui: &mut egui::Ui, why: &str) {
+    ui.label(
+        egui::RichText::new("⚠ Offline")
+            .strong()
+            .color(ui.visuals().warn_fg_color),
+    );
+    ui.label(egui::RichText::new(why).small());
+    ui.label(
+        egui::RichText::new(
+            "Kept in the show as saved. Put the file back, or connect the device, \
+             then open the show again.",
+        )
+        .small()
+        .weak(),
+    );
+}
+
 pub(super) fn render_playback_controls(
     ui: &mut egui::Ui,
     deck: &DeckUIInfo,
@@ -1753,13 +2197,22 @@ pub(super) fn render_playback_controls(
         duration
     };
     let has_range = vp.in_point > 0.0 || vp.out_point > 0.0;
+    // Each slider stops a frame short of the other point: In stays before
+    // Out (one put within half a frame of it, or past it, lets it go).
+    let frame = if vp.frame_rate > 0.0 {
+        1.0 / vp.frame_rate
+    } else {
+        1.0 / 30.0
+    };
+    let in_most = (effective_out - frame).clamp(0.0, duration);
+    let out_least = (vp.in_point + frame).clamp(0.0, duration);
 
     // In-point
     let mut in_pt = vp.in_point as f32;
     ui.horizontal(|ui| {
         ui.label("In:");
         let resp = ui.add(
-            egui::Slider::new(&mut in_pt, 0.0..=duration as f32)
+            egui::Slider::new(&mut in_pt, 0.0..=in_most as f32)
                 .show_value(false)
                 .trailing_fill(true),
         );
@@ -1776,7 +2229,9 @@ pub(super) fn render_playback_controls(
             data,
             actions,
         );
-        ui.label(format_time(f64::from(in_pt)));
+        // The clip's own In, not the slider's: the slider stops a frame
+        // short of the Out, the clip only half a frame.
+        ui.label(format_time(vp.in_point));
     });
 
     // Out-point
@@ -1784,7 +2239,7 @@ pub(super) fn render_playback_controls(
     ui.horizontal(|ui| {
         ui.label("Out:");
         let resp = ui.add(
-            egui::Slider::new(&mut out_pt, 0.0..=duration as f32)
+            egui::Slider::new(&mut out_pt, out_least as f32..=duration as f32)
                 .show_value(false)
                 .trailing_fill(true),
         );
@@ -1801,7 +2256,7 @@ pub(super) fn render_playback_controls(
             data,
             actions,
         );
-        ui.label(format_time(f64::from(out_pt)));
+        ui.label(format_time(effective_out));
     });
 
     // Set from current / clear buttons
@@ -1880,8 +2335,8 @@ pub(super) fn render_playback_controls(
 }
 
 /// Chain positions of the deck's framing effects — its first crop and first
-/// transform — and of its own mask, all shown in the framing controls. Any
-/// further ones are ordinary effects in the list.
+/// transform — and of its own mask and its frame, all shown in the framing
+/// controls. Any further ones are ordinary effects in the list.
 pub(super) fn framing_indices(deck: &DeckUIInfo) -> Vec<usize> {
     use crate::engine::value::mask::LAYER_MASK_EFFECT;
     FRAMING_EFFECTS
@@ -1889,7 +2344,16 @@ pub(super) fn framing_indices(deck: &DeckUIInfo) -> Vec<usize> {
         .map(|(name, _)| *name)
         .chain([LAYER_MASK_EFFECT])
         .filter_map(|name| deck.effects.iter().position(|(_, n, ..)| n == name))
+        .chain(deck.effects.iter().position(|(_, n, ..)| is_frame_effect(n)))
         .collect()
+}
+
+/// Whether a layer's effect, by the name it is shown under, is its frame:
+/// a `frame_*` filter — one whose shader is not there too, shown as
+/// "⚠ frame_… — offline" (see `effect_snapshot_to_ui`).
+fn is_frame_effect(shown: &str) -> bool {
+    use crate::engine::value::frame::is_frame;
+    is_frame(shown) || shown.strip_prefix("⚠ ").is_some_and(is_frame)
 }
 
 /// Width the columns after the preview take, so the preview can have the rest
@@ -1985,7 +2449,11 @@ pub(super) fn render_take_frame(
         .show(ui, |ui| {
             ui.set_width(super::switcher::TAKE_COLUMN_WIDTH - 12.0);
             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                ui.label(egui::RichText::new("Send to").strong());
+                ui.label(egui::RichText::new("Send to").strong()).on_hover_text(
+                    "Cut / Fade put this input on a bus in place of what it shows; Back puts \
+                     that back. To show it over what a bus shows, use Overlay (over Main) or \
+                     Show on (lower thirds).",
+                );
                 if let Some(ch) = data
                     .channels
                     .iter()
@@ -2093,6 +2561,7 @@ pub(super) fn render_framing(
             render_border(ui, deck, effect, border, data, actions);
         }
     }
+    render_frame(ui, deck, data, actions);
     ui.add_space(4.0);
     ui.label(section_title(ui, "Mask")).on_hover_text(
         "Cut a shape out of the layer — or keep only the shape — so what is under it shows",
@@ -2111,6 +2580,70 @@ pub(super) fn render_framing(
                     shader_name: name.to_string(),
                 });
             }
+        }
+    }
+}
+
+/// The Frame section: which frame holds the layer's picture — None, or one
+/// of the library's — and that frame's own settings. The frame's effect
+/// sits before Transform in the layer's chain, so the layer is moved and
+/// scaled frame and all.
+fn render_frame(ui: &mut egui::Ui, deck: &DeckUIInfo, data: &UIData, actions: &mut UIActions) {
+    let current = deck.effects.iter().find(|(_, name, ..)| is_frame_effect(name));
+    // A library with no frames offers none (a layer that has one, from a
+    // show made with them, still shows it).
+    if data.frames.is_empty() && current.is_none() {
+        return;
+    }
+    // The frame's title; one the library does not list — its shader gone
+    // from it, or not there — by the name it is shown under. None only
+    // when there is none.
+    let title = match current {
+        None => "None",
+        Some((_, name, ..)) => data
+            .frames
+            .iter()
+            .find(|frame| frame.name == *name)
+            .map_or(name.as_str(), |frame| frame.title.as_str()),
+    };
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.label(section_title(ui, "Frame")).on_hover_text(
+            "Put the layer's picture in a moving frame: it holds what shows of the picture, \
+             and goes where the layer goes",
+        );
+        egui::ComboBox::from_id_salt(("layer_frame", &deck.uuid))
+            .selected_text(title)
+            .width(150.0)
+            .show_ui(ui, |ui| frame_choices(ui, deck, data, actions));
+    });
+    if let Some(effect) = current {
+        render_deck_effect_controls(ui, &deck.uuid, effect, data, actions);
+    }
+}
+
+/// What the Frame drop-down lists: None, then every frame by its title.
+/// Picking one puts the layer's picture in it (in place of the frame it
+/// has); None takes the frame away.
+fn frame_choices(ui: &mut egui::Ui, deck: &DeckUIInfo, data: &UIData, actions: &mut UIActions) {
+    let current = deck
+        .effects
+        .iter()
+        .find(|(_, name, ..)| is_frame_effect(name))
+        .map(|(_, name, ..)| name.as_str());
+    if ui.selectable_label(current.is_none(), "None").clicked() && current.is_some() {
+        actions.commands.push(EngineCommand::SetLayerFrame {
+            deck_uuid: deck.uuid.clone(),
+            frame: None,
+        });
+    }
+    for frame in &data.frames {
+        let selected = current == Some(frame.name.as_str());
+        if ui.selectable_label(selected, frame.title.as_str()).clicked() && !selected {
+            actions.commands.push(EngineCommand::SetLayerFrame {
+                deck_uuid: deck.uuid.clone(),
+                frame: Some(frame.name.clone()),
+            });
         }
     }
 }
@@ -2318,6 +2851,29 @@ fn copy_paste_buttons(
 
 /// Copy / Paste position — crop, border and transform together — for a
 /// deck's right-click menu.
+/// "Reset input" on a camera layer's menu, as vMix's Reset: its capture
+/// closed and opened again, its formats read again, its sound opened again.
+pub(super) fn reset_menu_item(ui: &mut egui::Ui, deck: &DeckUIInfo, actions: &mut UIActions) {
+    if deck.camera_colour.is_none() {
+        return;
+    }
+    if ui
+        .button("Reset input")
+        .on_hover_text(
+            "Close the device and open it again: found afresh (another USB port too), \
+             its formats read again, its sound opened again",
+        )
+        .clicked()
+    {
+        actions
+            .commands
+            .push(crate::engine::EngineCommand::ResetInput {
+                deck_uuid: deck.uuid.clone(),
+            });
+        ui.close();
+    }
+}
+
 pub(super) fn framing_menu_items(ui: &mut egui::Ui, deck: &DeckUIInfo, actions: &mut UIActions) {
     if ui
         .button("Copy position")
@@ -2384,8 +2940,9 @@ pub(super) fn render_effect_controls(
     } else {
         render_effect_param_widgets(ui, owner, effect, data, actions);
     }
-    // Framing places the whole picture; a mask on it would make no sense.
-    if !FRAMING_EFFECTS.iter().any(|(name, _)| name == eff_name) {
+    // Framing places the whole picture, and a frame holds it; a mask on
+    // either would make no sense.
+    if !FRAMING_EFFECTS.iter().any(|(name, _)| name == eff_name) && !is_frame_effect(eff_name) {
         super::mask_edit::render_mask_row(ui, eff_uuid, data, actions);
     }
 }
@@ -2480,6 +3037,7 @@ mod tests {
                     value: ParamValue::Float(0.5),
                     min: Some(0.0),
                     max: Some(1.0),
+                    choices: None,
                 }],
             },
         )
@@ -2518,16 +3076,23 @@ mod tests {
             .collect()
     }
 
+    /// The file picked in an input shows its own picture, not the whole
+    /// input; with no picture of its own yet, the input's.
     #[test]
-    fn a_selected_deck_shows_its_channel_result_not_itself() {
+    fn a_selected_deck_shows_its_own_picture_not_its_channels() {
         let data = ch_b_deck_selected();
+        let deck = data.channels[1].decks[0].name.clone();
         let mut actions = UIActions::new();
         let h = harness(&data, &mut actions);
+        h.get_by_label(&format!("{deck} result"));
+        assert!(h.query_by_label("Ch B result").is_none(), "not the whole input");
+        drop(h);
+
+        let mut none_yet = ch_b_deck_selected();
+        none_yet.deck_preview_textures.clear();
+        let mut actions = UIActions::new();
+        let h = harness(&none_yet, &mut actions);
         h.get_by_label("Ch B result");
-        assert!(
-            h.query_by_label("test_generator_c result").is_none(),
-            "the bottom preview stays on the channel whichever deck is picked"
-        );
     }
 
     #[test]
@@ -2551,18 +3116,22 @@ mod tests {
         }
     }
 
+    /// A bus already showing the channel offers no Cut or Fade to it again,
+    /// but Back and Fade back — to what it showed before.
     #[test]
-    fn a_bus_already_showing_the_channel_cannot_take_it_again() {
-        use egui_kittest::kittest::NodeT;
+    fn a_bus_already_showing_the_channel_offers_back_not_cut() {
         // Ch A is what the fixture's TV bus has on air.
         let data = UIData::test_fixture();
         let mut actions = UIActions::new();
         let h = harness(&data, &mut actions);
         for button in ["Cut", "Fade"] {
             assert!(
-                h.get_by_label(button).accesskit_node().is_disabled(),
+                h.query_by_label(button).is_none(),
                 "{button} on the bus that has it on air"
             );
+        }
+        for button in ["Back", "Fade back"] {
+            assert!(h.query_by_label(button).is_some(), "{button}");
         }
     }
 
@@ -2614,6 +3183,118 @@ mod tests {
         );
     }
 
+    /// The Frame drop-down lists every frame by its title: picking one asks
+    /// for it on this layer, and — in a frame — None takes it away; the
+    /// frame's effect is shown with the framing controls, not among the
+    /// layer's effects.
+    #[test]
+    fn the_frame_section_puts_the_layer_in_a_frame() {
+        let mut data = UIData::test_fixture();
+        data.frames = vec![crate::engine::FrameLook {
+            name: "frame_hud".into(),
+            title: "HUD frame".into(),
+        }];
+        let (ch, dk) = data.selected_deck.expect("fixture selects a deck");
+        let deck = data.channels[ch].decks[dk].clone();
+        let mut actions = UIActions::new();
+        {
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(400.0, 300.0))
+                .build_ui(|ui| frame_choices(ui, &deck, &data, &mut actions));
+            h.get_by_label("HUD frame").click();
+            h.run();
+        }
+        assert!(
+            actions.commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetLayerFrame {
+                    deck_uuid,
+                    frame: Some(frame),
+                } if *deck_uuid == deck.uuid && frame == "frame_hud"
+            )),
+            "{:?}",
+            actions.commands
+        );
+
+        let framed = &mut data.channels[ch].decks[dk];
+        framed.effects.push((
+            "fx0frame".into(),
+            "frame_hud".into(),
+            true,
+            ShaderParamsUI {
+                shader_name: "frame_hud".into(),
+                params: Vec::new(),
+            },
+        ));
+        let at = framed.effects.len() - 1;
+        assert!(
+            framing_indices(framed).contains(&at),
+            "not an ordinary effect in the list"
+        );
+        let deck = framed.clone();
+        let mut actions = UIActions::new();
+        {
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(400.0, 300.0))
+                .build_ui(|ui| frame_choices(ui, &deck, &data, &mut actions));
+            h.get_by_label("None").click();
+            h.run();
+        }
+        assert!(
+            actions.commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetLayerFrame {
+                    deck_uuid,
+                    frame: None,
+                } if *deck_uuid == deck.uuid
+            )),
+            "{:?}",
+            actions.commands
+        );
+    }
+
+    /// A frame whose shader is not there is shown under another name
+    /// ("⚠ … — offline"): it is the layer's frame still — with the framing
+    /// controls, not among the effects, and None takes it away.
+    #[test]
+    fn a_frame_without_its_shader_is_the_layers_frame_still() {
+        let mut data = UIData::test_fixture();
+        let (ch, dk) = data.selected_deck.expect("fixture selects a deck");
+        let framed = &mut data.channels[ch].decks[dk];
+        framed.effects.push((
+            "fx0frame".into(),
+            "⚠ frame_future — offline".into(),
+            true,
+            ShaderParamsUI {
+                shader_name: "frame_future".into(),
+                params: Vec::new(),
+            },
+        ));
+        let at = framed.effects.len() - 1;
+        assert!(framing_indices(framed).contains(&at), "not among the effects");
+        assert!(!is_frame_effect("⚠ blur — offline"), "another effect's shader gone");
+        let deck = framed.clone();
+        let mut actions = UIActions::new();
+        {
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(400.0, 300.0))
+                .build_ui(|ui| frame_choices(ui, &deck, &data, &mut actions));
+            h.get_by_label("None").click();
+            h.run();
+        }
+        assert!(
+            actions.commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetLayerFrame {
+                    deck_uuid,
+                    frame: None,
+                } if *deck_uuid == deck.uuid
+            )),
+            "{:?}",
+            actions.commands
+        );
+    }
+
     /// Border on: Roundness offered — but not with Circle on, a circle
     /// being as round as can be.
     #[test]
@@ -2627,6 +3308,7 @@ mod tests {
             value,
             min: Some(0.0),
             max: Some(540.0),
+            choices: None,
         };
         for (circle, offered) in [(false, true), (true, false)] {
             let params = vec![
@@ -2654,6 +3336,196 @@ mod tests {
                 "circle {circle}"
             );
         }
+    }
+
+    /// A list setting — a Broadcast look's Palette — is a menu of its
+    /// choices by name: picking Custom sends its value, 0.
+    #[test]
+    fn a_list_setting_is_a_menu_by_name() {
+        let mut data = UIData::test_fixture();
+        let (ch, dk) = data.selected_deck.expect("fixture selects a deck");
+        let deck = &mut data.channels[ch].decks[dk];
+        deck.generator.params.push(ParamUIInfo {
+            name: "palette".into(),
+            label: Some("Palette".into()),
+            value: ParamValue::Long(7),
+            min: None,
+            max: None,
+            choices: Some(vec![
+                (0, "Custom (colours below)".into()),
+                (7, "Gala Gold".into()),
+            ]),
+        });
+        let deck = deck.clone();
+        let deck_uuid = deck.uuid.clone();
+        let mut actions = UIActions::new();
+        {
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(600.0, 500.0))
+                .build_ui(|ui| render_generator_params(ui, &deck, "t", &data, &mut actions));
+            h.get_by_label("Palette").click();
+            h.run();
+            h.get_by_label("Custom (colours below)").click();
+            h.run();
+        }
+        let sent: Vec<Option<i32>> = actions
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                EngineCommand::SetGeneratorParam {
+                    deck_uuid: d,
+                    name,
+                    value,
+                } if *d == deck_uuid && name == "palette" => Some(match value {
+                    ParamValue::Long(n) => Some(*n),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, [Some(0)]);
+    }
+
+    /// A colour picked on a look with a preset Palette switches it to
+    /// Custom, the other two colours starting as the preset's; on Custom
+    /// already, a colour picked is just that.
+    #[test]
+    fn a_colour_picked_on_a_preset_switches_to_custom() {
+        let mut data = UIData::test_fixture();
+        let (ch, dk) = data.selected_deck.expect("fixture selects a deck");
+        let colour = |name: &str| ParamUIInfo {
+            name: name.into(),
+            label: None,
+            value: ParamValue::Color([0.0, 0.0, 0.0, 1.0]),
+            min: None,
+            max: None,
+            choices: None,
+        };
+        let palette = |n: i32| ParamUIInfo {
+            name: "palette".into(),
+            label: Some("Palette".into()),
+            value: ParamValue::Long(n),
+            min: None,
+            max: None,
+            choices: Some(vec![(0, "Custom".into()), (12, "Lavender Mist".into())]),
+        };
+        let deck = &mut data.channels[ch].decks[dk];
+        deck.generator.params = vec![
+            palette(12),
+            colour("bg_colour"),
+            colour("main_colour"),
+            colour("accent_colour"),
+        ];
+        let picked = |uuid: &str| EngineCommand::SetGeneratorParam {
+            deck_uuid: uuid.to_string(),
+            name: "bg_colour".into(),
+            value: ParamValue::Color([0.5, 0.0, 0.5, 1.0]),
+        };
+        let mut actions = UIActions::new();
+        actions.commands.push(picked(&deck.uuid));
+        custom_when_a_colour_is_picked(deck, 0, &mut actions);
+        let sent: Vec<(String, String)> = actions
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                EngineCommand::SetGeneratorParam { name, value, .. } => {
+                    Some((name.clone(), format!("{value:?}")))
+                }
+                _ => None,
+            })
+            .collect();
+        let names: Vec<&str> = sent.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            ["palette", "main_colour", "accent_colour", "bg_colour"]
+        );
+        assert!(sent[0].1.contains("Long(0)"), "{sent:?}");
+        // Lavender Mist's Main, 9A8FC9.
+        let main = format!(
+            "{:?}",
+            ParamValue::Color([154.0 / 255.0, 143.0 / 255.0, 201.0 / 255.0, 1.0])
+        );
+        assert_eq!(sent[1].1, main);
+        assert!(
+            sent[3].1.contains("0.5"),
+            "the colour picked last: {sent:?}"
+        );
+
+        // Accent picked on a Vignette plate in Gala Gold: its Background
+        // starts as the plate the preset showed (lifted 35% toward the Main),
+        // not the preset's near-black — the plate does not change.
+        deck.generator.shader_name = "broadcast_vignette".into();
+        deck.generator.params[0] = ParamUIInfo {
+            value: ParamValue::Long(7),
+            ..palette(7)
+        };
+        let mut actions = UIActions::new();
+        actions.commands.push(EngineCommand::SetGeneratorParam {
+            deck_uuid: deck.uuid.clone(),
+            name: "accent_colour".into(),
+            value: ParamValue::Color([0.0, 0.0, 1.0, 1.0]),
+        });
+        custom_when_a_colour_is_picked(deck, 0, &mut actions);
+        let bg = actions.commands.iter().find_map(|c| match c {
+            EngineCommand::SetGeneratorParam {
+                name,
+                value: ParamValue::Color(c),
+                ..
+            } if name == "bg_colour" => Some(*c),
+            _ => None,
+        });
+        let bg = bg.expect("the background seeded");
+        assert!(
+            bg[0] > 0.45 && bg[0] < 0.65,
+            "the plate's red, ~0.55 sRGB: {bg:?}"
+        );
+
+        // On Custom already: nothing added.
+        deck.generator.shader_name = "broadcast_hex_glow".into();
+        deck.generator.params[0] = palette(0);
+        let mut actions = UIActions::new();
+        actions.commands.push(picked(&deck.uuid));
+        custom_when_a_colour_is_picked(deck, 0, &mut actions);
+        assert_eq!(actions.commands.len(), 1);
+    }
+
+    /// In MIDI learn mode a list setting is not changed by a click: the
+    /// click picks it as what the next control moved is mapped to.
+    #[test]
+    fn in_learn_mode_a_list_setting_is_picked_not_changed() {
+        let mut data = UIData::test_fixture();
+        data.midi_learn_active = true;
+        let (ch, dk) = data.selected_deck.expect("fixture selects a deck");
+        let deck = &mut data.channels[ch].decks[dk];
+        deck.generator.params = vec![ParamUIInfo {
+            name: "palette".into(),
+            label: Some("Palette".into()),
+            value: ParamValue::Long(7),
+            min: None,
+            max: None,
+            choices: Some(vec![(0, "Custom".into()), (7, "Gala Gold".into())]),
+        }];
+        let deck = deck.clone();
+        let mut actions = UIActions::new();
+        {
+            let mut h = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(600.0, 300.0))
+                .build_ui(|ui| render_generator_params(ui, &deck, "t", &data, &mut actions));
+            h.get_by_label("Palette").click();
+            h.run();
+            assert!(h.query_by_label("Custom").is_none(), "no menu opened");
+        }
+        assert!(
+            !actions
+                .commands
+                .iter()
+                .any(|c| matches!(c, EngineCommand::SetGeneratorParam { .. })),
+            "nothing changed"
+        );
+        assert_eq!(
+            actions.session.midi_learn_select.as_deref(),
+            Some(format!("deck/{}/param/palette", deck.uuid).as_str())
+        );
     }
 
     /// A camera layer offers its picture's colour range: choosing Full sends
@@ -2696,6 +3568,216 @@ mod tests {
                 matrix: CameraMatrix::Bt709,
             }]
         );
+    }
+
+    /// A camera layer's menu offers Reset input, which sends it for the
+    /// layer; a layer that is no camera has none.
+    #[test]
+    fn a_camera_layers_menu_resets_its_input() {
+        use crate::engine::value::camera::CameraColour;
+        let mut data = UIData::test_fixture();
+        let (ch, dk) = data.selected_deck.expect("fixture selects a deck");
+        let mut deck = data.channels[ch].decks[dk].clone();
+        let menu = |deck: &DeckUIInfo| {
+            let mut actions = UIActions::new();
+            let found = {
+                let mut h = egui_kittest::Harness::new_ui(|ui| {
+                    reset_menu_item(ui, deck, &mut actions);
+                });
+                h.run();
+                let found = h.query_by_label("Reset input").is_some();
+                if found {
+                    h.get_by_label("Reset input").click();
+                    h.run();
+                }
+                found
+            };
+            (found, actions.commands)
+        };
+        deck.camera_colour = None;
+        let (found, _) = menu(&deck);
+        assert!(!found, "no camera: no Reset input");
+        deck.camera_colour = Some(CameraColour::default());
+        let (found, sent) = menu(&deck);
+        assert!(found);
+        assert!(sent.iter().any(|c| matches!(
+            c,
+            EngineCommand::ResetInput { deck_uuid } if *deck_uuid == deck.uuid
+        )));
+        let _ = &mut data;
+    }
+
+    /// A camera's signal is shown under its picture settings; one sending
+    /// full range read as video range offers to read it as Full, which sets
+    /// its colour range so; one read as Full already is offered nothing.
+    /// A camera whose frames come far slower than it was opened at says so
+    /// where its signal is shown; one at its rate does not.
+    #[test]
+    fn a_camera_far_below_its_rate_says_so() {
+        use crate::engine::value::camera::{CameraColour, CameraSignal};
+        let data = UIData::test_fixture();
+        let (ch, dk) = data.selected_deck.expect("fixture selects a deck");
+        let mut deck = data.channels[ch].decks[dk].clone();
+        let signal = |fps: f64| CameraSignal {
+            width: 1920,
+            height: 1080,
+            fps,
+            opened_fps: Some(60.0),
+            format: "2vuy".into(),
+            matrix: "BT.709".into(),
+            full_range: Some(false),
+            below_black: 0.0,
+            shown_again: 0,
+            left_out: 0,
+        };
+        for (fps, said) in [(7.7, true), (59.94, false)] {
+            deck.camera_signal = Some(signal(fps));
+            let mut actions = UIActions::new();
+            let mut h = egui_kittest::Harness::new_ui(|ui| {
+                render_camera_colour(ui, &deck, CameraColour::default(), &mut actions);
+            });
+            h.run();
+            assert_eq!(
+                h.query_by_label_contains("frames a second arrive").is_some(),
+                said,
+                "at {fps} fps"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_range_signal_read_as_video_range_offers_full() {
+        use crate::engine::value::camera::{CameraColour, CameraRange, CameraSignal};
+        let data = UIData::test_fixture();
+        let (ch, dk) = data.selected_deck.expect("fixture selects a deck");
+        let mut deck = data.channels[ch].decks[dk].clone();
+        deck.camera_signal = Some(CameraSignal {
+            width: 1920,
+            height: 1080,
+            fps: 59.94,
+            opened_fps: Some(60.0),
+            format: "2vuy".into(),
+            matrix: "BT.709".into(),
+            full_range: Some(false),
+            below_black: 0.2,
+            shown_again: 0,
+            left_out: 0,
+        });
+        let shown = |colour: CameraColour| {
+            let mut actions = UIActions::new();
+            let offered = {
+                let mut h = egui_kittest::Harness::new_ui(|ui| {
+                    render_camera_colour(ui, &deck, colour, &mut actions);
+                });
+                h.run();
+                assert!(h.query_by_label_contains("Signal: 1920×1080").is_some());
+                let offered = h.query_by_label("Read as Full").is_some();
+                if offered {
+                    h.get_by_label("Read as Full").click();
+                    h.run();
+                }
+                offered
+            };
+            (offered, actions.commands)
+        };
+        let (offered, sent) = shown(CameraColour::default());
+        assert!(offered, "read as video range: offered");
+        assert!(sent.iter().any(|c| matches!(
+            c,
+            EngineCommand::SetCameraColour { deck_uuid, colour }
+                if *deck_uuid == deck.uuid && colour.range == CameraRange::Full
+        )));
+        let full = CameraColour {
+            range: CameraRange::Full,
+            ..CameraColour::default()
+        };
+        let (offered, _) = shown(full);
+        assert!(!offered, "read as Full already");
+    }
+
+    /// A camera that follows its signal offers no format: it says it
+    /// follows the signal, and what comes in now.
+    #[test]
+    fn a_camera_following_its_signal_says_so() {
+        use crate::engine::value::camera::{CameraMode, CameraSignal};
+        let mut data = UIData::test_fixture();
+        let (ch, dk) = data.selected_deck.expect("fixture selects a deck");
+        data.camera_modes = vec![(
+            3,
+            vec![CameraMode {
+                width: 4096,
+                height: 2160,
+                fps: 60,
+            }],
+        )];
+        data.cameras_following_signal = vec![3];
+        let mut deck = data.channels[ch].decks[dk].clone();
+        deck.camera_id = Some(3);
+        deck.camera_signal = Some(CameraSignal {
+            width: 1920,
+            height: 1080,
+            fps: 59.94,
+            opened_fps: Some(59.94),
+            format: "2vuy".into(),
+            matrix: "BT.709".into(),
+            full_range: Some(false),
+            below_black: 0.0,
+            shown_again: 0,
+            left_out: 0,
+        });
+        let mut actions = UIActions::new();
+        let mut h = egui_kittest::Harness::new_ui(|ui| {
+            render_camera_format(ui, &deck, &data, &mut actions);
+        });
+        h.run();
+        assert!(h
+            .query_by_label("follows the signal — 1920×1080 at 59.94 fps now")
+            .is_some());
+    }
+
+    /// A camera layer offers its formats; its frames coming at another rate
+    /// than it was opened at, the format for theirs, which opens it so.
+    #[test]
+    fn a_camera_at_another_rate_is_offered_its_format() {
+        use crate::engine::value::camera::{CameraMode, CameraSignal};
+        let mut data = UIData::test_fixture();
+        let (ch, dk) = data.selected_deck.expect("fixture selects a deck");
+        let mode = |fps| CameraMode {
+            width: 1920,
+            height: 1080,
+            fps,
+        };
+        data.camera_modes = vec![(3, vec![mode(60), mode(50), mode(25)])];
+        let mut deck = data.channels[ch].decks[dk].clone();
+        deck.camera_id = Some(3);
+        deck.camera_mode = Some(mode(60));
+        deck.camera_signal = Some(CameraSignal {
+            width: 1920,
+            height: 1080,
+            fps: 50.01,
+            opened_fps: Some(60.0),
+            format: "2vuy".into(),
+            matrix: "BT.709".into(),
+            full_range: Some(false),
+            below_black: 0.0,
+            shown_again: 0,
+            left_out: 0,
+        });
+        let mut actions = UIActions::new();
+        {
+            let mut h = egui_kittest::Harness::new_ui(|ui| {
+                render_camera_format(ui, &deck, &data, &mut actions);
+            });
+            h.run();
+            assert!(h.query_by_label("Format:").is_some());
+            h.get_by_label("Use 1920×1080 50p").click();
+            h.run();
+        }
+        assert!(actions.commands.iter().any(|c| matches!(
+            c,
+            EngineCommand::SetCameraMode { deck_uuid, mode: Some(m) }
+                if *deck_uuid == deck.uuid && m.fps == 50
+        )));
     }
 
     /// A camera layer offers its lowest latency: ticking it sends it for the
@@ -2828,5 +3910,193 @@ mod tests {
             })
             .collect();
         assert_eq!(added, ["crop", "transform"]);
+    }
+
+    fn listed(
+        kind: &str,
+        label: &str,
+        uuid: Option<&str>,
+        width: u32,
+    ) -> crate::engine::CaptureTargetSnapshot {
+        crate::engine::CaptureTargetSnapshot {
+            kind: kind.into(),
+            label: label.into(),
+            app: (kind == "window").then(|| "com.apple.Keynote".to_string()),
+            title: (kind == "window").then(|| label.to_string()),
+            width,
+            height: width * 9 / 16,
+            is_varda: false,
+            uuid: uuid.map(str::to_string),
+        }
+    }
+
+    /// A screen capture of "Display 1": kept by `uuid`, or by its name alone.
+    fn capture_of_display_1(uuid: Option<&str>) -> ScreenCaptureUI {
+        ScreenCaptureUI {
+            target_label: "Display 1".into(),
+            is_display: true,
+            target_uuid: uuid.map(str::to_string),
+            kept_by_name: uuid.is_none(),
+            rate: 0.5,
+            rate_fps: 60.0,
+            crop: [0.0, 0.0, 1.0, 1.0],
+            show_cursor: false,
+            exclude_varda: true,
+            bound: true,
+            connected: true,
+        }
+    }
+
+    /// The fixture's first layer as a screen capture, on a desk whose
+    /// capture box is "Display 1" and whose 4K "Display 2", a Keynote window
+    /// open.
+    fn capture_picker(
+        capture: ScreenCaptureUI,
+    ) -> egui_kittest::Harness<'static, UIActions> {
+        let mut data = UIData::test_fixture();
+        data.capture_targets = vec![
+            listed("display", "Display 1", Some("capture"), 1920),
+            listed("display", "Display 2", Some("4k"), 3840),
+            listed("window", "Opening", None, 1280),
+        ];
+        let deck = data.channels[0].decks[0].clone();
+        egui_kittest::Harness::builder()
+            .with_size(egui::vec2(520.0, 400.0))
+            .build_ui_state(
+                move |ui, actions: &mut UIActions| {
+                    render_capture_target(ui, &deck, &capture, &data, actions);
+                },
+                UIActions::new(),
+            )
+    }
+
+    const KEPT_BY_NUMBER: &str = "Kept by its number: this shows whichever screen is Display 1 \
+         now, and another once the screens are numbered anew. Pick its screen above to keep \
+         that screen itself.";
+
+    /// A screen input a show has by its display's number says so, and its
+    /// screen picked in the list is sent as that screen itself — the way a
+    /// show's two inputs made of its 4K, showing a capture box's own screen,
+    /// are put right (an M5 Max, 2026-11-10).
+    #[test]
+    fn a_screen_kept_by_its_number_says_so_and_takes_the_screen_picked() {
+        let mut h = capture_picker(capture_of_display_1(None));
+        h.get_by_label(KEPT_BY_NUMBER);
+        h.get_by_value("Display 1").click();
+        h.run();
+        h.get_by_label("Display 2 — 3840×2160").click();
+        h.run();
+        let deck = UIData::test_fixture().channels[0].decks[0].uuid.clone();
+        let picked: Vec<_> = h
+            .state()
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                EngineCommand::SetScreenCaptureTarget { deck_uuid, target } => {
+                    Some((deck_uuid.clone(), target.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            picked,
+            vec![(
+                deck,
+                crate::scene::CaptureTargetConfig::Display {
+                    name: "Display 2".into(),
+                    uuid: Some("4k".into()),
+                }
+            )]
+        );
+    }
+
+    /// One kept as the screen itself says nothing of numbers; a window in
+    /// the list is sent by its app and title, and Refresh looks again.
+    #[test]
+    fn a_screen_kept_as_itself_can_be_given_a_window() {
+        let mut h = capture_picker(capture_of_display_1(Some("capture")));
+        assert!(h.query_by_label(KEPT_BY_NUMBER).is_none());
+        h.get_by_label("Refresh").click();
+        h.run();
+        h.get_by_value("Display 1").click();
+        h.run();
+        h.get_by_label("Opening").click();
+        h.run();
+        let commands = &h.state().commands;
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, EngineCommand::RescanCaptureTargets)),
+            "looked again"
+        );
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                EngineCommand::SetScreenCaptureTarget {
+                    target: crate::scene::CaptureTargetConfig::Window { app, title },
+                    ..
+                } if app == "com.apple.Keynote" && title == "Opening"
+            )),
+            "the window, by its app and title"
+        );
+    }
+
+    /// The list marks what the input captures: its screen where it is kept
+    /// as itself — whatever number that screen has now — none where it is
+    /// kept by a number alone, and its window as the show names it. Of two
+    /// screens alike, the one of its name.
+    #[test]
+    fn the_list_marks_the_screen_or_window_the_input_captures() {
+        let targets = vec![
+            listed("display", "Display 1", Some("capture"), 1920),
+            listed("display", "Display 2", Some("4k"), 3840),
+            listed("window", "Opening", None, 1280),
+        ];
+        let marked =
+            |capture: &ScreenCaptureUI, targets: &[crate::engine::CaptureTargetSnapshot]| {
+                targets
+                    .iter()
+                    .filter(|t| is_captured(capture, t, targets))
+                    .map(|t| t.label.clone())
+                    .collect::<Vec<_>>()
+            };
+        // The 4K, saved as "Display 1" when it was that.
+        let the_4k = capture_of_display_1(Some("4k"));
+        assert_eq!(marked(&the_4k, &targets), ["Display 2"]);
+        let the_box = capture_of_display_1(Some("capture"));
+        assert_eq!(marked(&the_box, &targets), ["Display 1"]);
+        assert!(marked(&capture_of_display_1(None), &targets).is_empty());
+
+        let mut window = capture_of_display_1(None);
+        window.is_display = false;
+        window.kept_by_name = false;
+        window.target_label = "com.apple.Keynote — Opening".into();
+        assert_eq!(marked(&window, &targets), ["Opening"]);
+
+        let twins = vec![
+            listed("display", "Display 1", Some("twin"), 1920),
+            listed("display", "Display 2", Some("twin"), 1920),
+        ];
+        let mut second = capture_of_display_1(Some("twin"));
+        second.target_label = "Display 2".into();
+        assert_eq!(marked(&second, &twins), ["Display 2"]);
+
+        // No identities at all (not macOS): the name.
+        let plain = vec![
+            listed("display", "Display 1", None, 1920),
+            listed("display", "Display 2", None, 1920),
+        ];
+        let mut by_name = capture_of_display_1(None);
+        by_name.kept_by_name = false;
+        assert_eq!(marked(&by_name, &plain), ["Display 1"]);
+
+        // One screen with no identity among those that have: an input kept
+        // by that number is still none of them — the one of it tomorrow
+        // may be another.
+        let mixed = vec![
+            listed("display", "Display 1", None, 1920),
+            listed("display", "Display 2", Some("4k"), 3840),
+        ];
+        assert!(marked(&capture_of_display_1(None), &mixed).is_empty());
     }
 }

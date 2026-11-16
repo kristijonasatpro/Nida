@@ -18,23 +18,44 @@ impl KeyCombo {
 }
 
 /// Collect non-repeat key-down events this frame as domain combos.
+///
+/// Each with the modifiers its own event carries: a Shift let go before the
+/// frame still held for the key pressed with it.
 pub fn collect_pressed_keys(ctx: &egui::Context) -> Vec<KeyCombo> {
     ctx.input(|i| {
-        let mods = i.modifiers;
         i.events
             .iter()
-            .filter_map(|event| {
-                if let egui::Event::Key {
+            .filter_map(|event| match event {
+                egui::Event::Key {
                     key,
                     pressed: true,
                     repeat: false,
+                    modifiers,
                     ..
-                } = event
-                {
-                    Some(KeyCombo::from_egui(*key, &mods))
-                } else {
-                    None
-                }
+                } => Some(KeyCombo::from_egui(*key, modifiers)),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+/// Every key down this frame, and whether it is a repeat — the key held —
+/// where [`collect_pressed_keys`] gives the first presses only: a key a
+/// shortcut owns is taken from the panels while it repeats too, though acted
+/// on once.
+pub fn collect_key_downs(ctx: &egui::Context) -> Vec<(KeyCombo, bool)> {
+    ctx.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat,
+                    modifiers,
+                    ..
+                } => Some((KeyCombo::from_egui(*key, modifiers), *repeat)),
+                _ => None,
             })
             .collect()
     })
