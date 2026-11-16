@@ -553,11 +553,11 @@ fn no_look_goes_near_black() {
     }
 }
 
-/// Calm centre calms every look alike, over the middle of the picture —
-/// all of it but a border: at 1 the middle, and the lower part of it where
-/// names go, are at least a quarter dimmer than at 0 (or as dim as its
-/// calm plate already), whatever the look; at the picture's very edge the
-/// look is left as it is.
+/// Calm centre calms every look alike, in the middle of the picture: at 1
+/// the middle — a little under half of the picture across and down — is at
+/// least a quarter dimmer than at 0 (or as dim as its calm plate already),
+/// whatever the look; from there the look comes back softly, by degrees,
+/// and at the picture's very edge it is left as it is.
 #[test]
 fn calm_centre_calms_every_look() {
     let Some(ctx) = headless_gpu() else {
@@ -584,11 +584,11 @@ fn calm_centre_calms_every_look() {
             })
         };
         let (open, calmed) = (at(0.0), at(1.0));
-        // The calm box is from 0.17 to 0.83 across and 0.19 to 0.81 down,
-        // its corners rounded.
+        // Calm in full inside a box from 0.28 to 0.72 across and down, its
+        // corners rounded.
         for (place, x, y) in [
             ("middle", (0.38, 0.62), (0.36, 0.58)),
-            ("lower part", (0.2, 0.8), (0.62, 0.78)),
+            ("lower part", (0.36, 0.64), (0.6, 0.7)),
         ] {
             let (before, after) = (mean(&open, x, y), mean(&calmed, x, y));
             let drop = 1.0 - after / before.max(1e-6);
@@ -603,9 +603,17 @@ fn calm_centre_calms_every_look() {
         }
         // Never black there: LED panels go patchy near it.
         assert!(mean(&calmed, (0.38, 0.62), (0.36, 0.58)) > 0.02, "{name}: calmed to black");
-        // The calm has faded out 0.15 beyond its box: the top and bottom
-        // 3% of the picture and its outermost 1% at the sides are the look
-        // as it was.
+        // Calm in full in both: calmed, the lower part comes out as flat as
+        // the middle — within a third of it, whatever the look had in each.
+        let (middle, lower) =
+            (mean(&calmed, (0.38, 0.62), (0.36, 0.58)), mean(&calmed, (0.36, 0.64), (0.6, 0.7)));
+        assert!(
+            (lower / middle - 1.0).abs() < 0.3,
+            "{name}: calmed, the lower part at {lower:.3} is not as flat as the middle at {middle:.3}"
+        );
+        // The calm has faded out 0.26 beyond that box, by degrees: the top
+        // and bottom 3% of the picture and its outermost 1% at the sides
+        // are the look as it was.
         for (place, x, y) in [
             ("top edge", (0.0, 1.0), (0.0, 0.03)),
             ("bottom edge", (0.0, 1.0), (0.97, 1.0)),
