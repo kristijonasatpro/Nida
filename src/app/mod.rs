@@ -10,6 +10,7 @@ pub(crate) mod app_id;
 mod bus_dissolve;
 mod bus_overlay;
 mod commands;
+mod effect_loading;
 mod engine_impl;
 pub(crate) mod frame_parts;
 pub(crate) mod history;
@@ -631,6 +632,7 @@ pub(crate) struct MessageBus {
 pub struct VardaApp {
     // ── Engine core ──────────────────────────────────────────────
     mixer: Mixer,
+    effect_loader: Option<crate::deck::loading::EffectLoader>,
     /// Independent production buses (PVW/PGM switching per destination).
     ///
     /// Named in full to keep it distinct from `bus`, which is the cross-thread
@@ -965,6 +967,7 @@ impl VardaApp {
         let waiting_for_sound = audio_inputs_pending.is_some();
         let mut app = Self {
             mixer,
+            effect_loader: None,
             audio_manager,
             audio_mix: crate::audio_mix::AudioEngine::new(),
             clips_on_air: std::collections::HashMap::new(),

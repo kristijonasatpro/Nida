@@ -108,6 +108,7 @@ pub(super) fn render_master_effect_detail(
                                                 ui.label(egui::RichText::new(eff_name).strong());
                                             });
 
+                                            super::deck_detail::render_effect_load_state(ui, eff_uuid, data);
                                             if !eff_params.params.is_empty() {
                                                 let eff_idx_copy = eff_idx;
                                                 let eff_uuid_param = eff_uuid.clone();
@@ -390,6 +391,7 @@ pub(super) fn render_channel_effect_detail(
                                                 );
                                             });
 
+                                            super::deck_detail::render_effect_load_state(ui, eff_uuid, data);
                                             if !eff_params.params.is_empty() {
                                                 let ch_copy = ch_idx;
                                                 let eff_idx_copy = eff_idx;

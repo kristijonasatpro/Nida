@@ -362,10 +362,7 @@ const PLACEMENT: &[&str] = &[
 
 /// A deck's effects that are on, in order (an offline one is not run).
 fn enabled_effects(deck: &Deck) -> Vec<&crate::deck::Effect> {
-    deck.effects
-        .iter()
-        .filter(|e| e.enabled && e.offline().is_none())
-        .collect()
+    deck.effects.iter().filter(|e| e.is_active()).collect()
 }
 
 /// Whether anything modulates the settings under `prefix`.
@@ -406,7 +403,7 @@ type Fill<'a> = (&'a wgpu::TextureView, [f32; 4], Vec<Pixels>, u32);
 fn crisp_crops(deck: &Deck, modulation: &crate::modulation::ModulationEngine) -> bool {
     deck.effects
         .iter()
-        .filter(|e| e.enabled && e.shader.name() == "crop")
+        .filter(|e| e.is_active() && e.shader.name() == "crop")
         .all(|e| {
             e.plain_crop(modulation)
                 .is_some_and(|crop| crop.feather <= 0.0 && crop.border.is_none())
@@ -425,10 +422,7 @@ fn drawn_alike(a: &Deck, b: &Deck, modulation: &crate::modulation::ModulationEng
             && deck
                 .effects
                 .iter()
-                // An offline effect is kept, not run: its modulation moves nothing.
-                .all(|e| {
-                    !e.enabled || e.offline().is_some() || !modulated(modulation, e.param_prefix())
-                })
+                .all(|e| !e.is_active() || !modulated(modulation, e.param_prefix()))
     };
     if !still(a) || !still(b) || !crisp_crops(a, modulation) || !crisp_crops(b, modulation) {
         return false;
@@ -565,7 +559,7 @@ fn plain_tap(deck: &Deck, modulation: &crate::modulation::ModulationEngine) -> b
     let transforms = deck
         .effects
         .iter()
-        .filter(|e| e.enabled && e.shader.name() == "transform")
+        .filter(|e| e.is_active() && e.shader.name() == "transform")
         .count();
     deck.tap.is_some()
         && transforms <= 1
@@ -573,8 +567,7 @@ fn plain_tap(deck: &Deck, modulation: &crate::modulation::ModulationEngine) -> b
         && deck
             .effects
             .iter()
-            // An offline effect is kept, not run.
-            .filter(|e| e.enabled && e.offline().is_none())
+            .filter(|e| e.is_active())
             .all(|e| match e.shader.name().as_str() {
                 "crop" => e.is_neutral_framing(modulation),
                 "transform" => {
@@ -630,12 +623,7 @@ pub(super) fn layer_rect(
     modulation: &crate::modulation::ModulationEngine,
 ) -> [f32; 4] {
     let mut rect = FRAME;
-    // An offline effect is kept, not run: it moves nothing.
-    for effect in deck
-        .effects
-        .iter()
-        .filter(|e| e.enabled && e.offline().is_none())
-    {
+    for effect in deck.effects.iter().filter(|e| e.is_active()) {
         match effect.shader.name().as_str() {
             "crop" => {
                 let Some(crop) = effect.plain_crop(modulation) else {
@@ -929,12 +917,7 @@ impl Mixer {
             }
             Side::Channel(idx) => {
                 let channel = &self.channels[idx];
-                // An offline effect is kept, not run: no effect of its own.
-                if let Some(effect) = channel
-                    .effects
-                    .iter()
-                    .find(|e| e.enabled && e.offline().is_none())
-                {
+                if let Some(effect) = channel.effects.iter().find(|e| e.is_active()) {
                     return Err(format!(
                         "'{}' has an effect of its own ({})",
                         channel.name,

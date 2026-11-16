@@ -164,6 +164,40 @@ fn blue_under_red(app: &mut VardaApp) -> (String, String) {
     (channel, red)
 }
 
+/// Pixel assertions observe completed framing, including asynchronous defaults.
+/// Fail explicitly on a build error rather than comparing an unfinished source.
+fn wait_for_effects(app: &mut VardaApp) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        app.process_inputs();
+        let state = app.build_engine_state();
+        let mut building = false;
+        for effect in state
+            .mixer
+            .channels
+            .iter()
+            .flat_map(|channel| &channel.decks)
+            .flat_map(|deck| &deck.effects)
+        {
+            match &effect.load_state {
+                varda::engine::EffectLoadState::Ready => {}
+                varda::engine::EffectLoadState::Building => building = true,
+                varda::engine::EffectLoadState::Failed { message } => {
+                    panic!("effect failed: {message}")
+                }
+            }
+        }
+        if !building {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "source effects did not finish loading"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// The first channel's picture — the red layer over the blue one — drawn
 /// twice so every pass has run.
 fn picture(app: &mut VardaApp) -> (Vec<[f32; 4]>, u32, u32) {
@@ -173,6 +207,7 @@ fn picture(app: &mut VardaApp) -> (Vec<[f32; 4]>, u32, u32) {
 /// The picture of the channel at `index`, after so many frames more are
 /// drawn.
 fn picture_after(app: &mut VardaApp, index: usize, frames: u32) -> (Vec<[f32; 4]>, u32, u32) {
+    wait_for_effects(app);
     for _ in 0..frames {
         app.render_mixer_frame();
     }
@@ -190,6 +225,7 @@ fn own(app: &mut VardaApp, layer: &str) -> (Vec<[f32; 4]>, u32, u32) {
 
 /// The same, after so many frames more are drawn.
 fn own_after(app: &mut VardaApp, layer: &str, frames: u32) -> (Vec<[f32; 4]>, u32, u32) {
+    wait_for_effects(app);
     for _ in 0..frames {
         app.render_mixer_frame();
     }

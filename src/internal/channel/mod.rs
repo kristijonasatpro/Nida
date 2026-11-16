@@ -2017,8 +2017,7 @@ impl Channel {
             let mut fx_cmd_buffers: Vec<wgpu::CommandBuffer> = Vec::new();
 
             for (eff_idx, effect) in self.effects.iter_mut().enumerate() {
-                // An offline effect is kept, not run.
-                if !effect.enabled || effect.offline().is_some() {
+                if !effect.is_active() {
                     continue;
                 }
 

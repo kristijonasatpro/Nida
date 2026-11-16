@@ -1,4 +1,5 @@
 mod effect;
+pub(crate) mod loading;
 pub mod lower_third;
 pub mod media;
 pub mod playlist;
@@ -775,7 +776,8 @@ pub struct Effect {
     /// Cached "fx_{uuid}" prefix for modulation key lookups (avoids per-frame format!)
     param_prefix: String,
     pub shader: ISFShader,
-    pub pipeline: UnifiedPipeline,
+    pub pipeline: Option<UnifiedPipeline>,
+    build: loading::EffectBuild,
     pub enabled: bool,
     pub params: ShaderParams,
     pub pass_buffers: HashMap<String, PassBuffer>,
@@ -1859,6 +1861,11 @@ impl Deck {
                 e.preprocessor_textures
                     .iter()
                     .any(|s| s.analyzer_type == ty)
+                    || (matches!(
+                        e.load_state(),
+                        crate::engine::types::EffectLoadState::Building
+                    ) && crate::depth::preprocess::requested_device(&e.shader.metadata)
+                        .is_some())
             })
     }
 
@@ -2112,9 +2119,7 @@ impl Deck {
         }
         let mut effects = Vec::with_capacity(self.effects.len());
         for effect in &self.effects {
-            // An offline effect is kept, not run: it changes nothing.
-            if effect.enabled && effect.offline().is_none() && !effect.is_static_framing(modulation)
-            {
+            if effect.is_active() && !effect.is_static_framing(modulation) {
                 return None;
             }
             let values = effect
@@ -2123,7 +2128,7 @@ impl Deck {
                 .iter()
                 .flat_map(|name| param_bits(effect.params.values.get(name)))
                 .collect();
-            effects.push((effect.uuid().to_string(), effect.enabled, values));
+            effects.push((effect.uuid().to_string(), effect.is_active(), values));
         }
         Some(StillFrame {
             size: (self.texture.width(), self.texture.height()),
@@ -2173,11 +2178,10 @@ impl Deck {
         };
         // An offline effect is kept, not run: it changes nothing.
         source_opaque
-            && self.effects.iter().all(|effect| {
-                !effect.enabled
-                    || effect.offline().is_some()
-                    || effect.is_neutral_framing(modulation)
-            })
+            && self
+                .effects
+                .iter()
+                .all(|effect| !effect.is_active() || effect.is_neutral_framing(modulation))
     }
 
     /// Where this deck's picture is certain to be opaque, in UV of the frame:
@@ -2235,11 +2239,7 @@ impl Deck {
         // the composite's own sampling of the texture.
         let mut fringe = 0.0;
         for effect in &self.effects {
-            // An offline effect is kept, not run: it changes nothing.
-            if effect.enabled
-                && effect.offline().is_none()
-                && !effect.is_neutral_framing(modulation)
-            {
+            if effect.is_active() && !effect.is_neutral_framing(modulation) {
                 area = effect.opaque_after(area, aspect, modulation, &mut fringe)?;
             }
         }

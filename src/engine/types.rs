@@ -1025,6 +1025,8 @@ pub struct EffectSnapshot {
     pub uuid: String,
     pub name: String,
     pub enabled: bool,
+    /// Pending and failed effects remain editable but do not draw.
+    pub load_state: EffectLoadState,
     pub params: ShaderParamsSnapshot,
     /// Where the effect shows; everywhere when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1033,6 +1035,18 @@ pub struct EffectSnapshot {
     /// nothing: why (None = not offline).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offline: Option<String>,
+}
+
+/// Runtime state only; saved shows retain the effect's settings, not a job.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum EffectLoadState {
+    #[default]
+    Ready,
+    Building,
+    Failed {
+        message: String,
+    },
 }
 
 #[derive(Clone, Serialize)]
