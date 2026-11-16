@@ -953,11 +953,11 @@ fn a_frame_whose_shader_is_not_there_gives_way_keeping_its_choices() {
     );
     let deck = layer.uuid.clone();
 
-    let CommandResult::OkWithId { uuid: panel } = send_cmd(
+    let CommandResult::OkWithId { uuid: neon } = send_cmd(
         &mut app,
         EngineCommand::SetLayerFrame {
             deck_uuid: deck,
-            frame: Some("frame_panel".to_string()),
+            frame: Some("frame_neon_two".to_string()),
         },
     ) else {
         panic!("not put in its place");
@@ -965,11 +965,11 @@ fn a_frame_whose_shader_is_not_there_gives_way_keeping_its_choices() {
     let state = app.build_engine_state();
     let effects = &state.mixer.channels[0].decks[0].effects;
     let names: Vec<&str> = effects.iter().map(|e| e.name.as_str()).collect();
-    assert_eq!(names, ["crop", "frame_panel", "transform"], "the one without its shader gone");
+    assert_eq!(names, ["crop", "frame_neon_two", "transform"], "the one without its shader gone");
     let setting = |name: &str| {
         effects
             .iter()
-            .find(|e| e.uuid == panel)
+            .find(|e| e.uuid == neon)
             .expect("the new frame")
             .params
             .params

@@ -90,15 +90,16 @@ void bc_colours(int preset, vec4 bg, vec4 mn, vec4 ac, out vec3 b, out vec3 m, o
     a = bc_lin(BC_PALETTES[i + 2]);
 }
 
-// Calm centre, the last step of every moving look: in the middle and the
-// lower third, where slides and names go, the picture goes toward a flat,
-// dim plate of its background — whatever the look, so text over it reads —
-// never below the floor LED panels need (the base is a little above black).
+// Calm centre, the last step of every moving look: over the middle of the
+// picture — all of it but a border, so where slides, frames and names go —
+// the picture goes toward a flat, dim plate of its background, whatever
+// the look, so text over it reads; never below the floor LED panels need
+// (the base is a little above black). Calm inside a rounded box in the
+// middle, the look coming back by degrees toward the picture's edges.
 vec3 bc_calm_all(vec3 col, vec3 base, vec2 st, float amount) {
-    vec2 c = (st - vec2(0.5, 0.48)) * vec2(1.1, 1.6);
-    float centre = exp(-dot(c, c) * 3.0);
-    float lower = smoothstep(0.6, 0.72, st.y) * (1.0 - smoothstep(0.93, 1.0, st.y));
-    float m = clamp(amount, 0.0, 1.0) * max(centre, lower * 0.85);
+    vec2 from_box = abs(st - 0.5) - vec2(0.33, 0.31) + 0.14;
+    float outside = length(max(from_box, 0.0)) + min(max(from_box.x, from_box.y), 0.0) - 0.14;
+    float m = clamp(amount, 0.0, 1.0) * (1.0 - smoothstep(0.0, 0.15, outside));
     // Mixed as the eye sees it (sRGB): dark looks calm as much as bright.
     return bc_lin(mix(bc_srgb(col), bc_srgb(base) * 0.5, m * 0.9));
 }

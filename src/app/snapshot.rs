@@ -626,8 +626,8 @@ pub(crate) fn broadcast_looks(
 }
 
 /// The frames among `filters`: the `frame_*` shaders, each with a title
-/// from its description ("HUD frame — cut corners…" → "HUD frame"), by
-/// title.
+/// from its description ("HUD frame — machined gunmetal…" → "HUD frame"),
+/// by title.
 pub(crate) fn frame_looks(filters: &[&crate::isf::ISFShader]) -> Vec<crate::engine::FrameLook> {
     let mut frames: Vec<crate::engine::FrameLook> = filters
         .iter()
@@ -1152,7 +1152,7 @@ mod tests {
             return;
         };
         let registry = build_registry_snapshot(&app);
-        assert!(registry.frames.len() >= 14, "{:?}", registry.frames);
+        assert!(registry.frames.len() >= 12, "{:?}", registry.frames);
         for frame in &registry.frames {
             assert!(crate::engine::value::frame::is_frame(&frame.name), "{frame:?}");
             assert!(
@@ -1165,11 +1165,26 @@ mod tests {
                 frame.name
             );
         }
-        assert!(
-            registry.frames.iter().any(|f| f.title == "HUD frame"),
-            "{:?}",
-            registry.frames
-        );
+        for title in [
+            "Electric",
+            "Flare",
+            "HUD frame",
+            "HUD lines",
+            "Neon arrows",
+            "Neon double",
+            "Neon ring",
+            "Silver deco",
+            "Stepped neon",
+            "Stream overlay",
+            "Two-tone neon",
+            "White neon",
+        ] {
+            assert!(
+                registry.frames.iter().any(|f| f.title == title),
+                "{title} among {:?}",
+                registry.frames
+            );
+        }
     }
 
     /// The shipped library holds the Broadcast backgrounds, every mood among

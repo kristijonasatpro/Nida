@@ -789,6 +789,12 @@ pub struct Effect {
     pub phase_accumulators: [f32; 4],
     /// Phase input config from shader metadata
     pub phase_inputs_config: Option<Vec<crate::isf::PhaseInput>>,
+    /// The uniforms of each pass, by its index, for a multi-pass filter
+    /// none of whose targets is kept from frame to frame: its passes are
+    /// drawn in their turn with the rest of the frame (see
+    /// `Effect::apply_passes`), so each needs a buffer of its own. Empty for
+    /// any other effect.
+    pass_uniform_buffers: Vec<wgpu::Buffer>,
     /// Frames this effect has actually been run on a deck — neutral framing
     /// is skipped (see `Deck::render`).
     runs: u64,

@@ -1825,8 +1825,9 @@ pub enum EngineCommand {
         mask: Option<crate::engine::value::mask::EffectMask>,
     },
     /// Put a layer's picture in a frame: a `frame_*` filter (`frames` in
-    /// `GET /api/state/registry`) that holds the picture — scaled into its
-    /// window, cut to its shape, a moving outline round it — in place of
+    /// `GET /api/state/registry`) that holds the picture — what shows of
+    /// it, the frame drawn over its edge or the picture fitted inside the
+    /// frame — in place of
     /// the frame the layer has, keeping what was changed on that one;
     /// `None` takes the frame away. The frame runs before the layer's
     /// Transform, so the layer is moved and scaled frame and all. Answered

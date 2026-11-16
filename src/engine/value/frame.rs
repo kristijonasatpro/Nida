@@ -1,8 +1,12 @@
 //! Frames: filters that hold a layer's picture (`shaders/frame_*.fs`).
 //!
-//! A frame scales the picture into its window, cuts it to the frame's own
-//! shape and draws a moving outline round it, clear everywhere else. A
-//! layer has one from Input Settings → Position → Frame
+//! A frame's window is what shows of the layer's picture — what its Crop
+//! keeps, all of a picture that fills the layer — which the frame's shader
+//! finds itself, from the picture, each time it is drawn. The picture
+//! fills the window and the frame — a picture of one, or lines of light,
+//! with a light going round — is drawn over its edge; or, Picture inside
+//! the frame, the picture is fitted into the frame. Outside the window all
+//! is clear. A layer has one from Input Settings → Position → Frame
 //! (`EngineCommand::SetLayerFrame`), where it runs before the layer's
 //! Transform — so the layer is moved and scaled frame and all — and is
 //! told from the layer's other effects by its shader's name.

@@ -140,35 +140,66 @@ Transform, so a picture shrunk to a third shows a 6 px border as 2 px.
 ### Frame
 
 **Frame** puts the layer's picture in a moving frame, as stream overlays
-do — a slide, a PowerPoint or a camera in a HUD frame, a tech panel, an art
-deco border. Pick one from the list (**None** takes it away): the frame
-holds the picture, scaled into its window; cuts it to the frame's own shape
-(cut corners cut the picture's corners too); and draws its lines and lights
-round it, clear everywhere else, so what is under the layer shows there — a
-Broadcast background as the input's bottom layer makes the whole stage.
+do — a slide, a PowerPoint or a camera in a HUD frame, a neon outline, an
+overlay with a tab for a name. Pick one from the list (**None** takes it
+away). The frame's window is the whole picture, a light going round it:
+most frames are drawn over the picture's edge and leave the picture as it
+is; some (HUD lines, Stepped neon, Neon ring) start with the picture made
+a little smaller, inside the frame.
+
+There are twelve. **HUD frame** is a picture of a frame — gunmetal,
+screws, light strips. The others are drawn of lines of light: **HUD
+lines**, **Neon double**, **Two-tone neon**, **Stepped neon**, **Neon
+arrows**, **White neon**, **Flare**, **Electric**, **Silver deco**,
+**Stream overlay** (a solid band, with a dark tab above its bottom edge
+for a name) and **Neon ring** (the picture in a circle).
 
 The frame belongs to the layer: drag or resize the layer and picture and
 frame go together, and the channel's **Layout** templates (Side by side,
 PiP…) place framed layers as any other — slides in one frame, the speaker
-in another. Its settings are under the list:
+in another. It holds what shows of the layer's picture, and finds that
+itself, each frame: what **Crop** keeps — crop the layer and the frame
+closes round the part that is left — and as much of a picture cropped in
+the input it is repeated from (🔁), or of a picture that does not fill its
+layer. A layer with nothing showing has no frame either. Its settings are
+under the list:
 
+- **Size** — how much of the picture's place the frame's window takes. 1,
+  as it comes, is all of it; smaller, frame and picture shrink toward the
+  middle and the layer is clear round them, so what is under it shows — a
+  Broadcast background as the input's bottom layer makes the whole stage.
 - **Shape** — the window's shape: **As the picture**, or 16:9, 4:3, 1:1,
-  9:16 — a square or upright speaker box without Crop.
-- **Fill the frame** — off, the whole picture shows inside the window
-  (nothing of a slide is lost; where the shapes differ, the rest of the
-  window is clear); on, the picture fills the frame's shape, its edges cut.
-- **Size** — how much of the layer the window takes; the room left is for
-  the frame's marks outside it (ticks, fans, traces, tabs), which are as
-  large as that room allows and go when there is none.
-- **Speed** (0 stands still), **Line weight**, **Glow**, and the
-  **Palette** of the Broadcast backgrounds — or **Custom**, with the Main
-  and Accent colours below it.
+  9:16 — a square or upright speaker box without Crop. Beside a window
+  narrower than the picture the layer is clear.
+- **Fill the frame** — where the window's shape is not the picture's: off,
+  the whole picture shows inside the window (nothing of a slide is lost;
+  the HUD frame backs the room left with black, a line frame leaves it
+  clear); on, the picture covers the window, its edges cut.
+- **Picture inside the frame** — off, the picture fills the window and the
+  frame lies over its edge: the HUD frame's band hides the picture's
+  outermost few per cent, and a line frame covers what is outside its
+  outline. On, the picture is made smaller to fit inside the frame — the
+  HUD frame's opening, or a line frame's outline, cut to its shape — so
+  nothing of a slide is under the frame. HUD lines and Stepped neon start
+  with it on; the Neon ring with it and Fill the frame on.
+- **Backing** (the line frames) — the dark plate outside the frame's
+  outline, behind its lines and marks, which makes the frame a thing that
+  holds the picture. At 0 there is none: the picture shows there dimmed —
+  or, the picture inside the frame, nothing does, and what is under the
+  layer shows (as the Neon ring starts).
+- **Frame colour** — the colour of the lines, or of the HUD frame's
+  lights; the frames of two colours have a **Second colour**. **Frame
+  size** — how thick the lines, or the HUD frame's band, are. **Marks**
+  (HUD lines) — the band of marks above and below its outline; 0 for none.
+- **Animation** — the light: **A light going round**, **Two lights going
+  round**, **Two lights, opposite ways**, **Three lights going round**,
+  **Breathing**, or **Still** for none — with its **Light colour**,
+  **Light size** and **Glow**. **Speed** is how fast it all moves; 0
+  stands still.
 
 Another frame picked in its place keeps the settings changed on the first.
-The frame wraps the layer's whole picture — not what Crop keeps: for a
-cropped speaker use the frame's Shape. Over the API:
-`{"SetLayerFrame": {"deck_uuid": "…", "frame": "frame_hud"}}` to
-`POST /api/command` (`"frame": null` takes it away); `GET
+Over the API: `{"SetLayerFrame": {"deck_uuid": "…", "frame": "frame_hud"}}`
+to `POST /api/command` (`"frame": null` takes it away); `GET
 /api/state/registry` lists them under `frames`, and the frame's settings are
 set as any effect's.
 

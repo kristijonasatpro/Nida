@@ -2609,8 +2609,8 @@ fn render_frame(ui: &mut egui::Ui, deck: &DeckUIInfo, data: &UIData, actions: &m
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.label(section_title(ui, "Frame")).on_hover_text(
-            "Put the layer's picture in a moving frame: it holds the picture, cuts it to its \
-             shape, and goes where the layer goes",
+            "Put the layer's picture in a moving frame: it holds what shows of the picture, \
+             and goes where the layer goes",
         );
         egui::ComboBox::from_id_salt(("layer_frame", &deck.uuid))
             .selected_text(title)

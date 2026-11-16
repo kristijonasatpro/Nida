@@ -337,10 +337,11 @@ Vignette plate have their own: angle, style, edge darkening):
   makes the picture jump.
 - **Density** — how much of it there is: discs, cells, streaks, curtains.
   It costs the GPU the same however much.
-- **Calm centre** — how much the middle and the lower third go toward a flat,
-  dim plate of the background, so a slide or a name over it stays easy to
-  read; every look calms alike (at 1, a third to three quarters dimmer there),
-  never darker than LED panels take.
+- **Calm centre** — how much the middle of the picture — all of it but a
+  border, the look coming back by degrees toward the edges — goes toward a
+  flat, dim plate of the background, so a slide, a frame or a name over it
+  stays easy to read; every look calms alike (at 1, a third to three
+  quarters dimmer there), never darker than LED panels take.
 - **Palette** — twelve sets of three colours (Background, Main, Accent):
   Corporate Blue, Graphite Teal and Violet Tech for tech events; Ice, Neon
   and Terminal for cyber; Gala Gold, Sunset and Rosé for warm; Nordic Aurora,

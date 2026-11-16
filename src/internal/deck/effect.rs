@@ -164,6 +164,28 @@ impl Effect {
             );
         }
 
+        // A filter that makes its targets anew each frame has its passes
+        // drawn in their turn (see `apply_passes`): a uniform buffer for each.
+        let in_turn = num_passes > 0
+            && passes
+                .iter()
+                .all(|pass| pass.target.is_none() || !pass.persistent.unwrap_or(false));
+        let pass_uniform_buffers = if in_turn {
+            passes
+                .iter()
+                .map(|_| {
+                    context.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Effect Pass Uniforms"),
+                        size: std::mem::size_of::<ISFUniforms>() as u64,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Initialize parameters from shader inputs
         let inputs = shader.metadata.inputs.as_deref().unwrap_or(&[]);
         let params = ShaderParams::from_inputs(inputs);
@@ -187,6 +209,7 @@ impl Effect {
             preprocessor_textures,
             phase_accumulators: [0.0; 4],
             phase_inputs_config,
+            pass_uniform_buffers,
             runs: 0,
             pointwise,
             mask: None,
@@ -756,8 +779,19 @@ impl Effect {
                 for _iter in 0..iterations {
                     let mut pass_uniforms = *uniforms;
                     pass_uniforms.pass_index = i32::try_from(pass_idx).unwrap_or(i32::MAX);
-                    self.pipeline
-                        .update_uniforms(&context.queue, &pass_uniforms);
+                    // Drawn in its turn, a pass has its uniforms in a buffer
+                    // of its own (see below).
+                    let own_uniforms = self.pass_uniform_buffers.get(pass_idx);
+                    match own_uniforms {
+                        Some(buffer) => context.queue.write_buffer(
+                            buffer,
+                            0,
+                            bytemuck::cast_slice(&[pass_uniforms]),
+                        ),
+                        None => self
+                            .pipeline
+                            .update_uniforms(&context.queue, &pass_uniforms),
+                    }
 
                     let pass_buffer_views: Vec<&wgpu::TextureView> = self
                         .passes
@@ -766,8 +800,9 @@ impl Effect {
                         .map(super::PassBuffer::read_view)
                         .collect();
 
-                    let bind_group = self.pipeline.create_bind_group(
+                    let bind_group = self.pipeline.create_bind_group_with_uniforms(
                         &context.device,
+                        own_uniforms.unwrap_or(&self.pipeline.uniform_buffer),
                         Some(input_view),
                         &pass_buffer_views,
                         &imported_views,
@@ -811,10 +846,23 @@ impl Effect {
                         render_pass.draw(0..3, 0..1);
                     }
 
-                    // Multipass intermediate passes MUST submit immediately —
-                    // update_uniforms() overwrites the same buffer each iteration,
-                    // so batching would cause all passes to see the last pass's data.
-                    context.submit(std::iter::once(encoder.finish()));
+                    if own_uniforms.is_some() {
+                        // In its turn, after what was drawn before it this
+                        // frame — the picture it reads. Submitted at once
+                        // (as below) it would run before that: it would read
+                        // the input as the frame before left it, which, the
+                        // deck's two textures taking turns, is the picture
+                        // of the effect after this one.
+                        cmd_buffers.push(encoder.finish());
+                    } else {
+                        // With the pipeline's one uniform buffer, a pass MUST
+                        // be submitted at once — update_uniforms() overwrites
+                        // that buffer each iteration, so batching would cause
+                        // all passes to see the last pass's data. A filter
+                        // with a target kept from frame to frame is left so,
+                        // reading its input as the frame before left it.
+                        context.submit(std::iter::once(encoder.finish()));
+                    }
 
                     if let Some(pb) = self.pass_buffers.get_mut(&target_name) {
                         pb.swap();
