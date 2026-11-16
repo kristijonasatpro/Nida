@@ -164,9 +164,8 @@ mod tests {
             .filters()
             .iter()
             .find(|shader| shader.name() == crate::engine::value::mask::LAYER_MASK_EFFECT)
-            .unwrap()
-            .clone()
-            .clone();
+            .map(|shader| (*shader).clone())
+            .unwrap();
         let mask = app.load_effect(mask_shader).unwrap();
         assert_eq!(mask.load_state(), EffectLoadState::Ready);
         let effects = &mut app.mixer.channels_mut()[0].decks[0].deck.effects;
