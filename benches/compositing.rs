@@ -1,22 +1,19 @@
 /// GPU compositing benchmarks at 1080p.
 ///
-///   `channel_composite_solid`  — solid-color decks (`LoadOp::Clear`, no fragment shader).
-///                              The slope across deck counts isolates per-deck
-///                              copy-on-composite cost. The level at decks/1
-///                              includes fixed render-pass setup, not just
-///                              compositing.
+///   `channel_composite_solid`  — unchanged solid-color decks. After their first
+///                              clear, retained deck and channel pictures avoid
+///                              redundant work. Measures idle scene cost,
+///                              including culling and the master composite.
 ///
-///   `channel_composite_shader` — same shape but with bars.fs running on every
-///                              pixel. Difference vs solid at N decks ≈
-///                              N × per-deck shader execution cost.
+///   `channel_composite_shader` — bars.fs redrawn each frame: an active control.
+///                              Its culling and retention differ from solids,
+///                              so the delta includes more than shader cost.
 ///
 ///   `mixer_crossfade`          — two channels through the crossfader at 50%.
 ///
-///   `composite_resolution`     — solid decks at 1080p and 4K. Compositing traffic
-///                              scales with texel count, so the 4K/1080p ratio at
-///                              a fixed deck count isolates how bandwidth-bound
-///                              the stage is. Solid decks keep fragment cost flat
-///                              so the difference is data movement, not shading.
+///   `composite_resolution`     — the same unchanged solid scene at 1080p and
+///                              4K. Its retained pictures still pass through the
+///                              master composite; reports whole idle-frame cost.
 ///
 /// After the criterion groups complete, the per-deck slope (decks/8 minus
 /// decks/1, divided by 7) is computed from fresh samples and printed.
@@ -555,8 +552,8 @@ fn report_submits_per_frame(_c: &mut Criterion) {
     measure("2 channels x 4 solid decks", &mut two_ch);
 }
 
-/// Re-times solid composites at 1 and 8 decks (warmed, median of 11) and
-/// prints the per-deck slope to stderr.
+/// Re-times unchanged solid scenes at 1 and 8 decks (warmed, median of 11)
+/// and prints their per-deck slope, including culling and retention.
 fn report_per_deck_slope(_c: &mut Criterion) {
     let Some(ctx) = make_context() else { return };
     let mut m1 = setup_mixer_solid(&ctx, 1);

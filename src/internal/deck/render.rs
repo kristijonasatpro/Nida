@@ -363,10 +363,17 @@ impl Deck {
             return Ok(());
         }
 
-        // A still image whose inputs have not changed already has this
+        // A static picture whose inputs have not changed already has this
         // frame's picture in its texture.
         let still = self.still_frame(modulation);
         if still.is_some() && still == self.rendered_still {
+            if let DeckSource::SolidColor { frame_index, .. } = &mut self.source {
+                // A solid used to clear on every render request. Retain its
+                // pixels, but preserve the clock a filter inserted or enabled
+                // later sees. Hidden and rate-skipped decks do not reach here.
+                *frame_index += 1;
+                self.render_time += self.render_dt;
+            }
             // A clip between two of its frames is shown all the same: its
             // rate reads the show's, as it did drawn every frame.
             if still.as_ref().is_some_and(super::StillFrame::in_parts) {
@@ -461,6 +468,9 @@ impl Deck {
         self.render_time += time_delta;
         let time = self.render_time;
         self.frame_count += 1;
+        if let DeckSource::SolidColor { frame_index, .. } = &mut self.source {
+            *frame_index += 1;
+        }
 
         self.count_frame_shown();
 
@@ -739,7 +749,7 @@ impl Deck {
                 }
                 cmd_buffers.push(encoder.finish());
             }
-            DeckSource::SolidColor { color } => {
+            DeckSource::SolidColor { color, .. } => {
                 let mut encoder =
                     context
                         .device
@@ -1016,6 +1026,10 @@ impl Deck {
 
         // Apply effect chain (ping-pong between textures)
         let mut read_from_b = source_to_b;
+        let effect_frame_index = match &self.source {
+            DeckSource::SolidColor { frame_index, .. } => *frame_index,
+            _ => self.frame_count,
+        };
         for (run, &effect_idx) in enabled_effects.iter().enumerate() {
             // Accumulate phase times for this effect
             let effect = &mut self.effects[effect_idx];
@@ -1040,7 +1054,7 @@ impl Deck {
             let uniforms = ISFUniforms {
                 time,
                 time_delta,
-                frame_index: self.frame_count,
+                frame_index: effect_frame_index,
                 pass_index: 0,
                 render_size: [self.texture.width() as f32, self.texture.height() as f32],
                 audio_level: audio_data.level,

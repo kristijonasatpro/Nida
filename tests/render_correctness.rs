@@ -1367,6 +1367,265 @@ fn a_modulated_crop_does_not_count_as_covering() {
         composited(&mixer) > 1,
         "a modulated crop may open a hole any frame"
     );
+    let before = mixer.channels()[0].decks[2].deck.rendered_frames();
+    for frame in 1..=3 {
+        render_at(&ctx, &mut mixer, frame);
+    }
+    assert_eq!(
+        mixer.channels()[0].decks[2].deck.rendered_frames() - before,
+        3,
+        "a solid with a modulated crop must keep redrawing"
+    );
+}
+
+/// A colour is a still picture too. Reusing it must preserve every pixel,
+/// while colour, alpha, framing and texture changes must take effect at once.
+#[test]
+fn a_solid_color_keeps_its_pixels_until_its_inputs_change() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let mut deck = Deck::new_solid_color(&ctx, [0.25, 0.5, 0.75, 1.0], W, H).expect("colour");
+    framing(&ctx, &mut deck);
+    let uuid = deck.uuid().to_string();
+    let mut mixer = new_mixer(&ctx);
+    mixer.channel_mut(0).unwrap().add_deck(deck);
+    let frames = |m: &Mixer| m.channels()[0].decks[0].deck.rendered_frames();
+    let first = render_and_read(&ctx, &mut mixer);
+    for _ in 0..3 {
+        assert_eq!(
+            render_and_read(&ctx, &mut mixer),
+            first,
+            "all pixels retained"
+        );
+    }
+    assert_eq!(frames(&mixer), 1, "an unchanged colour is drawn once");
+
+    mixer.channel_mut(0).unwrap().decks[0]
+        .deck
+        .set_solid_color([0.25, 0.5, 0.75, 0.5]);
+    let alpha = center(&render_and_read(&ctx, &mut mixer));
+    assert_eq!(frames(&mixer), 2, "an alpha edit redraws");
+    for (got, want) in alpha.iter().zip([0.125, 0.25, 0.375]) {
+        assert_near(*got, want, 2e-3, "colour over black after the alpha edit");
+    }
+
+    mixer.channel_mut(0).unwrap().decks[0]
+        .deck
+        .set_solid_color([0.0, 0.0, 1.0, 1.0]);
+    let blue = render_and_read(&ctx, &mut mixer);
+    assert_eq!(frames(&mixer), 3, "a colour edit redraws");
+    assert_hi(center(&blue)[2], "the new blue colour");
+    assert_lo(center(&blue)[0], "none of the old red remains");
+
+    mixer.channel_mut(0).unwrap().decks[0].deck.effects[0]
+        .params
+        .set_float("crop_left", 0.5);
+    let cropped = render_and_read(&ctx, &mut mixer);
+    assert_eq!(frames(&mixer), 4, "a crop edit redraws");
+    let row = (H / 2 * W) as usize;
+    assert_lo(
+        cropped[row + 1][2],
+        "the cropped half disappears immediately",
+    );
+    assert_hi(
+        cropped[row + (W - 2) as usize][2],
+        "the kept half stays blue",
+    );
+
+    let deck = &mut mixer.channel_mut(0).unwrap().decks[0].deck;
+    deck.effects[0].params.set_float("crop_left", 0.0);
+    deck.effects[1].params.set_float("scale", 0.5);
+    let placed = render_and_read(&ctx, &mut mixer);
+    assert_eq!(frames(&mixer), 5, "a transform edit redraws");
+    assert_hi(center(&placed)[2], "blue in its new place");
+    assert_lo(placed[0][2], "the old full-frame blue is gone");
+
+    mixer.channel_mut(0).unwrap().decks[0]
+        .deck
+        .resize(&ctx, W, H);
+    assert_eq!(
+        render_and_read(&ctx, &mut mixer),
+        placed,
+        "same-size rebuild preserves pixels"
+    );
+    assert_eq!(frames(&mixer), 6, "new textures must be drawn into");
+    for _ in 0..3 {
+        render_once(&ctx, &mut mixer);
+    }
+    assert_eq!(
+        frames(&mixer),
+        6,
+        "the rebuilt picture is retained afterwards"
+    );
+    assert_eq!(
+        mixer.channels()[0].decks[0].deck.uuid(),
+        uuid,
+        "edits retain identity"
+    );
+}
+
+/// A still source does not make an animated effect still. Both phases of a
+/// strobe must remain visible, even though the underlying colour never changes.
+#[test]
+fn a_solid_color_with_an_animated_effect_keeps_advancing() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let mut deck = Deck::new_solid_color(&ctx, [0.0, 0.0, 1.0, 1.0], W, H).expect("blue");
+    framing(&ctx, &mut deck);
+    let shader = varda::isf::ISFShader::from_file(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/strobe.fs"),
+    )
+    .expect("strobe shader");
+    let mut effect = varda::deck::Effect::new(&ctx, shader).expect("strobe effect");
+    effect.params.set_float("strobe_rate", 4.0);
+    effect.params.set_float("strobe_duty", 0.5);
+    effect.params.set_color("strobe_color", [1.0; 4]);
+    deck.add_effect(effect);
+    let mut mixer = new_mixer(&ctx);
+    mixer.channel_mut(0).unwrap().add_deck(deck);
+    let mut flashed = false;
+    let mut unflashed = false;
+    for frame in 0..20 {
+        render_at(&ctx, &mut mixer, frame);
+        let pixel = center(&read_back(&ctx, &mixer, W, H));
+        flashed |= pixel[0] > 0.85 && pixel[1] > 0.85;
+        unflashed |= pixel[0] < 0.15 && pixel[1] < 0.15 && pixel[2] > 0.85;
+    }
+    assert!(
+        flashed && unflashed,
+        "the strobe shows both its flash and the blue source"
+    );
+    assert_eq!(mixer.channels()[0].decks[0].deck.rendered_frames(), 20);
+}
+
+/// Keeping a colour's pixels must not pause its logical clock: a filter
+/// inserted or re-enabled later sees the TIME and FRAMEINDEX it saw when
+/// the colour was cleared every frame.
+#[test]
+fn a_solid_color_keeps_its_clock_when_an_effect_is_inserted_or_enabled_later() {
+    let Some(ctx) = headless_gpu() else {
+        return;
+    };
+    let mut mixer = new_mixer(&ctx);
+    mixer
+        .channel_mut(0)
+        .unwrap()
+        .add_deck(Deck::new_solid_color(&ctx, [0.0, 0.0, 1.0, 1.0], W, H).expect("blue"));
+    for _ in 0..120 {
+        render_once(&ctx, &mut mixer);
+    }
+
+    // Keep the real filter's bindings, then expose the two clock uniforms
+    // as colour channels. The UV branch is true throughout the picture.
+    let original = include_str!("../shaders/invert.fs");
+    let source = original.replace(
+        "fragColor = vec4(mix(color.rgb, inverted, amount), color.a);",
+        "fragColor = vec4(mix(color.rgb, inverted, amount), color.a);\n\
+         if (uv.x >= 0.0) fragColor = vec4(TIME / 8.0, float(FRAMEINDEX) / 256.0, 0.0, 1.0);",
+    );
+    assert_ne!(
+        source, original,
+        "the clock probe replaces the final output"
+    );
+    let shader = varda::isf::ISFShader::from_string(&source).expect("clock probe shader");
+    let effect = varda::deck::Effect::new(&ctx, shader).expect("clock probe");
+    mixer.channel_mut(0).unwrap().decks[0]
+        .deck
+        .add_effect(effect);
+    let inserted = center(&render_and_read(&ctx, &mut mixer));
+    assert_near(
+        inserted[0],
+        121.0 / 60.0 / 8.0,
+        1e-3,
+        "TIME after insertion",
+    );
+    assert_near(
+        inserted[1],
+        121.0 / 256.0,
+        1e-3,
+        "FRAMEINDEX after insertion",
+    );
+
+    mixer.channel_mut(0).unwrap().decks[0].deck.effects[0].enabled = false;
+    for _ in 0..20 {
+        render_once(&ctx, &mut mixer);
+    }
+    mixer.channel_mut(0).unwrap().decks[0].deck.effects[0].enabled = true;
+    let enabled = center(&render_and_read(&ctx, &mut mixer));
+    assert_near(
+        enabled[0],
+        142.0 / 60.0 / 8.0,
+        1e-3,
+        "TIME after re-enabling",
+    );
+    assert_near(
+        enabled[1],
+        142.0 / 256.0,
+        1e-3,
+        "FRAMEINDEX after re-enabling",
+    );
+    mixer.channel_mut(0).unwrap().decks[0].mute = true;
+    for _ in 0..20 {
+        render_once(&ctx, &mut mixer);
+    }
+    mixer.channel_mut(0).unwrap().decks[0].mute = false;
+    let resumed = center(&render_and_read(&ctx, &mut mixer));
+    assert_near(
+        resumed[0],
+        143.0 / 60.0 / 8.0,
+        1e-3,
+        "a muted source's TIME did not advance",
+    );
+    assert_near(
+        resumed[1],
+        143.0 / 256.0,
+        1e-3,
+        "a muted source's FRAMEINDEX did not advance",
+    );
+
+    mixer.set_crossfader(1.0);
+    for _ in 0..20 {
+        render_once(&ctx, &mut mixer);
+    }
+    mixer.set_crossfader(0.0);
+    let on_air = center(&render_and_read(&ctx, &mut mixer));
+    assert_near(
+        on_air[0],
+        144.0 / 60.0 / 8.0,
+        1e-3,
+        "an off-air source's TIME did not advance",
+    );
+    assert_near(
+        on_air[1],
+        144.0 / 256.0,
+        1e-3,
+        "an off-air source's FRAMEINDEX did not advance",
+    );
+
+    let slot = &mut mixer.channel_mut(0).unwrap().decks[0];
+    slot.deck.effects[0].enabled = false;
+    slot.render_fps = varda::channel::DeckRenderFps::Fixed(15);
+    for _ in 0..12 {
+        render_once(&ctx, &mut mixer);
+    }
+    let slot = &mut mixer.channel_mut(0).unwrap().decks[0];
+    slot.deck.effects[0].enabled = true;
+    slot.render_fps = varda::channel::DeckRenderFps::Auto;
+    let after_skips = center(&render_and_read(&ctx, &mut mixer));
+    assert_near(
+        after_skips[0],
+        148.0 / 60.0 / 8.0,
+        1e-3,
+        "only three fixed-rate requests advanced TIME",
+    );
+    assert_near(
+        after_skips[1],
+        148.0 / 256.0,
+        1e-3,
+        "only three fixed-rate requests advanced FRAMEINDEX",
+    );
 }
 
 /// A still image renders once, then again only when something it depends on
@@ -1433,7 +1692,7 @@ fn neutral_framing_effects_are_skipped_until_a_setting_moves() {
     let Some(ctx) = headless_gpu() else {
         return;
     };
-    // A solid colour renders every frame, as a generator or video does.
+    // A solid colour draws again when its framing changes.
     let mut deck = Deck::new_solid_color(&ctx, [0.0, 0.0, 1.0, 1.0], W, H).expect("blue");
     framing(&ctx, &mut deck);
     let mut mixer = new_mixer(&ctx);

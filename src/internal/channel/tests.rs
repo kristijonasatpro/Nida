@@ -655,6 +655,14 @@ fn empty_channel_render_timing() {
 
 // ── Deck pipeline FPS tests ─────────────────────────────────────
 
+/// A moving source: retained solid pictures deliberately stop updating FPS.
+fn add_animated_deck(ch: &mut Channel, gpu: &GpuContext) {
+    let shader = crate::isf::ISFShader::from_string(include_str!("../../../shaders/plasma.fs"))
+        .expect("plasma shader");
+    let deck = crate::deck::Deck::new(gpu, shader, 64, 64).expect("animated deck");
+    ch.add_deck(deck);
+}
+
 #[test]
 fn new_deck_fps_starts_at_zero() {
     let gpu = headless_gpu();
@@ -666,7 +674,7 @@ fn new_deck_fps_starts_at_zero() {
 fn deck_fps_becomes_positive_after_renders() {
     let gpu = headless_gpu();
     let mut ch = test_channel(&gpu, "Test");
-    add_solid_deck(&mut ch, &gpu, [1.0, 0.0, 0.0, 1.0]);
+    add_animated_deck(&mut ch, &gpu);
 
     let audio = crate::audio::AudioData::default();
     let modulation = crate::modulation::ModulationEngine::new();
@@ -696,19 +704,25 @@ fn deck_fps_becomes_positive_after_renders() {
         deck_fps > 0.0,
         "Deck FPS should be positive after rendering, got {deck_fps}"
     );
+    assert_eq!(
+        ch.decks[0].deck.rendered_frames(),
+        5,
+        "all five frames really draw"
+    );
 }
 
 #[test]
 fn deck_fps_ignores_huge_first_frame_delta() {
     let gpu = headless_gpu();
     let mut ch = test_channel(&gpu, "Test");
-    add_solid_deck(&mut ch, &gpu, [1.0, 0.0, 0.0, 1.0]);
+    add_animated_deck(&mut ch, &gpu);
 
     let audio = crate::audio::AudioData::default();
     let modulation = crate::modulation::ModulationEngine::new();
 
-    // First render — time_delta may be very large (time since Deck creation)
-    // but the guard (time_delta < 1.0) should keep FPS sane
+    // Exercise the >= 1s wall-clock gap guard, then ensure the next real
+    // frame resumes measurement instead of leaving the deck's rate at zero.
+    std::thread::sleep(std::time::Duration::from_millis(1010));
     ch.render(
         &gpu,
         &audio,
@@ -726,11 +740,19 @@ fn deck_fps_ignores_huge_first_frame_delta() {
     )
     .unwrap();
     let fps = ch.decks[0].deck.fps();
-    // Either 0 (if first delta was >= 1s) or some reasonable value
-    assert!(fps >= 0.0);
+    assert_eq!(fps, 0.0, "the long first gap is not a frame interval");
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    render_once(&mut ch, &gpu);
+    let fps = ch.decks[0].deck.fps();
+    assert!(fps > 0.0, "a following frame resumes FPS measurement");
     assert!(
         fps < 100_000.0,
         "FPS should not be absurdly high, got {fps}"
+    );
+    assert_eq!(
+        ch.decks[0].deck.rendered_frames(),
+        2,
+        "both frames really draw"
     );
 }
 
@@ -738,9 +760,9 @@ fn deck_fps_ignores_huge_first_frame_delta() {
 fn multiple_decks_have_independent_fps() {
     let gpu = headless_gpu();
     let mut ch = test_channel(&gpu, "Test");
-    add_solid_deck(&mut ch, &gpu, [1.0, 0.0, 0.0, 1.0]);
-    // Translucent, so the deck below is not hidden (and not rendered).
-    add_solid_deck(&mut ch, &gpu, [0.0, 1.0, 0.0, 0.5]);
+    add_animated_deck(&mut ch, &gpu);
+    add_animated_deck(&mut ch, &gpu);
+    ch.decks[1].opacity = 0.5;
 
     let audio = crate::audio::AudioData::default();
     let modulation = crate::modulation::ModulationEngine::new();
@@ -769,13 +791,30 @@ fn multiple_decks_have_independent_fps() {
     let fps1 = ch.decks[1].deck.fps();
     assert!(fps0 > 0.0);
     assert!(fps1 > 0.0);
+    assert_eq!(ch.decks[0].deck.rendered_frames(), 5);
+    assert_eq!(ch.decks[1].deck.rendered_frames(), 5);
+
+    let shown0 = ch.decks[0].deck.last_shown();
+    let shown1 = ch.decks[1].deck.last_shown();
+    ch.decks[1].mute = true;
+    render_once(&mut ch, &gpu);
+    assert!(
+        ch.decks[0].deck.last_shown() > shown0,
+        "the live deck updates its own measurement"
+    );
+    assert_eq!(
+        ch.decks[1].deck.last_shown(),
+        shown1,
+        "the muted deck keeps its measurement"
+    );
+    assert_eq!(ch.decks[1].deck.fps(), fps1);
 }
 
 #[test]
 fn skipped_deck_keeps_old_fps() {
     let gpu = headless_gpu();
     let mut ch = test_channel(&gpu, "Test");
-    add_solid_deck(&mut ch, &gpu, [1.0, 0.0, 0.0, 1.0]);
+    add_animated_deck(&mut ch, &gpu);
 
     let audio = crate::audio::AudioData::default();
     let modulation = crate::modulation::ModulationEngine::new();
@@ -800,6 +839,15 @@ fn skipped_deck_keeps_old_fps() {
         .unwrap();
     }
     let fps_before = ch.decks[0].deck.fps();
+    assert!(
+        fps_before > 0.0,
+        "establish a measured moving-source rate before muting"
+    );
+    let drawn_before = ch.decks[0].deck.rendered_frames();
+    assert_eq!(
+        drawn_before, 5,
+        "the source actually rendered the warmup frames"
+    );
 
     // Mute the deck — it won't render
     ch.decks[0].mute = true;
@@ -823,6 +871,11 @@ fn skipped_deck_keeps_old_fps() {
     // FPS should remain unchanged (deck wasn't rendered, no EMA update)
     let fps_after = ch.decks[0].deck.fps();
     assert!((fps_before - fps_after).abs() < 1e-5);
+    assert_eq!(
+        ch.decks[0].deck.rendered_frames(),
+        drawn_before,
+        "the muted source did not render"
+    );
 }
 
 // ── Auto deck skipping ─────────────────────────────────────────────

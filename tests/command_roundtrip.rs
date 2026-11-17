@@ -616,11 +616,11 @@ fn a_full_resolution_still_reaches_the_output_pixel_exact() {
     );
 }
 
-/// A PNG layer is reported still — its rate counts redraws, not motion — and
-/// a colour layer, drawn every frame, is not. The FPS popover leaves stills
-/// out; averaged in, one idle image made a moving channel read 48.
+/// PNG and colour layers are reported still; a moving generator is not.
+/// The FPS popover leaves stills out; averaged in, one idle image made a
+/// moving channel read 48.
 #[test]
-fn an_image_layer_is_reported_still_and_a_colour_layer_is_not() {
+fn image_and_colour_layers_are_reported_still_and_a_generator_is_not() {
     let Some(mut app) = headless_app() else {
         return;
     };
@@ -640,8 +640,15 @@ fn an_image_layer_is_reported_still_and_a_colour_layer_is_not() {
     let colour = new_uuid(send_cmd(
         &mut app,
         EngineCommand::AddSolidColorDeck {
-            channel_uuid: ch,
+            channel_uuid: ch.clone(),
             color: [1.0, 0.0, 0.0, 1.0],
+        },
+    ));
+    let generator = new_uuid(send_cmd(
+        &mut app,
+        EngineCommand::AddDeck {
+            channel_uuid: ch,
+            shader_name: "plasma".into(),
         },
     ));
     app.render_mixer_frame();
@@ -655,7 +662,14 @@ fn an_image_layer_is_reported_still_and_a_colour_layer_is_not() {
             .expect("layer in the snapshot")
     };
     assert!(still(&image), "a PNG is drawn again only when it changes");
-    assert!(!still(&colour), "a colour layer is drawn every frame");
+    assert!(
+        still(&colour),
+        "a colour is drawn again only when it changes"
+    );
+    assert!(
+        !still(&generator),
+        "an animated generator is drawn every frame"
+    );
 }
 
 /// Size of the texture the deck at `idx` of channel 0 renders into.

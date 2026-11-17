@@ -1080,6 +1080,7 @@ impl Deck {
                 f64::from(color[2]),
                 f64::from(color[3]),
             ],
+            frame_index: 0,
         };
 
         Ok(Self::build_media_deck(
