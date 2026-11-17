@@ -672,21 +672,21 @@ impl Channel {
 
         let composite_pipeline =
             CompositeBlitPipeline::new(&context.device, context.compositing_format)?;
-        let blit_pipeline = BlitPipeline::with_blend(
-            &context.device,
+        let blit_pipeline = BlitPipeline::cached(
+            context,
             context.compositing_format,
             wgpu::BlendState::ALPHA_BLENDING,
-        )?;
-        let add_pipeline = BlitPipeline::with_blend(
-            &context.device,
+        );
+        let add_pipeline = BlitPipeline::cached(
+            context,
             context.compositing_format,
             crate::renderer::blit::ADD_BLENDING,
-        )?;
-        let screen_pipeline = BlitPipeline::with_blend(
-            &context.device,
+        );
+        let screen_pipeline = BlitPipeline::cached(
+            context,
             context.compositing_format,
             crate::renderer::blit::SCREEN_BLENDING,
-        )?;
+        );
 
         Ok(Self {
             uuid: crate::deck::generate_short_uuid(),

@@ -469,26 +469,26 @@ impl Mixer {
         // ALPHA_BLENDING (src factor SrcAlpha) which would re-apply coverage and
         // darken partial-opacity channels by an extra factor of their own alpha.
         // See /spec/linear-light-compositing.md.
-        let blit_pipeline = BlitPipeline::with_blend(
-            &context.device,
+        let blit_pipeline = BlitPipeline::cached(
+            context,
             context.compositing_format,
             wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-        )?;
-        let add_pipeline = BlitPipeline::with_blend(
-            &context.device,
+        );
+        let add_pipeline = BlitPipeline::cached(
+            context,
             context.compositing_format,
             crate::renderer::blit::ADD_BLENDING,
-        )?;
-        let screen_pipeline = BlitPipeline::with_blend(
-            &context.device,
+        );
+        let screen_pipeline = BlitPipeline::cached(
+            context,
             context.compositing_format,
             crate::renderer::blit::SCREEN_BLENDING,
-        )?;
-        let sum_pipeline = BlitPipeline::with_blend(
-            &context.device,
+        );
+        let sum_pipeline = BlitPipeline::cached(
+            context,
             context.compositing_format,
             crate::renderer::blit::SUM_BLENDING,
-        )?;
+        );
         let tonemap_pipeline = TonemapPipeline::new(&context.device, context.compositing_format)?;
         let lut_pipeline = LutPipeline::new(&context.device, context.compositing_format)?;
 
@@ -533,7 +533,7 @@ impl Mixer {
             lut_pipeline,
             active_lut: None,
             active_transition: None,
-            main_transitions: main_transition::MainTransitions::new(context)?,
+            main_transitions: main_transition::MainTransitions::new(context),
             transition_sequences: Vec::new(),
             sub_mix_cache: std::collections::HashMap::new(),
             tonemapped_channel_cache: std::collections::HashMap::new(),

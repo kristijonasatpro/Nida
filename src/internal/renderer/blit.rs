@@ -5,11 +5,82 @@ use anyhow::Result;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::sync::{Arc, Mutex, PoisonError};
 use wgpu::util::DeviceExt;
 
 /// Maximum number of per-draw parameter slots in the ring buffer.
 /// Supports batching up to 16 composites in a single `queue.submit()`.
 const MAX_DRAW_SLOTS: u64 = 16;
+
+#[derive(Clone)]
+struct BlitResources {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+struct CachedBlit {
+    instance: wgpu::Instance,
+    device: wgpu::Device,
+    format: wgpu::TextureFormat,
+    blend: wgpu::BlendState,
+    resources: Arc<BlitResources>,
+}
+
+/// Immutable pipelines shared by clones of one GPU context. Uniforms and ring
+/// buffers belong to each `BlitPipeline`, so sources retain independent state.
+#[derive(Clone, Default)]
+pub(super) struct BlitCache(Arc<Mutex<Vec<CachedBlit>>>);
+
+impl BlitCache {
+    fn resources(
+        &self,
+        instance: &wgpu::Instance,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        blend: wgpu::BlendState,
+    ) -> Arc<BlitResources> {
+        // Native wgpu Device equality compares an instance-local ID. Include
+        // the Instance (whose equality uses its context's Arc identity), so
+        // separate instances cannot alias devices with the same numeric ID.
+        let matches = |entry: &&CachedBlit| {
+            entry.instance == *instance
+                && entry.device == *device
+                && entry.format == format
+                && entry.blend == blend
+        };
+        {
+            let entries = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = entries.iter().find(matches) {
+                return entry.resources.clone();
+            }
+        }
+
+        // Never hold the cache lock during shader/driver construction. A
+        // concurrent miss may build twice instead of blocking the show behind
+        // a worker's compilation. Recheck before retaining the result.
+        let resources = Arc::new(BlitPipeline::create_resources(device, format, blend));
+        let evicted = {
+            let mut entries = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = entries.iter().find(matches) {
+                return entry.resources.clone();
+            }
+            // The fixed source/compositor variants fit comfortably here. Bound
+            // retained driver resources even if callers later add more formats.
+            let evicted = (entries.len() >= 16).then(|| entries.remove(0));
+            entries.push(CachedBlit {
+                instance: instance.clone(),
+                device: device.clone(),
+                format,
+                blend,
+                resources: resources.clone(),
+            });
+            evicted
+        };
+        drop(evicted);
+        resources
+    }
+}
 
 /// Uniform buffer for blit and final presentation parameters.
 #[repr(C)]
@@ -188,6 +259,33 @@ impl BlitPipeline {
         target_format: wgpu::TextureFormat,
         blend_state: wgpu::BlendState,
     ) -> Result<Self> {
+        Ok(Self::with_resources(
+            device,
+            &Self::create_resources(device, target_format, blend_state),
+        ))
+    }
+
+    /// Reuse the immutable pipeline for this exact device, format and blend
+    /// state while allocating independent draw parameters for this instance.
+    pub(crate) fn cached(
+        context: &super::context::GpuContext,
+        target_format: wgpu::TextureFormat,
+        blend_state: wgpu::BlendState,
+    ) -> Self {
+        let resources = context.blit_cache.resources(
+            &context.instance,
+            &context.device,
+            target_format,
+            blend_state,
+        );
+        Self::with_resources(&context.device, &resources)
+    }
+
+    fn create_resources(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        blend_state: wgpu::BlendState,
+    ) -> BlitResources {
         // Create bind group layout
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Blit Bind Group Layout"),
@@ -222,24 +320,6 @@ impl BlitPipeline {
                     count: None,
                 },
             ],
-        });
-
-        // Create params buffer with default opacity of 1.0
-        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Blit Params Buffer"),
-            contents: bytemuck::cast_slice(&[BlitParams {
-                opacity: 1.0,
-                rotation: 0,
-                uv_scale: [1.0, 1.0],
-                uv_offset: [0.0, 0.0],
-                premultiplied: 0,
-                srgb_encode: 0,
-                quantization_levels: 0.0,
-                dither_enabled: 0,
-                video_levels: 0,
-                coded: 0,
-            }]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         // Create pipeline layout
@@ -317,6 +397,36 @@ impl BlitPipeline {
             ..Default::default()
         });
 
+        BlitResources {
+            pipeline,
+            bind_group_layout,
+            sampler,
+        }
+    }
+
+    fn with_resources(device: &wgpu::Device, resources: &BlitResources) -> Self {
+        let BlitResources {
+            pipeline,
+            bind_group_layout,
+            sampler,
+        } = resources.clone();
+        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Blit Params Buffer"),
+            contents: bytemuck::cast_slice(&[BlitParams {
+                opacity: 1.0,
+                rotation: 0,
+                uv_scale: [1.0, 1.0],
+                uv_offset: [0.0, 0.0],
+                premultiplied: 0,
+                srgb_encode: 0,
+                quantization_levels: 0.0,
+                dither_enabled: 0,
+                video_levels: 0,
+                coded: 0,
+            }]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         // Pre-allocate ring buffer for batched per-draw params.
         let align = u64::from(device.limits().min_uniform_buffer_offset_alignment);
         let param_size = std::mem::size_of::<BlitParams>() as u64;
@@ -328,7 +438,7 @@ impl BlitPipeline {
             mapped_at_creation: false,
         });
 
-        Ok(Self {
+        Self {
             pipeline,
             bind_group_layout,
             sampler,
@@ -336,7 +446,7 @@ impl BlitPipeline {
             ring_buffer: RefCell::new(ring_buffer),
             ring_slots: Cell::new(MAX_DRAW_SLOTS as usize),
             ring_stride,
-        })
+        }
     }
 
     /// Create a bind group for a texture view using the static `params_buffer`.
@@ -2011,6 +2121,127 @@ fn ear_clip_point_in_tri(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> 
 mod tests {
     use super::*;
 
+    fn cache_gpu() -> Option<GpuContext> {
+        match GpuContext::new_headless() {
+            Ok(context) => Some(context),
+            Err(error) => {
+                assert!(
+                    std::env::var_os("VARDA_REQUIRE_GPU").is_none(),
+                    "VARDA_REQUIRE_GPU is set but no headless GPU context is available: {error:#}"
+                );
+                eprintln!("skipping cache GPU test: {error:#}");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn cached_blits_share_only_immutable_resources() {
+        let Some(ctx) = cache_gpu() else {
+            return;
+        };
+        let first = BlitPipeline::cached(&ctx, ctx.compositing_format, wgpu::BlendState::REPLACE);
+        let second = BlitPipeline::cached(
+            &ctx.clone(),
+            ctx.compositing_format,
+            wgpu::BlendState::REPLACE,
+        );
+        assert_eq!(first.pipeline, second.pipeline);
+        assert_eq!(first.bind_group_layout, second.bind_group_layout);
+        assert_eq!(first.sampler, second.sampler);
+        assert_ne!(first.params_buffer, second.params_buffer);
+        assert_ne!(*first.ring_buffer.borrow(), *second.ring_buffer.borrow());
+
+        first.ensure_ring_slots(&ctx.device, 17);
+        assert!(first.ring_slots.get() >= 17);
+        assert_eq!(second.ring_slots.get(), MAX_DRAW_SLOTS as usize);
+
+        // Write both instances before drawing either. Shared uniforms would
+        // make both pictures take the second instance's opacity.
+        first.set_opacity(&ctx.queue, 0.25);
+        second.set_opacity(&ctx.queue, 0.75);
+        let columns = [[0.25, 0.5, 0.75, 1.0]];
+        for (pipeline, alpha) in [(&first, 0.25), (&second, 0.75), (&first, 0.25)] {
+            let pixel = blit_columns_through(&ctx, &columns, 1, None, false, pipeline)[0];
+            assert_eq!(pixel, [0.25, 0.5, 0.75, alpha]);
+        }
+    }
+
+    #[test]
+    fn cached_blits_separate_devices_formats_and_blend_states() {
+        let Some(ctx) = cache_gpu() else {
+            return;
+        };
+        let Some(other) = cache_gpu() else {
+            return;
+        };
+        let validation = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let other_validation = other.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let replace = ctx.blit_cache.resources(
+            &ctx.instance,
+            &ctx.device,
+            ctx.compositing_format,
+            wgpu::BlendState::REPLACE,
+        );
+        let alpha = ctx.blit_cache.resources(
+            &ctx.instance,
+            &ctx.device,
+            ctx.compositing_format,
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
+        let eight_bit = ctx.blit_cache.resources(
+            &ctx.instance,
+            &ctx.device,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::BlendState::REPLACE,
+        );
+        // Exercise a different valid instance/device pair through the same
+        // cache. Native pipeline IDs alone can compare equal across instances.
+        let other_device = ctx.blit_cache.resources(
+            &other.instance,
+            &other.device,
+            other.compositing_format,
+            wgpu::BlendState::REPLACE,
+        );
+        assert_ne!(replace.pipeline, alpha.pipeline);
+        assert_ne!(replace.pipeline, eight_bit.pipeline);
+        assert!(!Arc::ptr_eq(&replace, &other_device));
+        let again = ctx.blit_cache.resources(
+            &ctx.instance,
+            &ctx.device,
+            ctx.compositing_format,
+            wgpu::BlendState::REPLACE,
+        );
+        assert!(Arc::ptr_eq(&replace, &again));
+
+        // Keep the shared cache while replacing the context's GPU ownership
+        // pair. Construct, draw and read back with both devices, rather than
+        // inferring device compatibility from wgpu's instance-local IDs.
+        let mut replaced = ctx.clone();
+        replaced.instance = other.instance.clone();
+        replaced.device = other.device.clone();
+        replaced.queue = other.queue.clone();
+        let first = BlitPipeline::cached(&ctx, ctx.compositing_format, wgpu::BlendState::REPLACE);
+        let second = BlitPipeline::cached(
+            &replaced,
+            replaced.compositing_format,
+            wgpu::BlendState::REPLACE,
+        );
+        first.set_opacity(&ctx.queue, 0.25);
+        second.set_opacity(&replaced.queue, 0.75);
+        let columns = [[0.25, 0.5, 0.75, 1.0]];
+        assert_eq!(
+            blit_columns_through(&ctx, &columns, 1, None, false, &first)[0],
+            [0.25, 0.5, 0.75, 0.25]
+        );
+        assert_eq!(
+            blit_columns_through(&replaced, &columns, 1, None, false, &second)[0],
+            [0.25, 0.5, 0.75, 0.75]
+        );
+        assert!(pollster::block_on(validation.pop()).is_none());
+        assert!(pollster::block_on(other_validation.pop()).is_none());
+    }
+
     /// A picture one grey a column, `greys`, four lines high, blitted onto
     /// a `to` × 4 target: each target column's grey.
     fn blit_greys(ctx: &GpuContext, greys: &[f32], to: u32) -> Vec<f32> {
@@ -2041,6 +2272,18 @@ mod tests {
         to: u32,
         part: Option<([f32; 2], [f32; 2])>,
         coded: bool,
+    ) -> Vec<[f32; 4]> {
+        let pipeline = BlitPipeline::new(&ctx.device, wgpu::TextureFormat::Rgba16Float).unwrap();
+        blit_columns_through(ctx, columns, to, part, coded, &pipeline)
+    }
+
+    fn blit_columns_through(
+        ctx: &GpuContext,
+        columns: &[[f32; 4]],
+        to: u32,
+        part: Option<([f32; 2], [f32; 2])>,
+        coded: bool,
+        pipeline: &BlitPipeline,
     ) -> Vec<[f32; 4]> {
         let from = columns.len() as u32;
         let texture = |label, width, usage| {
@@ -2093,7 +2336,6 @@ mod tests {
                 depth_or_array_layers: 1,
             },
         );
-        let pipeline = BlitPipeline::new(&ctx.device, wgpu::TextureFormat::Rgba16Float).unwrap();
         let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = pipeline.create_bind_group(&ctx.device, &source_view);

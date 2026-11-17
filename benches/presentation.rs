@@ -8,6 +8,66 @@ use varda::engine::value::render::{
 use varda::renderer::blit::BlitPipeline;
 use varda::renderer::context::GpuContext;
 
+/// Repeated source construction in one process/device, after driver/shader
+/// caches are warm. These fixtures exclude decoding and camera negotiation:
+/// the image is already decoded and the camera deck only refers to a handle.
+fn bench_source_pipeline_setup(c: &mut Criterion) {
+    let Ok(context) = GpuContext::new_headless() else {
+        eprintln!("no GPU adapter, skipping source pipeline setup benchmarks");
+        return;
+    };
+    eprintln!(
+        "source_pipeline_setup: {:?}; 1920x1080; repeated process/device; driver caches not cleared; debug_assertions={}",
+        context.adapter.get_info(),
+        cfg!(debug_assertions)
+    );
+    let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([230, 80, 30, 255]));
+    let mut group = c.benchmark_group("source_pipeline_setup");
+    group.sample_size(30);
+    group.bench_function("decoded_image", |bencher| {
+        bencher.iter(|| {
+            let deck = varda::deck::Deck::new_from_pixels(
+                &context,
+                &image,
+                "Pipeline probe".to_string(),
+                "",
+                1920,
+                1080,
+            )
+            .expect("image deck");
+            std::hint::black_box(&deck);
+            context.submit([]);
+            let _ = context.device.poll(wgpu::PollType::wait_indefinitely());
+        });
+    });
+    group.bench_function("external_deck_only", |bencher| {
+        bencher.iter(|| {
+            let deck = varda::deck::Deck::new_from_camera(
+                &context,
+                0,
+                "Pipeline probe",
+                1920,
+                1080,
+                1920,
+                1080,
+            )
+            .expect("external deck");
+            std::hint::black_box(&deck);
+            let _ = context.device.poll(wgpu::PollType::wait_indefinitely());
+        });
+    });
+    group.bench_function("channel", |bencher| {
+        bencher.iter(|| {
+            let channel =
+                varda::channel::Channel::new("Pipeline probe".to_string(), &context, 1920, 1080)
+                    .expect("channel");
+            std::hint::black_box(&channel);
+            let _ = context.device.poll(wgpu::PollType::wait_indefinitely());
+        });
+    });
+    group.finish();
+}
+
 fn presentation(
     depth: PresentationDepth,
     pixel_format: PresentationPixelFormat,
@@ -122,5 +182,5 @@ fn bench_presentation(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_presentation);
+criterion_group!(benches, bench_source_pipeline_setup, bench_presentation);
 criterion_main!(benches);

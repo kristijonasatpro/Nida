@@ -252,13 +252,13 @@ impl MainTransitions {
         self.travel_frames.get_mut().clear();
     }
 
-    pub(super) fn new(context: &GpuContext) -> anyhow::Result<Self> {
-        let layers = BlitPipeline::with_blend(
-            &context.device,
+    pub(super) fn new(context: &GpuContext) -> Self {
+        let layers = BlitPipeline::cached(
+            context,
             context.compositing_format,
             wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-        )?;
-        let add = BlitPipeline::with_blend(&context.device, context.compositing_format, SUM)?;
+        );
+        let add = BlitPipeline::cached(context, context.compositing_format, SUM);
         let black_texture = context.create_compositing_texture(1, 1);
         let black = black_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = context
@@ -268,7 +268,7 @@ impl MainTransitions {
             });
         clear(&mut encoder, &black);
         context.submit(std::iter::once(encoder.finish()));
-        Ok(Self {
+        Self {
             layers,
             add,
             shaders: std::collections::HashMap::new(),
@@ -278,7 +278,7 @@ impl MainTransitions {
             travel_frames: std::cell::RefCell::new(Vec::new()),
             _black_texture: black_texture,
             black,
-        })
+        }
     }
 }
 

@@ -250,6 +250,8 @@ pub fn set_occluded(surface: &wgpu::Surface<'_>, occluded: Option<bool>) {
 /// background thread deck creation.
 #[derive(Clone)]
 pub struct GpuContext {
+    /// Immutable source/compositor blits, shared only with this context's clones.
+    pub(super) blit_cache: super::blit::BlitCache,
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
@@ -418,6 +420,7 @@ impl GpuContext {
         errors.install(&device);
 
         let gpu = GpuContext {
+            blit_cache: super::blit::BlitCache::default(),
             instance,
             adapter,
             device,
@@ -555,6 +558,7 @@ impl GpuContext {
         errors.install(&device);
 
         Ok(GpuContext {
+            blit_cache: super::blit::BlitCache::default(),
             instance,
             adapter,
             device,

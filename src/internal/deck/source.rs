@@ -19,14 +19,18 @@ use std::time::Instant;
 /// RGBA verbatim (used when the deck is flagged `transparent`, preserving alpha);
 /// the `ALPHA_BLENDING` pipeline flattens the source over an opaque black clear (the
 /// default, so an HTML source with alpha<1 stays opaque). See /spec/html-source.md §2.
-fn external_blit_pipelines(context: &GpuContext) -> Result<(BlitPipeline, BlitPipeline)> {
-    let replace = BlitPipeline::new(&context.device, context.compositing_format)?;
-    let over_black = BlitPipeline::with_blend(
-        &context.device,
+fn external_blit_pipelines(context: &GpuContext) -> (BlitPipeline, BlitPipeline) {
+    let replace = BlitPipeline::cached(
+        context,
+        context.compositing_format,
+        wgpu::BlendState::REPLACE,
+    );
+    let over_black = BlitPipeline::cached(
+        context,
         context.compositing_format,
         wgpu::BlendState::ALPHA_BLENDING,
-    )?;
-    Ok((replace, over_black))
+    );
+    (replace, over_black)
 }
 
 /// Upload straight-alpha RGBA pixels as an image deck's source texture.
@@ -657,7 +661,11 @@ impl Deck {
 
             let convert_pipeline =
                 HapConvertPipeline::new(&context.device, context.compositing_format)?;
-            let blit_pipeline = BlitPipeline::new(&context.device, context.compositing_format)?;
+            let blit_pipeline = BlitPipeline::cached(
+                context,
+                context.compositing_format,
+                wgpu::BlendState::REPLACE,
+            );
 
             log::info!("Using HAP GPU path for '{source_name}' ({hap_fmt:?})");
 
@@ -734,7 +742,11 @@ impl Deck {
             });
             let video_texture_view =
                 video_texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let blit_pipeline = BlitPipeline::new(&context.device, context.compositing_format)?;
+            let blit_pipeline = BlitPipeline::cached(
+                context,
+                context.compositing_format,
+                wgpu::BlendState::REPLACE,
+            );
 
             let staging = VideoStagingBuffers::new(
                 &context.device,
@@ -798,7 +810,7 @@ impl Deck {
         if svg::is_svg_path(path) {
             let tree = svg::parse_file(path)?;
             let rgba = svg::rasterize(&tree, width, height)?;
-            return Self::new_image_deck(
+            return Ok(Self::new_image_deck(
                 context,
                 &rgba,
                 Some(tree),
@@ -806,13 +818,13 @@ impl Deck {
                 source_path_str,
                 width,
                 height,
-            );
+            ));
         }
 
         let img = image::open(path)
             .with_context(|| format!("Failed to load image: {}", path.display()))?;
         let rgba = img.to_rgba8();
-        Self::new_image_deck(
+        Ok(Self::new_image_deck(
             context,
             &rgba,
             None,
@@ -820,7 +832,7 @@ impl Deck {
             source_path_str,
             width,
             height,
-        )
+        ))
     }
 
     /// A picture deck of `rgba`, named `name`, its file `path` (a PDF
@@ -828,7 +840,7 @@ impl Deck {
     ///
     /// # Errors
     ///
-    /// Returns an error if the blit pipeline cannot be created.
+    /// Never returns `Err` today; kept uniform with the other source constructors.
     pub fn new_from_pixels(
         context: &GpuContext,
         rgba: &image::RgbaImage,
@@ -837,7 +849,15 @@ impl Deck {
         width: u32,
         height: u32,
     ) -> Result<Self> {
-        Self::new_image_deck(context, rgba, None, name, path.to_string(), width, height)
+        Ok(Self::new_image_deck(
+            context,
+            rgba,
+            None,
+            name,
+            path.to_string(),
+            width,
+            height,
+        ))
     }
 
     /// A Slides layer (see [`super::slides`]): `talks` in running order,
@@ -1029,10 +1049,14 @@ impl Deck {
         source_path_str: String,
         width: u32,
         height: u32,
-    ) -> Result<Self> {
+    ) -> Self {
         let (img_w, img_h) = rgba.dimensions();
         let (img_texture, img_texture_view) = upload_image_texture(context, rgba);
-        let blit_pipeline = BlitPipeline::new(&context.device, context.compositing_format)?;
+        let blit_pipeline = BlitPipeline::cached(
+            context,
+            context.compositing_format,
+            wgpu::BlendState::REPLACE,
+        );
 
         let source = DeckSource::Image {
             texture: img_texture,
@@ -1049,14 +1073,14 @@ impl Deck {
             svg: tree.map(Box::new),
         };
 
-        Ok(Self::build_media_deck(
+        Self::build_media_deck(
             context,
             source_name,
             Some(source_path_str),
             source,
             width,
             height,
-        ))
+        )
     }
 
     /// Create a new deck with a solid color fill
@@ -1108,7 +1132,7 @@ impl Deck {
         height: u32,
     ) -> Result<Self> {
         let source_name = format!("📹 {camera_name}");
-        let (blit_pipeline, blit_pipeline_over_black) = external_blit_pipelines(context)?;
+        let (blit_pipeline, blit_pipeline_over_black) = external_blit_pipelines(context);
 
         let source = DeckSource::ExternalSource {
             kind: ExternalSourceKind::Camera(camera_id),
@@ -1146,7 +1170,7 @@ impl Deck {
         height: u32,
     ) -> Result<Self> {
         let source_name = format!("🖥 {target_label}");
-        let (blit_pipeline, blit_pipeline_over_black) = external_blit_pipelines(context)?;
+        let (blit_pipeline, blit_pipeline_over_black) = external_blit_pipelines(context);
 
         let source = DeckSource::ExternalSource {
             kind: ExternalSourceKind::ScreenCapture(state.capture_id),
@@ -1179,7 +1203,7 @@ impl Deck {
         height: u32,
     ) -> Result<Self> {
         let source_name = format!("🔁 {label}");
-        let (blit_pipeline, blit_pipeline_over_black) = external_blit_pipelines(context)?;
+        let (blit_pipeline, blit_pipeline_over_black) = external_blit_pipelines(context);
 
         let deck_source = DeckSource::ExternalSource {
             kind: ExternalSourceKind::Tap,
@@ -1215,7 +1239,7 @@ impl Deck {
         height: u32,
     ) -> Result<Self> {
         let source_name = format!("📡 {sensor_name}");
-        let (blit_pipeline, blit_pipeline_over_black) = external_blit_pipelines(context)?;
+        let (blit_pipeline, blit_pipeline_over_black) = external_blit_pipelines(context);
 
         let source = DeckSource::ExternalSource {
             kind: ExternalSourceKind::DepthSensor(sensor_id),
@@ -1358,7 +1382,7 @@ impl Deck {
         width: u32,
         height: u32,
     ) -> Result<Self> {
-        let (blit_pipeline, blit_pipeline_over_black) = external_blit_pipelines(context)?;
+        let (blit_pipeline, blit_pipeline_over_black) = external_blit_pipelines(context);
 
         let source = DeckSource::ExternalSource {
             kind,
