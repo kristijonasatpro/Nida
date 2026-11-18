@@ -23,6 +23,7 @@ mod event_loop;
 mod monitor_frames;
 mod panel_windows;
 mod preview;
+mod responsiveness;
 mod shows;
 mod vsync;
 
@@ -104,7 +105,11 @@ pub struct UIRunner {
     ui_frames: u32,
     /// What the operator did in a frame the engine could not be had in time
     /// to apply it: applied at the next frame.
-    stashed_actions: Option<ui::UIActions>,
+    stashed_actions: std::collections::VecDeque<ui::UIActions>,
+    /// Last complete view model. Local menus keep drawing while the engine is busy.
+    cached_ui_data: Option<ui::UIData>,
+    last_shown: Option<Shown>,
+    ui_layout_dirty: bool,
     /// When the engine was last not had in time, for a report now and then.
     engine_late_reported: Option<std::time::Instant>,
     /// Test hook: the control window freezes this long once a second —
@@ -302,7 +307,10 @@ impl UIRunner {
             ui_frame_allowance: std::time::Duration::ZERO,
             ui_parts: crate::app::frame_parts::FrameParts::of("control window"),
             ui_frames: 0,
-            stashed_actions: None,
+            stashed_actions: std::collections::VecDeque::new(),
+            cached_ui_data: None,
+            last_shown: None,
+            ui_layout_dirty: false,
             engine_late_reported: None,
             ui_stall: UiStall::from_env(),
             last_ui_stall: None,
@@ -1102,24 +1110,25 @@ impl UIRunner {
         let started = std::time::Instant::now();
         self.last_ui_frame = Some(started);
         self.ui_parts.begin(started, None);
-        // What the operator did in a frame the engine was not had for.
-        if let Some(stashed) = self.stashed_actions.take() {
-            let mut actions = Some(stashed);
-            if self
-                .with_engine("applying what was done", |this| {
-                    this.ui_after(actions.take().expect("once"))
-                })
-                .is_none()
-            {
-                self.stashed_actions = actions;
+        // Never consume more input than the bounded pending queue can retain.
+        if self.stashed_actions.len() >= responsiveness::MAX_PENDING_FRAMES {
+            self.with_ui_engine("applying queued input", Self::drain_ui_actions);
+            if self.stashed_actions.len() >= responsiveness::MAX_PENDING_FRAMES {
                 return;
             }
         }
-        let Some(Some(ui_data)) =
-            self.with_engine("reading the show", |this| this.ui_before(event_loop))
-        else {
+        let fresh = self.with_ui_engine("reading the show", |this| {
+            this.drain_ui_actions();
+            this.ui_before(event_loop)
+        });
+        if let Some(Some(data)) = fresh {
+            self.cached_ui_data = Some(data);
+        }
+        let Some(mut ui_data) = self.cached_ui_data.take() else {
             return;
         };
+        self.ui_frames += 1;
+        responsiveness::update_layout(&mut ui_data, &self.layout);
         self.keep_screen_rate();
         self.keep_night_shift();
         let Some(window) = self.window else { return };
@@ -1225,23 +1234,28 @@ impl UIRunner {
 
         self.part("ui tessellate", t_part);
 
-        let mut actions = Some(ui_actions);
-        let shown = match self.with_engine("applying what was done", |this| {
-            this.ui_after(actions.take().expect("once"))
-        }) {
-            Some(Some(shown)) => shown,
-            Some(None) => return,
-            // Kept for the next frame, not lost.
-            None => {
-                self.stashed_actions = actions;
-                return;
-            }
-        };
+        // Selection and panel layout belong to this thread, not the engine.
+        self.layout.apply_selections(&ui_actions);
+        if let Some(screen) = &ui_actions.session.screen_layout {
+            self.ui_layout_dirty |=
+                !ui::screen_layout::same_arrangement(&screen.dock, &self.layout.screen.dock)
+                    || screen.windows != self.layout.screen.windows
+                    || screen.name != self.layout.screen.name
+                    || screen.locked != self.layout.screen.locked;
+            self.layout.screen.clone_from(screen);
+        }
+        self.queue_ui_actions(ui_actions, &ui_data);
+        self.with_ui_engine("applying what was done", Self::drain_ui_actions);
+        let shown = self.last_shown.unwrap_or(Shown {
+            target_fps: ui_data.target_fps,
+            motion: self.ui_motion,
+        });
+        self.cached_ui_data = Some(ui_data);
 
         self.ui_motion = shown.motion;
         // The control window's own frame: the UI.
         let t_submit = std::time::Instant::now();
-        self.submit_frame(&paint_jobs, pixels_per_point, &shown);
+        self.submit_frame(&paint_jobs, pixels_per_point, shown);
         self.part("ui submit", t_submit);
         #[allow(clippy::cast_precision_loss)]
         let frame_ms =
@@ -1275,15 +1289,26 @@ impl UIRunner {
     /// engine thread may be waiting for it (a call only the main thread can
     /// answer, which the engine should never make), and would never finish.
     fn with_engine<R>(&mut self, what: &'static str, f: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        self.with_engine_for(what, ENGINE_PATIENCE, f)
+    }
+
+    fn with_engine_for<R>(
+        &mut self,
+        what: &'static str,
+        patience: std::time::Duration,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Option<R> {
         let borrowed = match (&self.engine, &self.varda) {
             (Some(engine), None) => {
                 let t = std::time::Instant::now();
-                let taken = engine.baton().take_within(Some(ENGINE_PATIENCE));
+                let taken = engine.baton().take_within(Some(patience));
                 self.ui_parts.add("engine wait", t.elapsed());
                 match taken {
                     engine_thread::Taken::Engine(app) => self.varda = Some(app),
                     engine_thread::Taken::Late => {
-                        self.report_engine_late();
+                        if patience == ENGINE_PATIENCE {
+                            self.report_engine_late();
+                        }
                         return None;
                     }
                     engine_thread::Taken::Closed => {}
@@ -1640,7 +1665,6 @@ impl UIRunner {
         self.part("ui data", t_part);
 
         // How the control window has been doing, for the performance figures.
-        self.ui_frames += 1;
         if self.ui_frames.is_multiple_of(10) {
             #[allow(clippy::cast_precision_loss)]
             let period_ms = self.ui_period().as_secs_f32() * 1000.0;
@@ -1672,11 +1696,13 @@ impl UIRunner {
 
         // 6. Apply all UI actions
         // 6a. UI-consumer-owned selection/layout state
-        self.layout.apply_selections(&ui_actions);
         // What the operator has selected, as drawn: settled where it is once
         // this frame's changes are in (see `settle_selection`).
         let selected = self.layout.anchor(&self.frame_order);
         self.apply_screen_layout_actions(&mut ui_actions);
+        if std::mem::take(&mut self.ui_layout_dirty) {
+            self.varda.as_mut()?.remember_layout(&self.layout);
+        }
 
         // 6a2. Dome camera actions — apply to renderer (not layout state)
         {
@@ -2164,7 +2190,7 @@ impl UIRunner {
         &mut self,
         paint_jobs: &[egui::ClippedPrimitive],
         pixels_per_point: f32,
-        shown: &Shown,
+        shown: Shown,
     ) {
         let t_part = std::time::Instant::now();
         // Every pass's textures since the last frame painted — the panels'
@@ -2481,6 +2507,7 @@ fn display_id(monitor: &winit::monitor::MonitorHandle) -> Option<u32> {
 }
 
 /// What the control window's frame is drawn at, taken with the engine.
+#[derive(Clone, Copy)]
 struct Shown {
     target_fps: u32,
     /// What moves in the show: how often the next frames are drawn.

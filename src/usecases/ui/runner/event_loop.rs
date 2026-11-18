@@ -337,7 +337,14 @@ impl ApplicationHandler for UIRunner {
             let quiet = since.is_none_or(|since| since >= UI_FALLBACK);
             let period = self.ui_period();
             let rested = since.is_none_or(|since| since >= period);
-            if (self.ui_due && rested) || quiet {
+            let interacting = self
+                .last_input
+                .is_some_and(|at| at.elapsed() < super::HANDS_ON);
+            let interaction_wait = super::responsiveness::interaction_wait(interacting, since);
+            if (self.ui_due && rested)
+                || quiet
+                || interaction_wait == Some(std::time::Duration::ZERO)
+            {
                 self.ui_due = false;
                 self.ui_frame_allowance = super::frame_allowance(self.ui_frame_period, period);
                 self.ui_frame_period = period;
@@ -346,7 +353,8 @@ impl ApplicationHandler for UIRunner {
                 }
             }
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                std::time::Instant::now() + UI_FALLBACK,
+                std::time::Instant::now()
+                    + interaction_wait.unwrap_or(UI_FALLBACK).min(UI_FALLBACK),
             ));
         }
     }
@@ -441,6 +449,9 @@ impl UIRunner {
             if let Some(app) = engine.stop() {
                 self.varda = Some(app);
             }
+        }
+        if self.varda.is_some() && self.egui_renderer.is_some() {
+            self.drain_ui_actions();
         }
         if let Some(varda) = self.varda.as_mut() {
             if let Err(e) = varda.save_workspace(&self.layout) {
