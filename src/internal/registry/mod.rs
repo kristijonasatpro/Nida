@@ -19,6 +19,9 @@ pub enum ShaderEvent {
 
 /// Registry of discovered ISF shaders with hot-reload support
 pub struct ShaderRegistry {
+    /// Changes whenever the effective library can change, including edits
+    /// that keep the same shader count. Consumers may cache derived lists.
+    revision: u64,
     /// Map of shader name to shader data
     shaders: HashMap<String, ISFShader>,
 
@@ -51,9 +54,14 @@ pub struct ShaderRegistry {
 }
 
 impl ShaderRegistry {
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Create a new shader registry
     pub fn new() -> Self {
         Self {
+            revision: 0,
             shaders: HashMap::new(),
             path_to_name: HashMap::new(),
             name_to_paths: HashMap::new(),
@@ -153,6 +161,7 @@ impl ShaderRegistry {
     /// are logged and skipped — but the signature stays fallible so directory
     /// traversal failures can be surfaced without a breaking change.
     pub fn scan(&mut self) -> Result<usize> {
+        self.revision = self.revision.wrapping_add(1);
         self.shaders.clear();
         self.path_to_name.clear();
         self.name_to_paths.clear();
@@ -330,6 +339,7 @@ impl ShaderRegistry {
     /// registry's knowledge but does not clobber the override.
     fn reload_shader(&mut self, path: &Path) -> Result<()> {
         let shader = ISFShader::from_file(path)?;
+        self.revision = self.revision.wrapping_add(1);
         let name = shader.name();
 
         // If this file previously provided a different name (its NAME field was
@@ -405,6 +415,7 @@ impl ShaderRegistry {
     /// loading the highest-priority one. Returns whether the shader still
     /// exists afterward. Ties resolve to the last-recorded provider.
     fn resolve_winner(&mut self, name: &str) -> bool {
+        self.revision = self.revision.wrapping_add(1);
         let providers = match self.name_to_paths.get(name) {
             Some(p) if !p.is_empty() => p.clone(),
             _ => {

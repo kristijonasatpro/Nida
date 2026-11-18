@@ -539,6 +539,19 @@ fn build_sequence_snapshots(mixer: &crate::mixer::Mixer) -> Vec<SequenceSnapshot
 
 /// Build a `RegistrySnapshot` from the current `VardaApp` state.
 pub(crate) fn build_registry_snapshot(app: &VardaApp) -> RegistrySnapshot {
+    let revision = app.registry.revision();
+    let mut cached = app.registry_snapshot.borrow_mut();
+    if let Some((at, snapshot)) = cached.as_ref() {
+        if *at == revision {
+            return snapshot.clone();
+        }
+    }
+    let snapshot = collect_registry_snapshot(app);
+    *cached = Some((revision, snapshot.clone()));
+    snapshot
+}
+
+fn collect_registry_snapshot(app: &VardaApp) -> RegistrySnapshot {
     let mut generators: Vec<(String, usize)> = app
         .registry
         .generators()
@@ -1154,7 +1167,10 @@ mod tests {
         let registry = build_registry_snapshot(&app);
         assert!(registry.frames.len() >= 12, "{:?}", registry.frames);
         for frame in &registry.frames {
-            assert!(crate::engine::value::frame::is_frame(&frame.name), "{frame:?}");
+            assert!(
+                crate::engine::value::frame::is_frame(&frame.name),
+                "{frame:?}"
+            );
             assert!(
                 !frame.title.is_empty() && !frame.title.starts_with("frame_"),
                 "a title to read: {frame:?}"
@@ -1439,6 +1455,57 @@ mod tests {
                 pair[1].0,
             );
         }
+    }
+
+    #[test]
+    fn registry_snapshot_invalidates_when_a_same_count_shader_changes_kind() {
+        let Some(mut app) = headless_app() else {
+            return;
+        };
+        let folder = tempfile::tempdir().unwrap();
+        let shader = folder.path().join("changing.fs");
+        let write = |inputs: &str| {
+            std::fs::write(
+                &shader,
+                format!(
+                    "/*{{\"CATEGORIES\":[\"Test\"],\"INPUTS\":[{inputs}]}}*/\nvoid main() {{}}"
+                ),
+            )
+            .unwrap()
+        };
+        write("");
+        app.registry = crate::registry::ShaderRegistry::new();
+        app.registry_snapshot.replace(None);
+        app.registry.add_library_path(folder.path()).unwrap();
+        app.registry.scan().unwrap();
+        let before = build_registry_snapshot(&app);
+        assert_eq!(before.generators.len(), 1);
+        write(r#"{"NAME":"inputImage","TYPE":"image"}"#);
+        app.registry.scan().unwrap();
+        let after = build_registry_snapshot(&app);
+        assert_eq!(before.shader_count, after.shader_count);
+        assert!(after.generators.is_empty());
+        assert_eq!(after.filters.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "release-profile diagnostic; run with nothing else compiling"]
+    fn registry_snapshot_cache_performance() {
+        let app = headless_app().expect("a GPU");
+        let iterations = 500;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(collect_registry_snapshot(&app));
+        }
+        let uncached = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(build_registry_snapshot(&app));
+        }
+        eprintln!(
+            "registry {iterations} snapshots: uncached {uncached:?}, cached {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

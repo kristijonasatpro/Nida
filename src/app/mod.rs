@@ -708,6 +708,7 @@ pub struct VardaApp {
     /// Talks' files looked over for what may go wrong in the show.
     talk_checks: crate::presentation::check::Checker,
     registry: ShaderRegistry,
+    registry_snapshot: std::cell::RefCell<Option<(u64, crate::engine::RegistrySnapshot)>>,
     analyzer_registry: crate::analyzer::AnalyzerRegistry,
     context: GpuContext,
     /// Absolute show position. Distinct from the tempo clock in
@@ -997,6 +998,7 @@ impl VardaApp {
             web_talks: state::slides::WebTalks::new(config.headless),
             talk_checks: crate::presentation::check::Checker::new(),
             registry,
+            registry_snapshot: std::cell::RefCell::new(None),
             analyzer_registry: crate::analyzer::default_registry(),
             context: gpu,
             transport: crate::transport::Transport::new(),
