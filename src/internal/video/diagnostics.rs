@@ -134,7 +134,7 @@ fn pipeline_measurement() {
                 },
                 extent,
             );
-            gpu.queue.submit([]);
+            gpu.submit([]);
             gpu.device
                 .poll(wgpu::PollType::wait_indefinitely())
                 .unwrap();

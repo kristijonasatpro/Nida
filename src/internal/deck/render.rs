@@ -10,8 +10,8 @@ use crate::audio::AudioData;
 use crate::isf::{ISFPass, PhaseInput};
 use crate::modulation::ModulationEngine;
 use crate::params::ShaderParams;
-use crate::renderer::region::{draw_within, scissors_for, Area, Pixels};
 use crate::renderer::BlitPipeline;
+use crate::renderer::region::{Area, Pixels, draw_within, scissors_for};
 use crate::renderer::{GpuContext, ISFUniforms, UnifiedPipeline};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -172,6 +172,18 @@ impl Deck {
     /// are a no-op. The `Result` is kept so callers stay source-compatible if
     /// staging-buffer allocation becomes fallible.
     pub fn update_video_frame(&mut self, encoder: &mut wgpu::CommandEncoder) -> Result<()> {
+        self.update_video_frame_with_readiness(
+            encoder,
+            &mut crate::video::FrameReadiness::disabled(),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn update_video_frame_with_readiness(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        readiness: &mut crate::video::FrameReadiness,
+    ) {
         match &mut self.source {
             // A frame is taken only when it can be uploaded; one taken while
             // the staging buffer is still on its way back would be lost. A
@@ -182,12 +194,20 @@ impl Deck {
                 ref texture,
                 ref mut staging,
                 ..
-            } if staging.ready() => {
-                if let Some(frame) = handle.take_frame() {
+            } => {
+                if let Some(frame) =
+                    handle.take_ready_frame_with_readiness(staging.ready(), readiness)
+                {
                     let width = handle.width;
                     let height = handle.height;
-                    staging.upload(&frame.color_data, texture, width, height, encoder);
-                    handle.recycle(frame);
+                    match frame.color_data {
+                        #[cfg(target_os = "windows")]
+                        crate::video::DecodedPixels::Gpu(gpu) => gpu.encode(encoder, texture),
+                        crate::video::DecodedPixels::Cpu(ref bytes) => {
+                            staging.upload(bytes, texture, width, height, encoder);
+                            handle.recycle(frame);
+                        }
+                    }
                     self.frames_uploaded += 1;
                 }
             }
@@ -207,7 +227,13 @@ impl Deck {
                     // Whole 4×4 blocks, as the texture was made.
                     let width = handle.width.div_ceil(4) * 4;
                     let height = handle.height.div_ceil(4) * 4;
-                    staging.upload(&frame.color_data, texture, width, height, encoder);
+                    staging.upload(
+                        frame.color_data.cpu_bytes(),
+                        texture,
+                        width,
+                        height,
+                        encoder,
+                    );
 
                     if let (Some(alpha_data), Some(_alpha_fmt), Some(alpha_tex)) = (
                         frame.alpha_data.as_ref(),
@@ -224,15 +250,14 @@ impl Deck {
                     self.frames_uploaded += 1;
                 }
             }
-            DeckSource::Playlist(list) => list.tick(encoder),
-            DeckSource::Slides(slides) => slides.tick(encoder),
+            DeckSource::Playlist(list) => list.tick_with_readiness(encoder, readiness),
+            DeckSource::Slides(slides) => slides.tick_with_readiness(encoder, readiness),
             DeckSource::Timer(timer) => timer.tick(),
             DeckSource::LowerThird(lower) => lower.tick(),
             DeckSource::Text(text) => text.tick(),
             DeckSource::Presenter(presenter) => presenter.tick(),
             _ => {}
         }
-        Ok(())
     }
 
     /// Request re-mapping of staging buffers after `queue.submit()`.
@@ -1238,7 +1263,9 @@ impl Deck {
             ..
         } = &self.source
         else {
-            return Err("not a live input — a picture, clip or generator moves only when drawn alike in both");
+            return Err(
+                "not a live input — a picture, clip or generator moves only when drawn alike in both",
+            );
         };
         if self.analyzers.has_active_instances() {
             return Err("analysed for modulation");

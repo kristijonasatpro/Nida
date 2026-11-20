@@ -2313,8 +2313,10 @@ pub(super) fn render_playback_controls(
     }
 
     // Info line
-    let decode = if vp.hardware_decode {
-        "hardware decode"
+    let decode = if vp.gpu_resident {
+        "GPU-resident"
+    } else if vp.hardware_decode {
+        "hardware decode · CPU transfer"
     } else {
         "software decode"
     };
@@ -2327,10 +2329,16 @@ pub(super) fn render_playback_controls(
         .small()
         .weak(),
     )
-    .on_hover_text(if vp.hardware_decode {
-        "Decoded on the GPU/media engine. Colour conversion and upload may still use the CPU"
+    .on_hover_text(if vp.gpu_resident {
+        format!("GPU decoding and colour conversion. No uncompressed frame download or upload.\nGPU frames: {} · plane copies: {} · slots: {}/3 (peak {})\nFrame downloads: {} bytes · uploads: {} bytes · skipped: {}\nWorker copy + fence wait: {:.2} ms total",
+            vp.delivery.gpu_frames, vp.delivery.gpu_copies, vp.delivery.occupied_slots, vp.delivery.peak_slots,
+            vp.delivery.downloaded_bytes, vp.delivery.uploaded_bytes, vp.delivery.dropped_frames,
+            vp.delivery.copy_wait_ns as f64 / 1_000_000.0)
+    } else if vp.hardware_decode {
+        format!("Decoded on the GPU/media engine; colour conversion and frame transfer use the CPU.{}",
+            vp.delivery.fallback_reason.as_deref().map(|r| format!("\nGPU-resident path unavailable: {r}")).unwrap_or_default())
     } else {
-        "Decoded on the CPU: hardware decoding is unavailable for this codec, profile or device, or is disabled"
+        format!("Decoded on the CPU.{}", vp.delivery.fallback_reason.as_deref().map(|r| format!("\n{r}")).unwrap_or_default())
     });
 }
 

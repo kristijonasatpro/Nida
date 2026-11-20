@@ -2413,7 +2413,9 @@ impl UIRunner {
         TRACE.note(CONTROL, u64::from(self.ui_frames), Step::Submitted);
         parts.push(("ui draw", t_draw.elapsed()));
         let t_part = std::time::Instant::now();
+        crate::video::pacing_trace::emit("ui_present_begin", f64::from(self.ui_frames), 0.0);
         context.queue.present(output);
+        crate::video::pacing_trace::emit("ui_present_end", f64::from(self.ui_frames), 0.0);
         // The wait this frame was drawn for, for when macOS reports it shown.
         if self.ui_presented_allowances.len() >= PRESENTED_KEPT {
             self.ui_presented_allowances.pop_front();

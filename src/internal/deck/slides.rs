@@ -22,8 +22,8 @@ use crate::engine::value::playlist::PlaylistTransition;
 use crate::engine::value::presentation::{Go, Screen};
 use crate::engine::value::slides::{ClipPosition, SlidesSettings, Talk, TalkKind, TalkRef};
 use crate::presentation::pdf::{PdfDrawer, PdfEvent};
-use crate::renderer::playlist_mix::{Mix, PlaylistMixPipeline};
 use crate::renderer::GpuContext;
+use crate::renderer::playlist_mix::{Mix, PlaylistMixPipeline};
 
 /// The longest step time takes between two looks: a stall does not jump a
 /// fade.
@@ -424,13 +424,11 @@ impl Slides {
     /// — while it is in the list.
     pub fn previous_talk(&self) -> Option<&str> {
         let ended = self.stopped.as_ref().and_then(|s| s.talk.as_deref());
-        ended
-            .filter(|id| self.index_of(id).is_some())
-            .or_else(|| {
-                self.previous
-                    .as_deref()
-                    .filter(|id| self.index_of(id).is_some())
-            })
+        ended.filter(|id| self.index_of(id).is_some()).or_else(|| {
+            self.previous
+                .as_deref()
+                .filter(|id| self.index_of(id).is_some())
+        })
     }
 
     /// A new list: talks added, taken out, moved, renamed, given another
@@ -555,8 +553,14 @@ impl Slides {
             self.drop_coming();
             return Ok(id);
         }
-        let opening_it = self.opening.as_ref().is_some_and(|o| o.id == id && o.path == talk.path);
-        let coming_it = self.coming.as_ref().is_some_and(|o| o.id == id && o.path == talk.path);
+        let opening_it = self
+            .opening
+            .as_ref()
+            .is_some_and(|o| o.id == id && o.path == talk.path);
+        let coming_it = self
+            .coming
+            .as_ref()
+            .is_some_and(|o| o.id == id && o.path == talk.path);
         if opening_it || coming_it {
             return Ok(id);
         }
@@ -631,9 +635,7 @@ impl Slides {
         if self.live.is_none() && self.coming.is_none() && self.opening.is_none() {
             return false;
         }
-        let coming_at = self
-            .coming_talk()
-            .and_then(|(id, _)| self.index_of(id));
+        let coming_at = self.coming_talk().and_then(|(id, _)| self.index_of(id));
         self.drop_coming();
         let stopped = if let Some(OpenTalk { id, deck, .. }) = self.live.take() {
             // What comes next is counted on from the talk ended.
@@ -794,7 +796,8 @@ impl Slides {
     /// Where a web talk's page says it is (reveal.js): its slide and
     /// how many it has; kept as where it was left.
     pub fn set_position(&mut self, id: &str, path: &str, at: u32, of: u32) {
-        self.positions.insert((id.to_string(), path.to_string()), (at, of));
+        self.positions
+            .insert((id.to_string(), path.to_string()), (at, of));
         self.set_talk_slide(id, path, at);
     }
 
@@ -807,7 +810,11 @@ impl Slides {
             .coming
             .as_ref()
             .map(|o| (o.id.as_str(), o.path.as_str()))
-            .or_else(|| self.opening.as_ref().map(|o| (o.id.as_str(), o.path.as_str())));
+            .or_else(|| {
+                self.opening
+                    .as_ref()
+                    .map(|o| (o.id.as_str(), o.path.as_str()))
+            });
         let coming = starting == Some((id, path));
         // Said on the talk when it is the file the list has for it, or the
         // one starting; else only logged.
@@ -1025,11 +1032,18 @@ impl Slides {
     /// Once a frame: take what has opened and been drawn, move a change of
     /// talk on, and bring each clip's newest frame to its texture.
     pub fn tick(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.tick_with_readiness(encoder, &mut crate::video::FrameReadiness::disabled());
+    }
+
+    pub(crate) fn tick_with_readiness(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        readiness: &mut crate::video::FrameReadiness,
+    ) {
         self.step(Instant::now());
         for open in self.live.iter_mut().chain(self.coming.iter_mut()) {
-            if let Err(e) = open.deck.update_video_frame(encoder) {
-                log::warn!("Slides talk '{}': {e}", open.path);
-            }
+            open.deck
+                .update_video_frame_with_readiness(encoder, readiness);
         }
     }
 

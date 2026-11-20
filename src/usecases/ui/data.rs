@@ -150,7 +150,11 @@ pub type EffectInfo = (String, String, bool, ShaderParamsUI);
 
 /// Video playback state snapshot for UI display
 #[derive(Clone)]
+// Independent playback, decode, residency and source flags mirrored from the player.
+#[allow(clippy::struct_excessive_bools)]
 pub struct VideoPlaybackUI {
+    pub gpu_resident: bool,
+    pub delivery: crate::video::delivery::DeliveryDiagnostics,
     pub playing: bool,
     pub position: f64,
     pub duration: f64,

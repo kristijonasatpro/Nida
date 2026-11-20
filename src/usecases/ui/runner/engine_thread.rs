@@ -220,6 +220,8 @@ impl Phase {
 struct Signal {
     state: Mutex<SignalState>,
     changed: Condvar,
+    #[cfg(windows)]
+    timer: std::sync::OnceLock<Option<crate::video::command_channel::NativeWait>>,
 }
 
 #[derive(Default)]
@@ -246,11 +248,20 @@ impl Signal {
     fn tick(&self) {
         self.lock().ticks += 1;
         self.changed.notify_all();
+        self.notify_timer();
     }
 
     fn stop(&self) {
         self.lock().stop = true;
         self.changed.notify_all();
+        self.notify_timer();
+    }
+
+    fn notify_timer(&self) {
+        #[cfg(windows)]
+        if let Some(Some(timer)) = self.timer.get() {
+            timer.notify();
+        }
     }
 
     fn stopped(&self) -> bool {
@@ -286,6 +297,8 @@ impl Signal {
     /// Sleep until `deadline`; `false` if told to stop meanwhile.
     fn sleep_until(&self, deadline: Instant) -> bool {
         let mut state = self.lock();
+        #[cfg(windows)]
+        let mut native_failed = false;
         loop {
             if state.stop {
                 return false;
@@ -294,11 +307,38 @@ impl Signal {
             if left.is_zero() {
                 return true;
             }
+            let waiting_at = Instant::now();
+            crate::video::pacing_trace::emit("engine_timer_wait", left.as_secs_f64(), 0.0);
+            #[cfg(windows)]
+            if !native_failed {
+                if let Some(timer) = self
+                    .timer
+                    .get_or_init(crate::video::command_channel::NativeWait::new)
+                {
+                    // Auto-reset notification retains stop/tick signals sent
+                    // between unlocking state and entering the native wait.
+                    drop(state);
+                    let succeeded = timer.wait(left);
+                    state = self.lock();
+                    crate::video::pacing_trace::emit(
+                        "engine_timer_return",
+                        waiting_at.elapsed().as_secs_f64(),
+                        left.as_secs_f64(),
+                    );
+                    native_failed = !succeeded;
+                    continue;
+                }
+            }
             state = self
                 .changed
                 .wait_timeout(state, left)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
+            crate::video::pacing_trace::emit(
+                "engine_timer_return",
+                waiting_at.elapsed().as_secs_f64(),
+                left.as_secs_f64(),
+            );
         }
     }
 }
@@ -657,6 +697,11 @@ impl EngineLoop {
     /// One frame of the engine: what the operator and the API asked for,
     /// inputs, the mixer, every output, and now and then the state.
     fn frame(&mut self, varda: &mut VardaApp, baton_wait: Duration, gpu_wait: Duration) {
+        crate::video::pacing_trace::emit(
+            "engine_frame",
+            baton_wait.as_secs_f64(),
+            gpu_wait.as_secs_f64(),
+        );
         let target_fps = varda.target_fps();
         // A screen's mode changed: its clock looked at again now.
         if varda.take_clock_recheck() {
@@ -761,7 +806,11 @@ impl EngineLoop {
         // ahead while the screen still gave the old rate, and the first
         // timer frame after the clock was replaced was stamped up to a second
         // and a half in the future — a recording padded the gap (Codex).
-        let base = if clock_driven { refresh_at } else { self.cadence_anchor };
+        let base = if clock_driven {
+            refresh_at
+        } else {
+            self.cadence_anchor
+        };
         self.cadence_anchor = next_cadence_anchor(base, target_fps, Instant::now());
     }
 
@@ -831,8 +880,14 @@ impl EngineLoop {
 /// seconds, frames came at the old rate while each stepped the show's time
 /// by the new one: motion at double or half speed for a second and more on
 /// every output, and recordings with it (Max5 on the Studio, 60 to 30).
-fn clock_check_due(checked: Option<Instant>, checked_for: u32, target_fps: u32, now: Instant) -> bool {
-    checked_for != target_fps || checked.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(2))
+fn clock_check_due(
+    checked: Option<Instant>,
+    checked_for: u32,
+    target_fps: u32,
+    now: Instant,
+) -> bool {
+    checked_for != target_fps
+        || checked.is_none_or(|at| now.duration_since(at) >= Duration::from_secs(2))
 }
 
 /// The ideal start of the next frame on the timer, after a frame that ended
@@ -908,6 +963,28 @@ fn display_id(monitor: &winit::monitor::MonitorHandle) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stop_interrupts_the_engine_timer_wait() {
+        let signal = std::sync::Arc::new(super::Signal::default());
+        let waiting = signal.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker =
+            std::thread::spawn(move || {
+                done_tx
+                    .send(waiting.sleep_until(
+                        std::time::Instant::now() + std::time::Duration::from_secs(10),
+                    ))
+                    .unwrap();
+            });
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        signal.stop();
+        assert!(
+            !done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+        );
+        worker.join().unwrap();
+    }
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1100,10 +1177,19 @@ mod tests {
     fn a_new_target_rate_looks_at_the_display_clock_at_once() {
         let now = Instant::now();
         let just = now.checked_sub(Duration::from_millis(100)).unwrap();
-        assert!(!clock_check_due(Some(just), 60, 60, now), "looked at just now");
-        assert!(clock_check_due(Some(just), 60, 30, now), "the target changed: at once");
+        assert!(
+            !clock_check_due(Some(just), 60, 60, now),
+            "looked at just now"
+        );
+        assert!(
+            clock_check_due(Some(just), 60, 30, now),
+            "the target changed: at once"
+        );
         let long = now.checked_sub(Duration::from_secs(3)).unwrap();
-        assert!(clock_check_due(Some(long), 60, 60, now), "every two seconds");
+        assert!(
+            clock_check_due(Some(long), 60, 60, now),
+            "every two seconds"
+        );
         assert!(clock_check_due(None, 0, 60, now), "never looked at");
     }
 
@@ -1122,6 +1208,9 @@ mod tests {
         assert_eq!(next_cadence_anchor(Some(stale), 60, now), Some(now));
         // Run far ahead (frames came faster than the target): from now.
         let future = now + budget * 90;
-        assert_eq!(next_cadence_anchor(Some(future), 60, now), Some(now + budget));
+        assert_eq!(
+            next_cadence_anchor(Some(future), 60, now),
+            Some(now + budget)
+        );
     }
 }

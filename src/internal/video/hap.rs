@@ -502,7 +502,7 @@ impl HapPlayer {
         self.playback.playing
     }
     pub fn set_playing(&mut self, playing: bool) {
-        self.playback.playing = playing;
+        self.playback.set_playing(playing);
     }
     pub fn is_looping(&self) -> bool {
         self.playback.loop_mode == LoopMode::Loop

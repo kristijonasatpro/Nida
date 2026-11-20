@@ -7,20 +7,24 @@ param(
     [ValidateRange(0.1, 3600.0)][double]$Seconds = 10,
     [switch]$Playback,
     [switch]$Hardware,
+    [switch]$GpuResident,
     [switch]$Upload
 )
 $ErrorActionPreference = 'Stop'
+if ($GpuResident -and (!$Playback -or $Upload)) { throw 'GPU-resident measurement requires -Playback and does not support -Upload.' }
 if (Test-Path -LiteralPath $Output) { throw "Output already exists: $Output. Use a fresh log path." }
 $binary = (Resolve-Path -LiteralPath $TestBinary).Path
 $media = (Resolve-Path -LiteralPath $Clip).Path
 $previousClip = $env:VARDA_VIDEO_BENCH_CLIP
 $previousHardware = $env:VARDA_REQUIRE_HW_DECODE
+$previousResident = $env:VARDA_REQUIRE_GPU_RESIDENT
 $previousUpload = $env:VARDA_VIDEO_BENCH_UPLOAD
 $previousClips = $env:VARDA_VIDEO_BENCH_CLIPS
 $previousSeconds = $env:VARDA_VIDEO_BENCH_SECONDS
 try {
     $env:VARDA_VIDEO_BENCH_CLIP = $media
-    $env:VARDA_REQUIRE_HW_DECODE = if ($Hardware) { '1' } else { $null }
+    $env:VARDA_REQUIRE_HW_DECODE = if ($Hardware -or $GpuResident) { '1' } else { $null }
+    $env:VARDA_REQUIRE_GPU_RESIDENT = if ($GpuResident) { '1' } else { $null }
     $env:VARDA_VIDEO_BENCH_UPLOAD = if ($Upload) { '1' } else { $null }
     $env:VARDA_VIDEO_BENCH_CLIPS = "$Clips"
     $env:VARDA_VIDEO_BENCH_SECONDS = "$Seconds"
@@ -32,7 +36,9 @@ try {
         os = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
         gpu = if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { (& nvidia-smi --query-gpu=name,driver_version --format=csv,noheader) } else { 'unavailable' }
         probe = (& ffprobe -v error -show_streams -show_format -of json $media | ConvertFrom-Json)
-        hardware_required = [bool]$Hardware
+        hardware_required = [bool]($Hardware -or $GpuResident)
+        gpu_resident_required = [bool]$GpuResident
+        shader_sha256 = if ($env:NIDA_TEST_GPU_VIDEO_SHADER) { (Get-FileHash -LiteralPath $env:NIDA_TEST_GPU_VIDEO_SHADER -Algorithm SHA256).Hash } else { 'embedded' }
         upload_wait = [bool]$Upload
         realtime_rendering = [bool]$Playback
         clips = $Clips
@@ -49,6 +55,7 @@ try {
 } finally {
     $env:VARDA_VIDEO_BENCH_CLIP = $previousClip
     $env:VARDA_REQUIRE_HW_DECODE = $previousHardware
+    $env:VARDA_REQUIRE_GPU_RESIDENT = $previousResident
     $env:VARDA_VIDEO_BENCH_UPLOAD = $previousUpload
     $env:VARDA_VIDEO_BENCH_CLIPS = $previousClips
     $env:VARDA_VIDEO_BENCH_SECONDS = $previousSeconds

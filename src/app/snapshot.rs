@@ -110,6 +110,8 @@ pub(crate) fn build_mixer_snapshot(app: &VardaApp) -> MixerSnapshot {
                                     .video_transport_sync()
                                     .unwrap_or_default(),
                                 hardware_decode: ps.hardware_decode,
+                                gpu_resident: ps.gpu_resident,
+                                delivery: ps.delivery,
                                 auto: slot.deck.auto_playback,
                                 sound_only: slot.deck.is_sound_only(),
                             });

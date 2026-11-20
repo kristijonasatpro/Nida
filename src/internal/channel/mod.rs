@@ -872,6 +872,23 @@ impl Channel {
         refresh_at: Option<std::time::Instant>,
         held: bool,
     ) {
+        self.tick_video_frames_with_readiness(
+            encoder,
+            target_fps,
+            refresh_at,
+            held,
+            &mut crate::video::FrameReadiness::disabled(),
+        );
+    }
+
+    pub(crate) fn tick_video_frames_with_readiness(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_fps: u32,
+        refresh_at: Option<std::time::Instant>,
+        held: bool,
+        readiness: &mut crate::video::FrameReadiness,
+    ) {
         for slot in &mut self.decks {
             slot.deck
                 .set_video_suspended(!slot.source_demand.wants_frames());
@@ -892,9 +909,8 @@ impl Channel {
             slot.deck.set_video_output_fps(target_fps);
             slot.deck.set_frame_refresh_at(refresh_at);
             slot.deck.set_frame_held(held);
-            if let Err(e) = slot.deck.update_video_frame(encoder) {
-                log::warn!("Video frame update failed: {e}");
-            }
+            slot.deck
+                .update_video_frame_with_readiness(encoder, readiness);
         }
     }
 
@@ -943,8 +959,7 @@ impl Channel {
         let any_solo = self.decks.iter().any(|slot| slot.solo);
         self.blank_drawn
             && self.decks.iter().all(|slot| {
-                !self.draws(slot, any_solo)
-                    || slot.left_clear == Some(slot.deck.rendered_frames())
+                !self.draws(slot, any_solo) || slot.left_clear == Some(slot.deck.rendered_frames())
             })
     }
 
@@ -995,8 +1010,10 @@ impl Channel {
         hidden: &std::collections::HashSet<usize>,
         modulation: &ModulationEngine,
         target_fps: u32,
-    ) -> std::collections::HashMap<usize, (crate::renderer::placed_picture::Placed, wgpu::TextureView)>
-    {
+    ) -> std::collections::HashMap<
+        usize,
+        (crate::renderer::placed_picture::Placed, wgpu::TextureView),
+    > {
         if !self.direct_layers || self.draw_every_deck {
             return std::collections::HashMap::new();
         }
@@ -1025,7 +1042,12 @@ impl Channel {
                     return None;
                 }
                 let uuid = slot.deck.uuid();
-                if self.shown_alone.iter().chain(&self.previewed).any(|s| s == uuid) {
+                if self
+                    .shown_alone
+                    .iter()
+                    .chain(&self.previewed)
+                    .any(|s| s == uuid)
+                {
                     return None;
                 }
                 let framing = slot.deck.framing(modulation).ok()?;
@@ -1606,7 +1628,11 @@ impl Channel {
                 layers.flush(
                     context,
                     &self.composite_view,
-                    [&self.blit_pipeline, &self.add_pipeline, &self.screen_pipeline],
+                    [
+                        &self.blit_pipeline,
+                        &self.add_pipeline,
+                        &self.screen_pipeline,
+                    ],
                     self.placed_onto.as_ref(),
                     size,
                     &mut composite_cmds,
@@ -1945,7 +1971,11 @@ impl Channel {
         layers.flush(
             context,
             &self.composite_view,
-            [&self.blit_pipeline, &self.add_pipeline, &self.screen_pipeline],
+            [
+                &self.blit_pipeline,
+                &self.add_pipeline,
+                &self.screen_pipeline,
+            ],
             self.placed_onto.as_ref(),
             size,
             &mut composite_cmds,
@@ -2380,7 +2410,10 @@ fn auto_draws(
 
 /// Whether decks costing `estimated_us` each (CPU-measured × the GPU load
 /// ratio) together run over a frame's time at `target_fps`.
-pub(crate) fn decks_over_budget(estimated_us: impl IntoIterator<Item = f32>, target_fps: u32) -> bool {
+pub(crate) fn decks_over_budget(
+    estimated_us: impl IntoIterator<Item = f32>,
+    target_fps: u32,
+) -> bool {
     if target_fps == 0 {
         return false;
     }

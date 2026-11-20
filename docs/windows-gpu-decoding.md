@@ -1,5 +1,11 @@
 # Windows hardware decoding — local prototype
 
+Current file/playlist playback now uses the experimental GPU-resident D3D12 path
+when supported. See [implementation](windows-gpu-resident-video.md) and
+[qualification provenance](windows-gpu-resident-qualification.md). The D3D11VA
+measurements below describe the earlier transfer-based fallback and are retained
+as historical baseline evidence, not measurements of the new path.
+
 Windows GPU decoding remains experimental and off by default. The Setup toggle
 opts in without changing macOS automatic hardware selection.
 

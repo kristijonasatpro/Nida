@@ -60,6 +60,8 @@ pub(crate) fn build_ui_data(
                         frame_rate: vp.frame_rate,
                         transport_sync: vp.transport_sync,
                         hardware_decode: vp.hardware_decode,
+                        gpu_resident: vp.gpu_resident,
+                        delivery: vp.delivery.clone(),
                         auto: vp.auto,
                         sound_only: vp.sound_only,
                     });

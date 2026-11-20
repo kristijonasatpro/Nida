@@ -713,6 +713,8 @@ impl Deck {
                 (VideoDecodeHandle::spawn_sound_only(player), side, side)
             } else {
                 let mut player = VideoPlayer::new(&path)?;
+                #[cfg(target_os = "windows")]
+                player.enable_gpu(context);
                 player.set_playing(false);
                 player.playback.show_frame = true;
                 let (w, h) = (player.width(), player.height());
@@ -729,7 +731,9 @@ impl Deck {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
                 view_formats: &[],
             });
             let video_texture_view =
