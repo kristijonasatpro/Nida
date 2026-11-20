@@ -170,6 +170,23 @@ source on its own:
   column, beside the channel's preview, has the same **Cut** and **Fade** for
   every bus as buttons.
 
+The source buttons are all one size, whatever the name: a long one takes two
+lines and ends in "…" (point at the button for all of it). **CUT** and
+**AUTO** stand apart on the right of the card, bigger, so a take is never
+mistaken for one more source. A channel's button has its colour along the
+top — the colour its tile has — and a colour you gave the input
+(right-click → **Colour**) fills the whole button, so the cameras, the slides
+and the clips are told apart at a glance.
+
+**Buttons: all** on the card chooses which sources that bus's row has buttons
+for: an LED wall that only ever shows three inputs can offer just those three
+(the menu then reads **Buttons: 3 of 12**). Untick a source to take its
+button off, tick it to put it back, or **Show all**. Right-click a button for
+**Remove from LED** (and, for a channel, its colour). Only the button goes:
+what is on the bus stays, and a source can still be sent to the bus from its
+right-click menu. A new input gets a button on every bus. The choice is
+saved with the show, and **Undo** takes it back.
+
 A new bus shows **Main** — Master on its Preview and Program — until you take
 something else to it, so a bus sent to a screen shows the show straight away.
 A new show has one, **PGM**, covering the whole picture at the show's size.
@@ -243,17 +260,25 @@ MacBook Pro drives itself. Its picture goes out on its HDMI and SDI at once.
 - **Adding one.** Choose the device in a bus card's **Screen:** picker to send
   that bus to it — the device's output is then the bus's, named after it, and
   starts at once (renamed, the bus renames it). Or use the device's own **+**
-  button in the output panel, then pick its **Source:**. A new output takes
-  **1080p at the show's rate** (1080p60 for a 60 fps show), or the nearest
-  1080p rate the device has. A device shows one output at a time.
+  button in the output panel, then pick its **Source:**. A new output's
+  format is **Auto**: 1080p at the show's rate (1080p60 for a 60 fps show),
+  or the nearest 1080p rate the device has. A device shows one output at a
+  time.
 - **Levels.** **Video (16–235)**, the default, as video gear takes it; or **Full (0–255)**,
   for a display set to take full levels (its HDMI black level at Full or High). Changed
   while the output runs, it is taken up at the next frame. **Test card** puts the test card
   on the device in place of the picture, to check the levels there.
-- **Format.** While the output is stopped, **Format:** lists the device's
-  formats. Its frame is the format's size; the picture — Main, or a bus — is
-  fitted into it whole, its shape kept, with black around when the shapes
-  differ. It is never stretched.
+- **Format.** **Auto (1080p60)** follows the show: the format for the show's
+  rate as the output starts, chosen again when the show's rate changes — a
+  running output is started again in it, a moment of black on the device.
+  While the output is stopped, **Format:** also lists the device's formats,
+  to pick one by hand; it then stays, whatever the show's rate. A format at
+  another rate than the show's says what it does — **⚠ 1080p50 on a 60 fps
+  show: 10 of every 60 frames are left out** — as the box takes frames at
+  its own rate. An output saved before **Auto** follows the show. Its frame
+  is the format's size; the picture — Main, or a bus — is fitted into it
+  whole, its shape kept, with black around when the shapes differ. It is
+  never stretched.
 - **▶ Start / ⏹ Stop.** Start opens the device and puts the show on it; Stop
   lets it go. Both happen away from the show's frames, so the other screens
   never wait for the device. A device another output is using says so. An
@@ -274,7 +299,9 @@ MacBook Pro drives itself. Its picture goes out on its HDMI and SDI at once.
   frames put up and let go, how evenly the show handed them over and how
   long they waited for the device, how long converting and the device took
   and how much of that was work on a CPU, and the frame time of the
-  device's own clock.
+  device's own clock. Frames let go or handed over late with the GPU busy
+  (a 4K show on a laptop): **Latency → Normal** in the frame rate menu, or a
+  lower resolution.
 - **Unplugged.** A device that stops taking pictures for half a second, or
   stops answering for a second — unplugged, say — stops its output with a
   notice; **⚠ *device* is not connected** shows on an output whose device is

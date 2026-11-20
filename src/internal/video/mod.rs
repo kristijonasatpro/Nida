@@ -98,6 +98,10 @@ pub struct PlaybackState {
     /// Set to true for one frame when playback reaches the out-point/EOF.
     /// Used by auto-transition `ClipEnd` trigger. Cleared each frame before advance.
     pub reached_end: bool,
+    /// How many times the playhead has been sent somewhere — a seek asked
+    /// for (done or failed), or a loop going round: a reader that asked for
+    /// one knows it has been dealt with once this has moved on.
+    pub seeks: u64,
     /// Last wall-clock time `advance_frame` was called (for real-time delta).
     last_advance: std::time::Instant,
     /// Fractional frame accumulator — tracks sub-frame position for pacing.
@@ -143,6 +147,7 @@ impl PlaybackState {
             duration,
             frame_rate,
             reached_end: false,
+            seeks: 0,
             last_advance: std::time::Instant::now(),
             frame_accumulator: 0.0,
             transport_sync: DeckTransportSync::default(),
@@ -329,8 +334,15 @@ impl PlaybackState {
             if let modulation::PositionTarget::Absolute(_) = self.modulation.position {
                 (0.0, self.duration.max(0.0))
             } else {
-                let floor = self.in_point;
-                (floor, self.effective_out().max(floor))
+                // Bounds that are no number (set straight, not by a
+                // command) bound nothing rather than panic the clamp.
+                let floor = if self.in_point.is_finite() {
+                    self.in_point
+                } else {
+                    0.0
+                };
+                let out = self.effective_out();
+                (floor, if out.is_finite() { out.max(floor) } else { floor })
             };
         self.position = (self.position + step.delta).clamp(floor, ceiling);
 
@@ -586,6 +598,8 @@ pub struct PlaybackSnapshot {
     pub out_point: f64,
     pub reverse: bool,
     pub reached_end: bool,
+    /// See [`PlaybackState::seeks`].
+    pub seeks: u64,
     pub frame_rate: f64,
     /// Whether the ping-pong RAM cache was truncated (hit the memory cap).
     /// Always false for HAP sources (they reverse via seek, no cache).
@@ -604,6 +618,29 @@ pub struct PlaybackSnapshot {
 }
 
 impl PlaybackSnapshot {
+    /// A clip not playing, at its start, of no length yet.
+    pub fn stopped() -> Self {
+        Self {
+            playing: false,
+            position: 0.0,
+            duration: 0.0,
+            speed: 1.0,
+            effective_speed: 1.0,
+            position_offset: 0.0,
+            loop_mode: LoopMode::Loop,
+            in_point: 0.0,
+            out_point: 0.0,
+            reverse: false,
+            reached_end: false,
+            seeks: 0,
+            frame_rate: 30.0,
+            pingpong_cache_truncated: false,
+            hardware_decode: false,
+            suspended: false,
+            taken_at: std::time::Instant::now(),
+        }
+    }
+
     /// Effective out-point (uses duration if `out_point` is 0), mirroring
     /// [`PlaybackState::effective_out`] for readers that only have a snapshot.
     pub fn effective_out(&self) -> f64 {
@@ -629,6 +666,7 @@ impl PlaybackSnapshot {
             out_point: ps.out_point,
             reverse: ps.reverse,
             reached_end: ps.reached_end,
+            seeks: ps.seeks,
             frame_rate: ps.frame_rate,
             pingpong_cache_truncated: false,
             hardware_decode: false,
@@ -942,27 +980,9 @@ impl VideoDecodeHandle {
 
     /// Get the current playback snapshot (read-only copy).
     pub fn playback_snapshot(&self) -> PlaybackSnapshot {
-        self.snapshot.lock().map_or_else(
-            |_| PlaybackSnapshot {
-                playing: false,
-                position: 0.0,
-                duration: 0.0,
-                speed: 1.0,
-                effective_speed: 1.0,
-                position_offset: 0.0,
-                loop_mode: LoopMode::Loop,
-                in_point: 0.0,
-                out_point: 0.0,
-                reverse: false,
-                reached_end: false,
-                frame_rate: 30.0,
-                pingpong_cache_truncated: false,
-                hardware_decode: false,
-                suspended: false,
-                taken_at: std::time::Instant::now(),
-            },
-            |s| s.clone(),
-        )
+        self.snapshot
+            .lock()
+            .map_or_else(|_| PlaybackSnapshot::stopped(), |s| s.clone())
     }
 
     /// The cell the decode thread publishes its snapshot into, for a reader on
@@ -974,13 +994,80 @@ impl VideoDecodeHandle {
 }
 
 impl Drop for VideoDecodeHandle {
+    /// Stops the decode thread — not waiting for it, which ends on its own:
+    /// waited for, a decoder stuck reading its file (a disk gone to sleep,
+    /// a share gone) held up whoever let the clip go — the show's thread,
+    /// removing a layer or loading a show over it.
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::Release);
         // Send Stop to unblock recv_timeout
         let _ = self.cmd_tx.send(VideoCommand::Stop);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.thread.take();
+    }
+}
+
+/// A clip's In and Out — `points`, an Out of 0 none (played to the end) —
+/// with its In put at `secs`, for a clip `duration` long at `frame_rate`.
+///
+/// In stays before Out, as in an editing app: an In at or past the Out — or
+/// less than half a frame short of it — lets the Out go. An In is kept within
+/// the clip, a frame short of its end, so something is left to play: the
+/// wrong way round, or with nothing between them, a playing clip was sought
+/// back to its In every frame, frozen there. A time that is no number (a
+/// modulated playhead's NaN) leaves them as they were.
+#[must_use]
+pub fn put_in(points: (f64, f64), secs: f64, duration: f64, frame_rate: f64) -> (f64, f64) {
+    if !secs.is_finite() {
+        return points;
+    }
+    let frame = frame_of(frame_rate);
+    let last = if duration > 0.0 {
+        (duration - frame).max(0.0)
+    } else {
+        f64::INFINITY
+    };
+    let in_point = secs.clamp(0.0, last);
+    let out_point = points.1;
+    if out_point > 0.0 && out_point - in_point < 0.5 * frame {
+        (in_point, 0.0)
+    } else {
+        (in_point, out_point)
+    }
+}
+
+/// [`put_in`]'s Out: an Out at or before the In — or less than half a frame
+/// past it — lets the In go; one past the clip's end is its end; 0 is none.
+#[must_use]
+pub fn put_out(points: (f64, f64), secs: f64, duration: f64, frame_rate: f64) -> (f64, f64) {
+    if !secs.is_finite() {
+        return points;
+    }
+    let frame = frame_of(frame_rate);
+    let end = if duration > 0.0 {
+        duration
+    } else {
+        f64::INFINITY
+    };
+    let out_point = if secs <= 0.0 {
+        0.0
+    } else {
+        secs.clamp(frame.min(end), end)
+    };
+    let in_point = points.0;
+    if out_point > 0.0 && out_point - in_point < 0.5 * frame {
+        (0.0, out_point)
+    } else {
+        (in_point, out_point)
+    }
+}
+
+/// A frame's length at `frame_rate`, a 30th of a second for a rate that is
+/// none.
+fn frame_of(frame_rate: f64) -> f64 {
+    if frame_rate.is_finite() && frame_rate > 0.0 {
+        1.0 / frame_rate
+    } else {
+        1.0 / 30.0
     }
 }
 
@@ -1001,8 +1088,14 @@ fn apply_command(ps: &mut PlaybackState, cmd: &VideoCommand) {
         VideoCommand::Seek(_) | VideoCommand::Stop => {}
         VideoCommand::SetSpeed(s) => ps.speed = *s,
         VideoCommand::SetLoopMode(m) => ps.loop_mode = *m,
-        VideoCommand::SetInPoint(s) => ps.in_point = *s,
-        VideoCommand::SetOutPoint(s) => ps.out_point = *s,
+        VideoCommand::SetInPoint(s) => {
+            (ps.in_point, ps.out_point) =
+                put_in((ps.in_point, ps.out_point), *s, ps.duration, ps.frame_rate);
+        }
+        VideoCommand::SetOutPoint(s) => {
+            (ps.in_point, ps.out_point) =
+                put_out((ps.in_point, ps.out_point), *s, ps.duration, ps.frame_rate);
+        }
         VideoCommand::ClearInOutPoints => {
             ps.in_point = 0.0;
             ps.out_point = 0.0;
@@ -2074,6 +2167,8 @@ impl VideoPlayer {
     /// The file seeks to the keyframe at or before it; the frames from there
     /// to it are decoded, not shown (see `next_frame`).
     fn seek(&mut self, time_secs: f64) -> Result<()> {
+        // Count every requested seek, including requests that fail.
+        self.playback.seeks = self.playback.seeks.wrapping_add(1);
         if self.can_decode_forward_to(time_secs) {
             // Retain reference frames, the queued next picture and the GPU
             // decoder's surfaces. Starting at the keyframe again for every
@@ -2209,6 +2304,61 @@ impl VideoPlayer {
 
 #[cfg(test)]
 mod tests {
+    /// A player whose every frame takes a second: a decoder stuck reading
+    /// its file.
+    struct SlowPlayer {
+        playback: super::PlaybackState,
+        reading: std::sync::mpsc::Sender<()>,
+        frame: Vec<u8>,
+    }
+
+    impl super::FramePlayer for SlowPlayer {
+        fn playback(&mut self) -> &mut super::PlaybackState {
+            &mut self.playback
+        }
+        fn playback_state(&self) -> &super::PlaybackState {
+            &self.playback
+        }
+        fn next_frame(&mut self) -> anyhow::Result<Option<&[u8]>> {
+            let _ = self.reading.send(());
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            Ok(Some(&self.frame))
+        }
+        fn seek_and_reset(&mut self, _time_secs: f64) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn width(&self) -> u32 {
+            2
+        }
+        fn height(&self) -> u32 {
+            2
+        }
+    }
+
+    /// Letting a clip go never waits for its decoder: one stuck reading its
+    /// file ends on its own.
+    #[test]
+    fn letting_a_clip_go_never_waits_for_its_decoder() {
+        let (reading, read) = std::sync::mpsc::channel();
+        let handle = super::VideoDecodeHandle::spawn_player(
+            SlowPlayer {
+                playback: super::PlaybackState::new(10.0, 30.0),
+                reading,
+                frame: vec![0; 16],
+            },
+            "slow-decode",
+        );
+        read.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the decoder is reading");
+        let started = std::time::Instant::now();
+        drop(handle);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(300),
+            "dropping waited for the decoder: {:?}",
+            started.elapsed()
+        );
+    }
+
     use super::*;
 
     /// Decode time must come out of the wait, not be added to it. Waiting a
@@ -3379,6 +3529,101 @@ mod tests {
         let result = ps.advance_frame();
         assert!(result.needs_seek);
         assert_eq!(ps.position, 2.0);
+    }
+
+    /// Kept the wrong way round — the In past the Out — a playing clip is
+    /// sent back to its In every frame: frozen there, sought each time.
+    #[test]
+    fn in_and_out_the_wrong_way_round_seek_the_in_every_frame() {
+        let mut ps = PlaybackState::new(60.0, 25.0);
+        ps.in_point = 30.0;
+        ps.out_point = 20.0;
+        ps.position = 30.0;
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert!(ps.advance_frame().needs_seek);
+            assert_eq!(ps.position, 30.0);
+        }
+    }
+
+    /// In stays before Out, as in an editing app: an In put at or past the
+    /// Out lets the Out go, an Out put at or before the In lets the In go —
+    /// and the clip plays on from its In rather than being sought back.
+    #[test]
+    fn an_in_past_the_out_lets_the_out_go_and_an_out_before_the_in_the_in() {
+        let mut ps = PlaybackState::new(60.0, 25.0);
+        let set = |ps: &mut PlaybackState, cmd: VideoCommand| {
+            apply_command(ps, &cmd);
+            (ps.in_point, ps.out_point)
+        };
+        assert_eq!(set(&mut ps, VideoCommand::SetInPoint(10.0)), (10.0, 0.0));
+        assert_eq!(set(&mut ps, VideoCommand::SetOutPoint(20.0)), (10.0, 20.0));
+        assert_eq!(
+            set(&mut ps, VideoCommand::SetInPoint(30.0)),
+            (30.0, 0.0),
+            "played to the end"
+        );
+        assert_eq!(
+            set(&mut ps, VideoCommand::SetOutPoint(20.0)),
+            (0.0, 20.0),
+            "played from the start"
+        );
+        assert_eq!(set(&mut ps, VideoCommand::SetInPoint(20.0)), (20.0, 0.0));
+        assert_eq!(set(&mut ps, VideoCommand::SetOutPoint(20.0)), (0.0, 20.0));
+        // A show kept the wrong way round by an older Nida, put back as it
+        // restores one — its In, then its Out: the Out kept.
+        let mut ps = PlaybackState::new(60.0, 25.0);
+        set(&mut ps, VideoCommand::SetInPoint(30.0));
+        assert_eq!(set(&mut ps, VideoCommand::SetOutPoint(20.0)), (0.0, 20.0));
+
+        // Played from its In, it moves on.
+        set(&mut ps, VideoCommand::SetInPoint(5.0));
+        ps.position = ps.in_point;
+        ps.last_advance = std::time::Instant::now();
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert!(!ps.advance_frame().needs_seek);
+        }
+        assert!(ps.position > 5.0, "{}", ps.position);
+    }
+
+    /// Something is always left to play between In and Out: an In at the
+    /// clip's end is kept a frame short of it, an Out within half a frame of
+    /// the In lets the In go, an Out past the end is the end, one at the very
+    /// start a frame in; a time that is no number changes nothing. Restoring
+    /// a show puts its In then its Out, as these do.
+    #[test]
+    fn in_and_out_always_leave_something_to_play() {
+        let (duration, rate) = (60.0, 25.0);
+        let frame = 1.0 / rate;
+        let at_end = put_in((0.0, 20.0), 60.0, duration, rate);
+        assert!((at_end.0 - (60.0 - frame)).abs() < 1e-9 && at_end.1 == 0.0, "{at_end:?}");
+        assert_eq!(put_out((10.0, 0.0), 10.01, duration, rate), (0.0, 10.01));
+        assert_eq!(put_out((10.0, 0.0), 10.03, duration, rate), (10.0, 10.03));
+        assert_eq!(put_in((0.0, 10.03), 10.02, duration, rate), (10.02, 0.0));
+        assert_eq!(put_out((0.0, 0.0), 100.0, duration, rate), (0.0, 60.0));
+        assert_eq!(put_out((0.0, 0.0), 0.001, duration, rate), (0.0, frame));
+        assert_eq!(put_out((5.0, 20.0), 0.0, duration, rate), (5.0, 0.0), "none");
+        assert_eq!(put_in((5.0, 20.0), f64::NAN, duration, rate), (5.0, 20.0));
+        assert_eq!(put_out((5.0, 20.0), f64::INFINITY, duration, rate), (5.0, 20.0));
+        assert_eq!(put_in((5.0, 20.0), -3.0, duration, rate), (0.0, 20.0));
+        // A clip of no known length keeps any In.
+        assert_eq!(put_in((0.0, 0.0), 500.0, 0.0, rate), (500.0, 0.0));
+    }
+
+    /// A paused clip whose In is no number — set straight, not by a
+    /// command — is moved by its modulated playhead without a panic.
+    #[test]
+    fn a_paused_clip_with_an_in_that_is_no_number_moves_without_a_panic() {
+        let mut ps = PlaybackState::new(10.0, 30.0);
+        ps.playing = false;
+        ps.in_point = f64::NAN;
+        ps.set_modulation(modulation::PlaybackModulation {
+            speed: None,
+            position: modulation::PositionTarget::Offset(0.5),
+        });
+        let _ = ps.advance_frame();
+        assert!((ps.position - 0.5).abs() < 1e-9, "{}", ps.position);
     }
 
     #[test]

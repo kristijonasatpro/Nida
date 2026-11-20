@@ -133,6 +133,8 @@ pub(super) fn render_notifications(
             });
     }
 
-    // Request repaint to animate progress bars
-    ctx.request_repaint();
+    // The progress bars move, and a toast goes when its time is up: a tenth
+    // of a second is smooth enough for a two-pixel bar, and lets the window
+    // keep to its idle rate while nothing else moves.
+    ctx.request_repaint_after(std::time::Duration::from_millis(100));
 }

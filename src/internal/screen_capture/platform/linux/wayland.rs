@@ -103,6 +103,7 @@ fn portal_target() -> CaptureTargetInfo {
         // user knows that and only after the dialog. Claiming it here would make
         // `exclude_varda` look meaningful when the portal has no equivalent.
         is_varda: false,
+        uuid: None,
     }
 }
 

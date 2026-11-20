@@ -1,9 +1,13 @@
 mod effect;
+pub mod lower_third;
 pub mod media;
 pub mod playlist;
+pub mod presenter;
 mod render;
+pub mod slides;
 mod source;
 pub mod svg;
+pub mod text;
 pub mod timer;
 
 pub use render::get_current_date;
@@ -107,37 +111,73 @@ impl ScalingMode {
 
         match self {
             ScalingMode::Stretch => ([1.0, 1.0], [0.0, 0.0]),
+            // Filling or fitted, a picture as wide as the target — or as
+            // high — is drawn a pixel for a pixel: its other side is
+            // centred on whole pixels then, as one centred is.
             ScalingMode::Fill => {
                 if src_aspect > tgt_aspect {
                     let scale_x = tgt_aspect / src_aspect;
-                    let offset_x = (1.0 - scale_x) * 0.5;
+                    let offset_x = if source_h == target_h {
+                        centred_on_whole_pixels(source_w, target_w)
+                    } else {
+                        (1.0 - scale_x) * 0.5
+                    };
                     ([scale_x, 1.0], [offset_x, 0.0])
                 } else {
                     let scale_y = src_aspect / tgt_aspect;
-                    let offset_y = (1.0 - scale_y) * 0.5;
+                    let offset_y = if source_w == target_w {
+                        centred_on_whole_pixels(source_h, target_h)
+                    } else {
+                        (1.0 - scale_y) * 0.5
+                    };
                     ([1.0, scale_y], [0.0, offset_y])
                 }
             }
             ScalingMode::Fit => {
                 if src_aspect > tgt_aspect {
                     let scale_y = src_aspect / tgt_aspect;
-                    let offset_y = (1.0 - scale_y) * 0.5;
+                    let offset_y = if source_w == target_w {
+                        centred_on_whole_pixels(source_h, target_h)
+                    } else {
+                        (1.0 - scale_y) * 0.5
+                    };
                     ([1.0, scale_y], [0.0, offset_y])
                 } else {
                     let scale_x = tgt_aspect / src_aspect;
-                    let offset_x = (1.0 - scale_x) * 0.5;
+                    let offset_x = if source_h == target_h {
+                        centred_on_whole_pixels(source_w, target_w)
+                    } else {
+                        (1.0 - scale_x) * 0.5
+                    };
                     ([scale_x, 1.0], [offset_x, 0.0])
                 }
             }
             ScalingMode::Center => {
                 let scale_x = target_w as f32 / source_w as f32;
                 let scale_y = target_h as f32 / source_h as f32;
-                let offset_x = (1.0 - scale_x) * 0.5;
-                let offset_y = (1.0 - scale_y) * 0.5;
-                ([scale_x, scale_y], [offset_x, offset_y])
+                (
+                    [scale_x, scale_y],
+                    [
+                        centred_on_whole_pixels(source_w, target_w),
+                        centred_on_whole_pixels(source_h, target_h),
+                    ],
+                )
             }
         }
     }
+}
+
+/// Where a picture `source` pixels across, drawn a pixel for a pixel in a
+/// target `target` across, begins — in its own UV, as the offset of
+/// [`ScalingMode::compute_uv_transform`]: centred, on whole pixels.
+///
+/// Centred exactly, a picture an odd number of pixels wider or narrower
+/// than its target sits half a pixel off: each pixel drawn is then a blend
+/// of two of its own, and text goes soft. So it sits the half pixel to the
+/// right — or lower.
+fn centred_on_whole_pixels(source: u32, target: u32) -> f32 {
+    let before = (i64::from(source) - i64::from(target)).div_euclid(2);
+    before as f32 / source as f32
 }
 
 /// Whether a picture of `source` pixels, scaled into `target` by `mode`,
@@ -148,8 +188,91 @@ pub(crate) fn fills_the_frame(mode: ScalingMode, source: (u32, u32), target: (u3
     }
     let (scale, offset) = mode.compute_uv_transform(source.0, source.1, target.0, target.1);
     // Every target point lands inside the source: offset ≥ 0 and
-    // offset + scale ≤ 1 on both axes (a hair of slack for rounding).
-    (0..2).all(|i| offset[i] >= -1e-4 && offset[i] + scale[i] <= 1.0 + 1e-4)
+    // offset + scale ≤ 1 on both axes (a hair of slack for rounding: never
+    // a quarter of one of the target's pixels — a picture a pixel short of
+    // a very wide frame leaves a column of it bare).
+    let across = [target.0 as f32, target.1 as f32];
+    (0..2).all(|i| {
+        let slack = (0.25 * scale[i] / across[i]).min(1e-4);
+        offset[i] >= -slack && offset[i] + scale[i] <= 1.0 + slack
+    })
+}
+
+/// How big a screen or window capture is drawn in the show's frame by an
+/// input that shows it by `mode`, zoomed into `zoom` times across and down
+/// (its Transform's scale, where the pass drawing the capture does that
+/// too: see `Deck::capture_drawn`). What its capture is sized by (see
+/// `ScreenCaptureManager::size_as_drawn`).
+///
+/// Fitted or filling the frame it keeps its shape, and comes as the side
+/// zoomed into the more wants; stretched to the frame each side is the
+/// frame's, times its own zoom. Never less than fitted: shrunk into a
+/// corner it comes as it did. Centred it is placed as it comes fitted (see
+/// [`placed_size`]), and wants what one fitted does.
+pub(crate) fn capture_drawn_as(
+    mode: ScalingMode,
+    zoom: [f32; 2],
+) -> crate::screen_capture::backend::Drawn {
+    use crate::screen_capture::backend::Drawn;
+    let [across, down] = zoom.map(|z| if z.is_finite() { z } else { 1.0 });
+    let most = across.max(down);
+    match mode {
+        ScalingMode::Fit | ScalingMode::Center => Drawn {
+            fitted: most.max(1.0),
+            ..Drawn::default()
+        },
+        ScalingMode::Fill => Drawn {
+            fitted: 1.0,
+            across: most,
+            down: most,
+        },
+        ScalingMode::Stretch => Drawn {
+            fitted: 1.0,
+            across,
+            down,
+        },
+    }
+}
+
+/// The size a live source's picture is placed by in its deck's frame: its
+/// own — `source`, as it comes — but for a screen or window capture shown
+/// centred, which is placed as it comes fitted within the show's size.
+///
+/// Centred means at its own pixels, and a capture's are as many as it is
+/// asked for: fitted within the show's size, until an input of its screen
+/// — this one, or another — fills its frame or is zoomed into and the
+/// capture comes bigger for that (see `ScreenCaptureManager::size_as_drawn`).
+/// Placed by the pixels it came with then, the centred input would show the
+/// middle of its picture, enlarged, for as long as that lasted. The other
+/// modes go by the picture's shape, which stays. A PowerPoint show's
+/// capture is never sized so.
+pub(crate) fn placed_size(
+    mode: ScalingMode,
+    source: (u32, u32),
+    capture: Option<&ScreenCaptureState>,
+) -> (u32, u32) {
+    let bound = capture
+        .filter(|state| mode == ScalingMode::Center && state.presentation.is_none())
+        .and_then(|state| state.config.scale_to);
+    match bound {
+        Some((width, height)) if source.0 > 0 && source.1 > 0 => {
+            crate::screen_capture::resample::fit_within(source.0, source.1, width, height)
+        }
+        _ => source,
+    }
+}
+
+/// The view a deck draws its live source from, and whether that view reads
+/// it as it was coded: the `coded` one where the deck has both (see
+/// `Deck::external_source_coded_view`), else its `view`, read as light.
+pub(crate) fn source_read<'a>(
+    view: Option<&'a wgpu::TextureView>,
+    coded: Option<&'a wgpu::TextureView>,
+) -> Option<(&'a wgpu::TextureView, bool)> {
+    match (view, coded) {
+        (Some(_), Some(coded)) => Some((coded, true)),
+        (view, _) => view.map(|view| (view, false)),
+    }
 }
 
 /// A colour layer's name when nobody gave it one: its colour as hex.
@@ -411,8 +534,32 @@ pub enum DeckSource {
     },
     /// Clips and pictures one after another (see [`playlist`]).
     Playlist(Box<playlist::Playlist>),
+    /// A conference's presentations in running order, one on at a time
+    /// (see [`slides`]).
+    Slides(Box<slides::Slides>),
     /// A count down, count up or clock drawn as text (see [`timer`]).
     Timer(Box<timer::Timer>),
+    /// A lower third: names and titles brought on air one at a time (see
+    /// [`lower_third`]).
+    LowerThird(Box<lower_third::LowerThird>),
+    /// Lines of text typed in (see [`text`]).
+    Text(Box<text::Text>),
+    /// A PowerPoint input's show for the speaker's screen (see
+    /// [`presenter`]).
+    Presenter(Box<presenter::Presenter>),
+    /// An input that could not be opened as its show loaded — a file moved
+    /// or renamed, a drive not there, a camera unplugged: drawn clear, kept
+    /// as saved (see [`OfflineSource`]).
+    Offline(Box<OfflineSource>),
+}
+
+/// What a layer whose input could not be opened keeps: the input as saved,
+/// written back as it was at every save — left out, the show lost it at the
+/// next one — and why it is offline. Opening the show again tries it anew.
+#[derive(Debug, Clone)]
+pub struct OfflineSource {
+    pub saved: crate::scene::SourceConfig,
+    pub reason: String,
 }
 
 /// Discriminant for external source types sharing the same `DeckSource` layout.
@@ -487,6 +634,10 @@ impl ExternalSourceKind {
     }
 }
 
+/// The order capture settings were given in, across the decks given them (see
+/// [`ScreenCaptureState::given`]).
+static CAPTURE_GIVEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Live binding for a screen-capture deck.
 ///
 /// The `CaptureId` is a runtime handle and is never persisted; `identity` is the
@@ -496,10 +647,26 @@ pub struct ScreenCaptureState {
     pub capture_id: crate::screen_capture::CaptureId,
     pub identity: crate::screen_capture::backend::TargetIdentity,
     pub config: crate::screen_capture::backend::CaptureConfig,
-    /// Set when the router or UI edits `config`; the render loop pushes the new
-    /// config to the manager and clears it. The deck layer never reaches up into
-    /// a device, so the change travels down rather than sideways.
-    pub config_dirty: bool,
+    /// What the router or UI gave `config` since the render loop last sent
+    /// settings down, in the order given. The render loop gives them to the
+    /// capture — one for all the inputs of its screen or window, in the
+    /// order given across those inputs — and empties this, and `config` is
+    /// then as the capture runs. The deck layer never reaches up into a
+    /// device, so the change travels down rather than sideways.
+    pub given: Vec<crate::screen_capture::backend::CaptureGiven>,
+    /// What the input was last named after: its screen or window as it was
+    /// listed then ("Keynote — Opening"), its name then "🖥 " and that. A
+    /// screen or window picked for it, it is named after that one while its
+    /// name is still this (see `set_screen_capture_target`); any other name
+    /// is one given it — a preset's — and stays. Kept with the show: a
+    /// window is saved by its app's bundle id, which is not what the app is
+    /// called, so an input whose app is closed has nothing else to hold its
+    /// name against. `None`: never named after one, or named in a show that
+    /// kept no record of it.
+    pub listed_as: Option<String>,
+    /// A PowerPoint input: the deck PowerPoint plays in the captured window.
+    /// Its window is found by the presentation worker, never by name.
+    pub presentation: Option<crate::presentation::PresentationConfig>,
 }
 
 /// What a tap deck reads. See spec/program-tap.md.
@@ -622,6 +789,12 @@ pub struct Effect {
     pub phase_accumulators: [f32; 4],
     /// Phase input config from shader metadata
     pub phase_inputs_config: Option<Vec<crate::isf::PhaseInput>>,
+    /// The uniforms of each pass, by its index, for a multi-pass filter
+    /// none of whose targets is kept from frame to frame: its passes are
+    /// drawn in their turn with the rest of the frame (see
+    /// `Effect::apply_passes`), so each needs a buffer of its own. Empty for
+    /// any other effect.
+    pass_uniform_buffers: Vec<wgpu::Buffer>,
     /// Frames this effect has actually been run on a deck — neutral framing
     /// is skipped (see `Deck::render`).
     runs: u64,
@@ -634,6 +807,13 @@ pub struct Effect {
     /// The pass that mixes the effect in through its mask, made when there
     /// first is one.
     mask_pass: Option<crate::renderer::mask::MaskPass>,
+    /// The shader's path as the show named it, when that file was gone and
+    /// this copy's shader of the same name stood in (see
+    /// [`Effect::saved_path`]).
+    show_path: Option<String>,
+    /// Why its shader could not be loaded, when it could not: the effect is
+    /// then kept as saved, drawing nothing (see `persistence::restore_effect_kept`).
+    offline: Option<String>,
 }
 
 // Effect impl is in effect.rs
@@ -658,6 +838,8 @@ pub struct PassBuffer {
 }
 
 /// A Deck is an independent render unit that outputs a texture
+// Each bool is an independent property of the deck, not a state enum.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Deck {
     /// Stable UUID for this deck (8-char hex, persists across moves/saves)
     uuid: String,
@@ -748,6 +930,34 @@ pub struct Deck {
     /// For `DepthSensor` decks this holds the `R16Uint` depth view.
     pub external_source_view: Option<wgpu::TextureView>,
 
+    /// The same picture read as it was coded — sRGB code values, not light
+    /// — where its source has such a view: a screen or window captured (set
+    /// each frame beside `external_source_view`; see
+    /// `ScreenCaptureManager::coded_view`). The deck draws from this one
+    /// then, filtering the code values and making them light after (see
+    /// [`source_read`]): text drawn smaller keeps its weight, as it does
+    /// shrunk by anything else. `None`: drawn from `external_source_view`,
+    /// filtered as light — every other source, and whatever reads that
+    /// field without knowing of this one.
+    pub external_source_coded_view: Option<wgpu::TextureView>,
+    /// Which picture `external_source_view` holds, where its source says —
+    /// a screen or window captured: another number each time a frame is put
+    /// in its texture or the texture made anew, no two the same anywhere
+    /// (set each frame beside the view; see
+    /// `ScreenCaptureManager::picture`). The same from one frame to the
+    /// next, the picture is the same: its channel, standing still, keeps
+    /// what it has put together (see `Channel::keep_still_inputs`). `None`:
+    /// not known — any other source — and nothing is kept on its account.
+    pub external_source_picture: Option<u64>,
+    /// A tap of an input drawn before it this frame: that input's picture
+    /// number (`Channel::picture`), which is another the moment the input
+    /// is put together anew — read when this deck's own input is, later in
+    /// the same frame, so what the input shows is never a frame behind. Set
+    /// each frame beside the view (`Mixer::prepare_taps`). `None`: not a
+    /// tap, or one of Main or of an input drawn after it (a frame late,
+    /// round a loop), whose picture is not told so.
+    pub tapped_picture: Option<Arc<std::sync::atomic::AtomicU64>>,
+
     /// Depth-sensor RGB view (set each frame for `DepthSensor` decks).
     pub depth_rgb_view: Option<wgpu::TextureView>,
 
@@ -801,10 +1011,35 @@ pub struct Deck {
     /// can be applied without being told it again.
     master_size: (u32, u32),
 
-    /// For a still image: what its last render depended on. While that holds
-    /// the texture already has this frame's picture, so rendering is skipped
-    /// (see [`Deck::still_frame`]).
+    /// For a still image — or a lower third or a text standing still: what
+    /// its last render depended on. While that holds the texture already
+    /// has this frame's picture, so rendering is skipped (see
+    /// [`Deck::still_frame`]).
     rendered_still: Option<StillFrame>,
+    /// Keep a lower third or a text standing still as it is drawn, as a
+    /// still image is kept (see [`Deck::still_frame`]); off draws it every
+    /// frame, as before. Set by its channel each frame.
+    keep_still_text: bool,
+    /// Keep a clip's frame while the clip gives no new one — paused, held
+    /// on its last, or between two of its frames in a show running faster
+    /// (see [`Deck::still_frame`]); off draws it every frame, as before.
+    /// Set by its channel each frame: off in a deck no channel holds — an
+    /// item of a playlist, a talk's clip.
+    keep_still_clips: bool,
+    /// Keep the frame drawn of a live source whose picture is told (see
+    /// [`Deck::source_picture`]) while that picture is the same — another
+    /// input standing still, a window captured where nothing moves — as a
+    /// clip's is kept between two of its frames (see
+    /// [`Deck::still_frame`]); off draws it every frame, as before. Set by
+    /// its channel each frame (`Channel::keep_still_inputs`): off in a deck
+    /// no channel holds.
+    keep_still_sources: bool,
+    /// A number no other deck has, whatever its UUID: a deck made anew in
+    /// another's place — a show opened again, an undo — has another.
+    instance: u64,
+    /// Which textures the deck has: one more each time they are made anew,
+    /// empty (see [`Deck::texture_generation`]).
+    texture_generation: u32,
 
     /// The parts of the frame that show of this deck once the opaque decks
     /// over it are drawn, set by its channel each frame; `None` for all of
@@ -818,16 +1053,114 @@ pub struct Deck {
     /// Draws the picture cropped and placed in one pass, made when first
     /// needed (see `Deck::fold`).
     placed: Option<crate::renderer::placed_picture::PlacedPicturePipeline>,
+    /// A clip's frames put in its texture: none yet, and it shows nothing
+    /// (see [`Deck::has_video_frame`]).
+    frames_uploaded: u64,
 }
 
-/// Everything a still image deck's picture depends on: its size, how the
-/// image is fitted, and each framing effect's settings. Equal between frames
+/// Everything a deck's picture depends on while it stands still — a still
+/// image, a lower third on air or off, a text shown or hidden: its size,
+/// what it is of, and each framing effect's settings. Equal between frames
 /// means the texture is already right.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct StillFrame {
     size: (u32, u32),
-    scaling_mode: ScalingMode,
+    source: StillSource,
     effects: Vec<(String, bool, Vec<u32>)>,
+}
+
+impl StillFrame {
+    /// Drawn only where it shows, as a deck not standing still is — a
+    /// clip's frame, or a live source's picture: kept for as long as the
+    /// clip or the source gives no new one, not for good, it is not worth
+    /// drawing whole.
+    fn in_parts(&self) -> bool {
+        matches!(
+            self.source,
+            StillSource::Clip { .. } | StillSource::Live { .. }
+        )
+    }
+}
+
+/// What a deck standing still is of (see `StillFrame`).
+#[derive(Debug, Clone, PartialEq)]
+enum StillSource {
+    /// An image, as it is fitted.
+    Image(ScalingMode),
+    /// A lower third's or a text's drawing.
+    Drawing(Stand),
+    /// A clip's frame: which one, as it is fitted, and the parts of it
+    /// drawn (a clip is drawn only where it shows).
+    Clip {
+        frame: u64,
+        scaling_mode: ScalingMode,
+        visible: Option<Vec<crate::renderer::region::Area>>,
+    },
+    /// A live source's picture — another input's, a capture's: which one
+    /// (`Deck::source_picture`), the size it is placed by (`placed_size`:
+    /// its own, or a centred capture's as fitted), as it is fitted,
+    /// flattened over black or not, read as it was coded or as light, and
+    /// the parts of it drawn (drawn only where it shows, as a clip is).
+    /// The show's size is not here: another, the frame is forgotten
+    /// (`Deck::resize`).
+    Live {
+        picture: u64,
+        placed: (u32, u32),
+        scaling_mode: ScalingMode,
+        transparent: bool,
+        coded: bool,
+        visible: Option<Vec<crate::renderer::region::Area>>,
+    },
+}
+
+/// A lower third or a text standing still — neither coming nor going: what
+/// its frame shows (see `LowerThird::still`, `Text::still`).
+#[derive(Debug, Clone, PartialEq)]
+enum Stand {
+    /// Nothing: off, hidden, or with no drawing.
+    Clear,
+    /// A drawing — which (`next_drawing`: another each time one is put on
+    /// the GPU), and where and how far shown, as the numbers its shader is
+    /// given.
+    Drawing { serial: u64, placed: Vec<u8> },
+}
+
+/// Drawings put on the GPU, counted across every lower third and text.
+static DRAWINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A number no other drawing has (see `Stand::Drawing`).
+fn next_drawing() -> u64 {
+    DRAWINGS.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Pictures put where a deck can be drawn straight from — a capture's
+/// texture, an input's own picture — counted across them all.
+static PICTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A number no other picture has (see `Deck::source_picture`).
+pub(crate) fn next_picture() -> u64 {
+    PICTURES.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Deck {
+    /// Which picture its live source holds, where that is told: a capture's
+    /// (`external_source_picture`) or, a tap, the input's it shows
+    /// (`tapped_picture`). The same from one frame to the next, the source
+    /// is as it was.
+    pub fn source_picture(&self) -> Option<u64> {
+        match &self.tapped_picture {
+            Some(picture) => Some(picture.load(Ordering::Relaxed)),
+            None => self.external_source_picture,
+        }
+    }
+}
+
+/// Decks made, counted.
+static DECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A number no other deck has (see `Deck::instance`).
+fn next_instance() -> u64 {
+    DECKS.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A parameter value as comparable bits, for [`StillFrame`].
@@ -863,6 +1196,14 @@ impl Deck {
     }
 
     /// Get the source name (shader name, video filename, etc.)
+    /// Which textures the deck has: one more each time they are made anew,
+    /// empty, as a resize makes them — what was drawn into the old ones is
+    /// gone.
+    #[must_use]
+    pub fn texture_generation(&self) -> u32 {
+        self.texture_generation
+    }
+
     pub fn source_name(&self) -> &str {
         &self.source_name
     }
@@ -870,6 +1211,13 @@ impl Deck {
     /// Override the display name (e.g. when loading a preset with a custom name).
     pub fn set_source_name(&mut self, name: String) {
         self.source_name = name;
+    }
+
+    /// Keep `path`, the show's, as the source path a save writes — this
+    /// copy's shader stood in for a file gone (see
+    /// `persistence::saved_shader`).
+    pub(crate) fn keep_source_path(&mut self, path: String) {
+        self.source_path = Some(path);
     }
 
     /// Get the source file path (for persistence). None for solid color / camera.
@@ -885,6 +1233,7 @@ impl Deck {
                 audio.as_ref().map(crate::audio_mix::ClipAudio::shared)
             }
             DeckSource::Playlist(list) => list.clip_audio(),
+            DeckSource::Slides(slides) => slides.clip_audio(),
             _ => None,
         }
     }
@@ -898,6 +1247,16 @@ impl Deck {
                 Some(std::sync::Arc::as_ptr(&handle.snapshot_cell()) as usize)
             }
             _ => None,
+        }
+    }
+
+    /// Whether a clip has put a frame in its texture: until then its
+    /// picture is empty — a Slides talk waits for it. True for anything but
+    /// a clip.
+    pub fn has_video_frame(&self) -> bool {
+        match &self.source {
+            DeckSource::Video { .. } | DeckSource::HapVideo { .. } => self.frames_uploaded > 0,
+            _ => true,
         }
     }
 
@@ -922,11 +1281,49 @@ impl Deck {
             DeckSource::ExternalSource { kind, .. } => kind.source_type(),
             DeckSource::ComputeShader { .. } => "compute_shader",
             DeckSource::Playlist(_) => "playlist",
+            DeckSource::Slides(_) => "slides",
             DeckSource::Timer(_) => "timer",
+            DeckSource::LowerThird(_) => "lower_third",
+            DeckSource::Text(_) => "text",
+            DeckSource::Presenter(_) => "presenter",
+            DeckSource::Offline(_) => "offline",
         }
     }
 
     /// Get a read-only snapshot of the video playback state.
+    /// Whether its own picture changes by itself, for how often the control
+    /// window is drawn (see `app::state::ui_motion`): a generator reading the
+    /// clock, a clip or playlist playing, a live source, a talk that moves
+    /// (a clip playing, PowerPoint or a web page live) or another coming in. A timer's or a presenter's clock moves
+    /// by the second, which the window's idle rate keeps up with. Its effects
+    /// are asked about apart.
+    pub fn moves_by_itself(&self) -> bool {
+        match &self.source {
+            DeckSource::Shader { shader, .. } | DeckSource::ComputeShader { shader, .. } => {
+                shader.animates()
+            }
+            DeckSource::Video { handle, .. } | DeckSource::HapVideo { handle, .. } => {
+                handle.playback_snapshot().playing
+            }
+            // A camera, NDI, a capture, a stream, a web page: live — once it
+            // has a picture. A camera not plugged in, a screen not there, is
+            // a black layer that stands still. Another input shown as a layer
+            // (a tap) moves with what it shows, which is asked about itself.
+            DeckSource::ExternalSource { kind, .. } => {
+                !matches!(kind, ExternalSourceKind::Tap) && self.external_source_view.is_some()
+            }
+            DeckSource::Playlist(list) => list.is_playing(),
+            DeckSource::Slides(slides) => slides.moves_by_itself(),
+            DeckSource::Image { .. }
+            | DeckSource::SolidColor { .. }
+            | DeckSource::Timer(_)
+            | DeckSource::LowerThird(_)
+            | DeckSource::Text(_)
+            | DeckSource::Presenter(_)
+            | DeckSource::Offline(_) => false,
+        }
+    }
+
     pub fn playback_snapshot(&self) -> Option<PlaybackSnapshot> {
         match &self.source {
             DeckSource::Video { handle, .. } | DeckSource::HapVideo { handle, .. } => {
@@ -947,6 +1344,10 @@ impl Deck {
                 list.set_output_fps(fps);
                 list.for_each_deck(|d| d.set_video_output_fps(fps));
             }
+            DeckSource::Slides(slides) => {
+                slides.set_output_fps(fps);
+                slides.for_each_deck(|d| d.set_video_output_fps(fps));
+            }
             _ => {}
         }
     }
@@ -959,6 +1360,9 @@ impl Deck {
                 handle.set_suspended(suspended);
             }
             DeckSource::Playlist(list) => list.for_each_deck(|d| d.set_video_suspended(suspended)),
+            DeckSource::Slides(slides) => {
+                slides.for_each_deck(|d| d.set_video_suspended(suspended));
+            }
             _ => {}
         }
     }
@@ -1121,12 +1525,14 @@ impl Deck {
             | DeckSource::HapVideo { scaling_mode, .. }
             | DeckSource::ExternalSource { scaling_mode, .. } => Some(*scaling_mode),
             DeckSource::Playlist(list) => Some(list.scaling_mode()),
+            DeckSource::Slides(slides) => Some(slides.scaling_mode()),
             _ => None,
         }
     }
 
     /// The size of the picture a scaling mode fits into the frame, once known
-    /// (a live source reports it with its first frame).
+    /// (a live source reports it with its first frame; a capture centred, as
+    /// it is placed: see [`placed_size`]).
     pub fn source_size(&self) -> Option<[u32; 2]> {
         let (w, h) = match &self.source {
             DeckSource::Image {
@@ -1143,12 +1549,17 @@ impl Deck {
                 source_width,
                 source_height,
                 ..
-            }
-            | DeckSource::ExternalSource {
+            } => (*source_width, *source_height),
+            DeckSource::ExternalSource {
                 source_width,
                 source_height,
+                scaling_mode,
                 ..
-            } => (*source_width, *source_height),
+            } => placed_size(
+                *scaling_mode,
+                (*source_width, *source_height),
+                self.screen_capture.as_ref(),
+            ),
             _ => return None,
         };
         (w > 0 && h > 0).then_some([w, h])
@@ -1162,6 +1573,7 @@ impl Deck {
             | DeckSource::HapVideo { scaling_mode, .. }
             | DeckSource::ExternalSource { scaling_mode, .. } => *scaling_mode = mode,
             DeckSource::Playlist(list) => list.set_scaling_mode(mode),
+            DeckSource::Slides(slides) => slides.set_scaling_mode(mode),
             _ => {}
         }
     }
@@ -1183,6 +1595,21 @@ impl Deck {
     pub fn playlist_mut(&mut self) -> Option<&mut playlist::Playlist> {
         match &mut self.source {
             DeckSource::Playlist(list) => Some(list),
+            _ => None,
+        }
+    }
+
+    /// The Slides layer this deck is, if it is one.
+    pub fn slides(&self) -> Option<&slides::Slides> {
+        match &self.source {
+            DeckSource::Slides(slides) => Some(slides),
+            _ => None,
+        }
+    }
+
+    pub fn slides_mut(&mut self) -> Option<&mut slides::Slides> {
+        match &mut self.source {
+            DeckSource::Slides(slides) => Some(slides),
             _ => None,
         }
     }
@@ -1220,30 +1647,79 @@ impl Deck {
         }
     }
 
-    /// Set a screen-capture parameter from a normalized value (0.0–1.0).
-    /// Returns `false` if this deck is not a screen-capture source or `name` is
-    /// not a capture parameter. See spec/screen-capture.md § Parameters.
+    /// The lower third this deck shows, if it is one.
+    pub fn lower_third(&self) -> Option<&lower_third::LowerThird> {
+        match &self.source {
+            DeckSource::LowerThird(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// The text this deck shows, if it is a text input.
+    pub fn text(&self) -> Option<&text::Text> {
+        match &self.source {
+            DeckSource::Text(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    pub fn text_mut(&mut self) -> Option<&mut text::Text> {
+        match &mut self.source {
+            DeckSource::Text(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    pub fn lower_third_mut(&mut self) -> Option<&mut lower_third::LowerThird> {
+        match &mut self.source {
+            DeckSource::LowerThird(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// What an offline layer keeps of its input (see [`OfflineSource`]), if
+    /// it is one.
+    pub fn offline(&self) -> Option<&OfflineSource> {
+        match &self.source {
+            DeckSource::Offline(offline) => Some(offline),
+            _ => None,
+        }
+    }
+
+    /// The presenter view this deck shows, if it is one.
+    pub fn presenter(&self) -> Option<&presenter::Presenter> {
+        match &self.source {
+            DeckSource::Presenter(presenter) => Some(presenter),
+            _ => None,
+        }
+    }
+
+    pub fn presenter_mut(&mut self) -> Option<&mut presenter::Presenter> {
+        match &mut self.source {
+            DeckSource::Presenter(presenter) => Some(presenter),
+            _ => None,
+        }
+    }
+
+    /// Set a screen-capture parameter from a normalized value (0.0–1.0), and
+    /// keep it to be given the deck's capture (see
+    /// [`ScreenCaptureState::given`]). Returns `false` if this deck is not a
+    /// screen-capture source or `name` is not a capture parameter. See
+    /// spec/screen-capture.md § Parameters.
     pub fn set_capture_param(&mut self, name: &str, value: f32) -> bool {
-        use crate::screen_capture::backend::{MAX_CAPTURE_RATE, MIN_CAPTURE_RATE};
+        use crate::screen_capture::backend::{CaptureGiven, CaptureSetting};
         let Some(state) = &mut self.screen_capture else {
             return false;
         };
-        let v = value.clamp(0.0, 1.0);
-        match name {
-            "rate" => {
-                state.config.rate = MIN_CAPTURE_RATE + v * (MAX_CAPTURE_RATE - MIN_CAPTURE_RATE);
-            }
-            "crop_x" => state.config.crop.x = v,
-            "crop_y" => state.config.crop.y = v,
-            "crop_w" => state.config.crop.w = v,
-            "crop_h" => state.config.crop.h = v,
-            // Bucketed so a MIDI fader can drive it like every other toggle.
-            "cursor" => state.config.show_cursor = v > 0.5,
-            "exclude_varda" => state.config.exclude_varda = v > 0.5,
-            _ => return false,
-        }
-        state.config = state.config.clone().sanitized();
-        state.config_dirty = true;
+        let Some(setting) = CaptureSetting::named(name) else {
+            return false;
+        };
+        state.config.give(setting, value);
+        state.given.push(CaptureGiven {
+            at: CAPTURE_GIVEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            setting,
+            value,
+        });
         true
     }
 
@@ -1431,6 +1907,19 @@ impl Deck {
         }
     }
 
+    /// When a picture of it was last counted as shown (see
+    /// `count_frame_shown`), for tests.
+    #[cfg(test)]
+    pub(crate) fn last_shown(&self) -> std::time::Instant {
+        self.last_frame_time
+    }
+
+    /// As a GPU fault leaves it (see `gpu_error`), for tests.
+    #[cfg(test)]
+    pub(crate) fn fault(&mut self, message: &str) {
+        self.gpu_error = Some(message.to_string());
+    }
+
     /// Resolution this deck renders at, relative to the master.
     pub fn render_scale(&self) -> DeckRenderScale {
         self.render_scale
@@ -1450,10 +1939,50 @@ impl Deck {
         self.resize(context, width, height);
     }
 
-    /// Frames this deck has actually rendered — a still image skips the ones
-    /// where nothing it depends on changed (see [`Deck::still_frame`]).
+    /// Frames this deck has actually rendered — a still image, and a lower
+    /// third or a text standing still, skip the ones where nothing they
+    /// depend on changed (see [`Deck::still_frame`]).
     pub fn rendered_frames(&self) -> u32 {
         self.frame_count
+    }
+
+    /// Whether a lower third or a text standing still keeps the frame it
+    /// has (see [`Deck::still_frame`]); its channel says each frame.
+    pub(crate) fn set_keep_still_text(&mut self, keep: bool) {
+        self.keep_still_text = keep;
+    }
+
+    /// Whether a clip that gives no new frame keeps the one it has (see
+    /// [`Deck::still_frame`]); its channel says each frame.
+    pub(crate) fn set_keep_still_clips(&mut self, keep: bool) {
+        self.keep_still_clips = keep;
+    }
+
+    /// Whether the frame drawn of a live source keeps while the source's
+    /// picture is the same (see [`Deck::still_frame`]); its channel says
+    /// each frame.
+    pub(crate) fn set_keep_still_sources(&mut self, keep: bool) {
+        self.keep_still_sources = keep;
+    }
+
+    /// Standing still for as long as it is left alone — a still image, a
+    /// lower third or a text not moving — not a clip between two of its
+    /// frames, kept only till the next (see [`Deck::still_frame`]): for the
+    /// UI, which gives such a deck no rate.
+    pub(crate) fn is_still(&self, modulation: &crate::modulation::ModulationEngine) -> bool {
+        self.still_frame(modulation)
+            .is_some_and(|still| !still.in_parts())
+    }
+
+    /// A number no other deck has, whatever its UUID (see `instance`).
+    pub(crate) fn instance(&self) -> u64 {
+        self.instance
+    }
+
+    /// Frames of its clip put in its texture so far (tests).
+    #[cfg(test)]
+    pub(crate) fn clip_frames(&self) -> u64 {
+        self.frames_uploaded
     }
 
     /// Whether this deck preserves source alpha (transparent compositing).
@@ -1502,19 +2031,90 @@ impl Deck {
     /// changes. Only raster/vector images qualify, carrying no effects but
     /// crop and transform with nothing modulating them (both are pure
     /// functions of their settings), and no analyzer attached.
+    ///
+    /// A lower third and a text qualify the same way while they stand still
+    /// — on air or off, shown or hidden; not coming in, going out or fading
+    /// — and `keep_still_text` is on: a name on air was drawn again every
+    /// frame, a frame cleared and its plate placed, though nothing of it
+    /// moved. What they show then is their drawing as placed (see
+    /// `LowerThird::still`, `Text::still`): another drawing, another look
+    /// or place, and the frame is drawn again.
+    ///
+    /// A clip qualifies from one of its frames to the next — paused, held
+    /// on its last, or 25 frames a second in a show of 60 — while
+    /// `keep_still_clips` is on: its frame was drawn again every show
+    /// frame, though the clip had given no new one. What it shows then is
+    /// the frame it has, as fitted, in the parts drawn (see
+    /// `StillFrame::in_parts`): a new frame — played, stepped, sought — or
+    /// more of it showing, and it is drawn again. Not a HAP clip, drawn
+    /// another way.
+    ///
+    /// A live source whose picture is told — another input shown through a
+    /// tap, a screen or window captured (see [`Deck::source_picture`]) —
+    /// qualifies from one of its pictures to the next, while
+    /// `keep_still_sources` is on: a deck that draws its own frame of one
+    /// (its thumbnail on screen, a blend or a size the composite does not
+    /// draw straight from the source) drew it again every show frame,
+    /// though the source stood still — and its input, seeing a new frame of
+    /// it each time, was put together again with it. What it shows then is
+    /// that picture, as it is placed, fitted and read, in the parts drawn:
+    /// another picture, another size or fit, or more of it showing, and it
+    /// is drawn again — the very frame the source has the new picture,
+    /// never one behind. One whose picture is not told — a camera, a
+    /// stream, Main — or that has nothing to draw from yet is drawn every
+    /// frame, as before; and a depth sensor, whose picture is made here.
     pub(crate) fn still_frame(
         &self,
         modulation: &crate::modulation::ModulationEngine,
     ) -> Option<StillFrame> {
-        let DeckSource::Image { scaling_mode, .. } = &self.source else {
-            return None;
+        let source = match &self.source {
+            DeckSource::Image { scaling_mode, .. } => StillSource::Image(*scaling_mode),
+            DeckSource::LowerThird(lower) if self.keep_still_text => {
+                StillSource::Drawing(lower.still()?)
+            }
+            DeckSource::Text(text) if self.keep_still_text => StillSource::Drawing(text.still()?),
+            DeckSource::Video { scaling_mode, .. } if self.keep_still_clips => StillSource::Clip {
+                frame: self.frames_uploaded,
+                scaling_mode: *scaling_mode,
+                visible: self.visible.clone(),
+            },
+            // Not a depth sensor: its picture is made here, of more than
+            // the one view, and is not the same for a number's sake.
+            DeckSource::ExternalSource {
+                kind,
+                source_width,
+                source_height,
+                scaling_mode,
+                ..
+            } if self.keep_still_sources
+                && !matches!(kind, ExternalSourceKind::DepthSensor(_)) =>
+            {
+                // Nothing to draw from yet: the frame drawn now is not the
+                // picture's, whatever its number.
+                self.external_source_view.as_ref()?;
+                StillSource::Live {
+                    picture: self.source_picture()?,
+                    placed: placed_size(
+                        *scaling_mode,
+                        (*source_width, *source_height),
+                        self.screen_capture.as_ref(),
+                    ),
+                    scaling_mode: *scaling_mode,
+                    transparent: self.transparent,
+                    coded: self.external_source_coded_view.is_some(),
+                    visible: self.visible.clone(),
+                }
+            }
+            _ => return None,
         };
         if self.analyzers.has_active_instances() {
             return None;
         }
         let mut effects = Vec::with_capacity(self.effects.len());
         for effect in &self.effects {
-            if effect.enabled && !effect.is_static_framing(modulation) {
+            // An offline effect is kept, not run: it changes nothing.
+            if effect.enabled && effect.offline().is_none() && !effect.is_static_framing(modulation)
+            {
                 return None;
             }
             let values = effect
@@ -1527,9 +2127,28 @@ impl Deck {
         }
         Some(StillFrame {
             size: (self.texture.width(), self.texture.height()),
-            scaling_mode: *scaling_mode,
+            source,
             effects,
         })
+    }
+
+    /// Nothing of this deck shows, and nothing will until it is told to
+    /// show: a lower third that is off or a text hidden and faded out,
+    /// with no effect that could draw on the clear frame (an analyzer
+    /// feeding one counts). Its frame, drawn now, is clear — and so is its
+    /// channel's picture when every deck there is such (see
+    /// `Channel::blank`).
+    pub(crate) fn shows_nothing(&self, modulation: &crate::modulation::ModulationEngine) -> bool {
+        let off = match &self.source {
+            DeckSource::LowerThird(lower) => lower.is_off(),
+            DeckSource::Text(text) => text.is_off(),
+            _ => false,
+        };
+        off && self.gpu_error.is_none()
+            && !self.analyzers.has_active_instances()
+            && self.effects.iter().all(|effect| {
+                !effect.enabled || effect.offline().is_some() || effect.keeps_clear(modulation)
+            })
     }
 
     pub fn covers_frame(&self, modulation: &crate::modulation::ModulationEngine) -> bool {
@@ -1552,11 +2171,13 @@ impl Deck {
             DeckSource::ExternalSource { .. } => !self.transparent,
             _ => false,
         };
+        // An offline effect is kept, not run: it changes nothing.
         source_opaque
-            && self
-                .effects
-                .iter()
-                .all(|effect| !effect.enabled || effect.is_neutral_framing(modulation))
+            && self.effects.iter().all(|effect| {
+                !effect.enabled
+                    || effect.offline().is_some()
+                    || effect.is_neutral_framing(modulation)
+            })
     }
 
     /// Where this deck's picture is certain to be opaque, in UV of the frame:
@@ -1614,7 +2235,11 @@ impl Deck {
         // the composite's own sampling of the texture.
         let mut fringe = 0.0;
         for effect in &self.effects {
-            if effect.enabled && !effect.is_neutral_framing(modulation) {
+            // An offline effect is kept, not run: it changes nothing.
+            if effect.enabled
+                && effect.offline().is_none()
+                && !effect.is_neutral_framing(modulation)
+            {
                 area = effect.opaque_after(area, aspect, modulation, &mut fringe)?;
             }
         }
@@ -1740,6 +2365,16 @@ impl Deck {
         }
     }
 
+    /// Whether this input's capture is drawn from its code values (see
+    /// `external_source_coded_view`): a screen's or a window's is. A
+    /// PowerPoint show's is left as it was, drawn from its light — it is
+    /// its presentation's, as its size is — and so is what is no capture.
+    pub fn draws_its_capture_coded(&self) -> bool {
+        self.screen_capture
+            .as_ref()
+            .is_some_and(|state| state.presentation.is_none())
+    }
+
     /// Get the screen-capture ID (if source is a screen capture)
     pub fn screen_capture_id(&self) -> Option<crate::screen_capture::CaptureId> {
         match &self.source {
@@ -1749,6 +2384,61 @@ impl Deck {
             } => Some(*id),
             _ => None,
         }
+    }
+
+    /// A screen capture capped at the show's new size `width × height`, as it
+    /// is when added; one added to a 1080p show stayed at 1080p after the
+    /// show went to 4K. Its capture, which inputs on the same screen share,
+    /// is the caller's to cap (`ScreenCaptureManager::cap_to`), once and with
+    /// nothing else changed: sending this input's whole settings would put
+    /// back another's crop. Gives that capture, if any. A PowerPoint show's
+    /// capture is left to the presentation, whose cap is the picture its
+    /// slide is shown at.
+    pub fn cap_capture_to_show(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Option<crate::screen_capture::CaptureId> {
+        let state = self.screen_capture.as_mut()?;
+        if state.presentation.is_some() {
+            return None;
+        }
+        state.config.scale_to = Some((width, height));
+        self.screen_capture_id()
+            .filter(|id| *id != crate::screen_capture::UNBOUND_CAPTURE_ID)
+    }
+
+    /// Point a screen-capture deck at another capture session — its window
+    /// has come (a PowerPoint show started) or is a new one — and give back
+    /// the session it held.
+    pub fn rebind_screen_capture(
+        &mut self,
+        capture_id: crate::screen_capture::CaptureId,
+        identity: crate::screen_capture::backend::TargetIdentity,
+        config: crate::screen_capture::backend::CaptureConfig,
+        width: u32,
+        height: u32,
+    ) -> Option<crate::screen_capture::CaptureId> {
+        let state = self.screen_capture.as_mut()?;
+        let old = state.capture_id;
+        state.capture_id = capture_id;
+        state.identity = identity;
+        state.config = config;
+        // What it was given was for the one it held; this one runs as it
+        // is set.
+        state.given.clear();
+        if let DeckSource::ExternalSource {
+            kind: ExternalSourceKind::ScreenCapture(id),
+            source_width,
+            source_height,
+            ..
+        } = &mut self.source
+        {
+            *id = capture_id;
+            *source_width = width;
+            *source_height = height;
+        }
+        Some(old)
     }
 
     /// Push the live source dimensions of an external source down from its
@@ -1792,6 +2482,441 @@ impl Deck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a deck keeps of its screen capture `id`, for a show of `cap`.
+    fn capture_state(
+        id: crate::screen_capture::CaptureId,
+        cap: (u32, u32),
+        presentation: bool,
+    ) -> ScreenCaptureState {
+        ScreenCaptureState {
+            capture_id: id,
+            identity: crate::screen_capture::backend::TargetIdentity::Display {
+                label: "Display 1".into(),
+                uuid: None,
+            },
+            config: crate::screen_capture::backend::CaptureConfig {
+                scale_to: Some(cap),
+                ..Default::default()
+            },
+            given: Vec::new(),
+            listed_as: None,
+            presentation: presentation.then(|| crate::presentation::PresentationConfig {
+                path: "/talks/a.pptx".into(),
+                slide: None,
+                plays_on: crate::engine::value::presentation::PlaysOn::default(),
+            }),
+        }
+    }
+
+    /// A screen capture `id` for a show of `cap`.
+    fn capture_deck(
+        gpu: &crate::renderer::GpuContext,
+        id: crate::screen_capture::CaptureId,
+        cap: (u32, u32),
+        presentation: bool,
+    ) -> Deck {
+        Deck::new_from_screen_capture(
+            gpu,
+            capture_state(id, cap, presentation),
+            "Display 1",
+            cap.0,
+            cap.1,
+            cap.0,
+            cap.1,
+        )
+        .expect("a capture deck")
+    }
+
+    /// An input that fills the frame wants its capture filling it, one
+    /// zoomed into wants it that many times bigger — by the side zoomed
+    /// into the more, where the picture keeps its shape; stretched, each
+    /// side by its own. Never less than fitted; centred, as one fitted.
+    #[test]
+    fn a_capture_is_drawn_as_its_input_fits_and_zooms_it() {
+        use crate::screen_capture::backend::Drawn;
+        use ScalingMode::{Center, Fill, Fit, Stretch};
+        let drawn = |fitted, across, down| Drawn {
+            fitted,
+            across,
+            down,
+        };
+        assert_eq!(capture_drawn_as(Fit, [1.0; 2]), drawn(1.0, 0.0, 0.0));
+        assert_eq!(capture_drawn_as(Fit, [1.0; 2]), Drawn::default());
+        assert_eq!(capture_drawn_as(Fit, [2.5; 2]), drawn(2.5, 0.0, 0.0));
+        assert_eq!(capture_drawn_as(Fill, [1.0; 2]), drawn(1.0, 1.0, 1.0));
+        assert_eq!(capture_drawn_as(Fill, [3.0; 2]), drawn(1.0, 3.0, 3.0));
+        assert_eq!(capture_drawn_as(Stretch, [2.0; 2]), drawn(1.0, 2.0, 2.0));
+        assert_eq!(capture_drawn_as(Center, [1.0; 2]), Drawn::default());
+        assert_eq!(capture_drawn_as(Center, [4.0; 2]), drawn(4.0, 0.0, 0.0));
+        // Scaled apart: a picture keeping its shape, by the bigger; one
+        // stretched, each side by its own.
+        assert_eq!(capture_drawn_as(Fit, [1.5, 0.5]), drawn(1.5, 0.0, 0.0));
+        assert_eq!(capture_drawn_as(Fit, [0.5, 3.0]), drawn(3.0, 0.0, 0.0));
+        assert_eq!(capture_drawn_as(Fill, [2.0, 0.5]), drawn(1.0, 2.0, 2.0));
+        assert_eq!(capture_drawn_as(Fill, [0.5, 2.0]), drawn(1.0, 2.0, 2.0));
+        assert_eq!(capture_drawn_as(Stretch, [2.0, 0.5]), drawn(1.0, 2.0, 0.5));
+        assert_eq!(capture_drawn_as(Stretch, [0.5, 2.0]), drawn(1.0, 0.5, 2.0));
+        // Shrunk: no less than fitted, which its `fitted` of 1 keeps.
+        assert_eq!(capture_drawn_as(Fit, [0.3; 2]), drawn(1.0, 0.0, 0.0));
+        assert_eq!(capture_drawn_as(Center, [0.3; 2]), drawn(1.0, 0.0, 0.0));
+        assert_eq!(capture_drawn_as(Fill, [0.3; 2]), drawn(1.0, 0.3, 0.3));
+        assert_eq!(capture_drawn_as(Stretch, [0.3; 2]), drawn(1.0, 0.3, 0.3));
+        // No size at all, a side or both: that side as not zoomed.
+        assert_eq!(capture_drawn_as(Fit, [f32::NAN; 2]), drawn(1.0, 0.0, 0.0));
+        assert_eq!(
+            capture_drawn_as(Fit, [f32::INFINITY, 2.0]),
+            drawn(2.0, 0.0, 0.0)
+        );
+        assert_eq!(capture_drawn_as(Fill, [f32::NAN, 2.0]), drawn(1.0, 2.0, 2.0));
+        assert_eq!(
+            capture_drawn_as(Stretch, [f32::NAN, f32::INFINITY]),
+            drawn(1.0, 1.0, 1.0)
+        );
+        assert_eq!(
+            capture_drawn_as(Stretch, [2.0, f32::NAN]),
+            drawn(1.0, 2.0, 1.0)
+        );
+    }
+
+    /// A deck's capture is drawn as the deck shows it: by its scaling mode,
+    /// and its Transform's scale where the pass drawing the capture does it
+    /// — first of its effects (after a crop), not turned, the deck's frames
+    /// not read by an analyzer.
+    #[test]
+    fn a_decks_capture_is_drawn_by_its_mode_and_its_folded_zoom() {
+        use crate::params::ParamValue::{Bool, Float};
+        use crate::screen_capture::backend::Drawn;
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        let modulation = crate::modulation::ModulationEngine::new();
+        let apart = |fitted, across, down| {
+            Some((
+                7,
+                Drawn {
+                    fitted,
+                    across,
+                    down,
+                },
+            ))
+        };
+        let drawn = |fitted, fills| apart(fitted, fills, fills);
+        let effect = |name: &str| {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("shaders")
+                .join(format!("{name}.fs"));
+            let shader = crate::isf::ISFShader::from_file(path).expect("the shader");
+            Effect::new(&gpu, shader).expect("an effect")
+        };
+        let mut deck = capture_deck(&gpu, 7, (1920, 1080), false);
+        assert_eq!(deck.scaling_mode(), Some(ScalingMode::Fill), "as added");
+        assert_eq!(deck.capture_drawn(&modulation), drawn(1.0, 1.0));
+        deck.set_scaling_mode(ScalingMode::Fit);
+        assert_eq!(deck.capture_drawn(&modulation), drawn(1.0, 0.0));
+
+        // Its crop and Transform, as every input has them: neutral, nothing.
+        deck.add_effect(effect("crop"));
+        deck.add_effect(effect("transform"));
+        assert_eq!(deck.capture_drawn(&modulation), drawn(1.0, 0.0));
+        deck.effects[1].params.set("scale", Float(2.0));
+        assert_eq!(deck.capture_drawn(&modulation), drawn(2.0, 0.0), "zoomed");
+        deck.effects[0].params.set("crop_left", Float(0.25));
+        assert_eq!(deck.capture_drawn(&modulation), drawn(2.0, 0.0), "cropped too");
+        deck.set_scaling_mode(ScalingMode::Fill);
+        assert_eq!(deck.capture_drawn(&modulation), drawn(1.0, 2.0));
+        deck.set_scaling_mode(ScalingMode::Center);
+        assert_eq!(deck.capture_drawn(&modulation), drawn(2.0, 0.0), "as one fitted");
+        deck.set_scaling_mode(ScalingMode::Fit);
+
+        // Scaled apart: the wider of the two, the picture keeping its shape;
+        // each side by its own, stretched.
+        deck.effects[1].params.set("scale_mode", Bool(true));
+        deck.effects[1].params.set("scale_x", Float(1.5));
+        deck.effects[1].params.set("scale_y", Float(0.5));
+        assert_eq!(deck.capture_drawn(&modulation), drawn(3.0, 0.0));
+        deck.set_scaling_mode(ScalingMode::Fill);
+        assert_eq!(deck.capture_drawn(&modulation), drawn(1.0, 3.0));
+        deck.set_scaling_mode(ScalingMode::Stretch);
+        assert_eq!(deck.capture_drawn(&modulation), apart(1.0, 3.0, 1.0));
+        deck.set_scaling_mode(ScalingMode::Fit);
+        deck.effects[1].params.set("scale_mode", Bool(false));
+
+        // Shrunk into a corner: as fitted.
+        deck.effects[1].params.set("scale", Float(0.4));
+        assert_eq!(deck.capture_drawn(&modulation), drawn(1.0, 0.0), "shrunk");
+        deck.set_scaling_mode(ScalingMode::Fill);
+        assert_eq!(deck.capture_drawn(&modulation), drawn(1.0, 0.4), "shrunk");
+        deck.set_scaling_mode(ScalingMode::Fit);
+        deck.effects[1].params.set("scale", Float(2.0));
+
+        // Its frames read by an analyzer, the deck draws every pass apart
+        // (nothing is folded): the capture is drawn into its frame fitted.
+        let reads = deck.analyzers.request(
+            "brightness",
+            &crate::analyzer::default_registry(),
+            &serde_json::Value::Null,
+        );
+        assert!(reads.is_some(), "an analyzer running");
+        assert_eq!(deck.capture_drawn(&modulation), drawn(1.0, 0.0), "read");
+        deck.analyzers.release("brightness");
+        assert_eq!(deck.capture_drawn(&modulation), drawn(2.0, 0.0), "no more");
+
+        // Turned, the Transform is a pass of its own on the deck's frame:
+        // the capture is drawn into that fitted.
+        deck.effects[1].params.set("rotation", Float(0.5));
+        assert_eq!(deck.capture_drawn(&modulation), drawn(1.0, 0.0), "turned");
+        deck.effects[1].params.set("rotation", Float(0.0));
+        assert_eq!(deck.capture_drawn(&modulation), drawn(2.0, 0.0));
+
+        // A second Transform after it is such a pass too: only the first
+        // is the capture's.
+        deck.add_effect(effect("transform"));
+        deck.effects[2].params.set("scale", Float(4.0));
+        assert_eq!(deck.capture_drawn(&modulation), drawn(2.0, 0.0), "the first");
+        // And with the first off, the second comes first.
+        deck.effects[1].enabled = false;
+        deck.effects[0].enabled = false;
+        assert_eq!(deck.capture_drawn(&modulation), drawn(4.0, 0.0));
+    }
+
+    /// A deck draws its live source from the view that reads it as coded
+    /// where it has one beside its view — and says so — else from its view,
+    /// as light; with no view it draws nothing, whatever else it has.
+    #[test]
+    fn a_source_is_read_as_coded_where_its_deck_has_that_view_too() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        if !gpu.reads_a_texture_two_ways() {
+            eprintln!("Skipping: this GPU reads a texture one way");
+            return;
+        }
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("a source"),
+            size: wgpu::Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+        });
+        let light = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let coded = texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(wgpu::TextureFormat::Rgba8Unorm),
+            ..Default::default()
+        });
+        assert_ne!(light, coded);
+        assert_eq!(source_read(Some(&light), Some(&coded)), Some((&coded, true)));
+        assert_eq!(source_read(Some(&light), None), Some((&light, false)));
+        assert_eq!(source_read(None, Some(&coded)), None);
+        assert_eq!(source_read(None, None), None);
+
+        // And so a deck is framed for what draws it from its source in its
+        // stead — a Merge, its channel drawing it straight onto its
+        // picture: the view and how it is read, the two together.
+        let modulation = crate::modulation::ModulationEngine::new();
+        let mut deck = capture_deck(&gpu, 7, (1920, 1080), false);
+        deck.external_source_view = Some(light.clone());
+        let framing = deck.framing(&modulation).expect("a framing");
+        assert_eq!(framing.source, Some(&light));
+        assert!(!framing.placed.coded, "read as light");
+        deck.external_source_coded_view = Some(coded.clone());
+        let framing = deck.framing(&modulation).expect("a framing");
+        assert_eq!(framing.source, Some(&coded));
+        assert!(framing.placed.coded, "read as coded");
+        deck.external_source_view = None;
+        let framing = deck.framing(&modulation).expect("a framing");
+        assert_eq!(framing.source, None, "nothing to draw yet");
+        assert!(!framing.placed.coded);
+    }
+
+    /// A PowerPoint show's capture is sized by its presentation, and one
+    /// not there by nothing: neither is an input's to size, nor anything
+    /// that is no capture.
+    #[test]
+    fn a_shows_capture_and_one_not_there_are_no_inputs_to_size() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        let modulation = crate::modulation::ModulationEngine::new();
+        let live = capture_deck(&gpu, 7, (1920, 1080), false);
+        assert!(live.capture_drawn(&modulation).is_some(), "a capture's is");
+        let show = capture_deck(&gpu, 8, (1920, 1080), true);
+        assert_eq!(show.capture_drawn(&modulation), None, "its presentation's");
+        let gone = capture_deck(
+            &gpu,
+            crate::screen_capture::UNBOUND_CAPTURE_ID,
+            (1920, 1080),
+            false,
+        );
+        assert_eq!(gone.capture_drawn(&modulation), None, "no capture");
+        let colour = Deck::new_solid_color(&gpu, [1.0; 4], 64, 36).expect("a colour");
+        assert_eq!(colour.capture_drawn(&modulation), None, "not a capture");
+    }
+
+    /// A screen's or a window's capture is drawn from its code values; a
+    /// PowerPoint show's is left as it was, and so is what is no capture.
+    #[test]
+    fn a_shows_capture_is_drawn_from_its_light() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        let live = capture_deck(&gpu, 7, (1920, 1080), false);
+        assert!(live.draws_its_capture_coded(), "a capture's is");
+        let show = capture_deck(&gpu, 8, (1920, 1080), true);
+        assert!(!show.draws_its_capture_coded(), "its presentation's");
+        let colour = Deck::new_solid_color(&gpu, [1.0; 4], 64, 36).expect("a colour");
+        assert!(!colour.draws_its_capture_coded(), "not a capture");
+    }
+
+    /// A capture shown centred is placed as it comes fitted within the
+    /// show's size, however big it comes for another input of its screen
+    /// zoomed into: the same picture, where the deck draws it, where a Merge
+    /// reads its framing, where it is told opaque and where the panel draws
+    /// its outline. Any other mode goes by the picture as it comes, and so
+    /// does a capture with no size to come within, or a PowerPoint show's.
+    #[test]
+    fn a_centred_capture_is_placed_as_it_comes_fitted() {
+        use ScalingMode::{Center, Fill, Fit, Stretch};
+        let show = (1920, 1080);
+        let state = capture_state(7, show, false);
+        let placed = |mode, source| placed_size(mode, source, Some(&state));
+        assert_eq!(placed(Center, (1920, 1080)), (1920, 1080), "as it comes");
+        assert_eq!(placed(Center, (3840, 2160)), (1920, 1080), "come bigger");
+        assert_eq!(placed(Center, (2880, 1620)), (1920, 1080));
+        assert_eq!(placed(Center, (3456, 2160)), (1728, 1080), "another shape");
+        assert_eq!(placed(Center, (2160, 3840)), (608, 1080), "upright");
+        assert_eq!(placed(Center, (800, 600)), (800, 600), "smaller: its own");
+        assert_eq!(placed(Center, (0, 0)), (0, 0), "no frame yet");
+        for mode in [Fit, Fill, Stretch] {
+            assert_eq!(placed(mode, (3840, 2160)), (3840, 2160), "{mode:?}");
+        }
+        let mut unsized_one = capture_state(7, show, false);
+        unsized_one.config.scale_to = None;
+        assert_eq!(
+            placed_size(Center, (3840, 2160), Some(&unsized_one)),
+            (3840, 2160),
+            "nothing to come within"
+        );
+        let slides = capture_state(8, show, true);
+        assert_eq!(
+            placed_size(Center, (3840, 2160), Some(&slides)),
+            (3840, 2160),
+            "a PowerPoint show's"
+        );
+        assert_eq!(
+            placed_size(Center, (3840, 2160), None),
+            (3840, 2160),
+            "a camera"
+        );
+
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        let modulation = crate::modulation::ModulationEngine::new();
+        let mut deck = capture_deck(&gpu, 7, show, false);
+        deck.set_scaling_mode(Center);
+        deck.set_external_source_size(1920, 1080);
+        let fitted = deck.framing(&modulation).expect("a framing").placed;
+        assert_eq!(fitted.uv_scale, [1.0, 1.0], "the whole picture");
+        assert_eq!(fitted.uv_offset, [0.0, 0.0]);
+        assert_eq!(fitted.over_black, 0.0, "filling the frame");
+        assert_eq!(deck.source_size(), Some([1920, 1080]));
+
+        // Another input of the screen zoomed into: it comes twice the size.
+        deck.set_external_source_size(3840, 2160);
+        let framing = deck.framing(&modulation).expect("a framing");
+        assert_eq!(framing.placed, fitted, "placed as it was");
+        assert_eq!(framing.source_size, (3840, 2160), "the pixels it has");
+        assert_eq!(deck.source_size(), Some([1920, 1080]), "its outline too");
+
+        // A screen of another shape leaves bars at the sides, and is drawn
+        // over black — still, when it comes bigger than the frame.
+        deck.set_external_source_size(1728, 1080);
+        let barred = deck.framing(&modulation).expect("a framing").placed;
+        assert_eq!(barred.over_black, 1.0, "bars at its sides");
+        deck.set_external_source_size(3456, 2160);
+        let framing = deck.framing(&modulation).expect("a framing");
+        assert_eq!(framing.placed, barred, "placed as it was, bars and all");
+        assert_eq!(deck.source_size(), Some([1728, 1080]));
+
+        // Fitted, it goes by the picture as it comes.
+        deck.set_scaling_mode(Fit);
+        assert_eq!(deck.source_size(), Some([3456, 2160]));
+    }
+
+    /// A capture setting given a deck is set on it and kept to be given its
+    /// capture, in the order given; a name that is no setting's is refused
+    /// and nothing kept. Pointed at another capture it has nothing left to
+    /// give: that one runs as it is set.
+    #[test]
+    fn a_capture_setting_given_is_kept_to_be_sent_down() {
+        use crate::screen_capture::backend::CaptureSetting;
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        let mut deck = capture_deck(&gpu, 7, (1920, 1080), false);
+        assert!(deck.set_capture_param("crop_w", 0.5));
+        assert!(deck.set_capture_param("cursor", 1.0));
+        assert!(!deck.set_capture_param("scale_to", 0.5), "no setting");
+        let state = deck.screen_capture.as_ref().expect("a capture");
+        assert!((state.config.crop.w - 0.5).abs() < 1e-6, "set on it");
+        assert!(state.config.show_cursor, "set on it");
+        let given: Vec<_> = state.given.iter().map(|g| (g.setting, g.value)).collect();
+        assert_eq!(
+            given,
+            [(CaptureSetting::CropW, 0.5), (CaptureSetting::Cursor, 1.0)]
+        );
+        assert!(state.given[0].at < state.given[1].at, "in the order given");
+
+        let (identity, config) = (state.identity.clone(), state.config.clone());
+        assert_eq!(
+            deck.rebind_screen_capture(8, identity, config, 1920, 1080),
+            Some(7)
+        );
+        let state = deck.screen_capture.as_ref().expect("a capture");
+        assert!(state.given.is_empty(), "nothing of the one it left");
+    }
+
+    /// A capture added to a 1080p show is capped at 4K when the show goes to
+    /// 4K, and names its capture for the caller to cap — once, nothing else
+    /// sent; an unbound one names none; a PowerPoint show's is left to its
+    /// presentation.
+    #[test]
+    fn a_capture_follows_the_shows_size() {
+        let Ok(gpu) = crate::renderer::GpuContext::new_headless() else {
+            eprintln!("Skipping: no headless GPU available");
+            return;
+        };
+        let mut deck = capture_deck(&gpu, 7, (1920, 1080), false);
+        assert_eq!(deck.cap_capture_to_show(3840, 2160), Some(7));
+        let state = deck.screen_capture.as_ref().expect("a capture");
+        assert_eq!(state.config.scale_to, Some((3840, 2160)));
+        assert!(state.given.is_empty(), "nothing of its settings to send");
+
+        let unbound = crate::screen_capture::UNBOUND_CAPTURE_ID;
+        let mut waiting = capture_deck(&gpu, unbound, (1920, 1080), false);
+        assert_eq!(waiting.cap_capture_to_show(3840, 2160), None);
+        let state = waiting.screen_capture.as_ref().expect("a capture");
+        assert_eq!(state.config.scale_to, Some((3840, 2160)), "opened so when it comes");
+
+        let mut show = capture_deck(&gpu, 8, (1920, 1080), true);
+        assert_eq!(show.cap_capture_to_show(3840, 2160), None);
+        let state = show.screen_capture.as_ref().expect("a capture");
+        assert_eq!(state.config.scale_to, Some((1920, 1080)));
+    }
 
     #[test]
     fn generate_short_uuid_format() {
@@ -1915,6 +3040,119 @@ mod tests {
         assert!((scale[1] - 0.5).abs() < 1e-5);
         assert!((offset[0] - 0.25).abs() < 1e-5);
         assert!((offset[1] - 0.25).abs() < 1e-5);
+    }
+
+    /// The source pixel a target's first one shows, across and down, and
+    /// that the picture is drawn a pixel for a pixel: as many of its pixels
+    /// across the target as the target has.
+    fn first_pixel_shown(mode: ScalingMode, source: (u32, u32), target: (u32, u32)) -> (f32, f32) {
+        let (scale, offset) = mode.compute_uv_transform(source.0, source.1, target.0, target.1);
+        let (across, down) = (scale[0] * source.0 as f32, scale[1] * source.1 as f32);
+        assert!(
+            (across - target.0 as f32).abs() < 1e-2 && (down - target.1 as f32).abs() < 1e-2,
+            "{mode:?} {source:?} in {target:?}: {across} × {down} of its pixels shown"
+        );
+        (offset[0] * source.0 as f32, offset[1] * source.1 as f32)
+    }
+
+    /// `at` is the pixel `whole`, not between two.
+    fn on(at: (f32, f32), whole: (f32, f32)) -> bool {
+        (at.0 - whole.0).abs() < 1e-3 && (at.1 - whole.1).abs() < 1e-3
+    }
+
+    /// A centred picture begins a whole number of its pixels from the
+    /// target's edge, an odd number of pixels wider or narrower too: half
+    /// a pixel off, every pixel drawn would be a blend of two. The half
+    /// pixel it is moved by is to the right, and down.
+    #[test]
+    fn a_centred_picture_sits_on_whole_pixels() {
+        let cases = [
+            ((1499, 827), (3840, 2160), (-1171.0, -667.0)),
+            ((1500, 828), (3840, 2160), (-1170.0, -666.0)),
+            ((1500, 828), (3841, 2161), (-1171.0, -667.0)),
+            ((3841, 2161), (1920, 1080), (960.0, 540.0)),
+            ((63, 35), (64, 36), (-1.0, -1.0)),
+            ((65, 37), (64, 36), (0.0, 0.0)),
+        ];
+        for (source, target, first) in cases {
+            let at = first_pixel_shown(ScalingMode::Center, source, target);
+            assert!(on(at, first), "{source:?} in {target:?}: begins at {at:?}, not {first:?}");
+        }
+    }
+
+    /// A fitted picture as wide as the target, or as high, is drawn a pixel
+    /// for a pixel: its bars are whole pixels, an odd number of pixels
+    /// between them too.
+    #[test]
+    fn a_fitted_picture_as_wide_as_the_target_sits_on_whole_pixels() {
+        let cases = [
+            ((1920, 1055), (1920, 1080), (0.0, -13.0)),
+            ((1920, 1054), (1920, 1080), (0.0, -13.0)),
+            ((1001, 1080), (1920, 1080), (-460.0, 0.0)),
+            ((64, 35), (64, 36), (0.0, -1.0)),
+        ];
+        for (source, target, first) in cases {
+            let at = first_pixel_shown(ScalingMode::Fit, source, target);
+            assert!(on(at, first), "{source:?} in {target:?}: begins at {at:?}, not {first:?}");
+        }
+    }
+
+    /// A picture filling a target as wide as it is, or as high, is drawn a
+    /// pixel for a pixel: what is cut from it is whole pixels.
+    #[test]
+    fn a_filling_picture_as_wide_as_the_target_sits_on_whole_pixels() {
+        let cases = [
+            ((2561, 1080), (1920, 1080), (320.0, 0.0)),
+            ((1920, 1201), (1920, 1080), (0.0, 60.0)),
+            ((1920, 1200), (1920, 1080), (0.0, 60.0)),
+            ((64, 39), (64, 36), (0.0, 1.0)),
+        ];
+        for (source, target, first) in cases {
+            let at = first_pixel_shown(ScalingMode::Fill, source, target);
+            assert!(on(at, first), "{source:?} in {target:?}: begins at {at:?}, not {first:?}");
+        }
+    }
+
+    /// A picture a pixel short of its frame does not fill it, however wide
+    /// the frame: on whole pixels, the pixel it lacks is a bare column.
+    #[test]
+    fn a_picture_a_pixel_short_of_a_wide_frame_does_not_fill_it() {
+        let frame = (16384, 1080);
+        for mode in [ScalingMode::Center, ScalingMode::Fit] {
+            assert!(!fills_the_frame(mode, (16383, 1080), frame), "{mode:?}, a column short");
+            assert!(!fills_the_frame(mode, (16384, 1079), frame), "{mode:?}, a row short");
+            assert!(!fills_the_frame(mode, (1919, 1080), (1920, 1080)), "{mode:?}, a narrow frame");
+        }
+        for mode in [ScalingMode::Center, ScalingMode::Fit, ScalingMode::Fill] {
+            assert!(fills_the_frame(mode, frame, frame), "{mode:?}, as big as the frame");
+        }
+        for mode in [ScalingMode::Center, ScalingMode::Fill] {
+            assert!(fills_the_frame(mode, (16385, 1081), frame), "{mode:?}, a pixel more");
+        }
+    }
+
+    /// Scaled, a fitted picture is centred as it was: exactly.
+    #[test]
+    fn a_fitted_picture_scaled_is_centred_exactly() {
+        let (_, offset) = ScalingMode::Fit.compute_uv_transform(1499, 827, 3840, 2160);
+        // 3840 across; 827 × 3840 / 1499 = 2118.53 down: bars of 20.73.
+        let bar = -offset[1] * 827.0 * (3840.0 / 1499.0);
+        assert!(
+            offset[0].abs() < 1e-6 && (bar - 20.734).abs() < 1e-2,
+            "{offset:?}: bars of {bar}"
+        );
+    }
+
+    /// And a filling one.
+    #[test]
+    fn a_filling_picture_scaled_is_centred_exactly() {
+        let (_, offset) = ScalingMode::Fill.compute_uv_transform(1499, 827, 3840, 2160);
+        // 2160 down; 1499 × 2160 / 827 = 3915.16 across: 37.58 cut each side.
+        let cut = offset[0] * 1499.0 * (2160.0 / 827.0);
+        assert!(
+            offset[1].abs() < 1e-6 && (cut - 37.582).abs() < 1e-2,
+            "{offset:?}: {cut} cut"
+        );
     }
 
     #[test]

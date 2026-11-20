@@ -147,6 +147,10 @@ pub struct RecordOptions {
     /// Frames per second; `None` is Varda's own.
     #[serde(default)]
     pub fps: Option<u32>,
+    /// While not recording, NOT RECORDING blinks behind the take buttons:
+    /// in the middle of a show, Record is easily forgotten.
+    #[serde(default)]
+    pub warn_when_off: bool,
 }
 
 impl Default for RecordOptions {
@@ -162,6 +166,7 @@ impl Default for RecordOptions {
             audio_kbps: default_audio_kbps(),
             size: None,
             fps: None,
+            warn_when_off: false,
         }
     }
 }
@@ -199,6 +204,45 @@ impl RecordOptions {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let kbps = (12_000.0 * pixels * motion * codec).round() as u32;
         kbps.clamp(2_000, 150_000)
+    }
+
+    /// The codec to encode in Nida on the media engine, when it can be:
+    /// H.264 or HEVC, on the hardware encoder where it opens.
+    pub(crate) fn engine_codec(&self) -> Option<VideoCodec> {
+        let codec = self.codec.video_codec()?;
+        (self.encoder.resolved(codec).0 == StreamEncoder::Hardware).then_some(codec)
+    }
+
+    /// ffmpeg's video and container arguments for a picture encoded in Nida
+    /// (see `FfmpegSubprocess::spawn_record_with`): copied as it comes, each
+    /// frame at its own time, written out as it is made.
+    pub(crate) fn copied_video_args(&self) -> Vec<String> {
+        let mut args: Vec<String> = ["-c:v", "copy", "-flush_packets", "1"]
+            .map(str::to_string)
+            .to_vec();
+        // HEVC as Apple's players take it, as ffmpeg's encoders tag it.
+        if self.codec == RecordCodec::Hevc && self.format != RecordFormat::Mkv {
+            args.extend(["-tag:v", "hvc1"].map(str::to_string));
+        }
+        args.extend(self.container_args());
+        args
+    }
+
+    /// The container's arguments: MP4 in one-second pieces, so a crash loses
+    /// at most the last; MOV; Matroska.
+    fn container_args(&self) -> Vec<String> {
+        match self.format {
+            RecordFormat::Mp4 => [
+                "-movflags",
+                "+frag_keyframe+empty_moov+default_base_moof",
+                "-f",
+                "mp4",
+            ]
+            .map(str::to_string)
+            .to_vec(),
+            RecordFormat::Mov => ["-f", "mov"].map(str::to_string).to_vec(),
+            RecordFormat::Mkv => ["-f", "matroska"].map(str::to_string).to_vec(),
+        }
     }
 
     /// Whether the recording can take NV12 frames made on the GPU: H.264 and
@@ -280,19 +324,7 @@ impl RecordOptions {
         // crash can lose is what the OS has not written yet, not seconds of
         // picture sitting in ffmpeg.
         args.extend(["-flush_packets", "1"].map(str::to_string));
-        match self.format {
-            RecordFormat::Mp4 => args.extend(
-                [
-                    "-movflags",
-                    "+frag_keyframe+empty_moov+default_base_moof",
-                    "-f",
-                    "mp4",
-                ]
-                .map(str::to_string),
-            ),
-            RecordFormat::Mov => args.extend(["-f", "mov"].map(str::to_string)),
-            RecordFormat::Mkv => args.extend(["-f", "matroska"].map(str::to_string)),
-        }
+        args.extend(self.container_args());
         args
     }
 
@@ -369,8 +401,19 @@ pub struct RecordStatus {
     /// The rate frames reach the encoder at, as it was started.
     #[serde(default)]
     pub fps: u32,
+    /// The rate the file is written at: its own when set (Frame rate),
+    /// else that one.
+    #[serde(default)]
+    pub file_fps: u32,
     /// The last finished recording, for "Show in Finder".
     pub last_file: Option<String>,
+    /// Its encoder still starting: Record pressed, nothing written yet.
+    #[serde(default)]
+    pub starting: bool,
+    /// The audio-mixer bus the running recording carries, as chosen when it
+    /// started; none idle, or carrying silence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_bus: Option<String>,
 }
 
 impl RecordStatus {
@@ -385,7 +428,10 @@ impl RecordStatus {
             problem: None,
             dropped: 0,
             fps: 0,
+            file_fps: 0,
             last_file,
+            starting: false,
+            audio_bus: None,
         }
     }
 
@@ -417,6 +463,40 @@ pub const LOW_SPACE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// A new file's path: `Nida 2026-09-26 14-05-09.mp4` in `folder`, with
 /// ` (2)`, ` (3)` … when a take continues in more files or the name is taken.
+/// [`file_path`], passing over the paths in `given` too — handed already to
+/// an encoder starting, or one stopped before it started, that may yet make
+/// its file — and putting the one chosen there. It looks at the disk: not
+/// for the show's thread.
+pub fn file_path_unused<S: std::hash::BuildHasher>(
+    folder: &Path,
+    stamp: &str,
+    part: usize,
+    extension: &str,
+    given: &std::sync::Mutex<std::collections::HashSet<PathBuf, S>>,
+) -> PathBuf {
+    let base = if part > 1 {
+        format!("Nida {stamp} ({part})")
+    } else {
+        format!("Nida {stamp}")
+    };
+    let held = || {
+        given
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    let mut path = folder.join(format!("{base}.{extension}"));
+    let mut n = 2;
+    loop {
+        // The disk looked at with nothing held: a disk that keeps it waiting
+        // keeps no other start waiting.
+        if !held().contains(&path) && !path.exists() && held().insert(path.clone()) {
+            return path;
+        }
+        path = folder.join(format!("{base} {n}.{extension}"));
+        n += 1;
+    }
+}
+
 pub fn file_path(folder: &Path, stamp: &str, part: usize, extension: &str) -> PathBuf {
     let base = if part > 1 {
         format!("Nida {stamp} ({part})")
@@ -650,6 +730,56 @@ fn available_on(path: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A file handed to one encoder is never handed to another, though
+    /// neither has made it yet: one stopped before it started may still.
+    #[test]
+    fn a_file_is_never_handed_out_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let given = std::sync::Mutex::new(std::collections::HashSet::new());
+        let first = file_path_unused(dir.path(), "2026-11-04 15-30-00", 1, "mp4", &given);
+        let second = file_path_unused(dir.path(), "2026-11-04 15-30-00", 1, "mp4", &given);
+        assert_ne!(first, second);
+        assert!(
+            second
+                .to_string_lossy()
+                .ends_with("Nida 2026-11-04 15-30-00 2.mp4"),
+            "{second:?}"
+        );
+        // One on the disk is passed over too.
+        std::fs::write(dir.path().join("Nida 2026-11-04 15-30-01.mp4"), b"x").unwrap();
+        let third = file_path_unused(dir.path(), "2026-11-04 15-30-01", 1, "mp4", &given);
+        assert!(
+            third
+                .to_string_lossy()
+                .ends_with("Nida 2026-11-04 15-30-01 2.mp4"),
+            "{third:?}"
+        );
+    }
+    /// A picture encoded in Nida is copied into the file as it comes, HEVC
+    /// tagged as Apple's players take it, MP4 in one-second pieces.
+    #[test]
+    fn a_picture_encoded_in_nida_is_copied_hevc_tagged_for_apple() {
+        let hevc = super::RecordOptions {
+            codec: super::RecordCodec::Hevc,
+            ..super::RecordOptions::default()
+        };
+        let args = hevc.copied_video_args().join(" ");
+        assert!(
+            args.contains("-c:v copy") && args.contains("-tag:v hvc1"),
+            "{args}"
+        );
+        assert!(args.contains("+frag_keyframe+empty_moov"), "{args}");
+        let mkv = super::RecordOptions {
+            format: super::RecordFormat::Mkv,
+            ..hevc
+        };
+        assert!(
+            !mkv.copied_video_args().join(" ").contains("hvc1"),
+            "Matroska has no tag"
+        );
+    }
+
     use super::*;
 
     /// The free space where a recording goes is found at once — the frame

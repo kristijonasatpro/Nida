@@ -10,7 +10,7 @@ use crate::usecases::api::SharedState;
 
 fn read_or_error(
     state: &SharedState,
-) -> Result<crate::engine::EngineState, (StatusCode, &'static str)> {
+) -> Result<std::sync::Arc<crate::engine::EngineState>, (StatusCode, &'static str)> {
     projection::read_state(&state.engine_state).map_err(|e| match e {
         StateReadError::NotInitialized => (
             StatusCode::SERVICE_UNAVAILABLE,

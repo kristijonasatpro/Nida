@@ -27,6 +27,9 @@ pub struct ScreenFacts {
     pub position: (i32, i32),
     /// The platform's number for it (a `CGDirectDisplayID` on a Mac).
     pub display_id: Option<u32>,
+    /// Its panel's own pixels, when known: a 4K panel set to look like
+    /// 2560×1440 is drawn at 5120×2880 and scaled down to them.
+    pub panel: Option<(u32, u32)>,
 }
 
 /// The facts of `handles`, in order — asked of the platform on the main
@@ -53,6 +56,7 @@ pub(crate) fn facts(handles: &[MonitorHandle], keys: &[String]) -> Vec<ScreenFac
                     .map(|mhz| f64::from(mhz) / 1000.0),
                 position: (position.x, position.y),
                 display_id,
+                panel: display_id.and_then(panel_cached),
             }
         })
         .collect();
@@ -89,7 +93,9 @@ fn display_id(handle: &MonitorHandle) -> Option<u32> {
 
 /// How a screen is shown: the name given to it, or what the platform calls
 /// it, or the name outputs address it by — then what it is: "Stage LED (BMD
-/// HDMI · 1920×1080 · 60 Hz)", "Color LCD (3456×2234 · 120 Hz)". `twin` when
+/// HDMI · 1920×1080 · 60 Hz)", "Color LCD (3456×2234 · 120 Hz)"; a panel
+/// drawn at another size (a scaled mode) by its own pixels, the drawing's
+/// after: "Display (3840×2160, draws 5120×2880 · 60 Hz)". `twin` when
 /// another connected screen would read the same: then its place too.
 pub fn label(
     key: &str,
@@ -113,7 +119,12 @@ pub fn label(
             (None, _, _) => key.to_string(),
         },
     };
-    details.push(format!("{width}×{height}"));
+    match facts.and_then(|f| f.panel) {
+        Some((pw, ph)) if (pw, ph) != (width, height) => {
+            details.push(format!("{pw}×{ph}, draws {width}×{height}"));
+        }
+        _ => details.push(format!("{width}×{height}")),
+    }
     if let Some(hz) = facts.and_then(|f| f.refresh_hz) {
         details.push(format!("{hz:.0} Hz"));
     }
@@ -130,7 +141,9 @@ pub fn labels(
 ) -> Vec<String> {
     let base = |i: usize| -> (Option<String>, Option<String>) {
         let fact = facts.get(i);
-        let name = fact.and_then(|f| names.get(&f.identity)).map(str::to_string);
+        let name = fact
+            .and_then(|f| names.get(&f.identity))
+            .map(str::to_string);
         let model = fact
             .and_then(|f| f.model.clone())
             .filter(|m| !m.trim().is_empty());
@@ -227,6 +240,47 @@ impl ScreenNames {
     }
 }
 
+/// The panel's own pixels of the screen `handle` is, when known (a Mac's).
+pub fn panel_of(handle: &MonitorHandle) -> Option<(u32, u32)> {
+    display_id(handle).and_then(panel_cached)
+}
+
+/// Displays — number and UUID — and their panels' own pixels.
+type Panels = std::collections::HashMap<(u32, Option<String>), Option<(u32, u32)>>;
+
+/// Each display's panel, as last asked (see [`panel_cached`]).
+static PANELS: std::sync::Mutex<Option<Panels>> = std::sync::Mutex::new(None);
+
+/// Display `display`'s panel's own pixels, asked of macOS once: listing a
+/// screen's modes takes about a millisecond on the mini, longer with more
+/// modes and while macOS switches apps — asked every second for each of the
+/// Studio's five screens while the control window held the show, the
+/// outputs waited ("ui hold" 20–50 ms as he switched apps). A panel does not
+/// change with its "looks like" mode; asked again when the screens change,
+/// or another screen takes the number (its UUID differs).
+fn panel_cached(display: u32) -> Option<(u32, u32)> {
+    panel_cached_from(display, platform::uuid(display), platform::panel)
+}
+
+/// Display `display`'s (of `uuid`) panel as cached, asked of `ask` when it
+/// is not.
+fn panel_cached_from(
+    display: u32,
+    uuid: Option<String>,
+    ask: impl FnOnce(u32) -> Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    let mut panels = PANELS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *panels
+        .get_or_insert_with(Default::default)
+        .entry((display, uuid))
+        .or_insert_with(|| ask(display))
+}
+
+/// The screens have changed: each panel is asked again.
+pub(crate) fn forget_panels() {
+    *PANELS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
 /// Put each screen's label big on it for a couple of seconds — `screens`,
 /// (display, text) — so two alike can be told apart. A Mac's screens only.
 pub fn identify(screens: Vec<(u32, String)>) {
@@ -273,6 +327,70 @@ mod platform {
             .collect()
     }
 
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGDisplayCopyAllDisplayModes(
+            display: u32,
+            options: *const std::ffi::c_void,
+        ) -> *const std::ffi::c_void;
+        fn CGDisplayModeGetPixelWidth(mode: *const std::ffi::c_void) -> usize;
+        fn CGDisplayModeGetPixelHeight(mode: *const std::ffi::c_void) -> usize;
+        fn CGDisplayModeGetIOFlags(mode: *const std::ffi::c_void) -> u32;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFArrayGetCount(array: *const std::ffi::c_void) -> isize;
+        fn CFArrayGetValueAtIndex(
+            array: *const std::ffi::c_void,
+            at: isize,
+        ) -> *const std::ffi::c_void;
+        fn CFRelease(cf: *const std::ffi::c_void);
+    }
+
+    /// The display mode macOS marks as the panel's own (kDisplayModeNativeFlag).
+    const NATIVE_MODE: u32 = 0x0200_0000;
+
+    /// The display's panel's own pixels: its native mode's (the largest, if
+    /// it marks more than one); none when it marks none.
+    pub(super) fn panel(display: u32) -> Option<(u32, u32)> {
+        // SAFETY: any display number; a new array (the Copy rule), or null.
+        let modes = unsafe { CGDisplayCopyAllDisplayModes(display, std::ptr::null()) };
+        if modes.is_null() {
+            return None;
+        }
+        let mut panel: Option<(u32, u32)> = None;
+        // SAFETY: `modes` is a live CFArray of CGDisplayModes until released.
+        let count = unsafe { CFArrayGetCount(modes) };
+        for at in 0..count {
+            // SAFETY: an index within the array; its element, not retained.
+            let mode = unsafe { CFArrayGetValueAtIndex(modes, at) };
+            if mode.is_null() {
+                continue;
+            }
+            // SAFETY: a CGDisplayMode from the array, alive while it is.
+            let (flags, wide, high) = unsafe {
+                (
+                    CGDisplayModeGetIOFlags(mode),
+                    CGDisplayModeGetPixelWidth(mode),
+                    CGDisplayModeGetPixelHeight(mode),
+                )
+            };
+            if flags & NATIVE_MODE != 0 {
+                let size = (
+                    u32::try_from(wide).unwrap_or(0),
+                    u32::try_from(high).unwrap_or(0),
+                );
+                if panel.is_none_or(|p| size.0 * size.1 > p.0 * p.1) {
+                    panel = Some(size);
+                }
+            }
+        }
+        // SAFETY: copied above, released once.
+        unsafe { CFRelease(modes) };
+        panel.filter(|(w, h)| *w > 0 && *h > 0)
+    }
+
     /// What macOS calls the display ("Color LCD"); off the main thread, none.
     pub(super) fn model_name(display: u32) -> Option<String> {
         let mtm = MainThreadMarker::new()?;
@@ -299,7 +417,8 @@ mod platform {
                 .collect();
             let windows = dispatch2::MainThreadBound::new(windows, mtm);
             let _ = dispatch2::DispatchQueue::main().after(
-                dispatch2::DispatchTime::try_from(SHOWN_FOR).unwrap_or(dispatch2::DispatchTime::NOW),
+                dispatch2::DispatchTime::try_from(SHOWN_FOR)
+                    .unwrap_or(dispatch2::DispatchTime::NOW),
                 move || {
                     if let Some(mtm) = MainThreadMarker::new() {
                         for window in windows.get(mtm) {
@@ -335,7 +454,9 @@ mod platform {
         // Above full-screen output windows.
         window.setLevel(1000);
         let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
-        label.setFont(Some(&NSFont::boldSystemFontOfSize(frame.size.height / 12.0)));
+        label.setFont(Some(&NSFont::boldSystemFontOfSize(
+            frame.size.height / 12.0,
+        )));
         label.setTextColor(Some(&NSColor::whiteColor()));
         label.setAlignment(NSTextAlignment::Center);
         let height = frame.size.height / 4.0;
@@ -362,12 +483,39 @@ mod platform {
         None
     }
 
+    pub(super) fn panel(_display: u32) -> Option<(u32, u32)> {
+        None
+    }
+
     pub(super) fn identify(_labels: Vec<(u32, String)>) {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A screen's panel is asked of macOS once, not every second (listing
+    /// its modes held the show while the Studio switched apps); asked again
+    /// after the screens change, or for another screen given its number.
+    #[test]
+    fn a_screens_panel_is_asked_once_until_the_screens_change() {
+        let display = 0x7E57_0001;
+        let asked = std::cell::Cell::new(0);
+        let ask = |_| {
+            asked.set(asked.get() + 1);
+            Some((3840, 2160))
+        };
+        let first = || Some("A-1".to_string());
+        for _ in 0..3 {
+            assert_eq!(panel_cached_from(display, first(), ask), Some((3840, 2160)));
+        }
+        assert_eq!(asked.get(), 1, "asked once");
+        assert_eq!(panel_cached_from(display, Some("B-2".into()), ask), Some((3840, 2160)));
+        assert_eq!(asked.get(), 2, "another screen with its number: asked");
+        forget_panels();
+        assert_eq!(panel_cached_from(display, first(), ask), Some((3840, 2160)));
+        assert_eq!(asked.get(), 3, "asked again after a change");
+    }
 
     fn fact(model: Option<&str>, identity: &str, hz: Option<f64>, at: (i32, i32)) -> ScreenFacts {
         ScreenFacts {
@@ -376,7 +524,24 @@ mod tests {
             refresh_hz: hz,
             position: at,
             display_id: None,
+            panel: None,
         }
+    }
+
+    /// A 4K panel set to look like 2560×1440 — drawn at 5120×2880 — reads
+    /// by its own pixels, the drawing's after; one drawn at its own, as ever.
+    #[test]
+    fn a_scaled_panel_reads_by_its_own_pixels() {
+        let mut display = fact(Some("Display"), "u9", Some(60.0), (0, 0));
+        display.panel = Some((3840, 2160));
+        assert_eq!(
+            label("Monitor #1", Some(&display), None, (5120, 2880), false),
+            "Display (3840×2160, draws 5120×2880 · 60 Hz)"
+        );
+        assert_eq!(
+            label("Monitor #1", Some(&display), None, (3840, 2160), false),
+            "Display (3840×2160 · 60 Hz)"
+        );
     }
 
     /// A screen reads by the name given to it, what macOS calls it, its size
@@ -386,18 +551,33 @@ mod tests {
     fn a_screen_reads_by_its_given_name_then_macos_name_then_key() {
         let lcd = fact(Some("Color LCD"), "u1", Some(120.0), (0, 0));
         assert_eq!(
-            label("Monitor #41041", Some(&lcd), Some("Laptop"), (3456, 2234), false),
+            label(
+                "Monitor #41041",
+                Some(&lcd),
+                Some("Laptop"),
+                (3456, 2234),
+                false
+            ),
             "Laptop (Color LCD · 3456×2234 · 120 Hz)"
         );
         assert_eq!(
             label("Monitor #41041", Some(&lcd), None, (3456, 2234), false),
             "Color LCD (3456×2234 · 120 Hz)"
         );
-        assert_eq!(label("HDMI-A-1", None, None, (1920, 1080), false), "HDMI-A-1 (1920×1080)");
+        assert_eq!(
+            label("HDMI-A-1", None, None, (1920, 1080), false),
+            "HDMI-A-1 (1920×1080)"
+        );
         // A display macOS gives a blank name (seen on a Mac mini's screen).
         let blank = fact(Some(""), "u2", Some(60.0), (0, 0));
         assert_eq!(
-            label("Monitor #1986622068", Some(&blank), None, (1920, 1080), false),
+            label(
+                "Monitor #1986622068",
+                Some(&blank),
+                None,
+                (1920, 1080),
+                false
+            ),
             "Monitor #1986622068 (1920×1080 · 60 Hz)"
         );
     }
@@ -416,10 +596,14 @@ mod tests {
         assert_eq!(facts[0].identity, "same @ 1728,0");
         assert_eq!(facts[1].identity, "same @ -1920,0");
         assert_eq!(facts[2].identity, "lcd");
-        let keys: Vec<String> = ["Monitor #0 @ 1728,0", "Monitor #0 @ -1920,0", "Monitor #41041"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
+        let keys: Vec<String> = [
+            "Monitor #0 @ 1728,0",
+            "Monitor #0 @ -1920,0",
+            "Monitor #41041",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
         let sizes = [(1920, 1080), (1920, 1080), (3456, 2234)];
         let mut names = ScreenNames::load_from(None);
         let unnamed = labels(&keys, &facts, &names, &sizes);
@@ -430,8 +614,7 @@ mod tests {
         let with_a_name = labels(&keys, &facts, &names, &sizes);
         assert_eq!(with_a_name[1], "ATEM in 2 (BMD HDMI · 1920×1080 · 60 Hz)");
         assert_eq!(
-            with_a_name[0],
-            "BMD HDMI (1920×1080 · 60 Hz)",
+            with_a_name[0], "BMD HDMI (1920×1080 · 60 Hz)",
             "its twin alone, no place needed"
         );
     }
@@ -462,9 +645,16 @@ mod tests {
         names.set("u1", Some("  Stage LED ")).unwrap();
         names.set("u2", Some("Confidence TV")).unwrap();
         let again = ScreenNames::load_from(Some(path.clone()));
-        assert_eq!((again.get("u1"), again.get("u2")), (Some("Stage LED"), Some("Confidence TV")));
+        assert_eq!(
+            (again.get("u1"), again.get("u2")),
+            (Some("Stage LED"), Some("Confidence TV"))
+        );
         names.set("u1", Some("   ")).unwrap();
         let after = ScreenNames::load_from(Some(path));
-        assert_eq!((after.get("u1"), after.get("u2")), (None, Some("Confidence TV")));
+        assert_eq!(
+            (after.get("u1"), after.get("u2")),
+            (None, Some("Confidence TV"))
+        );
     }
 }
+

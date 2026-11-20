@@ -10,7 +10,7 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
 #[derive(Deserialize, ToSchema)]
@@ -39,7 +39,7 @@ pub struct RearmBody {
     pub seconds: Option<f64>,
 }
 
-#[utoipa::path(post, path = "/api/arrangement/lanes/{deck_uuid}", params(("deck_uuid" = String, Path, description = "Deck the lane drives")), responses((status = 200, body = CommandResult)), tag = "Arrangement")]
+#[utoipa::path(post, path = "/api/arrangement/lanes/{deck_uuid}", params(("deck_uuid" = String, Path, description = "Deck the lane drives")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Arrangement")]
 pub async fn add_lane(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -50,7 +50,7 @@ pub async fn add_lane(
     }
 }
 
-#[utoipa::path(delete, path = "/api/arrangement/lanes/{deck_uuid}", params(("deck_uuid" = String, Path, description = "Deck the lane drives")), responses((status = 200, body = CommandResult)), tag = "Arrangement")]
+#[utoipa::path(delete, path = "/api/arrangement/lanes/{deck_uuid}", params(("deck_uuid" = String, Path, description = "Deck the lane drives")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Arrangement")]
 pub async fn remove_lane(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -64,7 +64,7 @@ pub async fn remove_lane(
     }
 }
 
-#[utoipa::path(put, path = "/api/arrangement/lanes/{deck_uuid}/collapsed", params(("deck_uuid" = String, Path, description = "Deck the lane drives")), request_body = CollapsedBody, responses((status = 200, body = CommandResult)), tag = "Arrangement")]
+#[utoipa::path(put, path = "/api/arrangement/lanes/{deck_uuid}/collapsed", params(("deck_uuid" = String, Path, description = "Deck the lane drives")), request_body = CollapsedBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Arrangement")]
 pub async fn set_lane_collapsed(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -82,7 +82,7 @@ pub async fn set_lane_collapsed(
     }
 }
 
-#[utoipa::path(post, path = "/api/arrangement/lanes/{deck_uuid}/regions", params(("deck_uuid" = String, Path, description = "Deck the lane drives")), request_body = RegionBody, responses((status = 200, body = CommandResult)), tag = "Arrangement")]
+#[utoipa::path(post, path = "/api/arrangement/lanes/{deck_uuid}/regions", params(("deck_uuid" = String, Path, description = "Deck the lane drives")), request_body = RegionBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Arrangement")]
 pub async fn add_region(
     State(s): State<SharedState>,
     Path(deck_uuid): Path<String>,
@@ -100,7 +100,7 @@ pub async fn add_region(
     }
 }
 
-#[utoipa::path(put, path = "/api/arrangement/lanes/{deck_uuid}/regions/{index}", params(("deck_uuid" = String, Path, description = "Deck the lane drives"), ("index" = usize, Path, description = "Region position within the lane")), request_body = RegionBody, responses((status = 200, body = CommandResult)), tag = "Arrangement")]
+#[utoipa::path(put, path = "/api/arrangement/lanes/{deck_uuid}/regions/{index}", params(("deck_uuid" = String, Path, description = "Deck the lane drives"), ("index" = usize, Path, description = "Region position within the lane")), request_body = RegionBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Arrangement")]
 pub async fn update_region(
     State(s): State<SharedState>,
     Path((deck_uuid, index)): Path<(String, usize)>,
@@ -119,7 +119,7 @@ pub async fn update_region(
     }
 }
 
-#[utoipa::path(delete, path = "/api/arrangement/lanes/{deck_uuid}/regions/{index}", params(("deck_uuid" = String, Path, description = "Deck the lane drives"), ("index" = usize, Path, description = "Region position within the lane")), responses((status = 200, body = CommandResult)), tag = "Arrangement")]
+#[utoipa::path(delete, path = "/api/arrangement/lanes/{deck_uuid}/regions/{index}", params(("deck_uuid" = String, Path, description = "Deck the lane drives"), ("index" = usize, Path, description = "Region position within the lane")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Arrangement")]
 pub async fn remove_region(
     State(s): State<SharedState>,
     Path((deck_uuid, index)): Path<(String, usize)>,
@@ -133,7 +133,7 @@ pub async fn remove_region(
     }
 }
 
-#[utoipa::path(put, path = "/api/arrangement/idle", request_body = IdleBody, responses((status = 200, body = CommandResult)), tag = "Arrangement")]
+#[utoipa::path(put, path = "/api/arrangement/idle", request_body = IdleBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Arrangement")]
 pub async fn set_idle(State(s): State<SharedState>, Json(b): Json<IdleBody>) -> impl IntoResponse {
     match s
         .send_command(EngineCommand::SetIdleBehaviour { idle: b.idle })
@@ -144,7 +144,7 @@ pub async fn set_idle(State(s): State<SharedState>, Json(b): Json<IdleBody>) -> 
     }
 }
 
-#[utoipa::path(post, path = "/api/arrangement/rearm/{param_key}", params(("param_key" = String, Path, description = "Modulation key of the held parameter")), request_body = RearmBody, responses((status = 200, body = CommandResult)), tag = "Arrangement")]
+#[utoipa::path(post, path = "/api/arrangement/rearm/{param_key}", params(("param_key" = String, Path, description = "Modulation key of the held parameter")), request_body = RearmBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Arrangement")]
 pub async fn rearm_param(
     State(s): State<SharedState>,
     Path(param_key): Path<String>,
@@ -162,7 +162,7 @@ pub async fn rearm_param(
     }
 }
 
-#[utoipa::path(post, path = "/api/arrangement/rearm", request_body = RearmBody, responses((status = 200, body = CommandResult)), tag = "Arrangement")]
+#[utoipa::path(post, path = "/api/arrangement/rearm", request_body = RearmBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Arrangement")]
 pub async fn rearm_all(
     State(s): State<SharedState>,
     Json(b): Json<RearmBody>,
@@ -195,7 +195,7 @@ pub struct UpdateCueBody {
     pub name: Option<String>,
 }
 
-#[utoipa::path(post, path = "/api/arrangement/cues", request_body = AddCueBody, responses((status = 200, body = CommandResult)), tag = "Arrangement")]
+#[utoipa::path(post, path = "/api/arrangement/cues", request_body = AddCueBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Arrangement")]
 pub async fn add_cue(State(s): State<SharedState>, Json(b): Json<AddCueBody>) -> impl IntoResponse {
     match s
         .send_command(EngineCommand::AddCue {
@@ -209,7 +209,7 @@ pub async fn add_cue(State(s): State<SharedState>, Json(b): Json<AddCueBody>) ->
     }
 }
 
-#[utoipa::path(put, path = "/api/arrangement/cues/{uuid}", params(("uuid" = String, Path, description = "Cue identifier")), request_body = UpdateCueBody, responses((status = 200, body = CommandResult)), tag = "Arrangement")]
+#[utoipa::path(put, path = "/api/arrangement/cues/{uuid}", params(("uuid" = String, Path, description = "Cue identifier")), request_body = UpdateCueBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Arrangement")]
 pub async fn update_cue(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,
@@ -228,7 +228,7 @@ pub async fn update_cue(
     }
 }
 
-#[utoipa::path(delete, path = "/api/arrangement/cues/{uuid}", params(("uuid" = String, Path, description = "Cue identifier")), responses((status = 200, body = CommandResult)), tag = "Arrangement")]
+#[utoipa::path(delete, path = "/api/arrangement/cues/{uuid}", params(("uuid" = String, Path, description = "Cue identifier")), responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Arrangement")]
 pub async fn remove_cue(
     State(s): State<SharedState>,
     Path(uuid): Path<String>,

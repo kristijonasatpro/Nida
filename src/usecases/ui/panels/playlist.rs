@@ -30,17 +30,20 @@ pub(super) fn of_channel(ch: &ChannelUIInfo) -> Option<(&DeckUIInfo, &PlaylistSn
 // ── Play / stop ─────────────────────────────────────────────────────
 
 /// ▶ for a stopped playlist, ■ (green) for a playing one.
+/// ▶ plays the playlist; ■ stops it, its sound fading out first as a
+/// Stop's right-click sets.
 pub(super) fn play_button(
     ui: &mut egui::Ui,
     deck_uuid: &str,
     list: &PlaylistSnapshot,
     size: egui::Vec2,
+    data: &UIData,
     actions: &mut UIActions,
 ) -> egui::Response {
     let (text, hover) = if list.playing {
-        ("■", "Stop the playlist")
+        ("■", super::transport::stop_hover(data, deck_uuid, "Stop"))
     } else {
-        ("▶", "Play the playlist")
+        ("▶", "Play the playlist".to_string())
     };
     let mut button = egui::Button::new(
         egui::RichText::new(text)
@@ -49,16 +52,23 @@ pub(super) fn play_button(
             .color(egui::Color32::WHITE),
     )
     .min_size(size);
-    button = button.fill(if list.playing {
-        PLAYING_GREEN
-    } else {
+    button = button.fill(if !list.playing {
         egui::Color32::from_black_alpha(170)
+    } else if super::transport::stopping(data, deck_uuid) {
+        super::transport::FADING_AMBER
+    } else {
+        PLAYING_GREEN
     });
     let response = ui.add(button).on_hover_text(hover);
-    if response.clicked() {
+    if list.playing {
+        if response.clicked() {
+            super::transport::stop(actions, deck_uuid);
+        }
+        super::transport::stop_menu(&response, data, actions);
+    } else if response.clicked() {
         actions.commands.push(EngineCommand::SetPlaylistPlaying {
             deck_uuid: deck_uuid.to_string(),
-            playing: !list.playing,
+            playing: true,
         });
     }
     response
@@ -89,6 +99,7 @@ pub(super) fn overlay_on_picture(
     ui: &mut egui::Ui,
     picture: egui::Rect,
     ch: &ChannelUIInfo,
+    data: &UIData,
     actions: &mut UIActions,
 ) {
     let Some((deck, list)) = of_channel(ch) else {
@@ -105,7 +116,7 @@ pub(super) fn overlay_on_picture(
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
     row_ui.spacing_mut().item_spacing.x = 3.0;
-    play_button(&mut row_ui, &deck.uuid, list, size, actions);
+    play_button(&mut row_ui, &deck.uuid, list, size, data, actions);
     list_button(&mut row_ui, &deck.uuid, size);
     if let Some(text) = position_text(list) {
         row_ui.label(
@@ -139,7 +150,13 @@ fn clock(secs: f64) -> String {
 }
 
 /// ⏮ ▶/■ ⏭ in a row, for the window and the layer's settings.
-fn transport(ui: &mut egui::Ui, deck_uuid: &str, list: &PlaylistSnapshot, actions: &mut UIActions) {
+fn transport(
+    ui: &mut egui::Ui,
+    deck_uuid: &str,
+    list: &PlaylistSnapshot,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
     let size = egui::vec2(34.0, 26.0);
     let len = list.items.len();
     let step = |by: isize| -> Option<usize> {
@@ -159,7 +176,7 @@ fn transport(ui: &mut egui::Ui, deck_uuid: &str, list: &PlaylistSnapshot, action
         }
     };
     skip(ui, "⏮", "The item before", step(-1));
-    play_button(ui, deck_uuid, list, size, actions);
+    play_button(ui, deck_uuid, list, size, data, actions);
     skip(ui, "⏭", "The next item, now", step(1));
     if let Some(index) = picked {
         actions.commands.push(EngineCommand::ShowPlaylistItem {
@@ -226,7 +243,7 @@ pub(super) fn render_playlist_window(ctx: &egui::Context, data: &UIData, actions
         .default_size(egui::vec2(480.0, 460.0))
         .resizable(true)
         .collapsible(false)
-        .show(ctx, |ui| body(ui, &deck_uuid, list, actions));
+        .show(ctx, |ui| body(ui, &deck_uuid, list, data, actions));
     if let Some(window) = window {
         ctx.data_mut(|d| d.insert_temp(rect_id(), window.response.rect));
     }
@@ -235,9 +252,15 @@ pub(super) fn render_playlist_window(ctx: &egui::Context, data: &UIData, actions
     }
 }
 
-fn body(ui: &mut egui::Ui, deck_uuid: &str, list: &PlaylistSnapshot, actions: &mut UIActions) {
+fn body(
+    ui: &mut egui::Ui,
+    deck_uuid: &str,
+    list: &PlaylistSnapshot,
+    data: &UIData,
+    actions: &mut UIActions,
+) {
     ui.horizontal(|ui| {
-        transport(ui, deck_uuid, list, actions);
+        transport(ui, deck_uuid, list, data, actions);
         ui.add_space(8.0);
         let now = list
             .shown
@@ -475,12 +498,13 @@ fn items(ui: &mut egui::Ui, deck_uuid: &str, list: &PlaylistSnapshot, actions: &
 /// transport, and the window.
 pub(super) fn render_deck_column(
     ui: &mut egui::Ui,
+    data: &UIData,
     deck: &DeckUIInfo,
     list: &PlaylistSnapshot,
     actions: &mut UIActions,
 ) {
     ui.label(egui::RichText::new("Playlist").strong());
-    ui.horizontal(|ui| transport(ui, &deck.uuid, list, actions));
+    ui.horizontal(|ui| transport(ui, &deck.uuid, list, data, actions));
     let now = list
         .shown
         .and_then(|i| list.items.get(i))
@@ -764,6 +788,8 @@ mod tests {
         assert!(of_channel(&data.channels[1]).is_none());
     }
 
+    /// ▶ starts a stopped list; ■ stops a playing one as a Stop does, its
+    /// sound fading out first.
     #[test]
     fn play_starts_a_stopped_list_and_stop_stops_a_playing_one() {
         let deck = data(false).channels[0].decks[0].uuid.clone();
@@ -773,10 +799,14 @@ mod tests {
             EngineCommand::SetPlaylistPlaying { deck_uuid, playing: true } if *deck_uuid == deck
         )));
         let stopped = window(&data(true), "■");
-        assert!(stopped
-            .commands
-            .iter()
-            .any(|c| matches!(c, EngineCommand::SetPlaylistPlaying { playing: false, .. })));
+        assert!(
+            matches!(
+                stopped.commands.as_slice(),
+                [EngineCommand::StopWithFade { deck_uuid, secs: None }] if *deck_uuid == deck
+            ),
+            "{:?}",
+            stopped.commands
+        );
     }
 
     #[test]

@@ -476,6 +476,8 @@ impl HapPlayer {
         // replayed on every subsequent read, so the loop wrap would never
         // produce another packet.
         self.ictx.clear_eof();
+        // Counted when asked for, done or not (see `PlaybackState::seeks`).
+        self.playback.seeks = self.playback.seeks.wrapping_add(1);
         self.ictx.seek(ts, ..ts)?;
         self.playback.position = time_secs;
         Ok(())

@@ -113,7 +113,11 @@ impl MainTransition {
     /// evenly; the moving ones easing in and out — gathering speed, then
     /// settling — as vMix's do.
     pub fn eased(self, progress: f32) -> f32 {
-        let t = if progress.is_finite() { progress.clamp(0.0, 1.0) } else { 1.0 };
+        let t = if progress.is_finite() {
+            progress.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         match self {
             Self::Fade => t,
             _ if t < 0.5 => 4.0 * t * t * t,
@@ -153,6 +157,9 @@ pub struct MainSnapshot {
     pub transition: MainTransition,
     /// Overlay channels switched on, by UUID.
     pub overlays_on: Vec<String>,
+    /// Overlay channels showing now — on, or still fading out, and drawn
+    /// (their channel's opacity, as resolved, above 0) — by UUID, sorted.
+    pub overlays_showing: Vec<String>,
 }
 
 impl MainSnapshot {
@@ -164,6 +171,7 @@ impl MainSnapshot {
             fade_secs: main.fade_secs,
             transition: main.transition,
             overlays_on: main.overlays_on(),
+            overlays_showing: main.overlays_showing(),
         }
     }
 }
@@ -291,6 +299,19 @@ impl MainProgram {
         on
     }
 
+    /// The overlays showing now — on, or still fading out — by channel UUID,
+    /// sorted.
+    pub fn overlays_showing(&self) -> Vec<String> {
+        let mut showing: Vec<String> = self
+            .overlays
+            .iter()
+            .filter(|(_, l)| l.now > 0.0)
+            .map(|(u, _)| u.clone())
+            .collect();
+        showing.sort();
+        showing
+    }
+
     /// Put saved overlays back on, as a scene loads.
     pub fn restore_overlays(&mut self, on: &[String]) {
         self.overlays.clear();
@@ -387,7 +408,10 @@ mod tests {
         assert!((merge.eased(0.5) - 0.5).abs() < 1e-6);
         assert!(merge.eased(0.9) > 0.9, "settling");
         assert!((merge.eased(1.0) - 1.0).abs() < 1e-6 && merge.eased(0.0).abs() < 1e-6);
-        assert!((MainTransition::Fade.eased(0.3) - 0.3).abs() < 1e-6, "a fade evenly");
+        assert!(
+            (MainTransition::Fade.eased(0.3) - 0.3).abs() < 1e-6,
+            "a fade evenly"
+        );
     }
 
     /// A fade starts from its start on the first frame drawn after it is
@@ -424,14 +448,21 @@ mod tests {
             m.set_overlay("logo", false, true);
             m.tick(0.05);
         }
-        assert!(m.overlay_level("logo").abs() < 1e-6, "{}", m.overlay_level("logo"));
+        assert!(
+            m.overlay_level("logo").abs() < 1e-6,
+            "{}",
+            m.overlay_level("logo")
+        );
         m.set_overlay("logo", true, true);
         m.tick(0.0);
         for _ in 0..4 {
             m.set_overlay("logo", true, true);
             m.tick(0.25);
         }
-        assert!((m.overlay_level("logo") - 1.0).abs() < 1e-6, "on, said four times over");
+        assert!(
+            (m.overlay_level("logo") - 1.0).abs() < 1e-6,
+            "on, said four times over"
+        );
         m.tick(1.0);
         // How long an overlay has to go: its fade's time at its start, what
         // is left of it on the way, none when it is there.
@@ -443,7 +474,10 @@ mod tests {
         m.tick(0.5);
         assert!((m.overlay_settle_secs("logo") - 1.5).abs() < 1e-6);
         m.set_overlay("logo", true, true);
-        assert!((m.overlay_settle_secs("logo") - 0.5).abs() < 1e-6, "back the way it came");
+        assert!(
+            (m.overlay_settle_secs("logo") - 0.5).abs() < 1e-6,
+            "back the way it came"
+        );
         m.set_overlay("logo", true, false);
         assert!(m.overlay_settle_secs("logo").abs() < 1e-6);
         assert!(m.overlay_settle_secs("no such overlay").abs() < 1e-6);

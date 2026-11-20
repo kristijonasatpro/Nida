@@ -1,40 +1,86 @@
 use anyhow::{Context, Result};
 use shaderc::{Compiler, ShaderKind};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
-/// Compile GLSL fragment shader to SPIR-V
-///
-/// # Errors
-///
-/// Returns an error if the shaderc compiler or its compile options cannot be
-/// created, or if `glsl_source` fails to compile (the shaderc diagnostic is
-/// attached as context).
-pub fn compile_glsl_to_spirv(glsl_source: &str, shader_name: &str) -> Result<Vec<u32>> {
+// Adapted from Varda f0f727901e983b94a49832ff443e79c2ea41f570.
+// Keep full inputs, rather than just a source hash, so hash collisions cannot
+// return another shader's code. The name is also a shaderc input (e.g. __FILE__).
+#[derive(Hash, PartialEq, Eq)]
+struct CacheKey {
+    kind: u32,
+    source: String,
+    name: String,
+}
+
+impl CacheKey {
+    fn new(kind: ShaderKind, source: &str, name: &str) -> Self {
+        Self {
+            kind: kind as u32,
+            source: source.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+}
+
+type SpirvCache = HashMap<CacheKey, Vec<u32>>;
+
+// Like Varda, start over after 512 successful compilations. Hot reload creates
+// a new key per edit; old revisions must not accumulate for the entire session.
+const SPIRV_CACHE_LIMIT: usize = 512;
+
+fn spirv_cache() -> &'static Mutex<SpirvCache> {
+    static CACHE: OnceLock<Mutex<SpirvCache>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn compile_cached(
+    cache: &Mutex<SpirvCache>,
+    glsl_source: &str,
+    shader_name: &str,
+    kind: ShaderKind,
+) -> Result<Vec<u32>> {
+    let key = CacheKey::new(kind, glsl_source, shader_name);
+    if let Some(spirv) = cache.lock().ok().and_then(|c| c.get(&key).cloned()) {
+        return Ok(spirv);
+    }
+
+    // Compile outside the lock so unrelated shader builds can run in parallel.
+    // Racing misses may compile twice; each still returns its own valid result.
+    // A poisoned cache also falls back to compilation instead of breaking loads.
+    let spirv = compile_uncached(glsl_source, shader_name, kind)?;
+    if let Ok(mut cache) = cache.lock() {
+        if cache.len() >= SPIRV_CACHE_LIMIT && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, spirv.clone());
+    }
+    Ok(spirv)
+}
+
+fn compile_uncached(glsl_source: &str, shader_name: &str, kind: ShaderKind) -> Result<Vec<u32>> {
     let compiler = Compiler::new().context("Failed to create shaderc compiler")?;
-
     let mut options = shaderc::CompileOptions::new().context("Failed to create compile options")?;
-
-    // Set GLSL version to 330 (common for ISF shaders)
+    // These options and the entry point are fixed for all callers. If they
+    // become configurable, their values must also be part of CacheKey.
     options.set_source_language(shaderc::SourceLanguage::GLSL);
     options.set_target_env(
         shaderc::TargetEnv::Vulkan,
         shaderc::EnvVersion::Vulkan1_2 as u32,
     );
 
-    // Compile to SPIR-V
+    let what = if kind == ShaderKind::Compute {
+        "compute shader"
+    } else {
+        "shader"
+    };
     let binary_result = compiler
-        .compile_into_spirv(
-            glsl_source,
-            ShaderKind::Fragment,
-            shader_name,
-            "main",
-            Some(&options),
-        )
-        .with_context(|| format!("Failed to compile shader '{shader_name}'"))?;
+        .compile_into_spirv(glsl_source, kind, shader_name, "main", Some(&options))
+        .with_context(|| format!("Failed to compile {what} '{shader_name}'"))?;
 
-    // Check for warnings
     if binary_result.get_num_warnings() > 0 {
         log::warn!(
-            "Shader '{}' compiled with warnings:\n{}",
+            "{what} '{}' compiled with warnings:\n{}",
             shader_name,
             binary_result.get_warning_messages()
         );
@@ -43,43 +89,31 @@ pub fn compile_glsl_to_spirv(glsl_source: &str, shader_name: &str) -> Result<Vec
     Ok(binary_result.as_binary().to_vec())
 }
 
-/// Compile GLSL compute shader to SPIR-V
+/// Compile a GLSL fragment shader to SPIR-V, reusing successful compilations
+/// with identical source, shader name and stage within this process.
 ///
 /// # Errors
 ///
-/// Returns an error if the shaderc compiler or its compile options cannot be
-/// created, or if `glsl_source` fails to compile (the shaderc diagnostic is
-/// attached as context).
+/// Returns an error if shaderc cannot be set up or `glsl_source` fails to
+/// compile (the diagnostic is attached as context). Failures are not cached.
+pub fn compile_glsl_to_spirv(glsl_source: &str, shader_name: &str) -> Result<Vec<u32>> {
+    compile_cached(
+        spirv_cache(),
+        glsl_source,
+        shader_name,
+        ShaderKind::Fragment,
+    )
+}
+
+/// Compile a GLSL compute shader to SPIR-V, reusing successful compilations
+/// with identical source, shader name and stage within this process.
+///
+/// # Errors
+///
+/// Returns an error if shaderc cannot be set up or `glsl_source` fails to
+/// compile (the diagnostic is attached as context). Failures are not cached.
 pub fn compile_glsl_compute_to_spirv(glsl_source: &str, shader_name: &str) -> Result<Vec<u32>> {
-    let compiler = Compiler::new().context("Failed to create shaderc compiler")?;
-
-    let mut options = shaderc::CompileOptions::new().context("Failed to create compile options")?;
-
-    options.set_source_language(shaderc::SourceLanguage::GLSL);
-    options.set_target_env(
-        shaderc::TargetEnv::Vulkan,
-        shaderc::EnvVersion::Vulkan1_2 as u32,
-    );
-
-    let binary_result = compiler
-        .compile_into_spirv(
-            glsl_source,
-            ShaderKind::Compute,
-            shader_name,
-            "main",
-            Some(&options),
-        )
-        .with_context(|| format!("Failed to compile compute shader '{shader_name}'"))?;
-
-    if binary_result.get_num_warnings() > 0 {
-        log::warn!(
-            "Compute shader '{}' compiled with warnings:\n{}",
-            shader_name,
-            binary_result.get_warning_messages()
-        );
-    }
-
-    Ok(binary_result.as_binary().to_vec())
+    compile_cached(spirv_cache(), glsl_source, shader_name, ShaderKind::Compute)
 }
 
 /// Inject ISF automatic uniforms into GLSL source
@@ -180,6 +214,150 @@ pub fn generate_user_params_block(inputs: &[super::ISFInput]) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CACHE_FRAGMENT: &str = "#version 450
+layout(location = 0) out vec4 color;
+void main() { color = vec4(0.25, 0.5, 0.75, 1.0); }
+";
+    const CACHE_COMPUTE: &str = "#version 450
+layout(local_size_x = 1) in;
+void main() {}
+";
+
+    #[test]
+    fn cache_reuses_spirv_without_sharing_mutable_results() {
+        let cache = Mutex::new(SpirvCache::new());
+        let expected = compile_uncached(CACHE_FRAGMENT, "reuse", ShaderKind::Fragment).unwrap();
+        let mut first =
+            compile_cached(&cache, CACHE_FRAGMENT, "reuse", ShaderKind::Fragment).unwrap();
+        assert_eq!(first, expected);
+        first[0] = 0;
+        let second = compile_cached(&cache, CACHE_FRAGMENT, "reuse", ShaderKind::Fragment).unwrap();
+        assert_eq!(second, expected);
+        assert_eq!(cache.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cache_observes_edits_and_does_not_hide_compile_errors() {
+        let cache = Mutex::new(SpirvCache::new());
+        let first = compile_cached(&cache, CACHE_FRAGMENT, "edited", ShaderKind::Fragment).unwrap();
+        let edited = CACHE_FRAGMENT.replace("0.25", "0.875");
+        let changed = compile_cached(&cache, &edited, "edited", ShaderKind::Fragment).unwrap();
+        assert_ne!(first, changed);
+        assert_eq!(
+            changed,
+            compile_uncached(&edited, "edited", ShaderKind::Fragment).unwrap()
+        );
+        let invalid = CACHE_FRAGMENT.replace("void main()", "void broken(");
+        let error = compile_cached(&cache, &invalid, "edited", ShaderKind::Fragment).unwrap_err();
+        assert!(format!("{error:#}").contains("edited"));
+        assert_eq!(cache.lock().unwrap().len(), 2, "failures are not cached");
+        assert_eq!(
+            compile_cached(&cache, CACHE_FRAGMENT, "edited", ShaderKind::Fragment).unwrap(),
+            first,
+            "restoring the previous revision restores its compiled result"
+        );
+    }
+
+    #[test]
+    fn cache_keeps_shader_stages_separate() {
+        let cache = Mutex::new(SpirvCache::new());
+        compile_cached(&cache, CACHE_FRAGMENT, "stage", ShaderKind::Fragment).unwrap();
+        assert!(compile_cached(&cache, CACHE_FRAGMENT, "stage", ShaderKind::Compute).is_err());
+        let compute = compile_cached(&cache, CACHE_COMPUTE, "stage", ShaderKind::Compute).unwrap();
+        assert_eq!(
+            compute,
+            compile_uncached(CACHE_COMPUTE, "stage", ShaderKind::Compute).unwrap()
+        );
+        assert_eq!(
+            compile_cached(&cache, CACHE_COMPUTE, "stage", ShaderKind::Compute).unwrap(),
+            compute
+        );
+        assert_eq!(cache.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cache_keeps_shader_names_and_error_diagnostics_separate() {
+        let cache = Mutex::new(SpirvCache::new());
+        for name in ["first.fs", "second.fs"] {
+            assert_eq!(
+                compile_cached(&cache, CACHE_FRAGMENT, name, ShaderKind::Fragment).unwrap(),
+                compile_uncached(CACHE_FRAGMENT, name, ShaderKind::Fragment).unwrap()
+            );
+            let error =
+                compile_cached(&cache, "#error broken", name, ShaderKind::Fragment).unwrap_err();
+            assert!(format!("{error:#}").contains(name));
+        }
+        assert_eq!(cache.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cache_restarts_at_its_entry_limit_and_hits_do_not_evict() {
+        let cache = Mutex::new(SpirvCache::new());
+        let expected =
+            compile_cached(&cache, CACHE_FRAGMENT, "retained", ShaderKind::Fragment).unwrap();
+        {
+            let mut entries = cache.lock().unwrap();
+            for revision in 1..SPIRV_CACHE_LIMIT {
+                entries.insert(
+                    CacheKey::new(ShaderKind::Fragment, &revision.to_string(), "old"),
+                    expected.clone(),
+                );
+            }
+        }
+        assert_eq!(
+            compile_cached(&cache, CACHE_FRAGMENT, "retained", ShaderKind::Fragment).unwrap(),
+            expected
+        );
+        assert_eq!(cache.lock().unwrap().len(), SPIRV_CACHE_LIMIT);
+        let edited = CACHE_FRAGMENT.replace("0.25", "0.875");
+        let result = compile_cached(&cache, &edited, "retained", ShaderKind::Fragment).unwrap();
+        let entries = cache.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries.get(&CacheKey::new(ShaderKind::Fragment, &edited, "retained")),
+            Some(&result)
+        );
+    }
+
+    #[test]
+    fn cache_supports_concurrent_loads() {
+        let cache = Mutex::new(SpirvCache::new());
+        std::thread::scope(|scope| {
+            let builds: Vec<_> = (0..6)
+                .map(|_| {
+                    scope.spawn(|| {
+                        compile_cached(&cache, CACHE_FRAGMENT, "parallel", ShaderKind::Fragment)
+                            .unwrap()
+                    })
+                })
+                .collect();
+            let expected =
+                compile_uncached(CACHE_FRAGMENT, "parallel", ShaderKind::Fragment).unwrap();
+            for build in builds {
+                assert_eq!(build.join().unwrap(), expected);
+            }
+        });
+        assert_eq!(cache.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cache_poisoning_falls_back_to_compilation() {
+        let cache = Mutex::new(SpirvCache::new());
+        std::thread::scope(|scope| {
+            let _ = scope
+                .spawn(|| {
+                    let _guard = cache.lock().unwrap();
+                    panic!("poison the optional cache");
+                })
+                .join();
+        });
+        assert!(cache.is_poisoned());
+        assert_eq!(
+            compile_cached(&cache, CACHE_FRAGMENT, "poisoned", ShaderKind::Fragment).unwrap(),
+            compile_uncached(CACHE_FRAGMENT, "poisoned", ShaderKind::Fragment).unwrap()
+        );
+    }
 
     #[test]
     fn test_compile_simple_shader() {

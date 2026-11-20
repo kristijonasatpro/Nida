@@ -3,7 +3,7 @@
 use super::super::{widgets, EffectDrag, LibraryDrag, UIActions, UIData};
 use super::clipboard_menu;
 use super::utils::{
-    channel_color, render_effect_drag_ghost, render_effect_drag_handle, render_effect_drop_zone,
+    render_effect_drag_ghost, render_effect_drag_handle, render_effect_drop_zone,
 };
 use crate::engine::EngineCommand;
 use crate::modulation::DEFAULT_ASSIGNMENT_AMOUNT;
@@ -273,7 +273,7 @@ pub(super) fn render_channel_effect_detail(
         return;
     };
 
-    let accent = channel_color(ch_idx);
+    let accent = ch.accent();
     ui.horizontal(|ui| {
         ui.heading(egui::RichText::new(format!("🔮 {} Effects", ch.name)).color(accent));
 

@@ -9,7 +9,7 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
 async fn dispatch(state: &SharedState, cmd: EngineCommand) -> axum::response::Response {
@@ -27,7 +27,7 @@ pub struct MixModeBody {
     pub mode: crate::mixer::MixMode,
 }
 
-#[utoipa::path(put, path = "/api/main/mode", request_body = MixModeBody, responses((status = 200, body = CommandResult)), tag = "Main")]
+#[utoipa::path(put, path = "/api/main/mode", request_body = MixModeBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Main")]
 pub async fn set_mode(
     State(s): State<SharedState>,
     Json(b): Json<MixModeBody>,
@@ -40,12 +40,13 @@ pub async fn set_mode(
 pub struct TakeBody {
     /// `{"Channel": "<uuid>"}`, `{"Deck": "<uuid>"}` or `"Black"`.
     pub source: crate::mixer::MainSource,
-    /// Dissolve over the fade time rather than cut.
+    /// Take it with Main's transition (fade, merge, wipe, slide, zoom or
+    /// iris) over the fade time, rather than cut.
     #[serde(default)]
     pub fade: bool,
 }
 
-#[utoipa::path(post, path = "/api/main/take", request_body = TakeBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such channel or deck")), tag = "Main")]
+#[utoipa::path(post, path = "/api/main/take", request_body = TakeBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such channel or deck")), tag = "Main")]
 pub async fn take(State(s): State<SharedState>, Json(b): Json<TakeBody>) -> impl IntoResponse {
     dispatch(
         &s,
@@ -64,7 +65,7 @@ pub struct FadeTimeBody {
     pub secs: f32,
 }
 
-#[utoipa::path(put, path = "/api/main/fade-time", request_body = FadeTimeBody, responses((status = 200, body = CommandResult)), tag = "Main")]
+#[utoipa::path(put, path = "/api/main/fade-time", request_body = FadeTimeBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Main")]
 pub async fn set_fade_time(
     State(s): State<SharedState>,
     Json(b): Json<FadeTimeBody>,
@@ -79,7 +80,7 @@ pub struct TransitionBody {
 }
 
 /// What a take to Main that is not a cut does: fade, merge, wipe, slide, zoom or iris.
-#[utoipa::path(put, path = "/api/main/transition", request_body = TransitionBody, responses((status = 200, body = CommandResult)), tag = "Main")]
+#[utoipa::path(put, path = "/api/main/transition", request_body = TransitionBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Main")]
 pub async fn set_transition(
     State(s): State<SharedState>,
     Json(b): Json<TransitionBody>,
@@ -99,7 +100,7 @@ pub struct OverlayBody {
     pub overlay: bool,
 }
 
-#[utoipa::path(put, path = "/api/channels/{channel_uuid}/overlay", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = OverlayBody, responses((status = 200, body = CommandResult), (status = 404, description = "No such channel")), tag = "Main")]
+#[utoipa::path(put, path = "/api/channels/{channel_uuid}/overlay", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = OverlayBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 404, description = "No such channel")), tag = "Main")]
 pub async fn set_overlay(
     State(s): State<SharedState>,
     Path(channel_uuid): Path<String>,
@@ -123,7 +124,7 @@ pub struct OverlayOnBody {
     pub fade: bool,
 }
 
-#[utoipa::path(put, path = "/api/channels/{channel_uuid}/overlay-on", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = OverlayOnBody, responses((status = 200, body = CommandResult), (status = 400, description = "Not an overlay"), (status = 404, description = "No such channel")), tag = "Main")]
+#[utoipa::path(put, path = "/api/channels/{channel_uuid}/overlay-on", params(("channel_uuid" = String, Path, description = "Channel UUID")), request_body = OverlayOnBody, responses((status = 200, body = crate::usecases::api::ApiReply), (status = 400, description = "Not an overlay"), (status = 404, description = "No such channel")), tag = "Main")]
 pub async fn set_overlay_on(
     State(s): State<SharedState>,
     Path(channel_uuid): Path<String>,

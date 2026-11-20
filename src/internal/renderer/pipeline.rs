@@ -368,13 +368,45 @@ impl UnifiedPipeline {
         preprocessor_views: &[&wgpu::TextureView],
         user_params_buffer: Option<&wgpu::Buffer>,
     ) -> wgpu::BindGroup {
+        self.create_bind_group_with_uniforms(
+            device,
+            &self.uniform_buffer,
+            input_view,
+            pass_buffer_views,
+            imported_views,
+            preprocessor_views,
+            user_params_buffer,
+        )
+    }
+
+    /// The same, its uniforms read from `uniforms` — a buffer of the
+    /// caller's own, as large as [`ISFUniforms`] — not from the pipeline's
+    /// one: for a pass that is drawn later, with others of this pipeline
+    /// whose uniforms are not the same (see `Effect::apply_passes`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pipeline was built with `has_input_image` but `input_view`
+    /// is `None`.
+    // The bind group's parts are distinct GPU resources; no shared invariant to bundle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_bind_group_with_uniforms(
+        &self,
+        device: &wgpu::Device,
+        uniforms: &wgpu::Buffer,
+        input_view: Option<&wgpu::TextureView>,
+        pass_buffer_views: &[&wgpu::TextureView],
+        imported_views: &[&wgpu::TextureView],
+        preprocessor_views: &[&wgpu::TextureView],
+        user_params_buffer: Option<&wgpu::Buffer>,
+    ) -> wgpu::BindGroup {
         let mut entries = vec![];
         let mut next_binding: u32 = 0;
 
         // Binding 0: Uniforms
         entries.push(wgpu::BindGroupEntry {
             binding: next_binding,
-            resource: self.uniform_buffer.as_entire_binding(),
+            resource: uniforms.as_entire_binding(),
         });
         next_binding += 1;
 

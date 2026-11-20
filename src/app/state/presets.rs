@@ -376,6 +376,9 @@ impl VardaApp {
         at: Option<usize>,
         identity: Identity,
     ) -> anyhow::Result<String> {
+        // A talk that comes back with a layer pasted, or a preset loaded,
+        // is asked anew for its slide pictures.
+        self.forget_slide_pictures_of_talks_gone();
         Self::restore_deck_into_channel(
             config,
             ch_idx,
@@ -427,7 +430,11 @@ impl VardaApp {
         crate::scene::reidentify::deck(&mut config, &|uuid| always || taken.contains(uuid));
         let config = &config;
 
-        let mut deck = crate::persistence::restore_deck(
+        // An input that cannot be opened comes as it was, offline (see
+        // `persistence::offline_deck`): a pasted or duplicated offline layer,
+        // or a channel or preset holding one, keeps it rather than leaving it
+        // out.
+        let mut deck = match crate::persistence::restore_deck(
             config,
             context,
             registry,
@@ -439,7 +446,20 @@ impl VardaApp {
             html_manager,
             render_width,
             render_height,
-        )?;
+        ) {
+            Ok(deck) => deck,
+            Err(e) => {
+                log::warn!("{}", crate::persistence::offline_message(&config.name, &e));
+                crate::persistence::offline_deck(
+                    config,
+                    context,
+                    registry,
+                    &e,
+                    render_width,
+                    render_height,
+                )
+            }
+        };
         // Apply the preset's display name (overrides the generator/source name).
         if !config.name.is_empty() {
             deck.set_source_name(crate::persistence::label_now(&config.name));

@@ -784,7 +784,8 @@ fn collect_target_paths(data: &UIData) -> Vec<(String, String)> {
                 }
             }
         }
-        for d in &ch.decks {
+        // Front first, as the lists of a channel's layers.
+        for d in ch.decks.iter().rev() {
             out.push((
                 format!("{} · {} · opacity", ch.name, d.name),
                 format!("deck/{}/opacity", d.uuid),

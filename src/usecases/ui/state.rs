@@ -143,6 +143,57 @@ impl Default for UILayoutState {
     }
 }
 
+/// The channels by UUID, front to back as the mixer holds them, each with
+/// its decks' UUIDs: where a selection held by UUID is found again (see
+/// [`UILayoutState::reanchor`]).
+#[derive(Clone, Debug, Default)]
+pub struct ChannelOrder(Vec<(String, Vec<String>)>);
+
+impl ChannelOrder {
+    pub fn of(channels: &[crate::channel::Channel]) -> Self {
+        Self(
+            channels
+                .iter()
+                .map(|ch| {
+                    let decks = ch.decks.iter().map(|s| s.deck.uuid().to_string());
+                    (ch.uuid().to_string(), decks.collect())
+                })
+                .collect(),
+        )
+    }
+
+    fn channel_at(&self, ch: usize) -> Option<&str> {
+        self.0.get(ch).map(|(uuid, _)| uuid.as_str())
+    }
+
+    fn deck_at(&self, ch: usize, deck: usize) -> Option<&str> {
+        self.0.get(ch)?.1.get(deck).map(String::as_str)
+    }
+
+    fn channel(&self, uuid: &str) -> Option<usize> {
+        self.0.iter().position(|(u, _)| u == uuid)
+    }
+
+    /// Where the deck is: in its channel, else in whichever channel holds
+    /// it now (moved to another).
+    fn deck(&self, channel: &str, deck: &str) -> Option<(usize, usize)> {
+        let in_channel = |ch: usize| {
+            let at = self.0[ch].1.iter().position(|d| d == deck)?;
+            Some((ch, at))
+        };
+        self.channel(channel)
+            .and_then(in_channel)
+            .or_else(|| (0..self.0.len()).find_map(in_channel))
+    }
+}
+
+/// What the selection is on, by UUID (see [`UILayoutState::anchor`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SelectionAnchor {
+    channel: Option<String>,
+    deck: Option<(String, String)>,
+}
+
 /// Where a channel moved before another (or to the end) goes: its position
 /// now and after, in `order`. `None` when it is not there.
 pub fn move_target(order: &[String], uuid: &str, before: Option<&str>) -> Option<(usize, usize)> {
@@ -356,6 +407,38 @@ impl UILayoutState {
         }
     }
 
+    /// What the selection is on, by UUID: the channel, or the deck, at the
+    /// selected positions in `order`.
+    pub fn anchor(&self, order: &ChannelOrder) -> SelectionAnchor {
+        SelectionAnchor {
+            channel: self
+                .selected_channel
+                .and_then(|ch| order.channel_at(ch))
+                .map(str::to_string),
+            deck: self.selected_deck.and_then(|(ch, deck)| {
+                Some((
+                    order.channel_at(ch)?.to_string(),
+                    order.deck_at(ch, deck)?.to_string(),
+                ))
+            }),
+        }
+    }
+
+    /// Put the selection back on what `anchor` names, wherever that is in
+    /// `order` now. Selections are held by position, so after an undo, a
+    /// redo or the API reordering channels they would land on whichever
+    /// channel took that place — and the next take would send that one.
+    /// What is gone is no longer selected; a selection `anchor` does not
+    /// name, or one cleared since, is left as it is.
+    pub fn reanchor(&mut self, anchor: &SelectionAnchor, order: &ChannelOrder) {
+        if let (Some(uuid), Some(_)) = (&anchor.channel, self.selected_channel) {
+            self.selected_channel = order.channel(uuid);
+        }
+        if let (Some((channel, deck)), Some(_)) = (&anchor.deck, self.selected_deck) {
+            self.selected_deck = order.deck(channel, deck);
+        }
+    }
+
     /// Fix up selection indices after a channel is removed.
     pub fn fixup_channel_removal(&mut self, removed_ch: usize) {
         if let Some((sel_ch, _)) = self.selected_deck {
@@ -415,6 +498,89 @@ mod channel_move_tests {
         assert_eq!(layout.selected_deck, Some((2, 2)), "pushed along");
         layout.fixup_channel_move(0, 3);
         assert_eq!(layout.selected_deck, Some((1, 2)), "and back");
+    }
+
+    fn channels(of: &[(&str, &[&str])]) -> ChannelOrder {
+        ChannelOrder(
+            of.iter()
+                .map(|(ch, decks)| {
+                    let decks = decks.iter().map(|d| (*d).to_string()).collect();
+                    ((*ch).to_string(), decks)
+                })
+                .collect(),
+        )
+    }
+
+    /// Undo, redo or the API move channels under a selection held by
+    /// position: it is found again on the channel and deck it was on.
+    #[test]
+    fn the_selection_stays_on_what_it_was_on_wherever_that_goes() {
+        let before = channels(&[("a", &["a1"]), ("b", &["b1", "b2"]), ("c", &[])]);
+        let after = channels(&[("a", &["a1"]), ("c", &[]), ("b", &["b2", "b1"])]);
+        let mut layout = UILayoutState {
+            selected_channel: Some(1),
+            ..Default::default()
+        };
+        let anchor = layout.anchor(&before);
+        layout.reanchor(&anchor, &after);
+        assert_eq!(layout.selected_channel, Some(2), "still b");
+
+        let mut layout = UILayoutState {
+            selected_deck: Some((1, 0)),
+            ..Default::default()
+        };
+        let anchor = layout.anchor(&before);
+        layout.reanchor(&anchor, &after);
+        assert_eq!(layout.selected_deck, Some((2, 1)), "still b1");
+
+        let moved = channels(&[("a", &["a1", "b1"]), ("b", &["b2"]), ("c", &[])]);
+        let mut layout = UILayoutState {
+            selected_deck: Some((1, 0)),
+            ..Default::default()
+        };
+        let anchor = layout.anchor(&before);
+        layout.reanchor(&anchor, &moved);
+        assert_eq!(
+            layout.selected_deck,
+            Some((0, 1)),
+            "b1, moved into a, still"
+        );
+    }
+
+    /// A channel gone takes its selection with it; one never named, or
+    /// cleared since, is left alone.
+    #[test]
+    fn a_selection_gone_is_cleared_and_one_cleared_stays_so() {
+        let before = channels(&[("a", &[]), ("b", &["b1"])]);
+        let gone = channels(&[("a", &[])]);
+        let mut layout = UILayoutState {
+            selected_channel: Some(1),
+            selected_deck: Some((1, 0)),
+            ..Default::default()
+        };
+        let anchor = layout.anchor(&before);
+        layout.reanchor(&anchor, &gone);
+        assert_eq!(
+            (layout.selected_channel, layout.selected_deck),
+            (None, None)
+        );
+
+        let mut layout = UILayoutState {
+            selected_channel: Some(5),
+            ..Default::default()
+        };
+        let anchor = layout.anchor(&before);
+        layout.reanchor(&anchor, &gone);
+        assert_eq!(layout.selected_channel, Some(5), "not named: left");
+
+        let mut layout = UILayoutState {
+            selected_channel: Some(1),
+            ..Default::default()
+        };
+        let anchor = layout.anchor(&before);
+        layout.selected_channel = None;
+        layout.reanchor(&anchor, &before);
+        assert_eq!(layout.selected_channel, None, "cleared since: stays so");
     }
 
     #[test]

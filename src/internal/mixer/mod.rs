@@ -5,6 +5,17 @@ mod program;
 mod render;
 mod transition;
 
+#[cfg(test)]
+mod blank_tests;
+#[cfg(test)]
+mod kept_tests;
+#[cfg(test)]
+mod main_pass_tests;
+#[cfg(test)]
+mod main_through_tests;
+#[cfg(test)]
+mod still_tests;
+
 pub use program::{
     MainFade, MainProgram, MainSnapshot, MainSource, MainTransition, MixMode, DEFAULT_FADE_SECS,
 };
@@ -88,6 +99,16 @@ impl GpuTimingFrame {
         Some((begin, end))
     }
 
+    /// The pair handed out last is given back: its deck drew nothing, so
+    /// neither time stamp was written. Left handed out, the pair would be
+    /// read back holding whatever an earlier frame wrote there — another
+    /// draw's time, taken for this deck's.
+    pub fn release_last(&mut self) {
+        if self.allocations.pop().is_some() {
+            self.next_index -= 2;
+        }
+    }
+
     /// Number of queries actually written this frame.
     pub fn query_count(&self) -> u32 {
         self.next_index
@@ -139,9 +160,28 @@ pub struct FrameTiming {
 }
 
 /// How often a channel shown only as a tile in the control window is drawn:
-/// plenty for a thumbnail — a clock turns over once a second — at a third of
+/// plenty for a thumbnail — a clock turns over once a second — at a sixth of
 /// the cost of every frame at 60.
-pub const TILE_FPS: u32 = 20;
+pub const TILE_FPS: u32 = 10;
+
+/// Every how many frames a tile is drawn at `target_fps` (see [`TILE_FPS`]):
+/// rounded, so a 30 fps show draws tiles every third frame, not — 30 / 20
+/// rounding down to 1 — every frame.
+pub fn tile_every(target_fps: u32) -> u32 {
+    let fps = if target_fps == 0 { 60 } else { target_fps };
+    ((fps + TILE_FPS / 2) / TILE_FPS).max(1)
+}
+
+/// Whether a new mixer draws a slow deck less often when frames run late
+/// (see `Mixer::slow_layers_less_often`). A show does. A test build does
+/// not: a test draws its frames back to back with no frame's time to keep,
+/// and how long they take there says how busy the machine is with the
+/// other tests, not what the show costs — a deck's first draw taking
+/// 10 ms on a loaded machine left it undrawn the next frame, and a test
+/// reading its picture failed. A test of the rule turns it on.
+const fn slow_layers_less_often_by_default() -> bool {
+    !cfg!(any(test, feature = "test-fixtures"))
+}
 
 // The flags are unrelated render switches (visible parts, tiles, tap
 // state…), not one state enum.
@@ -290,14 +330,85 @@ pub struct Mixer {
     /// (see [`TILE_FPS`]) instead of not at all, which froze its tile until
     /// it was selected. Set by the app.
     pub tile_previews: bool,
+    /// The channels whose tiles are seen this frame (set by the app): an
+    /// off-air channel is drawn for its tile only while it is seen — with
+    /// fifty inputs, most off air and many scrolled away, the rest cost
+    /// nothing.
+    pub tile_channels: Vec<usize>,
+    /// The frame each channel was last drawn on, by UUID: one a seen tile
+    /// shows is drawn with it only if it has not been for a tile's while.
+    drawn_on: std::collections::HashMap<String, u32>,
     /// Draw each deck only where the opaque decks over it leave it showing
     /// (see [`crate::renderer::region`]). On by default; off draws every
     /// deck whole, as before, for comparing the two.
     pub draw_visible_parts: bool,
+    /// Draw a layer that is only its live source placed straight onto its
+    /// channel from that source (see `Channel::direct_layers`); off for
+    /// comparing (`SetCompositor`).
+    pub direct_layers: bool,
+    /// Draw a channel's blend-unit layers in one pass (see
+    /// `Channel::merge_layer_passes`); off for comparing.
+    pub merge_layer_passes: bool,
+    /// Draw a deck on Auto less often while the decks together run over a
+    /// frame's time (see `channel::auto_draws`), and then no covered deck
+    /// again for its thumbnail — one not drawn yet is drawn all the same
+    /// (see `channel::thumbnail_pick`). On in a show;
+    /// off in a test build (see [`slow_layers_less_often_by_default`]), and
+    /// off for comparing — a deck's own Rate, and leaving out what is not
+    /// seen, are as ever.
+    pub slow_layers_less_often: bool,
+    /// Leave a channel nothing of which shows — a lower third that is off —
+    /// undrawn, and off Main's layers, once it is drawn clear (see
+    /// `Channel::blank`); off draws it every frame, for comparing
+    /// (`SetCompositor`).
+    pub skip_blank_channels: bool,
+    /// Keep a lower third or a text standing still — a name on air, a text
+    /// shown, nothing of it moving — as it is drawn (see
+    /// `Deck::still_frame`); off draws it every frame, for comparing
+    /// (`SetCompositor`).
+    pub keep_still_text: bool,
+    /// Keep a clip's frame while the clip gives no new one — paused, or
+    /// between two of its frames in a show running faster (see
+    /// `Deck::still_frame`); off draws it every frame, for comparing
+    /// (`SetCompositor`).
+    pub keep_still_clips: bool,
+    /// Keep an input's picture while nothing it is made of changes (see
+    /// `Channel::keep_still_inputs`); off puts it together every frame,
+    /// for comparing (`SetCompositor`).
+    pub keep_still_inputs: bool,
+    /// Draw Main's bottom layer and each over it the blend unit composites
+    /// (Normal, Add, Screen, a dissolve's sum) in one render pass, which
+    /// loads and stores Main once — not once a layer (as
+    /// `Channel::merge_layer_passes` does for a channel's decks); off draws
+    /// each in a pass of its own, for comparing (`SetCompositor`).
+    pub merge_main_passes: bool,
+    /// Render passes the last frame's blend-unit layers of Main took (tests).
+    pub(crate) main_passes: u32,
+    /// Main that is one input, whole — at full level, with no master effect,
+    /// tone map, LUT or tap of Main after it — is that input's picture, so
+    /// hand that out as Main's (`composite_view`) and draw nothing: the pass
+    /// that copied it, over the whole frame, saved every frame the show is
+    /// one input with nothing over it. Off draws the pass, for comparing
+    /// (`SetCompositor`).
+    pub pass_main_through: bool,
+    /// The input's picture handed out as Main's since the last frame, when
+    /// that one was passed through (see `pass_main_through`).
+    main_through: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// Decks whose thumbnails the control window drew last frame, by UUID
+    /// (see `Channel::previewed`).
+    pub previewed_decks: Vec<String>,
     /// The order channels render in this frame, set by `prepare_taps`: a
     /// channel shown in another renders before it, so the other shows this
     /// frame's picture. Channel order everywhere else is unchanged.
     render_order: Vec<usize>,
+    /// The channels each channel's decks show (taps, a presenter view's
+    /// slides), set by `prepare_taps`: a channel drawn for what it shows
+    /// draws them too.
+    tap_shows: Vec<Vec<usize>>,
+    /// Channels read the frame before (a loop: one showing itself, or two
+    /// each other), set by `prepare_taps`: drawn every frame, their two
+    /// pictures swapped each frame.
+    tap_loops: std::collections::HashSet<usize>,
 
     /// GPU performance profiling: when > 0, insert device.poll(Wait) between
     /// GPU work stages to measure actual GPU drain time per category.
@@ -430,8 +541,24 @@ impl Mixer {
             decks_shown_alone: Vec::new(),
             frame_timing: FrameTiming::default(),
             tile_previews: false,
+            tile_channels: Vec::new(),
+            drawn_on: std::collections::HashMap::new(),
             draw_visible_parts: true,
+            direct_layers: true,
+            merge_layer_passes: true,
+            slow_layers_less_often: slow_layers_less_often_by_default(),
+            skip_blank_channels: true,
+            keep_still_text: true,
+            keep_still_clips: true,
+            keep_still_inputs: true,
+            merge_main_passes: true,
+            main_passes: 0,
+            pass_main_through: true,
+            main_through: None,
+            previewed_decks: Vec::new(),
             render_order: Vec::new(),
+            tap_shows: Vec::new(),
+            tap_loops: std::collections::HashSet::new(),
             query_set: if context.timestamp_supported {
                 Some(context.device.create_query_set(&wgpu::QuerySetDescriptor {
                     label: Some("GPU Timing QuerySet"),
@@ -495,6 +622,8 @@ impl Mixer {
             .effect_ping_texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         self.main_transitions.resized();
+        // Main's own, at the new size, until the next frame is drawn.
+        self.main_through = None;
 
         // Tap targets are dropped rather than resized; `sync_tap_targets`
         // reallocates them at the new size on the next frame.
@@ -527,10 +656,30 @@ impl Mixer {
             .map(|(i, ch)| (ch.uuid().to_string(), i))
             .collect();
         let mut master_tapped = false;
+        // Where each Slides layer is: a presenter view of one shows its
+        // picture, so draws after it, as a tap does.
+        let slides_at: std::collections::HashMap<String, usize> = self
+            .channels
+            .iter()
+            .enumerate()
+            .flat_map(|(i, ch)| {
+                ch.decks
+                    .iter()
+                    .filter(|slot| slot.deck.slides().is_some())
+                    .map(move |slot| (slot.deck.uuid().to_string(), i))
+            })
+            .collect();
         // The channels each channel's decks show.
         let mut shows: Vec<Vec<usize>> = vec![Vec::new(); self.channels.len()];
         for (at, channel) in self.channels.iter().enumerate() {
             for slot in &channel.decks {
+                if let Some(&shown) = slot
+                    .deck
+                    .presenter()
+                    .and_then(|p| slides_at.get(p.follows()))
+                {
+                    shows[at].push(shown);
+                }
                 match slot.deck.tap.as_ref().map(|t| &t.source) {
                     Some(crate::deck::TapSource::MasterProgram) => master_tapped = true,
                     Some(crate::deck::TapSource::Channel(uuid)) => {
@@ -565,6 +714,8 @@ impl Mixer {
         for (at, channel) in self.channels.iter_mut().enumerate() {
             channel.tapped = shows.iter().any(|shown| shown.contains(&at));
         }
+        self.tap_shows.clone_from(&shows);
+        self.tap_loops.clone_from(&late);
 
         // Cloned up front because binding borrows the channels mutably and so
         // cannot also read the channel that is being tapped.
@@ -579,6 +730,10 @@ impl Mixer {
             .iter()
             .map(|ch| ch.tap_view().cloned())
             .collect();
+        // And which picture each holds, as it will stand when the channel
+        // showing it is put together: after its own render this frame.
+        let pictures: Vec<std::sync::Arc<std::sync::atomic::AtomicU64>> =
+            self.channels.iter().map(Channel::picture).collect();
         let labels: Vec<(String, String)> = self
             .channels
             .iter()
@@ -590,6 +745,9 @@ impl Mixer {
                 let Some(tap) = slot.deck.tap.as_ref() else {
                     continue;
                 };
+                // Which picture it shows is told only of a channel drawn
+                // before this one: Main's, or one a frame late, is not.
+                let mut picture = None;
                 let (view, label) = match &tap.source {
                     crate::deck::TapSource::MasterProgram => {
                         (master_view.clone(), "Master Program".to_string())
@@ -597,6 +755,7 @@ impl Mixer {
                     crate::deck::TapSource::Channel(uuid) => {
                         let view = index.get(uuid).and_then(|&ch| {
                             if position[ch] < position[at] {
+                                picture = Some(std::sync::Arc::clone(&pictures[ch]));
                                 Some(live[ch].clone())
                             } else {
                                 before[ch].clone()
@@ -606,6 +765,7 @@ impl Mixer {
                     }
                 };
                 slot.deck.external_source_view = view;
+                slot.deck.tapped_picture = picture;
                 // Renaming a channel has to move the tap deck's label with it,
                 // and this is the only place that sees both.
                 let name = format!("🔁 {label}");
@@ -1026,8 +1186,19 @@ impl Mixer {
     }
 
     /// The composited output texture view (post-crossfade, post-master-effects, post-tonemap).
+    ///
+    /// The one input's own picture when the last frame passed it through
+    /// (see `pass_main_through`): ask every frame, do not keep it.
     pub fn composite_view(&self) -> &wgpu::TextureView {
-        &self.composite_view
+        self.main_through
+            .as_ref()
+            .map_or(&self.composite_view, |(_, view)| view)
+    }
+
+    /// Whether the last frame handed one input's picture out as Main's
+    /// (see `pass_main_through`).
+    pub fn main_passed_through(&self) -> bool {
+        self.main_through.is_some()
     }
 
     /// The composited output texture (post-crossfade, post-master-effects, post-tonemap).
@@ -1037,7 +1208,9 @@ impl Mixer {
     /// created with `COPY_SRC` (see `GpuContext::create_compositing_texture`).
     /// Used by render-correctness tests (see /spec/render-testing.md).
     pub fn composite_texture(&self) -> &wgpu::Texture {
-        &self.composite_texture
+        self.main_through
+            .as_ref()
+            .map_or(&self.composite_texture, |(texture, _)| texture)
     }
 
     /// Current tonemap mode.
@@ -1325,6 +1498,13 @@ fn channel_name(index: usize) -> String {
     format!("Ch {index}")
 }
 
+/// Whether `name` is one a channel was given when made ("Ch 25"), not one
+/// it was named: its number counts every channel ever made, not where it is.
+pub fn is_default_channel_name(name: &str) -> bool {
+    name.strip_prefix("Ch ")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// The order to render channels in, given the channels each one's decks
 /// show: every channel after the ones it shows, otherwise as they stand.
 /// Round a loop no order can do that, so the loop's first channel found goes
@@ -1524,6 +1704,25 @@ mod tests {
         assert_eq!(channel_name(42), "Ch 42");
     }
 
+    /// The name a channel is made with is told from one it was given.
+    #[test]
+    fn a_made_name_is_told_from_a_given_one() {
+        for made in [channel_name(0), channel_name(25)] {
+            assert!(is_default_channel_name(&made), "{made}");
+        }
+        for given in [
+            "Ch A",
+            "Ch ",
+            "Ch 2a",
+            "Ch 25 talk",
+            "Camera",
+            "1_Forward",
+            "",
+        ] {
+            assert!(!is_default_channel_name(given), "{given:?}");
+        }
+    }
+
     // ── Mixer-level DnD data model tests ─────────────────────────────
     //
     // Tests for cross-channel deck moves and master effect reordering,
@@ -1540,6 +1739,15 @@ mod tests {
         let gpu = headless_gpu();
         let mixer = Mixer::new(&gpu, 64, 64).unwrap();
         assert_eq!(mixer.channel_count(), 2);
+    }
+
+    /// A test's mixer draws no deck less often for being slow (see
+    /// `slow_layers_less_often_by_default`).
+    #[test]
+    fn a_tests_mixer_does_not_draw_slow_decks_less_often() {
+        let gpu = headless_gpu();
+        let mixer = Mixer::new(&gpu, 64, 64).unwrap();
+        assert!(!mixer.slow_layers_less_often);
     }
 
     #[test]
@@ -1684,6 +1892,91 @@ mod tests {
         );
     }
 
+    /// A channel shown in another (a tap) is drawn every frame while that
+    /// one is on air (or shown in one that is, down the chain); while all
+    /// that show it are off air it is drawn as a tile, as any off-air
+    /// channel is — not every frame for an input nobody sees.
+    #[test]
+    fn a_channel_shown_only_in_off_air_ones_is_drawn_as_a_tile() {
+        let gpu = headless_gpu();
+        let mut mixer = Mixer::new(&gpu, 64, 64).unwrap();
+        // Ch 1 a picture; Ch 2 shows Ch 1; Ch 3 shows Ch 2. All off air.
+        add_solid_deck_to(&mut mixer, &gpu, 1, [1.0, 0.0, 0.0, 1.0]);
+        let shows = |mixer: &mut Mixer, at: usize, of: usize| {
+            let uuid = mixer.channel(of).unwrap().uuid().to_string();
+            let tap = crate::deck::Deck::new_from_tap(
+                &gpu,
+                crate::deck::TapSource::Channel(uuid),
+                "tap",
+                64,
+                64,
+            )
+            .expect("tap deck");
+            mixer.channel_mut(at).unwrap().add_deck(tap);
+        };
+        let ch2 = mixer.add_channel(&gpu, 64, 64).unwrap();
+        let ch3 = mixer.add_channel(&gpu, 64, 64).unwrap();
+        shows(&mut mixer, ch2, 1);
+        shows(&mut mixer, ch3, ch2);
+        for ch in [1, ch2, ch3] {
+            mixer.channel_mut(ch).unwrap().opacity = 0.0;
+        }
+        mixer.tile_previews = true;
+        mixer.tile_channels = vec![1, ch2, ch3];
+        let every = tile_every(60);
+        let drawn = |mixer: &mut Mixer, frames: u32| {
+            let before = mixer.channel(1).unwrap().frames_drawn();
+            for _ in 0..frames {
+                mixer.prepare_taps(&gpu);
+                render_once(mixer, &gpu, &[]);
+            }
+            mixer.channel(1).unwrap().frames_drawn() - before
+        };
+        // (Its first picture drawn as soon as one is wanted.)
+        drawn(&mut mixer, every);
+        assert_eq!(
+            drawn(&mut mixer, every * 4),
+            4,
+            "shown only in off-air inputs: drawn as a tile"
+        );
+        // Ch 3 on air: it shows Ch 2, which shows Ch 1 — every frame.
+        mixer.channel_mut(ch3).unwrap().opacity = 1.0;
+        assert_eq!(
+            drawn(&mut mixer, every * 4),
+            every * 4,
+            "shown down the chain from an input on air: every frame"
+        );
+    }
+
+    /// A channel showing itself (a feedback loop), off air: drawn every
+    /// frame still, its two pictures swapping each frame — not as a tile,
+    /// which would show the two by turns.
+    #[test]
+    fn a_feedback_loop_off_air_is_drawn_every_frame() {
+        let gpu = headless_gpu();
+        let mut mixer = Mixer::new(&gpu, 64, 64).unwrap();
+        let ch = mixer.add_channel(&gpu, 64, 64).unwrap();
+        let uuid = mixer.channel(ch).unwrap().uuid().to_string();
+        let tap = crate::deck::Deck::new_from_tap(
+            &gpu,
+            crate::deck::TapSource::Channel(uuid),
+            "itself",
+            64,
+            64,
+        )
+        .expect("tap deck");
+        mixer.channel_mut(ch).unwrap().add_deck(tap);
+        mixer.channel_mut(ch).unwrap().opacity = 0.0;
+        mixer.tile_previews = true;
+        mixer.tile_channels = vec![ch];
+        let frames = tile_every(60) * 4;
+        for _ in 0..frames {
+            mixer.prepare_taps(&gpu);
+            render_once(&mut mixer, &gpu, &[]);
+        }
+        assert_eq!(mixer.channel(ch).unwrap().frames_drawn(), frames);
+    }
+
     /// With the control window showing every channel as a tile, an off-air
     /// channel is still drawn — a few times a second — so its tile does not
     /// freeze (a clock stood still until its channel was selected).
@@ -1692,13 +1985,27 @@ mod tests {
         let gpu = headless_gpu();
         let mut mixer = Mixer::new(&gpu, 64, 64).unwrap();
         add_solid_deck_to(&mut mixer, &gpu, 1, [1.0, 0.0, 0.0, 1.0]);
-        let every = 60 / TILE_FPS;
+        let every = tile_every(60);
         for _ in 0..every * 4 {
             render_once(&mut mixer, &gpu, &[]);
         }
-        assert_eq!(mixer.channel(1).unwrap().frames_drawn(), 0, "culled without tiles");
+        assert_eq!(
+            mixer.channel(1).unwrap().frames_drawn(),
+            0,
+            "culled without tiles"
+        );
 
+        // Tiles shown, but not this one (scrolled away): still not drawn.
         mixer.tile_previews = true;
+        for _ in 0..every * 4 {
+            render_once(&mut mixer, &gpu, &[]);
+        }
+        assert_eq!(
+            mixer.channel(1).unwrap().frames_drawn(),
+            0,
+            "its tile not seen"
+        );
+        mixer.tile_channels = vec![1];
         for _ in 0..every * 4 {
             render_once(&mut mixer, &gpu, &[]);
         }
@@ -1707,6 +2014,93 @@ mod tests {
             4,
             "drawn every {every} frames for its tile, not every frame nor never"
         );
+    }
+
+    /// An input only on Main — on no bus, tapped by nothing, its tile not
+    /// seen — is drawn every frame, as is the one cued (Preview): the big
+    /// monitors never show the tile rate (Max5 saw them stutter on the
+    /// 768aada2 kit while the outputs were smooth).
+    #[test]
+    fn an_input_on_main_and_the_cued_one_are_drawn_every_frame() {
+        let gpu = headless_gpu();
+        let mut mixer = Mixer::new(&gpu, 64, 64).unwrap();
+        add_solid_deck_to(&mut mixer, &gpu, 0, [1.0, 0.0, 0.0, 1.0]);
+        add_solid_deck_to(&mut mixer, &gpu, 1, [0.0, 1.0, 0.0, 1.0]);
+        mixer.set_mix_mode(MixMode::Program);
+        let on_main = mixer.channel(0).unwrap().uuid().to_string();
+        mixer.main_mut().take(MainSource::Channel(on_main), false);
+        mixer.tile_previews = true;
+        mixer.tile_channels = Vec::new();
+        let frames = tile_every(60) * 4;
+        for _ in 0..frames {
+            // Ch 2 cued: the Preview monitor shows it.
+            render_once(&mut mixer, &gpu, &[1]);
+        }
+        assert_eq!(
+            mixer.channel(0).unwrap().frames_drawn(),
+            frames,
+            "on Main: every frame"
+        );
+        assert_eq!(
+            mixer.channel(1).unwrap().frames_drawn(),
+            frames,
+            "cued: every frame"
+        );
+    }
+
+    /// An off-air input whose tile is seen, showing one whose tile is not:
+    /// the one shown is drawn on the seen tile's turns too — not frozen.
+    #[test]
+    fn a_seen_tile_draws_what_it_shows() {
+        let gpu = headless_gpu();
+        let mut mixer = Mixer::new(&gpu, 64, 64).unwrap();
+        add_solid_deck_to(&mut mixer, &gpu, 1, [1.0, 0.0, 0.0, 1.0]);
+        let ch2 = mixer.add_channel(&gpu, 64, 64).unwrap();
+        let uuid = mixer.channel(1).unwrap().uuid().to_string();
+        let tap = crate::deck::Deck::new_from_tap(
+            &gpu,
+            crate::deck::TapSource::Channel(uuid),
+            "tap",
+            64,
+            64,
+        )
+        .expect("tap deck");
+        mixer.channel_mut(ch2).unwrap().add_deck(tap);
+        for ch in [1, ch2] {
+            mixer.channel_mut(ch).unwrap().opacity = 0.0;
+        }
+        mixer.tile_previews = true;
+        // Only Ch 2's tile seen.
+        mixer.tile_channels = vec![ch2];
+        let every = tile_every(60);
+        for _ in 0..every * 4 {
+            mixer.prepare_taps(&gpu);
+            render_once(&mut mixer, &gpu, &[]);
+        }
+        assert_eq!(
+            mixer.channel(ch2).unwrap().frames_drawn(),
+            4,
+            "its tile's turns"
+        );
+        assert_eq!(
+            mixer.channel(1).unwrap().frames_drawn(),
+            4,
+            "what it shows drawn with it"
+        );
+    }
+
+    /// A tile is drawn ten times a second whatever the show's rate: every
+    /// sixth frame at 60, every third at 30 — not every frame (30 / 20
+    /// rounded down to 1 drew a 30 fps show's off-air inputs every frame).
+    #[test]
+    fn tiles_are_drawn_ten_times_a_second_at_any_rate() {
+        assert_eq!(tile_every(60), 6);
+        assert_eq!(tile_every(50), 5);
+        assert_eq!(tile_every(30), 3);
+        assert_eq!(tile_every(25), 3);
+        assert_eq!(tile_every(24), 2);
+        assert_eq!(tile_every(5), 1);
+        assert_eq!(tile_every(0), 6, "uncapped: as at 60");
     }
 
     #[test]

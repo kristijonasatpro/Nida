@@ -6,7 +6,7 @@ use axum::Json;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::engine::{CommandResult, EngineCommand};
+use crate::engine::EngineCommand;
 use crate::usecases::api::{command_response, SharedState};
 
 #[derive(Deserialize, ToSchema)]
@@ -33,7 +33,7 @@ pub struct BeatCrossfadeBody {
     pub beats: f32,
 }
 
-#[utoipa::path(put, path = "/api/mixer/crossfader", request_body = CrossfaderBody, responses((status = 200, body = CommandResult)), tag = "Mixer")]
+#[utoipa::path(put, path = "/api/mixer/crossfader", request_body = CrossfaderBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Mixer")]
 pub async fn set_crossfader(
     State(state): State<SharedState>,
     Json(body): Json<CrossfaderBody>,
@@ -47,7 +47,7 @@ pub async fn set_crossfader(
     }
 }
 
-#[utoipa::path(post, path = "/api/mixer/auto-crossfade", request_body = AutoCrossfadeBody, responses((status = 200, body = CommandResult)), tag = "Mixer")]
+#[utoipa::path(post, path = "/api/mixer/auto-crossfade", request_body = AutoCrossfadeBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Mixer")]
 pub async fn auto_crossfade(
     State(state): State<SharedState>,
     Json(body): Json<AutoCrossfadeBody>,
@@ -65,7 +65,7 @@ pub async fn auto_crossfade(
     }
 }
 
-#[utoipa::path(post, path = "/api/mixer/beat-crossfade", request_body = BeatCrossfadeBody, responses((status = 200, body = CommandResult)), tag = "Mixer")]
+#[utoipa::path(post, path = "/api/mixer/beat-crossfade", request_body = BeatCrossfadeBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Mixer")]
 pub async fn beat_crossfade(
     State(state): State<SharedState>,
     Json(body): Json<BeatCrossfadeBody>,
@@ -88,7 +88,7 @@ pub struct TonemapModeBody {
     pub mode: crate::renderer::tonemap::TonemapMode,
 }
 
-#[utoipa::path(put, path = "/api/mixer/tonemap", request_body = TonemapModeBody, responses((status = 200, body = CommandResult)), tag = "Mixer")]
+#[utoipa::path(put, path = "/api/mixer/tonemap", request_body = TonemapModeBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Mixer")]
 pub async fn set_tonemap_mode(
     State(state): State<SharedState>,
     Json(body): Json<TonemapModeBody>,
@@ -108,7 +108,7 @@ pub struct LoadLutBody {
     pub filename: String,
 }
 
-#[utoipa::path(put, path = "/api/mixer/lut", request_body = LoadLutBody, responses((status = 200, body = CommandResult)), tag = "Mixer")]
+#[utoipa::path(put, path = "/api/mixer/lut", request_body = LoadLutBody, responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Mixer")]
 pub async fn load_lut(
     State(state): State<SharedState>,
     Json(body): Json<LoadLutBody>,
@@ -124,7 +124,7 @@ pub async fn load_lut(
     }
 }
 
-#[utoipa::path(delete, path = "/api/mixer/lut", responses((status = 200, body = CommandResult)), tag = "Mixer")]
+#[utoipa::path(delete, path = "/api/mixer/lut", responses((status = 200, body = crate::usecases::api::ApiReply)), tag = "Mixer")]
 pub async fn unload_lut(State(state): State<SharedState>) -> impl IntoResponse {
     match state.send_command(EngineCommand::UnloadLut).await {
         Ok(result) => command_response(result),

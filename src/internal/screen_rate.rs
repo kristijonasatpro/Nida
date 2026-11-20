@@ -93,6 +93,9 @@ pub struct ScreenRate {
     /// again for [`TRY_AGAIN`].
     tried: Vec<(u32, u32, Instant)>,
     checked: Option<Instant>,
+    /// The show's rate as last looked at for: a new one is looked at at
+    /// once, not at the next couple of seconds' look.
+    asked_fps: Option<u32>,
     /// When the screen held was last set again (see [`AGAIN_AFTER`]).
     again_at: Option<Instant>,
     /// What sets a screen's rate, and what gives a screen back its own
@@ -109,6 +112,7 @@ impl Default for ScreenRate {
             held: None,
             tried: Vec::new(),
             checked: None,
+            asked_fps: None,
             again_at: None,
             set_rate,
             give_back,
@@ -134,7 +138,8 @@ impl ScreenRate {
         on: bool,
     ) -> Option<Kept> {
         let now = Instant::now();
-        if self.checked.is_some_and(|at| now < at + EVERY) {
+        let new_rate = self.asked_fps.replace(fps) != Some(fps);
+        if !new_rate && self.checked.is_some_and(|at| now < at + EVERY) {
             return None;
         }
         self.checked = Some(now);
@@ -387,6 +392,28 @@ mod tests {
         GIVEN_BACK.fetch_add(1, Ordering::SeqCst);
         GIVEN_BACK_SCREEN.store(display + 1, Ordering::SeqCst);
         true
+    }
+
+    /// A new show rate is looked at at once, not at the next couple of
+    /// seconds' look: the screen set to it straight away.
+    #[test]
+    fn a_new_show_rate_is_looked_at_at_once() {
+        // Its own setters: the counters above are other tests'.
+        let mut rate = ScreenRate {
+            set_rate: |_, fps| Ok(Some((120.0, f64::from(fps)))),
+            give_back: |_| true,
+            current_rate: |_| None,
+            ..ScreenRate::default()
+        };
+        assert!(matches!(
+            rate.keep(|| Some(3), || Some(Vec::new()), 60, true),
+            Some(Kept::Set { to, .. }) if to == 60.0
+        ));
+        assert_eq!(rate.keep(|| Some(3), || Some(Vec::new()), 60, true), None, "looked at just now");
+        assert!(matches!(
+            rate.keep(|| Some(3), || Some(Vec::new()), 30, true),
+            Some(Kept::Set { to, .. }) if to == 30.0
+        ), "a new rate: at once");
     }
 
     /// The control window's screen is set once, left alone while nothing

@@ -18,7 +18,7 @@ mod tests {
         let state = make_test_state();
         let (cmd_tx, mut cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
-        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(state)));
+        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state))));
 
         // Spawn a background task that processes commands
         tokio::spawn(async move {
@@ -36,11 +36,36 @@ mod tests {
         crate::usecases::api::runner::build_router(shared)
     }
 
+    /// A router whose engine records every command it is sent, answering Ok.
+    fn router_recording_commands() -> (
+        axum::Router,
+        std::sync::Arc<std::sync::Mutex<Vec<crate::engine::EngineCommand>>>,
+    ) {
+        let state = make_test_state();
+        let (cmd_tx, mut cmd_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = sent.clone();
+        tokio::spawn(async move {
+            while let Some((cmd, reply_tx)) = cmd_rx.recv().await {
+                log.lock().unwrap().push(cmd);
+                if let Some(tx) = reply_tx {
+                    let _ = tx.send(CommandResult::Ok);
+                }
+            }
+        });
+        let shared = SharedState {
+            command_tx: cmd_tx,
+            engine_state: std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state)))),
+        };
+        (crate::usecases::api::runner::build_router(shared), sent)
+    }
+
     fn router_with_state() -> axum::Router {
         let state = make_test_state();
         let shared = SharedState {
             command_tx: tokio::sync::mpsc::unbounded_channel().0,
-            engine_state: std::sync::Arc::new(std::sync::RwLock::new(Some(state))),
+            engine_state: std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state)))),
         };
         crate::usecases::api::runner::build_router(shared)
     }
@@ -203,7 +228,7 @@ mod tests {
         };
         let shared = SharedState {
             command_tx: tokio::sync::mpsc::unbounded_channel().0,
-            engine_state: std::sync::Arc::new(std::sync::RwLock::new(Some(state))),
+            engine_state: std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state)))),
         };
         let app = crate::usecases::api::runner::build_router(shared);
 
@@ -3355,7 +3380,7 @@ mod tests {
         let state = make_test_state();
         let (cmd_tx, mut cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
-        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(state)));
+        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state))));
         tokio::spawn(async move {
             while let Some((_cmd, reply_tx)) = cmd_rx.recv().await {
                 if let Some(tx) = reply_tx {
@@ -3377,7 +3402,7 @@ mod tests {
         let state = make_test_state();
         let (cmd_tx, mut cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
-        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(state)));
+        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state))));
         tokio::spawn(async move {
             while let Some((_cmd, reply_tx)) = cmd_rx.recv().await {
                 if let Some(tx) = reply_tx {
@@ -3399,7 +3424,7 @@ mod tests {
         let state = make_test_state();
         let (cmd_tx, mut cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
-        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(state)));
+        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state))));
         tokio::spawn(async move {
             while let Some((_cmd, reply_tx)) = cmd_rx.recv().await {
                 if let Some(tx) = reply_tx {
@@ -3420,7 +3445,7 @@ mod tests {
         let state = make_test_state();
         let (cmd_tx, mut cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
-        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(state)));
+        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state))));
         tokio::spawn(async move {
             while let Some((_cmd, reply_tx)) = cmd_rx.recv().await {
                 if let Some(tx) = reply_tx {
@@ -3495,7 +3520,7 @@ mod tests {
         let state = make_test_state();
         let (cmd_tx, cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
-        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(state)));
+        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state))));
         // Drop receiver immediately so sends fail
         drop(cmd_rx);
         let shared = SharedState {
@@ -3764,7 +3789,7 @@ mod tests {
         let state = make_test_state();
         let (cmd_tx, mut cmd_rx) =
             tokio::sync::mpsc::unbounded_channel::<crate::engine::CommandEnvelope>();
-        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(state)));
+        let engine_state = std::sync::Arc::new(std::sync::RwLock::new(Some(std::sync::Arc::new(state))));
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
         tokio::spawn(async move {
@@ -4071,5 +4096,248 @@ mod tests {
             .unwrap();
         let status = resp.status().as_u16();
         assert!((400..500).contains(&status), "Expected 4xx, got {status}");
+    }
+
+    // ── Audio processing routes ─────────────────────────────────────
+
+    /// A send's on alone is as it always was; a level or point goes as one
+    /// change, a level never turning the send on; a bus becomes a monitor mix.
+    #[tokio::test]
+    async fn a_sends_level_and_point_and_a_monitor_mix_are_set_from_the_body() {
+        use crate::engine::EngineCommand as C;
+        for (body, check) in [
+            (
+                serde_json::json!({"on": true}),
+                (|c: &C| matches!(c, C::SetAudioSend { on: true, .. })) as fn(&C) -> bool,
+            ),
+            (serde_json::json!({"gain_db": -6.0}), |c: &C| {
+                matches!(c, C::SetAudioSendSettings { on: None, gain_db: Some(g), mode: None, .. } if (*g + 6.0).abs() < 1e-6)
+            }),
+            (serde_json::json!({"on": false, "mode": "pre"}), |c: &C| {
+                matches!(c, C::SetAudioSendSettings { on: Some(false), gain_db: None, mode: Some(crate::audio_mix::SendMode::Pre), .. })
+            }),
+        ] {
+            let (app, sent) = router_recording_commands();
+            let (status, json) = put_json(app, "/api/audio-sources/mic1/sends/bus1", body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            let sent = sent.lock().unwrap();
+            assert!(sent.len() == 1 && check(&sent[0]), "{body}: {sent:?}");
+        }
+        let (app, sent) = router_recording_commands();
+        let (status, _) = put_json(app, "/api/audio-buses/bus1/pre-fader", serde_json::json!({"pre_fader": true})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(matches!(
+            &sent.lock().unwrap()[..],
+            [C::SetAudioBusPreFader { uuid, pre_fader: true }] if uuid == "bus1"
+        ));
+        for (body, room) in [
+            (serde_json::json!({"room": "room1"}), Some("room1")),
+            (serde_json::json!({"room": null}), None),
+            (serde_json::json!({}), None),
+        ] {
+            let (app, sent) = router_recording_commands();
+            let (status, _) = put_json(app, "/api/audio-buses/bus1/echo-room", body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(
+                matches!(
+                    &sent.lock().unwrap()[..],
+                    [C::SetAudioBusEchoRoom { uuid, room: r }] if uuid == "bus1" && r.as_deref() == room
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sources_de_esser_is_set_from_the_body() {
+        use crate::engine::EngineCommand as C;
+        let (app, sent) = router_recording_commands();
+        let (status, json) = put_json(
+            app,
+            "/api/audio-sources/mic1/de-esser",
+            serde_json::json!({"enabled": true, "hz": 7000.0, "threshold_db": -28.0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let sent = sent.lock().unwrap();
+        assert!(
+            matches!(&sent[..], [C::SetAudioSourceDeEsser { uuid, config }]
+                if uuid == "mic1" && config.enabled && (config.hz - 7000.0).abs() < 1e-3
+                    && (config.threshold_db + 28.0).abs() < 1e-6 && (config.range_db - 8.0).abs() < 1e-6),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sources_eq_is_set_whole_from_the_body() {
+        use crate::engine::EngineCommand as C;
+        let (app, sent) = router_recording_commands();
+        let (status, json) = put_json(
+            app,
+            "/api/audio-sources/mic1/eq",
+            serde_json::json!({"enabled": true, "bands": [
+                {"hz": 150.0, "gain_db": -3.0},
+                {"hz": 350.0},
+                {"hz": 3000.0, "gain_db": 2.0, "q": 1.5},
+                {"hz": 8000.0}
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let sent = sent.lock().unwrap();
+        assert!(
+            matches!(&sent[..], [C::SetAudioSourceEq { uuid, config }]
+                if uuid == "mic1" && config.enabled && (config.bands[2].gain_db - 2.0).abs() < 1e-6
+                    && (config.bands[2].q - 1.5).abs() < 1e-6 && config.bands[1].enabled),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sources_gate_is_set_whole_from_the_body() {
+        use crate::audio_mix::GateConfig;
+        use crate::engine::EngineCommand as C;
+        let (app, sent) = router_recording_commands();
+        let (status, json) = put_json(
+            app,
+            "/api/audio-sources/mic1/gate",
+            serde_json::json!({"enabled": true, "threshold_db": -45.0, "range_db": 12.0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let sent = sent.lock().unwrap();
+        assert!(
+            matches!(&sent[..], [C::SetAudioSourceGate { uuid, config }]
+                if uuid == "mic1" && *config == GateConfig { enabled: true, threshold_db: -45.0, range_db: 12.0, ..GateConfig::default() }),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sources_low_cut_is_set_whole_from_the_body() {
+        use crate::audio_mix::LowCutConfig;
+        use crate::engine::EngineCommand as C;
+        let (app, sent) = router_recording_commands();
+        let (status, json) = put_json(
+            app,
+            "/api/audio-sources/mic1/low-cut",
+            serde_json::json!({"enabled": true, "hz": 120.0, "slope_db": 12}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let sent = sent.lock().unwrap();
+        assert!(
+            matches!(&sent[..], [C::SetAudioSourceLowCut { uuid, config }]
+                if uuid == "mic1" && *config == LowCutConfig { enabled: true, hz: 120.0, slope_db: 12 }),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_speech_preset_sets_low_cut_leveler_and_compressor_in_that_order() {
+        use crate::audio_mix::{CompressorConfig, LevelerConfig, LowCutConfig};
+        use crate::engine::EngineCommand as C;
+        let (app, sent) = router_recording_commands();
+        let (status, json) = post_json(
+            app,
+            "/api/audio-sources/mic1/speech-preset",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let sent = sent.lock().unwrap();
+        assert!(
+            matches!(&sent[..], [
+                C::SetAudioSourceLowCut { config: low_cut, .. },
+                C::SetAudioSourceLeveler { config: leveler, .. },
+                C::SetAudioSourceCompressor { uuid, config: compressor },
+            ] if uuid == "mic1"
+                && *low_cut == LowCutConfig::speech()
+                && *leveler == LevelerConfig::speech()
+                && *compressor == CompressorConfig::speech()),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_buses_limiter_and_loudness_reset_have_routes() {
+        use crate::audio_mix::LimiterConfig;
+        use crate::engine::EngineCommand as C;
+        let (app, sent) = router_recording_commands();
+        let (status, _) = put_json(
+            app.clone(),
+            "/api/audio-buses/b1/limiter",
+            serde_json::json!({"enabled": false, "ceiling_db": -2.0, "release_ms": 200.0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_json(
+            app.clone(),
+            "/api/audio-buses/b1/loudness/reset",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_json(
+            app,
+            "/api/audio-buses/b1/meters/reset",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let sent = sent.lock().unwrap();
+        // Two resets apart: the loudness, and the held peak.
+        assert!(
+            matches!(&sent[..], [
+                C::SetAudioBusLimiter { uuid, config },
+                C::ResetAudioLoudness { uuid: loudness },
+                C::ResetAudioMeter { uuid: reset, bus: true },
+            ] if uuid == "b1" && loudness == "b1" && reset == "b1"
+                && *config == LimiterConfig { enabled: false, ceiling_db: -2.0, release_ms: 200.0 }),
+            "{sent:?}"
+        );
+    }
+
+    /// The screen or window a capture layer is pointed at is the body's: a
+    /// display by its name, with its identity when given, a window by its
+    /// app and title. A body with no target never reaches the engine.
+    #[tokio::test]
+    async fn a_captures_screen_or_window_is_picked_from_the_body() {
+        use crate::engine::EngineCommand as C;
+        use crate::scene::CaptureTargetConfig as T;
+        for (body, picked) in [
+            (
+                serde_json::json!({"target": {"kind": "display", "name": "Display 2"}}),
+                T::Display { name: "Display 2".into(), uuid: None },
+            ),
+            (
+                serde_json::json!({"target": {"kind": "display", "name": "Display 2", "uuid": "4k"}}),
+                T::Display { name: "Display 2".into(), uuid: Some("4k".into()) },
+            ),
+            (
+                serde_json::json!({"target": {"kind": "window", "app": "com.apple.Keynote", "title": "Opening"}}),
+                T::Window { app: "com.apple.Keynote".into(), title: "Opening".into() },
+            ),
+        ] {
+            let (app, sent) = router_recording_commands();
+            let (status, json) = put_json(app, "/api/decks/layer1/screen/target", body.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            let sent = sent.lock().unwrap();
+            assert!(
+                matches!(&sent[..], [C::SetScreenCaptureTarget { deck_uuid, target }]
+                    if deck_uuid == "layer1" && *target == picked),
+                "{body}: {sent:?}"
+            );
+        }
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"target": {"kind": "display"}}),
+            serde_json::json!({"target": {"kind": "screen", "name": "Display 2"}}),
+        ] {
+            let (app, sent) = router_recording_commands();
+            let (status, _) = put_json(app, "/api/decks/layer1/screen/target", body.clone()).await;
+            assert!(status.is_client_error(), "{body}: {status}");
+            assert!(sent.lock().unwrap().is_empty(), "{body}");
+        }
     }
 }

@@ -169,7 +169,7 @@ A copy is rebuilt from scratch rather than shared, so the two objects are indepe
 
 That last row is the one worth remembering: in the mixer a deck is a source, so a copy is a bare deck. On the timeline it is a source *and* a placement, so a copy plays at the same times as the original.
 
-A paste lands directly after whatever you right-clicked, or at the end when you use the container's own menu. A channel is pasted as a new channel at the end of the mixer. Copy and paste is the lightweight version of a preset: same result, no naming and no file. Reach for a [preset](04-performance.md#presets) when something should outlive the session.
+A paste lands directly after whatever you right-clicked — a layer just in front of it, so above it in the lists of layers, which show the layer in front first — or at the end (in front of all) when you use the container's own menu. A channel is pasted as a new channel at the end of the mixer. Copy and paste is the lightweight version of a preset: same result, no naming and no file. Reach for a [preset](04-performance.md#presets) when something should outlive the session.
 
 ---
 

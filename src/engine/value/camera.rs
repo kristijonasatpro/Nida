@@ -15,6 +15,14 @@ impl CameraMode {
     /// "1920×1080 60p". Rates come in whole frames, so NTSC's 59.94 arrives
     /// as 59 (and a camera at 59 is unheard of): those read as broadcast
     /// names them.
+    /// Its rate as the camera keeps it: 29 is 29.97, 59 is 59.94.
+    pub fn nominal_fps(&self) -> f64 {
+        match self.fps {
+            23 | 29 | 59 | 119 => f64::from(self.fps + 1) * 1000.0 / 1001.0,
+            fps => f64::from(fps),
+        }
+    }
+
     pub fn label(&self) -> String {
         let rate = match self.fps {
             23 => "23.98".to_string(),
@@ -54,6 +62,86 @@ pub struct CameraColour {
     pub range: CameraRange,
     #[serde(default)]
     pub matrix: CameraMatrix,
+}
+
+/// What a camera sends, as its frames say: their size, the rate they come
+/// at, how they are coded, and whether their darks keep to the range they
+/// are read in — shown in Input Settings (see `CameraManager::signal`).
+#[derive(
+    Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+pub struct CameraSignal {
+    pub width: u32,
+    pub height: u32,
+    /// Frames a second as they come; 0 until known.
+    pub fps: f64,
+    /// The rate it was opened at, as its format says — 29.97 as 29.97.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opened_fps: Option<f64>,
+    /// Its pixel format, as macOS names it: `2vuy`, `yuvs`, `420v`, `420f`,
+    /// `BGRA`.
+    pub format: String,
+    /// The colour matrix it is read with: its own tag, or what its size
+    /// implies.
+    pub matrix: String,
+    /// Read as full range — black at 0, white at 255 — rather than video
+    /// range (16–235); none for an RGB picture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_range: Option<bool>,
+    /// Of its brightness sampled lately, the share well below video black
+    /// (under 8 of 255).
+    pub below_black: f32,
+    /// Show frames since it opened that showed its picture before again,
+    /// none new having come in time, and its pictures left out, more
+    /// having come than were shown: at the show's rate a steady camera
+    /// does neither but now and then — a stutter shows here. A camera
+    /// slower than the show repeats by its nature.
+    #[serde(default)]
+    pub shown_again: u64,
+    #[serde(default)]
+    pub left_out: u64,
+}
+
+impl CameraSignal {
+    /// The share of brightness well below video black over which a picture
+    /// read as video range may well be full range: video keeps its darks
+    /// at 16 — some footroom and noise below it, not a fiftieth of the
+    /// picture under 8.
+    pub const BELOW_BLACK: f32 = 0.02;
+
+    /// Read as video range, its darks keep going well below video black:
+    /// the source may well be full range (an ATEM's USB picture, tagged
+    /// video range), read so with its shadows crushed and whites clipped.
+    pub fn looks_full_range(&self) -> bool {
+        self.full_range == Some(false) && self.below_black > Self::BELOW_BLACK
+    }
+
+    /// The rate its frames come at, when other than the one it was opened at
+    /// by more than 2% — a source sending 50 fps to a camera opened for 60.
+    pub fn other_rate(&self) -> Option<f64> {
+        let opened = self.opened_fps.filter(|fps| *fps > 0.0)?;
+        (self.fps > 0.0 && (self.fps - opened).abs() > opened * 0.02).then_some(self.fps)
+    }
+
+    /// One line for the operator: `1920×1080 · 59.94 fps · 2vuy · BT.709 ·
+    /// video range`.
+    pub fn summary(&self) -> String {
+        let mut parts = vec![format!("{}×{}", self.width, self.height)];
+        if self.fps > 0.0 {
+            parts.push(format!("{:.2} fps", self.fps));
+        }
+        parts.push(self.format.clone());
+        parts.push(self.matrix.clone());
+        parts.push(
+            match self.full_range {
+                Some(true) => "full range",
+                Some(false) => "video range",
+                None => "RGB",
+            }
+            .into(),
+        );
+        parts.join(" · ")
+    }
 }
 
 impl CameraColour {
@@ -268,6 +356,74 @@ pub fn default_mode(modes: &[CameraMode]) -> Option<CameraMode> {
 
 #[cfg(test)]
 mod tests {
+    use super::CameraSignal;
+
+    fn signal() -> CameraSignal {
+        CameraSignal {
+            width: 1920,
+            height: 1080,
+            fps: 59.94,
+            opened_fps: Some(60.0),
+            format: "2vuy".into(),
+            matrix: "BT.709".into(),
+            full_range: Some(false),
+            below_black: 0.0,
+            shown_again: 0,
+            left_out: 0,
+        }
+    }
+
+    /// A camera read as video range whose darks keep going below video
+    /// black is taken for full range; one keeping to it, or read as full
+    /// already, or RGB, is not.
+    #[test]
+    fn darks_below_video_black_read_as_video_range_look_full_range() {
+        assert!(!signal().looks_full_range(), "darks kept to video black");
+        let mut crushed = signal();
+        crushed.below_black = 0.05;
+        assert!(crushed.looks_full_range());
+        crushed.full_range = Some(true);
+        assert!(!crushed.looks_full_range(), "read as full already");
+        crushed.full_range = None;
+        assert!(!crushed.looks_full_range(), "RGB");
+        let mut noise = signal();
+        noise.below_black = 0.01;
+        assert!(!noise.looks_full_range(), "footroom and noise below black");
+    }
+
+    /// Frames at another rate than the camera was opened for, by more than
+    /// 2%, are told; 59.94 for 60 is not another rate.
+    #[test]
+    fn frames_at_another_rate_than_opened_are_told() {
+        assert_eq!(signal().other_rate(), None, "59.94 for 60");
+        let mut fifty = signal();
+        fifty.fps = 50.0;
+        assert_eq!(fifty.other_rate(), Some(50.0));
+        fifty.opened_fps = None;
+        assert_eq!(
+            fifty.other_rate(),
+            None,
+            "opened at its best: no rate asked"
+        );
+        let mut unknown = signal();
+        unknown.fps = 0.0;
+        assert_eq!(unknown.other_rate(), None, "rate not known yet");
+        let mut ntsc = signal();
+        (ntsc.fps, ntsc.opened_fps) = (29.97, Some(30_000.0 / 1001.0));
+        assert_eq!(ntsc.other_rate(), None, "29.97 opened as 29.97");
+        (ntsc.fps, ntsc.opened_fps) = (23.976, Some(24_000.0 / 1001.0));
+        assert_eq!(ntsc.other_rate(), None, "23.976 opened as 23.976");
+    }
+
+    /// The signal in one line.
+    #[test]
+    fn a_signal_reads_as_one_line() {
+        assert_eq!(
+            signal().summary(),
+            "1920×1080 · 59.94 fps · 2vuy · BT.709 · video range"
+        );
+    }
+
     use super::*;
 
     fn m(width: u32, height: u32, fps: u32) -> CameraMode {

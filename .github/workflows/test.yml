@@ -63,6 +63,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential cmake pkg-config \
+            ffmpeg \
             libvulkan-dev \
             libsrt-gnutls-dev \
             libasound2-dev \
@@ -78,6 +79,12 @@ jobs:
 
       - name: Select FFmpeg 9 SDK
         uses: ./.github/actions/linux-ffmpeg
+      # The audio-header and sound-only tests create media with these tools;
+      # the development libraries above do not install the executables.
+      - name: Verify FFmpeg tools
+        run: |
+          ffmpeg -version
+          ffprobe -version
 
       # GitHub runners have no GPU. lavapipe (Mesa's software Vulkan
       # implementation) provides the headless adapter that the render, engine,

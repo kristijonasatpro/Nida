@@ -10,8 +10,8 @@ pub mod routes;
 pub mod runner;
 pub mod ws;
 
-use crate::engine::{CommandEnvelope, CommandResult, EngineCommand, EngineState, ErrorCode};
-use std::sync::{Arc, RwLock};
+use crate::engine::{CommandEnvelope, CommandResult, EngineCommand, ErrorCode};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Shared state passed to all route handlers via axum's `State` extractor.
@@ -23,7 +23,7 @@ pub struct SharedState {
     /// Send commands to the engine. The engine processes them once per frame.
     pub command_tx: mpsc::UnboundedSender<CommandEnvelope>,
     /// Read the latest engine state snapshot (updated each frame by `publish_state`).
-    pub engine_state: Arc<RwLock<Option<EngineState>>>,
+    pub engine_state: Arc<crate::engine::types::PublishedState>,
 }
 
 impl SharedState {
@@ -40,6 +40,25 @@ impl SharedState {
             .map_err(|_| "Engine channel closed")?;
         rx.await.map_err(|_| "Engine dropped reply channel")
     }
+}
+
+/// What a route that sends the engine a command answers over HTTP.
+///
+/// Done: `200` with `{"status": "ok"}`, and `uuid` when the command made
+/// something, `data` when it reports something. Refused by the engine: `400`,
+/// `404`, `500` or `503` with `{"error": "invalid_input" | "not_found" |
+/// "internal" | "unavailable", "message": "…"}`. A request that cannot be read
+/// (bad JSON, a missing field, no JSON content type) gets a plain-text `400`,
+/// `415` or `422` instead, and a few routes answer some failures in plain text.
+#[derive(utoipa::ToSchema)]
+pub struct ApiReply {
+    /// `"ok"`.
+    #[schema(example = "ok")]
+    pub status: String,
+    /// The UUID of what the command made, when it made something.
+    pub uuid: Option<String>,
+    /// What the command reports, when it reports something.
+    pub data: Option<serde_json::Value>,
 }
 
 /// Map a `CommandResult` to an axum HTTP response.

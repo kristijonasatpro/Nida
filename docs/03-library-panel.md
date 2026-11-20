@@ -85,7 +85,7 @@ The **resolution selector** is not in the Library — it lives in the **deck det
 
 ## Screen Capture
 
-The **🖥 Screen Capture** section lists capturable displays and windows, split into **Displays** and **Windows** groups. Drag either onto a channel to create a live capture deck. Hovering a row shows the target's pixel size.
+The **🖥 Screen Capture** section lists capturable displays and windows, split into **Displays** and **Windows** groups. Drag either onto a channel to create a live capture deck. Hovering a row shows the target's pixel size. A capture comes at the screen's or window's own pixels (two to each point on a Retina or scaled screen), up to the show's size, and follows the show's size when it is changed.
 
 - **🔄 Rescan** re-enumerates targets. The list is never polled in the background, because window lists change every time you switch apps, so press Rescan after opening or closing the app you want.
 - Nida's own windows are labeled `(Nida)` and tinted, so self-capture is deliberate rather than accidental.

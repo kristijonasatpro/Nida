@@ -466,7 +466,88 @@ pub fn render_params<S: std::hash::BuildHasher>(
                     }
                 });
             }
-            _ => {} // Long, Point2D — not yet handled
+            ParamValue::Long(v) => {
+                let any_learn_active = midi_learn_active || keyboard_learn_active;
+                // A list setting (a palette, a style) is a menu of its
+                // choices by name; one without a list a whole number in its
+                // range. In learn mode it is disabled, a click on it picking
+                // it as the mapping target, as a slider is.
+                let rect = ui
+                    .horizontal(|ui| {
+                        let name = ui.label(egui::RichText::new(label).small());
+                        ui.add_enabled_ui(!any_learn_active, |ui| {
+                            if let Some(choices) = &param.choices {
+                                let shown = choices
+                                    .iter()
+                                    .find(|(n, _)| *n == v)
+                                    .map_or_else(|| v.to_string(), |(_, name)| name.clone());
+                                egui::ComboBox::from_id_salt(format!(
+                                    "long_{}_{}",
+                                    id_prefix, param.name
+                                ))
+                                .selected_text(shown)
+                                .show_ui(ui, |ui| {
+                                    for (n, name) in choices {
+                                        if ui.selectable_label(*n == v, name).clicked() && *n != v {
+                                            commands.push(make_update(
+                                                &param.name,
+                                                ParamValue::Long(*n),
+                                            ));
+                                        }
+                                    }
+                                })
+                                .response
+                                .labelled_by(name.id)
+                                .rect
+                            } else {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let range = param.min.map_or(i32::MIN, |m| m as i32)
+                                    ..=param.max.map_or(i32::MAX, |m| m as i32);
+                                let mut n = v;
+                                let response = ui
+                                    .add(egui::DragValue::new(&mut n).range(range))
+                                    .labelled_by(name.id);
+                                // A held drag is a single undo gesture.
+                                if response.dragged() {
+                                    *gesture_active = true;
+                                }
+                                if response.changed() {
+                                    commands.push(make_update(&param.name, ParamValue::Long(n)));
+                                }
+                                response.rect
+                            }
+                        })
+                        .inner
+                    })
+                    .inner;
+                if let Some(prefix) = midi_learn_path_prefix {
+                    let path = format!("{}/param/{}", prefix, param.name);
+                    if midi_learn_active {
+                        if midi_learn_target.is_some_and(|t| t == path) {
+                            draw_midi_learn_selected(ui, rect);
+                        } else {
+                            draw_midi_learn_glow(ui, rect);
+                        }
+                        let click_id = ui.id().with(("midi_learn_param", &param.name));
+                        if ui.interact(rect, click_id, egui::Sense::click()).clicked() {
+                            *midi_learn_select = Some(path.clone());
+                        }
+                    }
+                    if keyboard_learn_active {
+                        if keyboard_learn_target.is_some_and(|t| t == path) {
+                            draw_keyboard_learn_selected(ui, rect);
+                        } else {
+                            draw_keyboard_learn_glow(ui, rect);
+                        }
+                        let click_id = ui.id().with(("kb_learn_param", &param.name));
+                        if ui.interact(rect, click_id, egui::Sense::click()).clicked() {
+                            *keyboard_learn_select =
+                                Some(crate::keymap::KeyTarget::ParamPath(path));
+                        }
+                    }
+                }
+            }
+            ParamValue::Point2D(_) => {} // not yet handled
         }
     }
 }

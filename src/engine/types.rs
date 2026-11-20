@@ -61,12 +61,14 @@ pub enum ClipboardSource {
 
 /// Where a paste lands.
 ///
-/// The `After*` forms are what a right-click uses, so a copy arrives directly
-/// below the thing the menu was opened on; the `Into*` forms append, which is
-/// what the container's own menu and an API caller mean.
+/// The `After*` forms are what a right-click uses, so a copy arrives next to
+/// the thing the menu was opened on — a deck's just after it in its
+/// channel's stack, in front of it, which the lists of layers show above
+/// it; the `Into*` forms append, which is what the container's own menu and
+/// an API caller mean.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum PasteTarget {
-    /// This deck's channel, directly below it.
+    /// This deck's channel, just after it in the stack: in front of it.
     AfterDeck(String),
     /// The end of this channel.
     IntoChannel(String),
@@ -161,10 +163,30 @@ pub struct PacingSnapshot {
     /// The control window's last slow frames, part by part.
     #[serde(default)]
     pub control_slow_frames: Vec<SlowFrame>,
+    /// How often the control window is drawn, and why.
+    #[serde(default)]
+    pub control_rate: ControlRateStats,
+    /// The channels whose tiles the control window (and its panels'
+    /// windows) shows now, by index: an off-air one is drawn for its tile
+    /// only while it is seen.
+    #[serde(default)]
+    pub tiles_seen: Vec<usize>,
     /// How busy the GPU is (0–100), as the OS reports it (macOS: the
     /// accelerator's "Device Utilization %"); absent where it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_busy_pct: Option<f32>,
+    /// Nida's own share of the GPU (0–100), as Activity Monitor shows it
+    /// (macOS: its clients' accumulated GPU time); absent where unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_app_pct: Option<f32>,
+    /// Nida's own memory in bytes, as Activity Monitor's Memory column
+    /// (its physical footprint); absent where unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footprint_bytes: Option<u64>,
+    /// How the control window's Main and Preview monitors stepped through
+    /// the show's frames (see `monitor_frames`).
+    #[serde(default)]
+    pub control_monitors: ControlMonitorsStats,
     /// Where Nida's GPU time went over the last second, by part of the app
     /// (macOS: when each command buffer ran on the GPU); absent elsewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,12 +268,28 @@ pub struct SlowFrame {
     pub at_secs: f64,
     /// From the start of the frame before.
     pub interval_ms: f32,
+    /// Of that, from the end of the frame before to this one's start: time
+    /// that is no part of either frame.
+    pub between_ms: f32,
     /// From the refresh that called for it to its start, when a screen's
     /// refresh starts frames.
     pub start_delay_ms: Option<f32>,
     /// From its start to its end.
     pub busy_ms: f32,
-    /// Its parts over 0.3 ms, in the order spent.
+    /// Its parts of 0.3 ms or more, in the order spent.
+    pub parts: Vec<FramePart>,
+    /// The frame before, when this one came or started late, less than a
+    /// second after that one started, and that one was not slow itself (a
+    /// slow one is a slow frame of its own).
+    pub before: Option<FrameBefore>,
+}
+
+/// The frame before a slow one.
+#[derive(Clone, Debug, Default, Serialize, utoipa::ToSchema)]
+pub struct FrameBefore {
+    /// From its start to its end.
+    pub busy_ms: f32,
+    /// Its parts of 0.3 ms or more, in the order spent; not its start delay.
     pub parts: Vec<FramePart>,
 }
 
@@ -294,6 +332,52 @@ pub struct ControlQueueStats {
     pub waiting: u64,
 }
 
+/// How a monitor of the control window stepped through the show's frames,
+/// since Nida started: each window frame it picked one for, the next frame
+/// — or the same again (no newer one yet: a window faster than the show,
+/// or the show held up), or one or more skipped (the window drawn less
+/// often than the show, as while the show stands still). Counted as
+/// picked: a window frame given up before it was drawn (rare) counts too.
+#[derive(Clone, Copy, Debug, Default, Serialize, utoipa::ToSchema)]
+pub struct MonitorSteps {
+    /// Window frames it picked a frame for.
+    pub shown: u64,
+    /// Window frames it picked the same frame as the one before.
+    pub same_as_last: u64,
+    /// Window frames it skipped frames to (one count each, however many).
+    pub skipped: u64,
+}
+
+/// The Main and Preview monitors' steps.
+#[derive(Clone, Copy, Debug, Default, Serialize, utoipa::ToSchema)]
+pub struct ControlMonitorsStats {
+    pub main: MonitorSteps,
+    pub preview: MonitorSteps,
+}
+
+/// How often the control window is drawn, and why (see
+/// `app::state::ui_motion`).
+#[derive(Clone, Debug, Default, Serialize, utoipa::ToSchema)]
+pub struct ControlRateStats {
+    /// What moves in the show: `pictures` (drawn every frame), `sound`
+    /// (about 30 a second), `still` (about 15 a second).
+    pub motion: String,
+    /// The first thing found moving, said for a person ("'CAM' in 'Camera'
+    /// moves", "a meter above -60 dBFS"); absent when the show stands still.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// The wait between the window's frames now, milliseconds: 0 is every
+    /// frame.
+    pub period_ms: f32,
+    /// A hand on the window or a panel's window in the last second: drawn
+    /// every frame whatever moves.
+    pub hands_on: bool,
+    /// How soon the window's own widgets asked to be drawn again,
+    /// milliseconds (an animation, a blink); absent for not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widgets_ms: Option<f32>,
+}
+
 /// A live input's frames on their way into the show.
 #[derive(Clone, Debug, Default, Serialize, utoipa::ToSchema)]
 pub struct InputPacing {
@@ -320,6 +404,24 @@ pub struct OutputPacing {
     pub follows_clock: bool,
     /// How evenly its frames reached the screen.
     pub on_screen: OnScreenStats,
+}
+
+/// The engine's state as last published, for other threads (the API): a
+/// reader takes the pointer and lets go of the lock at once, then reads or
+/// serializes what it points to — the engine never waits on a reader that
+/// is slow with a big show (see `App::publish_state`).
+pub type PublishedState = std::sync::RwLock<Option<std::sync::Arc<EngineState>>>;
+
+/// The show's size as it is drawn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RenderSnapshot {
+    pub width: u32,
+    pub height: u32,
+    /// Following the largest screen an output is on (Auto).
+    pub auto: bool,
+    /// A smaller size every output with a size of its own still gets all it
+    /// shows from, when there is one (see `VardaApp::render_hint`).
+    pub hint: Option<crate::app::RenderHint>,
 }
 
 // Serialized DTO: the flags mirror independent engine toggles, not a state enum.
@@ -355,6 +457,8 @@ pub struct EngineState {
     pub frame_count: u64,
     /// Target FPS (0 = uncapped)
     pub target_fps: u32,
+    /// The show's size, and a smaller one enough for every output.
+    pub render: RenderSnapshot,
     /// How evenly frames are started and shown.
     pub pacing: PacingSnapshot,
     /// Discovered NDI sources (names)
@@ -426,6 +530,9 @@ pub struct BusSnapshot {
     pub auto_duration: f32,
     /// Mixer layers (channel UUIDs) this bus leaves out when it shows Master.
     pub hidden_layers: Vec<String>,
+    /// Sources its switcher row has no button for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_sources: Vec<BusInputRef>,
     /// In-flight transition, if any.
     pub transition: Option<BusTransitionSnapshot>,
     /// Where the bus is shown from its card's Screen: picker: a monitor, by
@@ -449,6 +556,13 @@ pub struct RundownSnapshot {
     /// The wait of a step that goes on to the next by itself, while it
     /// runs.
     pub wait: Option<RundownWaitSnapshot>,
+    /// The step whose time of day was held, by UUID: it waits for GO.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_held: Option<String>,
+    /// Steps taken at their time even when not next whose time was held,
+    /// by UUID: each waits till its time is set again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_always: Vec<String>,
 }
 
 /// One step of the rundown, and whether it can be taken now.
@@ -479,6 +593,10 @@ pub struct RundownWaitSnapshot {
     pub secs_left: f32,
     /// Whether that step is faded to, or cut.
     pub fade: bool,
+    /// The clip or playlist it waits to end, by deck UUID, instead of a
+    /// time; `secs_left` is then about how long it has left to play.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
 }
 
 /// Snapshot of an in-flight bus transition.
@@ -664,12 +782,44 @@ pub struct TimecodeSnapshot {
 
 // ── Registry Snapshot ──────────────────────────────────────────────
 
+/// The moods the Broadcast backgrounds go by, in the order they are shown.
+pub const BROADCAST_MOODS: [&str; 5] = ["Tech", "Cyber", "Warm", "Calm", "Colours"];
+
+/// A Broadcast background: a generator for events, kept apart from the
+/// rest (see `shaders/broadcast_*.fs`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BroadcastLook {
+    /// Its shader, as `InputSource::Generator` names it.
+    pub name: String,
+    /// As the operator reads it: "Hex field".
+    pub title: String,
+    /// Tech, Cyber, Warm, Calm or Colours.
+    pub mood: String,
+    /// Its index among the generators.
+    pub index: usize,
+}
+
+/// A frame: a filter that holds a layer's picture (see
+/// `shaders/frame_*.fs`, `EngineCommand::SetLayerFrame`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct FrameLook {
+    /// Its shader, as `SetLayerFrame` names it.
+    pub name: String,
+    /// As the operator reads it: "HUD frame".
+    pub title: String,
+}
+
 #[derive(Clone, Serialize)]
 pub struct RegistrySnapshot {
-    /// Generator shaders: (name, index)
+    /// Generator shaders: (name, index) — the Broadcast backgrounds too.
     pub generators: Vec<(String, usize)>,
-    /// Filter shaders: (name, index)
+    /// The Broadcast backgrounds, by mood: also among `generators`.
+    pub broadcast: Vec<BroadcastLook>,
+    /// Filter shaders: (name, index) — all but the frames and a layer's
+    /// own mask, which Input Settings set.
     pub filters: Vec<(String, usize)>,
+    /// The frames a layer's picture can be put in, by title.
+    pub frames: Vec<FrameLook>,
     /// Total shader count
     pub shader_count: usize,
 }
@@ -707,6 +857,15 @@ pub struct ChannelSnapshot {
     pub active_deck_count: u32,
     /// An overlay in Main mode.
     pub overlay: bool,
+    /// Where it is on air: `"main"`, or the UUID of the first bus whose
+    /// Program shows it — a layer of it, on its own or inside another input
+    /// shown there, fading or not. Absent off air.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_air: Option<String>,
+    /// The colour the operator gave it, red, green, blue. Absent when it
+    /// has the one its place gives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[u8; 3]>,
 }
 
 // Serialized DTO: the flags mirror independent deck toggles, not a state enum.
@@ -735,9 +894,33 @@ pub struct DeckSnapshot {
     /// A playlist's items and where it has got (None = not a playlist).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playlist: Option<crate::engine::value::playlist::PlaylistSnapshot>,
+    /// A Slides input's talks and where it has got (None = not a Slides
+    /// input).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slides: Option<crate::engine::value::slides::SlidesSnapshot>,
+    /// A lower third's rows, look and what is on air (None = not one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lower_third: Option<crate::engine::value::lower_third::LowerThirdSnapshot>,
+    /// A text input's text and look (None = not one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<crate::engine::value::text::TextSnapshot>,
     /// A timer's settings and what it reads (None = not a timer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timer: Option<crate::engine::value::timer::TimerSnapshot>,
+    /// A PowerPoint input's show (None = not a PowerPoint input).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<crate::engine::value::presentation::PresentationSnapshot>,
+    /// A presenter view: the PowerPoint input's layer (deck UUID) it shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presenter_of: Option<String>,
+    /// A presenter view's layout (see `SetPresenterLayout`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presenter_layout: Option<crate::engine::value::presentation::PresenterLayout>,
+    /// An input that could not be opened as its show loaded — a file moved,
+    /// a camera unplugged — kept as saved and drawn clear: why (None = not
+    /// offline). Opening the show again tries it anew.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offline: Option<String>,
     /// How a camera's picture is read into colours (None = not a camera).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camera_colour: Option<crate::engine::value::camera::CameraColour>,
@@ -748,6 +931,16 @@ pub struct DeckSnapshot {
     /// camera).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camera_lowest_latency: Option<bool>,
+    /// What a camera sends, as its pictures say: size, rate, format,
+    /// matrix, range (None = not a camera, or no picture read yet).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camera_signal: Option<crate::engine::value::camera::CameraSignal>,
+    /// A camera layer's camera, by id (`GET /api/state/cameras`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camera_id: Option<crate::camera::CameraId>,
+    /// The format a camera layer's camera is opened at; none, its best.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camera_mode: Option<crate::engine::value::camera::CameraMode>,
     pub opacity: f32,
     pub effective_opacity: f32,
     pub blend_mode: BlendMode,
@@ -779,7 +972,8 @@ pub struct DeckSnapshot {
     pub gpu_render_cost_us: f32,
     /// Smoothed FPS from actual deck render pipeline timing
     pub fps: f32,
-    /// An image drawn again only when its settings change (see
+    /// An image drawn again only when its settings change — or a lower
+    /// third or a text standing still, till it moves or changes (see
     /// `Deck::still_frame`): its `fps` counts redraws, not motion.
     #[serde(default)]
     pub still: bool,
@@ -835,6 +1029,10 @@ pub struct EffectSnapshot {
     /// Where the effect shows; everywhere when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mask: Option<crate::engine::value::mask::EffectMask>,
+    /// An effect whose shader could not be loaded, kept as saved and drawing
+    /// nothing: why (None = not offline).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offline: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -850,6 +1048,9 @@ pub struct ParamSnapshot {
     pub value: ParamValue,
     pub min: Option<f32>,
     pub max: Option<f32>,
+    /// A list setting's choices: each value and its name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choices: Option<Vec<(i32, String)>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1125,6 +1326,11 @@ pub struct MonitorSnapshot {
     /// The name given to it on this computer.
     pub given_name: Option<String>,
     pub refresh_hz: Option<f64>,
+    /// What a name given to it, or a PowerPoint input's screen, is kept by:
+    /// its lasting identity (see `app::screens`).
+    pub identity: String,
+    /// This Mac's screen: the one with the menu bar.
+    pub main: bool,
 }
 
 // ── MIDI Snapshot ───────────────────────────────────────────────────
@@ -1163,6 +1369,14 @@ pub struct CameraSnapshot {
     pub modes: Vec<(CameraId, Vec<crate::engine::value::camera::CameraMode>)>,
     /// The OS refuses this app the cameras (Camera access off on a Mac).
     pub access_denied: bool,
+    /// The cameras whose sound comes with their pictures (Blackmagic
+    /// inputs): into the mixer by themselves.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub with_own_sound: Vec<CameraId>,
+    /// The cameras that take the format coming in, whatever they were
+    /// opened at (a Blackmagic input that tells it): no format to choose.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub following_signal: Vec<CameraId>,
     /// macOS camera effects on for this app (Portrait, Studio Light, Edge
     /// Light, Background, Reactions gestures): each changes every camera's
     /// picture, on air too.
@@ -1190,6 +1404,14 @@ pub struct ScreenCaptureDeckSnapshot {
     pub target_label: String,
     /// Display targets get the `exclude_varda` toggle; window targets do not.
     pub is_display: bool,
+    /// The identity its display is kept by (the UUID macOS has for it);
+    /// none for a window, or a display kept by its name alone.
+    pub target_uuid: Option<String>,
+    /// A display kept by its name alone — by a show saved before displays
+    /// had an identity (0.9.9) — where they have one: it shows whichever
+    /// screen has that name now, until its screen is picked again
+    /// (`PUT /api/decks/{deck_uuid}/screen/target`).
+    pub kept_by_name: bool,
     /// Capture rate as a 0–1 fraction of the 1–120 fps range, matching what
     /// `deck/<uuid>/capture/rate` accepts.
     pub rate_norm: f32,
@@ -1241,6 +1463,10 @@ pub struct CaptureTargetSnapshot {
     /// This target is one of Varda's own windows — capturing it is a deliberate
     /// self-capture, which the UI marks so it is an informed choice.
     pub is_varda: bool,
+    /// A display's own identity, where the platform gives one: the same
+    /// whatever number it is listed under. Displays only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
 }
 
 /// Screen-capture subsystem state for GUI/API/WS consumers.
@@ -1395,7 +1621,9 @@ mod tests {
             },
             registry: RegistrySnapshot {
                 generators: vec![],
+                broadcast: vec![],
                 filters: vec![],
+                frames: vec![],
                 shader_count: 0,
             },
             midi: MidiSnapshot {
@@ -1408,6 +1636,8 @@ mod tests {
                 devices: vec![],
                 modes: vec![],
                 access_denied: false,
+                with_own_sound: Vec::new(),
+                following_signal: Vec::new(),
                 video_effects: Vec::new(),
             },
             depth_sensors: DepthSensorSnapshot { devices: vec![] },
@@ -1433,6 +1663,12 @@ mod tests {
             fps: 60.0,
             frame_count: 0,
             target_fps: 60,
+            render: RenderSnapshot {
+                width: 1920,
+                height: 1080,
+                auto: false,
+                hint: None,
+            },
             pacing: crate::engine::PacingSnapshot::default(),
             ndi_sources: vec![],
             ndi_available: false,
@@ -1494,7 +1730,9 @@ mod tests {
             },
             registry: RegistrySnapshot {
                 generators: vec![("Sine".into(), 0)],
+                broadcast: vec![],
                 filters: vec![],
+                frames: vec![],
                 shader_count: 1,
             },
             midi: MidiSnapshot {
@@ -1507,6 +1745,8 @@ mod tests {
                 devices: vec![],
                 modes: vec![],
                 access_denied: false,
+                with_own_sound: Vec::new(),
+                following_signal: Vec::new(),
                 video_effects: Vec::new(),
             },
             depth_sensors: DepthSensorSnapshot { devices: vec![] },
@@ -1532,6 +1772,12 @@ mod tests {
             fps: 59.9,
             frame_count: 42,
             target_fps: 60,
+            render: RenderSnapshot {
+                width: 1920,
+                height: 1080,
+                auto: false,
+                hint: None,
+            },
             pacing: crate::engine::PacingSnapshot::default(),
             ndi_sources: vec![],
             ndi_available: false,
@@ -1601,6 +1847,8 @@ mod tests {
     fn channel_snapshot_fields() {
         let ch = ChannelSnapshot {
             overlay: false,
+            on_air: None,
+            color: None,
             idx: 0,
             uuid: "test0001".into(),
             name: "Ch 0".into(),
@@ -1653,10 +1901,20 @@ mod tests {
             screen_capture: None,
             tap: None,
             playlist: None,
+            slides: None,
             timer: None,
+            lower_third: None,
+            text: None,
+            presentation: None,
+            presenter_of: None,
+            presenter_layout: None,
+            offline: None,
             camera_colour: None,
             camera_profile: None,
             camera_lowest_latency: None,
+            camera_signal: None,
+            camera_id: None,
+            camera_mode: None,
             opacity: 1.0,
             effective_opacity: 0.5,
             blend_mode: BlendMode::Normal,

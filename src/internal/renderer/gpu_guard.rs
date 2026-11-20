@@ -37,6 +37,9 @@ struct Inner {
 struct State {
     context: Option<String>,
     faults: VecDeque<GpuFault>,
+    /// A fault a test awaits: the scope it is to be raised in, its message.
+    #[cfg(test)]
+    awaited: Option<(String, String)>,
 }
 
 /// Installs a non-fatal uncaptured-error handler and records what it catches.
@@ -98,11 +101,44 @@ impl GpuErrorGuard {
             Ok(mut state) => state.context.replace(context.to_owned()),
             Err(_) => None,
         };
+        #[cfg(test)]
+        self.raise_awaited(context);
         GpuErrorScope {
             guard: self,
             start,
             previous,
         }
+    }
+
+    /// For tests: a fault raised in the next scope opened for `context`,
+    /// recorded as wgpu's handler records one — what was encoded in that
+    /// scope is encoded, and the scope reads as faulted.
+    #[cfg(test)]
+    pub(crate) fn fault_in_scope(&self, context: &str, message: &str) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.awaited = Some((context.to_owned(), message.to_owned()));
+        }
+    }
+
+    #[cfg(test)]
+    fn raise_awaited(&self, context: &str) {
+        let Ok(mut state) = self.inner.state.lock() else {
+            return;
+        };
+        if !matches!(&state.awaited, Some((scope, _)) if scope == context) {
+            return;
+        }
+        let Some((_, message)) = state.awaited.take() else {
+            return;
+        };
+        self.inner.count.fetch_add(1, Ordering::Relaxed);
+        if state.faults.len() == MAX_RETAINED {
+            state.faults.pop_front();
+        }
+        state.faults.push_back(GpuFault {
+            context: Some(context.to_owned()),
+            message,
+        });
     }
 
     /// Drain the retained faults.

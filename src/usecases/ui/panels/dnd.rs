@@ -28,8 +28,24 @@ enum FxHover {
 /// Every effect drop surface drawn this frame, in draw order.
 type FxSurfaces = Vec<(FxHover, egui::Rect)>;
 
-fn fx_surfaces_id() -> egui::Id {
-    egui::Id::new("__fx_drop_surfaces")
+/// The effect drop surfaces of the window drawn in (`ctx`'s viewport): one
+/// in a panel's window of its own takes no drop meant for this one.
+fn fx_surfaces_id(ctx: &egui::Context) -> egui::Id {
+    fx_surfaces_of(ctx.viewport_id())
+}
+
+fn fx_surfaces_of(viewport: egui::ViewportId) -> egui::Id {
+    egui::Id::new("__fx_drop_surfaces").with(viewport)
+}
+
+/// Tests: how many effect drop surfaces the window `viewport` has now.
+#[cfg(test)]
+pub(super) fn fx_surface_count(ctx: &egui::Context, viewport: egui::ViewportId) -> usize {
+    ctx.memory(|m| {
+        m.data
+            .get_temp::<FxSurfaces>(fx_surfaces_of(viewport))
+            .map_or(0, |s| s.len())
+    })
 }
 
 /// Drop the surfaces published last frame, before the panels republish.
@@ -40,12 +56,13 @@ fn fx_surfaces_id() -> egui::Id {
 /// that has since moved) would otherwise keep claiming drops at the place it
 /// used to occupy. See /spec/effect-drop-targets.md.
 pub(super) fn begin_fx_surface_frame(ctx: &egui::Context) {
-    ctx.memory_mut(|mem| mem.data.remove::<FxSurfaces>(fx_surfaces_id()));
+    let id = fx_surfaces_id(ctx);
+    ctx.memory_mut(|mem| mem.data.remove::<FxSurfaces>(id));
 }
 
 fn publish_fx_surface(ctx: &egui::Context, owner: FxHover, rect: egui::Rect) {
+    let id = fx_surfaces_id(ctx);
     ctx.memory_mut(|mem| {
-        let id = fx_surfaces_id();
         let mut surfaces: FxSurfaces = mem.data.get_temp(id).unwrap_or_default();
         surfaces.push((owner, rect));
         mem.data.insert_temp(id, surfaces);
@@ -117,8 +134,8 @@ fn resolve_fx_from_surfaces(
 }
 
 fn resolve_fx_hover(ctx: &egui::Context, pos: egui::Pos2) -> Option<FxHover> {
-    let surfaces: FxSurfaces =
-        ctx.memory(|mem| mem.data.get_temp(fx_surfaces_id()).unwrap_or_default());
+    let id = fx_surfaces_id(ctx);
+    let surfaces: FxSurfaces = ctx.memory(|mem| mem.data.get_temp(id).unwrap_or_default());
     resolve_fx_from_surfaces(pos, &surfaces)
 }
 
@@ -145,7 +162,7 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
     let ctx = ui.ctx();
     let had_payload_id = egui::Id::new("__lib_dnd_had_payload");
     let hover_ch_id = egui::Id::new("__lib_dnd_hover_ch");
-    let hover_y_id = egui::Id::new("__lib_dnd_hover_y");
+    let hover_y_id = egui::Id::new("__lib_dnd_hover_pos");
     let hover_fx_target_id = egui::Id::new("__lib_dnd_hover_fx_target");
     let on_new_ch_id = egui::Id::new("__lib_dnd_on_new_ch_zone");
     let awaiting_new_ch_id = egui::Id::new("__lib_dnd_awaiting_new_ch");
@@ -178,7 +195,7 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
 
             ctx.memory_mut(|mem| {
                 mem.data.insert_temp(hover_ch_id, found_ch);
-                mem.data.insert_temp(hover_y_id, pos.y);
+                mem.data.insert_temp(hover_y_id, pos);
                 mem.data.insert_temp(hover_fx_target_id, found_fx);
                 mem.data.insert_temp::<bool>(on_new_ch_id, on_new_ch);
                 mem.data.insert_temp::<bool>(had_payload_id, true);
@@ -190,7 +207,7 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
         if drag_just_ended {
             let hover_ch: Option<usize> =
                 ctx.memory(|mem| mem.data.get_temp(hover_ch_id).unwrap_or(None));
-            let hover_y: Option<f32> = ctx.memory(|mem| mem.data.get_temp(hover_y_id));
+            let hover_pos: Option<egui::Pos2> = ctx.memory(|mem| mem.data.get_temp(hover_y_id));
             let hover_fx: Option<FxHover> =
                 ctx.memory(|mem| mem.data.get_temp(hover_fx_target_id).unwrap_or(None));
             let on_new_ch_zone: bool =
@@ -237,23 +254,22 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
                 if let Some(gen_idx) = gen_idx {
                     log::info!("Library drop (deferred): generator {gen_idx} -> ch {channel_uuid}");
                     // Between the cards it was dropped between, when dropped
-                    // on a channel; a new channel just takes it.
+                    // on a channel, else behind its layers (what it shows on
+                    // air stays); a new channel just takes it.
                     let on_window: bool =
                         ctx.memory(|mem| mem.data.get_temp(on_window_id).unwrap_or(false));
-                    let before_deck_uuid =
-                        hover_ch
-                            .zip(hover_y)
-                            .filter(|_| !on_window)
-                            .and_then(|(ch_idx, y)| {
-                                super::insertion::insertion_at(ctx, ch_idx, y).before
-                            });
-                    actions.session.shader_to_add = Some((
-                        crate::usecases::ui::DeckPlace {
+                    let place = match hover_ch {
+                        Some(ch_idx) => super::insertion::deck_place(
+                            channel_uuid.clone(),
+                            super::insertion::place_at(ctx, ch_idx, hover_pos, on_window),
+                        ),
+                        None => crate::usecases::ui::DeckPlace {
                             channel_uuid: channel_uuid.clone(),
-                            before_deck_uuid,
+                            before_deck_uuid: None,
+                            back: false,
                         },
-                        gen_idx,
-                    ));
+                    };
+                    actions.session.shader_to_add = Some((place, gen_idx));
                 }
 
                 let cam_key = egui::Id::new("__lib_dnd_cam_id");
@@ -265,6 +281,7 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
                         channel_uuid: channel_uuid.clone(),
                         camera_id: cam_id,
                         mode: None,
+                        audio: None,
                     });
                 }
 
@@ -459,7 +476,7 @@ pub(super) fn handle_library_dnd(ui: &egui::Ui, data: &UIData, actions: &mut UIA
             ctx.memory_mut(|mem| {
                 mem.data.remove::<bool>(had_payload_id);
                 mem.data.remove::<Option<usize>>(hover_ch_id);
-                mem.data.remove::<f32>(hover_y_id);
+                mem.data.remove::<egui::Pos2>(hover_y_id);
                 mem.data.remove::<Option<FxHover>>(hover_fx_target_id);
                 mem.data.remove::<bool>(on_new_ch_id);
                 mem.data.remove::<usize>(egui::Id::new("__lib_dnd_gen_idx"));

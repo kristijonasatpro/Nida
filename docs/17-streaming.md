@@ -167,6 +167,17 @@ dropped** under the window's top line counts frames it still missed; the
 button only turns yellow for the encoder when more than one frame in a
 hundred is missed over ten seconds.
 
+An encoder that falls behind for longer — the Mac's media engine shared with
+a **4K recording beside a 4K stream**, more than one Mac's engine may manage
+at 60 fps — skips ahead to the newest picture rather than making up the lost
+time: the stream stays live, at fewer pictures a second while the engine is
+full, and is back to every picture as soon as it has room — when the
+recording stops. (Before, it never caught up: the stream showed a still
+picture until it was stopped and started again.) The destination then says
+it is **sending slower than real time, with nothing waiting to go** — the
+encoder, or the upload: if a recording is running at 4K, record or stream at
+1080p, or lower the frame rate, rather than the bit rate.
+
 ### Destinations
 
 Each of the four destinations has:
@@ -241,7 +252,11 @@ Opening another workspace stops the stream; loading one never starts it.
 With the stage (`.varda/stage.json`), in the clear, as vMix keeps them — they
 belong to the event, not to the show. Keep the workspace folder private. The
 API and `GET /api/state` never show keys or passwords: a key appears only by
-its last four characters, a password only as set or not.
+its last four characters, a password only as set or not. Nida's log and the
+Stream window's messages blank them out of what the sender says. Each
+destination is sent by an FFmpeg process, which is given the key once, on its
+command line — macOS shows any process's command line to every account on
+the Mac (Activity Monitor, `ps`), so keep show Macs to accounts you trust.
 
 ## API
 
