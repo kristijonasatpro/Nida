@@ -25,6 +25,14 @@ pub struct SubmitGate {
 }
 
 impl SubmitGate {
+    /// A private native queue submission, excluded from surface configure.
+    /// Never wait for GPU completion while holding this guard.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn native_submit<T>(&self, submit: impl FnOnce() -> T) -> T {
+        let _submitting = self.gate.read().unwrap_or_else(PoisonError::into_inner);
+        submit()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

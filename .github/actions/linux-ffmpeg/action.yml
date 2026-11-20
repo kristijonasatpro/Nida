@@ -1,0 +1,18 @@
+name: FFmpeg 9 Linux SDK
+description: Select matching FFmpeg 9 commands, development headers and shared libraries
+runs:
+  using: composite
+  steps:
+    - name: Resolve published SDK checksum
+      id: sdk
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: python3 scripts/ci/setup-linux-ffmpeg.py --resolve-only --metadata "$RUNNER_TEMP/nida-ffmpeg9.json"
+    - uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/nida-ffmpeg9
+        key: ffmpeg9-${{ runner.os }}-${{ runner.arch }}-${{ steps.sdk.outputs.sha256 }}-${{ hashFiles('scripts/ci/setup-linux-ffmpeg.py') }}
+    - name: Install and verify FFmpeg 9 headers, libraries and commands
+      shell: bash
+      run: python3 scripts/ci/setup-linux-ffmpeg.py --metadata "$RUNNER_TEMP/nida-ffmpeg9.json" --prefix "$RUNNER_TEMP/nida-ffmpeg9"

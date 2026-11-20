@@ -25,4 +25,5 @@ pub mod slides;
 pub mod surface;
 pub mod timer;
 pub mod video;
+pub mod video_delivery;
 pub mod warp;

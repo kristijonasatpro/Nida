@@ -1,0 +1,15 @@
+[package]
+name = "nida-gpu-video-checks"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+ffmpeg-next = "9.0.0"
+naga = { version = "30.0", features = ["wgsl-in", "wgsl-out", "spv-in"] }
+serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }

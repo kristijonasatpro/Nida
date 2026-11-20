@@ -463,6 +463,29 @@ impl UIRunner {
                 varda.notify_error(e);
             }
         }
+        if let Some(enabled) = session.windows_hardware_decode.take() {
+            let result = crate::video::hwdecode::set_windows_enabled(enabled)
+                .map_err(|e| e.to_string())
+                .and_then(|(path, text)| {
+                    let failed =
+                        format!("Could not save decoding preference to {}", path.display());
+                    keep_file(
+                        self.varda.as_deref_mut(),
+                        "decoding preferences",
+                        &path,
+                        text,
+                        None,
+                        failed,
+                        None,
+                    )
+                });
+            if let Err(e) = result {
+                log::warn!("{e}");
+                if let Some(varda) = self.varda.as_mut() {
+                    varda.notify_error(e);
+                }
+            }
+        }
         if let Some(choices) = session.window_choices.take() {
             let varda = self.varda.as_deref_mut();
             let kept = self.window_choices.set_with(choices, |path, text| {
@@ -1582,6 +1605,11 @@ impl UIRunner {
             .map(|(texture, ch)| (ch, texture));
         ui_data.saved_layouts = self.saved_layouts.layouts();
         ui_data.window_choices = self.window_choices.choices();
+        if cfg!(target_os = "windows") {
+            ui_data.windows_hardware_decode = crate::video::hwdecode::windows_enabled();
+            ui_data.software_decode_forced =
+                std::env::var_os(crate::video::hwdecode::SOFTWARE_ENV).is_some();
+        }
         ui_data.recent_shows = std::sync::Arc::clone(&self.recent_shows);
         ui_data.can_undo = varda_ref.history_can_undo();
         ui_data.can_redo = varda_ref.history_can_redo();
@@ -2385,7 +2413,9 @@ impl UIRunner {
         TRACE.note(CONTROL, u64::from(self.ui_frames), Step::Submitted);
         parts.push(("ui draw", t_draw.elapsed()));
         let t_part = std::time::Instant::now();
+        crate::video::pacing_trace::emit("ui_present_begin", f64::from(self.ui_frames), 0.0);
         context.queue.present(output);
+        crate::video::pacing_trace::emit("ui_present_end", f64::from(self.ui_frames), 0.0);
         // The wait this frame was drawn for, for when macOS reports it shown.
         if self.ui_presented_allowances.len() >= PRESENTED_KEPT {
             self.ui_presented_allowances.pop_front();

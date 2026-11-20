@@ -52,13 +52,33 @@ The table above covers local file content. Nida can also route live and network 
 
 ## Build from Source
 
-Requires [Rust](https://rustup.rs/) (stable) and a GPU with Metal (macOS), Vulkan (Linux), or DirectX 12 (Windows) support.
+Requires FFmpeg **9 or newer** (commands and development libraries), [Rust](https://rustup.rs/) (stable) and a GPU with Metal (macOS), Vulkan (Linux), or DirectX 12 (Windows) support.
 
 ### Ubuntu / Debian
 
 ```bash
-sudo apt install build-essential cmake pkg-config libvulkan-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libavdevice-dev libsrt-gnutls-dev libasound2-dev libv4l-dev libfreenect-dev libpipewire-0.3-dev libshaderc-dev libwayland-dev libxkbcommon-dev libx11-dev libxrandr-dev libxi-dev libgtk-3-dev
+sudo apt install build-essential cmake pkg-config libvulkan-dev python3 libclang-dev libsrt-gnutls-dev libasound2-dev libv4l-dev libfreenect-dev libpipewire-0.3-dev libshaderc-dev libwayland-dev libxkbcommon-dev libx11-dev libxrandr-dev libxi-dev libgtk-3-dev
 ```
+
+Ubuntu 24.04's standard FFmpeg is 6.1, which is too old for the frame-reuse
+APIs used here. On Linux x86_64, install the same FFmpeg 9 shared SDK selected
+in CI, without replacing system libraries:
+
+```bash
+python3 scripts/ci/setup-linux-ffmpeg.py
+source "$HOME/.local/nida-ffmpeg-9/nida-env.sh"
+ffmpeg -version
+pkg-config --modversion libavcodec  # 63.x for FFmpeg 9
+```
+
+The helper verifies the archive's published SHA256, selects matching binaries,
+headers and shared libraries, and compiles/runs a check of the required frame
+side-data API. It records the exact download and checksum in
+`nida-build-inputs.json`. CI caches by that checksum. This SDK enables GPL
+codecs, like the Windows SDK. Other Linux architectures need a native FFmpeg
+9+ build and matching development libraries; this helper is x86_64-only.
+Re-source `nida-env.sh` in each new build/run shell. For a portable Linux package,
+`scripts/ci/build-linux.sh` bundles this SDK's commands, libraries and licence.
 
 Two of those back default-on features and are easy to miss, because leaving them
 out fails the build rather than disabling the feature: `libpipewire-0.3-dev` is
@@ -77,6 +97,7 @@ cargo build --release
 ```bash
 brew tap homebrew-ffmpeg/ffmpeg
 brew install homebrew-ffmpeg/ffmpeg/ffmpeg --with-srt
+pkg-config --atleast-version=63 libavcodec  # FFmpeg 9+
 
 # Depth-sensor support (the default-on `depth` feature)
 brew install libfreenect

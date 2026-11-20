@@ -150,7 +150,11 @@ pub type EffectInfo = (String, String, bool, ShaderParamsUI);
 
 /// Video playback state snapshot for UI display
 #[derive(Clone)]
+// Independent playback, decode, residency and source flags mirrored from the player.
+#[allow(clippy::struct_excessive_bools)]
 pub struct VideoPlaybackUI {
+    pub gpu_resident: bool,
+    pub delivery: crate::video::delivery::DeliveryDiagnostics,
     pub playing: bool,
     pub position: f64,
     pub duration: f64,
@@ -599,6 +603,10 @@ pub struct UIData {
     pub right_panel_open: bool,
     /// Which panels the window shows, and where.
     pub screen: crate::usecases::ui::screen_layout::ScreenLayout,
+    /// Windows' choice for new decoders; open videos keep their selection.
+    pub windows_hardware_decode: bool,
+    /// A troubleshooting environment override forces CPU decoding.
+    pub software_decode_forced: bool,
     /// The operator's saved layouts, for the Layout menu.
     pub saved_layouts: std::sync::Arc<Vec<crate::usecases::ui::screen_layout::SavedLayout>>,
     /// The open show's name (its folder's) and folder.

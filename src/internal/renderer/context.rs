@@ -577,7 +577,10 @@ impl GpuContext {
         I: IntoIterator<Item = wgpu::CommandBuffer>,
     {
         self.submits.record();
-        self.submit_gate.submit(&self.queue, command_buffers)
+        crate::video::pacing_trace::emit("submit_begin", 0.0, 0.0);
+        let index = self.submit_gate.submit(&self.queue, command_buffers);
+        crate::video::pacing_trace::emit("submit_end", 0.0, 0.0);
+        index
     }
 
     /// Configure `surface` as `config` says, with no submit from any thread
@@ -1027,7 +1030,9 @@ impl PresentJob {
         }
         context.submit(std::iter::once(encoder.finish()));
         TRACE.note(&self.name, self.frame, Step::Submitted);
+        crate::video::pacing_trace::emit("present_begin", self.frame as f64, 0.0);
         context.queue.present(output);
+        crate::video::pacing_trace::emit("present_end", self.frame as f64, 0.0);
         TRACE.note(&self.name, self.frame, Step::Presented);
         self.stats.presents.fetch_add(1, Relaxed);
         self.stats.presented.store(true, Relaxed);

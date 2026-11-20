@@ -15,6 +15,9 @@ on:
       - 'Cargo.lock'
       - 'build.rs'
       - '.github/workflows/clippy.yml'
+      - '.github/actions/linux-ffmpeg/**'
+      - 'scripts/ci/setup-linux-ffmpeg.py'
+      - 'scripts/ci/setup-windows-build.ps1'
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,7 +52,6 @@ jobs:
           sudo apt-get install -y \
             build-essential cmake pkg-config \
             libvulkan-dev \
-            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev libavdevice-dev \
             libsrt-gnutls-dev \
             libasound2-dev \
             libv4l-dev \
@@ -61,6 +63,9 @@ jobs:
           # the linker needs for -lfreenect is missing.
           test -e /usr/lib/x86_64-linux-gnu/libfreenect.so \
             || { echo "::error::libfreenect-dev did not provide libfreenect.so"; exit 1; }
+
+      - name: Select FFmpeg 9 SDK
+        uses: ./.github/actions/linux-ffmpeg
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -90,6 +95,8 @@ jobs:
           brew install cmake pkg-config nasm
           # libfreenect backs the default-on `depth` feature — see spec/depth-sensors.md.
           brew install libfreenect
+          pkg-config --atleast-version=63 libavcodec || { echo "FFmpeg 9+ is required" >&2; exit 1; }
+          ffmpeg -version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -117,32 +124,12 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache vcpkg packages
-        uses: actions/cache@v4
-        with:
-          path: C:\vcpkg\installed
-          key: vcpkg-windows-x64-${{ hashFiles('.github/workflows/release.yml') }}
-          restore-keys: vcpkg-windows-x64-
-
-      # `ffmpeg-next` and `shaderc` are unconditional dependencies, so even a
-      # `--no-default-features` check needs FFmpeg headers and libclang. This
-      # mirrors the release job's setup; the NDI runtime is omitted because the
-      # SDK is `dlopen`'d at runtime rather than linked.
-      - name: Install vcpkg FFmpeg
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Set up FFmpeg 9 and libclang 20
         shell: pwsh
-        run: |
-          vcpkg install ffmpeg:x64-windows
-          echo "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
-
-      - name: Install LLVM (for shaderc)
-        run: choco install llvm -y
-        shell: cmd
-
-      - name: Set build environment
-        shell: pwsh
-        run: |
-          echo "LIBCLANG_PATH=C:\Program Files\LLVM\lib" >> $env:GITHUB_ENV
-          echo "PKG_CONFIG_PATH=C:\vcpkg\installed\x64-windows\lib\pkgconfig" >> $env:GITHUB_ENV
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./scripts/ci/setup-windows-build.ps1 -ToolsDirectory (Join-Path $env:RUNNER_TEMP 'nida-build-tools')
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
